@@ -12,7 +12,7 @@ from typing import Final
 
 from pydantic import BaseModel
 
-from gridforge.config import DensityLevel, HillshadeStrength, SheetLayout, Units
+from gridforge.config import ColorMode, DensityLevel, HillshadeStrength, SheetLayout, Units
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +35,7 @@ class TerrainResult(BaseModel):
     min_elev: float
     max_elev: float
     center_elev_m: float
+    slope_tif: Path | None = None
 
 
 def choose_contour_interval(
@@ -322,6 +323,94 @@ def _postprocess_contours_gpkg(terrain_gpkg: Path, index_interval: float) -> Non
         ds = None
 
 
+SLOPE_COLOR_TABLE_COLOR: Final[str] = """\
+nv 0 0 0 0
+0.0 0 0 0 0
+26.999 0 0 0 0
+27.0 246 224 94 115
+29.999 246 224 94 115
+30.0 237 137 54 155
+34.999 237 137 54 155
+35.0 229 62 62 185
+44.999 229 62 62 185
+45.0 128 90 213 195
+49.999 128 90 213 195
+50.0 59 7 100 205
+90.0 59 7 100 205
+"""
+
+SLOPE_COLOR_TABLE_BW: Final[str] = """\
+nv 0 0 0 0
+0.0 0 0 0 0
+29.999 0 0 0 0
+30.0 120 120 120 85
+34.999 120 120 120 85
+35.0 55 55 55 135
+44.999 55 55 55 135
+45.0 15 15 15 180
+90.0 15 15 15 180
+"""
+
+
+def build_slope_shading(
+    dem_utm_tif: Path,
+    color_mode: ColorMode,
+    work_dir: Path,
+) -> Path:
+    """Compute discrete avalanche slope-angle shading RGBA GeoTIFF from ``dem_utm_tif``.
+
+    Uses ``gdaldem slope -compute_edges`` followed by ``gdaldem color-relief -alpha``
+    with tightly-stepped degree bands so flat terrain is fully transparent and steep
+    backcountry slopes (>= 27° Color / >= 30° B&W) render as crisp discrete bands.
+    Temporary slope rasters and color tables are removed after generation.
+    """
+    work_dir.mkdir(parents=True, exist_ok=True)
+    slope_deg_tif = work_dir / "slope_deg.tif"
+    color_table_txt = work_dir / "slope_color_table.txt"
+    slope_tif = work_dir / "slope_shading.tif"
+
+    table_text = SLOPE_COLOR_TABLE_BW if color_mode == ColorMode.BW else SLOPE_COLOR_TABLE_COLOR
+    try:
+        slope_cmd = [
+            "gdaldem",
+            "slope",
+            "-compute_edges",
+            "-of",
+            "GTiff",
+            "-co",
+            "COMPRESS=DEFLATE",
+            "-co",
+            "TILED=YES",
+            str(dem_utm_tif),
+            str(slope_deg_tif),
+        ]
+        logger.info("Computing terrain slope in degrees -> %s", slope_deg_tif)
+        _run_subprocess(slope_cmd, context="gdaldem slope")
+
+        color_table_txt.write_text(table_text, encoding="ascii")
+        relief_cmd = [
+            "gdaldem",
+            "color-relief",
+            "-alpha",
+            "-of",
+            "GTiff",
+            "-co",
+            "COMPRESS=DEFLATE",
+            "-co",
+            "TILED=YES",
+            str(slope_deg_tif),
+            str(color_table_txt),
+            str(slope_tif),
+        ]
+        logger.info("Generating %s slope-angle shading RGBA raster -> %s", color_mode.value, slope_tif)
+        _run_subprocess(relief_cmd, context="gdaldem color-relief (slope shading)")
+    finally:
+        slope_deg_tif.unlink(missing_ok=True)
+        color_table_txt.unlink(missing_ok=True)
+
+    return slope_tif
+
+
 def _run_subprocess(cmd: list[str], context: str) -> None:
     proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if proc.returncode != 0:
@@ -463,6 +552,15 @@ def build_terrain_products(
     # 5. Tag index contours (is_index) and clean integer labels (elev_label)
     _postprocess_contours_gpkg(terrain_gpkg, index_interval=index_interval)
 
+    # 6. Optional avalanche / steepness slope-angle shading RGBA GeoTIFF
+    slope_tif: Path | None = None
+    if layout.spec.carto.show_slope_shading:
+        slope_tif = build_slope_shading(
+            dem_utm_tif,
+            color_mode=layout.spec.color_mode,
+            work_dir=work_dir,
+        )
+
     return TerrainResult(
         dem_utm_tif=dem_utm_tif,
         hillshade_tif=hillshade_tif,
@@ -473,4 +571,5 @@ def build_terrain_products(
         min_elev=min_elev,
         max_elev=max_elev,
         center_elev_m=center_elev_m,
+        slope_tif=slope_tif,
     )

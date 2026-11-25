@@ -17,6 +17,12 @@ from gridforge.sources.overlays_au import (
     GAInfraSource,
     build_au_overlay_sources,
 )
+from gridforge.sources.overlays_au_states import (
+    NSWTrailsSource,
+    VICTrailsSource,
+    is_in_nsw_coverage,
+    is_in_vic_coverage,
+)
 from gridforge.sources.overlays_us import (
     FAATowersSource,
     FEMAFloodSource,
@@ -40,13 +46,17 @@ __all__ = [
     "LocalPBFSource",
     "NHDHydroSource",
     "NOAAENCSource",
+    "NSWTrailsSource",
     "OverpassOSMSource",
     "OverlaySource",
     "USGS3DEPSource",
     "UserOverlaySource",
+    "VICTrailsSource",
     "VectorSource",
     "build_au_overlay_sources",
     "build_us_overlay_sources",
     "is_in_australia_coverage",
+    "is_in_nsw_coverage",
     "is_in_us_3dep_coverage",
+    "is_in_vic_coverage",
 ]

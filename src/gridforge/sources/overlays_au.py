@@ -966,11 +966,15 @@ def build_au_overlay_sources(
             )
             normalized_overrides[key_str] = Path(raw_path)
 
+    from gridforge.sources.overlays_au_states import NSWTrailsSource, VICTrailsSource
+
     registry: dict[AUOverlayKind, type[_BaseAUOverlaySource]] = {
         AUOverlayKind.AU_HYDRO: GAHydroSource,
         AUOverlayKind.AU_PARKS: CAPADParksSource,
         AUOverlayKind.AU_INFRA: GAInfraSource,
         AUOverlayKind.AU_AVIATION: GAAviationSource,
+        AUOverlayKind.AU_NSW_TRAILS: NSWTrailsSource,
+        AUOverlayKind.AU_VIC_TRAILS: VICTrailsSource,
     }
 
     sources: dict[str, OverlaySource] = {}
