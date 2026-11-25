@@ -20,17 +20,19 @@ from gridforge.config import BBox, SheetLayout
 logger = logging.getLogger(__name__)
 
 PRIMARY_OVERPASS_URL: Final[str] = "https://overpass-api.de/api/interpreter"
-FALLBACK_OVERPASS_URL: Final[str] = "https://overpass.private.coffee/api/interpreter"
-USER_AGENT: Final[str] = "gridforge/0.1 (+https://github.com/gridforge/gridforge)"
+FALLBACK_OVERPASS_URL: Final[str] = "https://maps.mail.ru/osm/tools/overpass/api/interpreter"
+TERTIARY_OVERPASS_URL: Final[str] = "https://overpass.private.coffee/api/interpreter"
+USER_AGENT: Final[str] = "gridforge/0.2 (+https://github.com/gridforge/gridforge)"
 
 _REMARK_RE = re.compile(rb"<remark\b[^>]*>(.*?)</remark>", flags=re.IGNORECASE | re.DOTALL)
 
 
 def default_overpass_endpoints() -> list[str]:
-    """Return deduplicated default Overpass endpoints honoring ``OVERPASS_URL``."""
+    """Return deduplicated default Overpass planet endpoints honoring ``OVERPASS_URL``."""
     raw = [
         os.environ.get("OVERPASS_URL", PRIMARY_OVERPASS_URL).strip() or PRIMARY_OVERPASS_URL,
         FALLBACK_OVERPASS_URL,
+        TERTIARY_OVERPASS_URL,
     ]
     endpoints: list[str] = []
     for url in raw:
@@ -53,24 +55,58 @@ def round_enclosing_bbox(bbox: BBox, step_deg: float = 0.001) -> BBox:
 def bbox_cache_key(bbox: BBox) -> str:
     """Compute a deterministic SHA256 cache key for an enclosing 0.001°-rounded bbox."""
     rounded = round_enclosing_bbox(bbox, step_deg=0.001)
-    payload = f"{rounded.min_x:.3f},{rounded.min_y:.3f},{rounded.max_x:.3f},{rounded.max_y:.3f}"
+    payload = f"v3:{rounded.min_x:.3f},{rounded.min_y:.3f},{rounded.max_x:.3f},{rounded.max_y:.3f}"
     return hashlib.sha256(payload.encode("ascii")).hexdigest()
 
 
 def build_overpass_query(
     bbox: BBox,
-    timeout_s: int = 90,
+    timeout_s: int = 60,
     maxsize_bytes: int = 536870912,
 ) -> str:
-    """Build a GDAL-compatible Overpass QL query using a single union and ID-sorted ``out body;``.
+    """Build a GDAL-compatible cartographic Overpass QL query with single ID-sorted ``out body;``.
 
-    Never uses ``out skel qt;`` or split ``out`` blocks, which violate GDAL's strict
-    ``nodes -> ways -> relations`` ascending-ID ordering requirement.
+    Fetches all topographic/military features styled by GridForge (nodes, ways, and
+    non-administrative multipolygons) while excluding statewide transit ``type=route``
+    relations, ``boundary=administrative`` polygons, and untagged/non-cartographic urban
+    clutter (addresses, individual trees, bollards) that overload public Overpass servers
+    in dense metro areas like Sydney CBD. Never uses ``out skel qt;`` or split ``out`` blocks,
+    preserving GDAL's strict ``nodes -> ways -> relations`` ascending-ID ordering.
     """
     s, w, n, e = bbox.min_y, bbox.min_x, bbox.max_y, bbox.max_x
+    coords = f"{s:.6f},{w:.6f},{n:.6f},{e:.6f}"
     return (
         f"[out:xml][timeout:{timeout_s}][maxsize:{maxsize_bytes}];\n"
-        f"(nwr({s:.6f},{w:.6f},{n:.6f},{e:.6f}); >;);\n"
+        "(\n"
+        f'  node["natural"~"^(peak|saddle|volcano|spring|water|cave_entrance|cliff)$"]({coords});\n'
+        f'  node["place"]({coords});\n'
+        f'  node["highway"="motorway_junction"]({coords});\n'
+        f'  node["railway"~"^(station|halt|stop|tram_stop|level_crossing)$"]({coords});\n'
+        f'  node["aeroway"]({coords});\n'
+        f'  node["amenity"~"^(hospital|clinic|fire_station|police|school|college|university|place_of_worship|fuel|shelter)$"]({coords});\n'
+        f'  node["emergency"]({coords});\n'
+        f'  node["power"~"^(tower|pole|substation|plant|generator)$"]({coords});\n'
+        f'  node["man_made"~"^(tower|mast|communications_tower|water_tower|lighthouse|windmill|mineshaft|survey_point|cairn)$"]({coords});\n'
+        f'  node["tourism"~"^(viewpoint|camp_site|alpine_hut|wilderness_hut|picnic_site)$"]({coords});\n'
+        f'  node["historic"~"^(monument|memorial|ruins|castle|fort)$"]({coords});\n'
+        f'  way["highway"]({coords});\n'
+        f'  way["railway"]({coords});\n'
+        f'  way["aeroway"]({coords});\n'
+        f'  way["waterway"]({coords});\n'
+        f'  way["natural"~"^(water|wood|forest|scrub|heath|grassland|fell|wetland|mud|bare_rock|scree|shingle|sand|beach|coastline|cliff)$"]({coords});\n'
+        f'  way["landuse"~"^(forest|wood|meadow|grass|orchard|vineyard|farmland|recreation_ground|residential|commercial|industrial|retail|military|reservoir|basin)$"]({coords});\n'
+        f'  way["leisure"~"^(park|nature_reserve|golf_course|recreation_ground)$"]({coords});\n'
+        f'  way["power"]({coords});\n'
+        f'  way["man_made"~"^(pipeline|pier|breakwater|dam|weir|bridge|embankment)$"]({coords});\n'
+        f'  way["building"]({coords});\n'
+        f'  relation["type"="multipolygon"]["boundary"!="administrative"]["natural"~"^(water|wood|forest|scrub|heath|grassland|wetland|mud|bare_rock|sand|beach)$"]({coords});\n'
+        f'  relation["type"="multipolygon"]["boundary"!="administrative"]["landuse"~"^(forest|wood|meadow|farmland|recreation_ground|residential|commercial|industrial|retail|military|reservoir|basin)$"]({coords});\n'
+        f'  relation["type"="multipolygon"]["boundary"!="administrative"]["leisure"~"^(park|nature_reserve|golf_course|recreation_ground)$"]({coords});\n'
+        f'  relation["type"="multipolygon"]["boundary"!="administrative"]["building"]({coords});\n'
+        f'  relation["type"="multipolygon"]["boundary"!="administrative"]["aeroway"]({coords});\n'
+        f'  relation["type"="multipolygon"]["boundary"!="administrative"]["amenity"~"^(hospital|school|university|place_of_worship|fire_station|police)$"]({coords});\n'
+        ");\n"
+        "(._;>;);\n"
         "out body;\n"
     )
 
@@ -126,10 +162,10 @@ class OverpassOSMSource:
         self,
         endpoints: Sequence[str] | None = None,
         cache_dir: Path | str | None = None,
-        query_timeout_s: int = 90,
-        http_timeout_s: float = 120.0,
+        query_timeout_s: int = 60,
+        http_timeout_s: float = 75.0,
         rate_limit_backoff_s: float = 30.0,
-        transient_backoff_s: float = 3.0,
+        transient_backoff_s: float = 2.0,
         max_rounds: int = 2,
         client: httpx.Client | None = None,
     ) -> None:
@@ -161,7 +197,7 @@ class OverpassOSMSource:
             self._injected_client
             if self._injected_client is not None
             else httpx.Client(
-                timeout=self.http_timeout_s,
+                timeout=httpx.Timeout(self.http_timeout_s, connect=min(10.0, self.http_timeout_s)),
                 follow_redirects=True,
                 headers={"User-Agent": USER_AGENT},
             )

@@ -229,11 +229,18 @@ def test_local_dem_source_directory_vrt(tmp_path: Path) -> None:
 def test_overpass_query_is_gdal_compatible() -> None:
     bbox = BBox(min_x=150.27, min_y=-33.77, max_x=150.36, max_y=-33.69)
     q = build_overpass_query(bbox)
-    assert "[out:xml][timeout:90][maxsize:536870912];" in q
-    assert "(nwr(-33.770000,150.270000,-33.690000,150.360000); >;);" in q
+    coords = "-33.770000,150.270000,-33.690000,150.360000"
+    assert "[out:xml][timeout:60][maxsize:536870912];" in q
+    assert f'way["highway"]({coords});' in q
+    assert f'way["building"]({coords});' in q
+    assert f'node["place"]({coords});' in q
+    assert 'relation["type"="multipolygon"]["boundary"!="administrative"]' in q
+    assert "nwr(" not in q
+    assert "(._;>;);" in q
     assert q.strip().endswith("out body;")
     assert "skel" not in q.lower()
     assert "qt;" not in q.lower()
+    assert q.count("out ") == 1
 
 
 def test_overpass_remark_and_truncation_detection() -> None:

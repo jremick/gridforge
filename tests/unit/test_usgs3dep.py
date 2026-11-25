@@ -21,6 +21,7 @@ from gridforge.config import (
     Units,
 )
 from gridforge.sources.base import ElevationSource
+from gridforge.sources.dem_au_elvis import AUElvisDEMSource
 from gridforge.sources.dem_copernicus import CopernicusGLO30Source
 from gridforge.sources.dem_usgs3dep import (
     AutoDEMSource,
@@ -295,9 +296,20 @@ def test_usgs3dep_incomplete_1m_falls_back_to_10m_navd88(
         assert [c[0] for c in invoked_cmds] == ["gdalwarp", "gdal_translate"]
 
 
-def test_auto_dem_source_routes_us_vs_australia_and_fallback(tmp_path: Path) -> None:
+def test_auto_dem_source_routes_us_australia_global_and_fallback(tmp_path: Path) -> None:
     boulder = _boulder_layout()
     nsw = _blue_mountains_layout()
+    swiss_alps = nsw.model_copy(
+        update={
+            "spec": SheetSpec(center_lat=46.55, center_lon=7.98, scale=25000),
+            "utm_epsg": 32632,
+            "utm_zone": 32,
+            "utm_hemisphere": "N",
+            "gzd": "32T",
+            "wgs84_bbox": BBox(min_x=7.95, min_y=46.52, max_x=8.01, max_y=46.58),
+            "wgs84_fetch_bbox": BBox(min_x=7.93, min_y=46.51, max_x=8.03, max_y=46.59),
+        }
+    )
 
     class _StubUSGS(USGS3DEPSource):
         def __init__(self, should_fail: bool = False) -> None:
@@ -314,6 +326,21 @@ def test_auto_dem_source_routes_us_vs_australia_and_fallback(tmp_path: Path) -> 
             out.write_bytes(b"mock-3dep")
             return out
 
+    class _StubAU(AUElvisDEMSource):
+        def __init__(self, should_fail: bool = False) -> None:
+            super().__init__(cache_dir=tmp_path)
+            self.should_fail = should_fail
+            self.called = 0
+
+        def fetch_dem(self, layout: SheetLayout, work_dir: Path) -> Path:
+            self.called += 1
+            if self.should_fail:
+                raise RuntimeError("Simulated GA outage")
+            out = work_dir / "dem_raw.tif"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(b"mock-au-elvis")
+            return out
+
     class _StubGLO30(CopernicusGLO30Source):
         def __init__(self) -> None:
             super().__init__(cache_dir=tmp_path)
@@ -328,30 +355,40 @@ def test_auto_dem_source_routes_us_vs_australia_and_fallback(tmp_path: Path) -> 
 
     # 1. US sheet -> chooses USGS 3DEP (NAVD88)
     usgs_ok = _StubUSGS(should_fail=False)
+    au_ok = _StubAU(should_fail=False)
     glo30 = _StubGLO30()
-    auto = AutoDEMSource(usgs_source=usgs_ok, copernicus_source=glo30)
+    auto = AutoDEMSource(usgs_source=usgs_ok, au_source=au_ok, copernicus_source=glo30)
     auto.fetch_dem(boulder, tmp_path / "us_ok")
-    assert usgs_ok.called == 1
-    assert glo30.called == 0
+    assert (usgs_ok.called, au_ok.called, glo30.called) == (1, 0, 0)
     assert auto.resolved_source_name == "usgs-3dep"
     assert auto.resolved_vertical_datum == "NAVD88"
     assert "3DEP" in auto.resolved_attribution
     assert auto.attribution == auto.resolved_attribution
 
-    # 2. Australia sheet -> skips USGS 3DEP and uses Copernicus GLO-30 (EGM2008)
+    # 2. Australia sheet -> chooses GA / ELVIS (AHD)
     auto.fetch_dem(nsw, tmp_path / "au_ok")
-    assert usgs_ok.called == 1
-    assert glo30.called == 1
+    assert (usgs_ok.called, au_ok.called, glo30.called) == (1, 1, 0)
+    assert auto.resolved_source_name == "au-elvis"
+    assert auto.resolved_vertical_datum == "AHD"
+    assert "Geoscience Australia" in auto.resolved_attribution
+
+    # 3. Europe sheet (Swiss Alps) -> skips US & AU and uses Copernicus GLO-30 (EGM2008)
+    auto.fetch_dem(swiss_alps, tmp_path / "eu_ok")
+    assert (usgs_ok.called, au_ok.called, glo30.called) == (1, 1, 1)
     assert auto.resolved_source_name == "copernicus-glo30"
     assert auto.resolved_vertical_datum == "EGM2008"
     assert "Copernicus" in auto.resolved_attribution
 
-    # 3. US sheet where 3DEP fails -> falls back cleanly to Copernicus GLO-30 (EGM2008)
-    usgs_fail = _StubUSGS(should_fail=True)
-    glo30_fb = _StubGLO30()
-    auto_fb = AutoDEMSource(usgs_source=usgs_fail, copernicus_source=glo30_fb)
+    # 4. US & Australia fallback cleanly to Copernicus GLO-30 (EGM2008) on regional failure
+    auto_fb = AutoDEMSource(
+        usgs_source=_StubUSGS(should_fail=True),
+        au_source=_StubAU(should_fail=True),
+        copernicus_source=_StubGLO30(),
+    )
     auto_fb.fetch_dem(boulder, tmp_path / "us_fb")
-    assert usgs_fail.called == 1
-    assert glo30_fb.called == 1
+    assert auto_fb.resolved_source_name == "copernicus-glo30"
+    assert auto_fb.resolved_vertical_datum == "EGM2008"
+
+    auto_fb.fetch_dem(nsw, tmp_path / "au_fb")
     assert auto_fb.resolved_source_name == "copernicus-glo30"
     assert auto_fb.resolved_vertical_datum == "EGM2008"
