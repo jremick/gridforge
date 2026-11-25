@@ -1,22 +1,73 @@
 services:
-  gridforge:
+  web:
     build:
       context: .
       dockerfile: Dockerfile
     image: gridforge:dev
+    command: ["uvicorn", "gridforge.web.app:app", "--host", "0.0.0.0", "--port", "8080"]
+    ports:
+      - "8080:8080"
+    environment:
+      - GRIDFORGE_DATA_DIR=/data/jobs
+      - GRIDFORGE_PACKS_DIR=/data/packs
+      - GRIDFORGE_WEB_DIST=/app/web/dist
+      - GDAL_CACHEMAX=192
+      - OMP_THREAD_LIMIT=1
+    volumes:
+      - gridforge-data:/data/jobs
+      - ./packs:/data/packs:ro
+    # Web server never imports qgis.core; stays lightweight (< 150 MB typical)
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: gridforge:dev
+    command: ["python3", "-m", "gridforge.web.worker"]
+    environment:
+      - QT_QPA_PLATFORM=offscreen
+      - GRIDFORGE_DATA_DIR=/data/jobs
+      - GRIDFORGE_PACKS_DIR=/data/packs
+      - GRIDFORGE_CACHE_DIR=/tmp/gridforge-cache
+      - GRIDFORGE_WORKER_CONCURRENCY=1
+      - GDAL_CACHEMAX=192
+      - OMP_THREAD_LIMIT=1
+      - OVERPASS_URL=${OVERPASS_URL:-https://overpass-api.de/api/interpreter}
+    volumes:
+      - gridforge-data:/data/jobs
+      - gridforge-cache:/tmp/gridforge-cache
+      - ./packs:/data/packs:ro
+    # Single-concurrency worker with strict memory guardrails for 16 GB hosts
+    mem_limit: 3g
+    memswap_limit: 3584m
+    restart: unless-stopped
+
+  cli:
+    profiles: ["cli"]
+    image: gridforge:dev
     volumes:
       - .:/app
-      - ./output:/output
+      - ./out:/out
+      - ./packs:/data/packs:ro
       - gridforge-cache:/tmp/gridforge-cache
     environment:
       - QT_QPA_PLATFORM=offscreen
-      - GDAL_CACHEMAX=256
-      - OMP_THREAD_LIMIT=1
       - GRIDFORGE_CACHE_DIR=/tmp/gridforge-cache
+      - GRIDFORGE_PACKS_DIR=/data/packs
+      - GDAL_CACHEMAX=192
+      - OMP_THREAD_LIMIT=1
       - OVERPASS_URL=${OVERPASS_URL:-https://overpass-api.de/api/interpreter}
-    # Cap memory cleanly for local workstations (16 GB hosts running 300 DPI A3 sheets)
-    mem_limit: 4g
+    mem_limit: 3g
     command: ["gridforge", "--help"]
 
 volumes:
+  gridforge-data:
   gridforge-cache:

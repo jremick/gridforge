@@ -22,10 +22,16 @@ htmlcov/
 .idea/
 
 # Runtime outputs, caches, and GIS artifacts
-out/
-output/
-work/
+/out/
+/output/
+/work/
+/packs/
+.gridforge-data/
 .cache/
+
+# Phase 4 web frontend
+web/node_modules/
+web/dist/
 *.pdf
 *.gpkg
 *.gpkg-shm

@@ -70,6 +70,7 @@ class DemSourceKind(str, Enum):
     AUTO = "auto"
     GLO30 = "glo30"
     USGS3DEP = "usgs3dep"
+    AU_ELVIS = "au-elvis"
 
 
 class USOverlayKind(str, Enum):
@@ -79,6 +80,15 @@ class USOverlayKind(str, Enum):
     NHD = "nhd"
     TOWERS = "towers"
     ENC = "enc"
+
+
+class AUOverlayKind(str, Enum):
+    """Optional Australia-wide CC BY 4.0 national thematic overlay layers."""
+
+    AU_HYDRO = "au-hydro"
+    AU_PARKS = "au-parks"
+    AU_INFRA = "au-infra"
+    AU_AVIATION = "au-aviation"
 
 
 class ExportFormat(str, Enum):
@@ -151,6 +161,7 @@ class SheetSpec(BaseModel):
     carto: CartoOptions = Field(default_factory=CartoOptions)
     dem_source: DemSourceKind = DemSourceKind.AUTO
     us_overlays: list[USOverlayKind] = Field(default_factory=list)
+    au_overlays: list[AUOverlayKind] = Field(default_factory=list)
 
     @field_validator("center_lat")
     @classmethod
@@ -317,3 +328,21 @@ class ExportResult(BaseModel):
     max_tile_px: tuple[int, int] | None = None
     max_tile_bytes: int | None = None
     elapsed_seconds: float
+
+
+class PackManifest(BaseModel):
+    """Manifest describing a self-contained air-gapped offline regional data pack."""
+
+    pack_id: str
+    name: str
+    region: str
+    bbox_wgs84: BBox
+    utm_zones: list[str]
+    dem_path: str | None = None
+    vertical_datum: str = "AHD"
+    dem_attribution: str | None = None
+    osm_pbf_path: str | None = None
+    overlays: dict[str, str] = Field(default_factory=dict)
+    attributions: list[str] = Field(default_factory=list)
+    created_at: str
+    size_bytes: int = 0

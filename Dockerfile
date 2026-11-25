@@ -1,6 +1,18 @@
 # syntax=docker/dockerfile:1
-# Multi-arch (linux/arm64 + linux/amd64) headless PyQGIS 3.40 LTR image on Debian Trixie
-FROM debian:trixie-slim
+# Multi-stage, multi-arch (linux/arm64 + linux/amd64) GridForge image:
+#   Stage 1 (frontend): Builds the MapLibre GL JS + Vite SPA (`web/dist`)
+#   Stage 2 (runtime):  Headless PyQGIS 3.40 LTR + GDAL + FastAPI/Uvicorn on Debian Trixie
+
+FROM node:22-slim AS frontend
+
+WORKDIR /web
+COPY web/package*.json ./
+RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
+COPY web/index.html web/tsconfig.json web/vite.config.ts ./
+COPY web/src/ ./src/
+RUN npm run build
+
+FROM debian:trixie-slim AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -28,7 +40,7 @@ RUN python3 -m venv --system-site-packages /opt/venv \
     && echo 'export PATH="/opt/venv/bin:${PATH}"' > /etc/profile.d/gridforge-venv.sh
 ENV PATH="/opt/venv/bin:${PATH}"
 
-# Install Python runtime and test dependencies before copying application code for layer caching
+# Install Python runtime, web API, and test dependencies before copying application code for layer caching
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
     && pip install --no-cache-dir \
         "typer>=0.12" \
@@ -40,13 +52,16 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
         "httpx>=0.27" \
         "pypdf>=4.2" \
         "pillow>=10.3" \
+        "fastapi>=0.115" \
+        "uvicorn[standard]>=0.30" \
+        "python-multipart>=0.0.9" \
         "pytest>=8.0"
 
-# Headless Qt, PROJ, GDAL /vsicurl/ COG streaming, and memory-bounded runtime defaults
+# Headless Qt, PROJ, GDAL /vsicurl/ COG streaming, and strict 16 GB-host memory-bounded defaults
 ENV QT_QPA_PLATFORM=offscreen \
     XDG_RUNTIME_DIR=/tmp/runtime-root \
     PROJ_DATA=/usr/share/proj \
-    GDAL_CACHEMAX=256 \
+    GDAL_CACHEMAX=192 \
     OMP_THREAD_LIMIT=1 \
     GDAL_DISABLE_READDIR_ON_OPEN=EMPTY_DIR \
     CPL_VSIL_CURL_ALLOWED_EXTENSIONS=.tif,.vrt \
@@ -55,20 +70,26 @@ ENV QT_QPA_PLATFORM=offscreen \
     GDAL_HTTP_MAX_RETRY=3 \
     GDAL_HTTP_RETRY_DELAY=2 \
     GRIDFORGE_CACHE_DIR=/tmp/gridforge-cache \
+    GRIDFORGE_DATA_DIR=/data/jobs \
+    GRIDFORGE_PACKS_DIR=/data/packs \
+    GRIDFORGE_WEB_DIST=/app/web/dist \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app/src
 
-RUN mkdir -p /tmp/runtime-root /tmp/gridforge-cache \
+RUN mkdir -p /tmp/runtime-root /tmp/gridforge-cache /data/jobs /data/packs \
     && chmod 700 /tmp/runtime-root
 
 WORKDIR /app
 
-# Copy project metadata, config, styles, and source, then install editable (volume-mount friendly)
+# Copy project metadata, config, styles/icons, source, and built SPA
 COPY pyproject.toml README.md LICENSE ./
 COPY config/ ./config/
 COPY assets/ ./assets/
 COPY src/ ./src/
+COPY --from=frontend /web/dist /app/web/dist
 
 RUN pip install --no-cache-dir --no-deps --no-build-isolation -e .
+
+EXPOSE 8080
 
 CMD ["gridforge", "--help"]
