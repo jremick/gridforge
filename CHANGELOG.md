@@ -5,6 +5,26 @@ All notable changes to **GridForge** are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-11-26
+
+Field navigation, backcountry alpine cartography, and print-verification release adding five high-impact operational tools across the CLI, PyQGIS renderer, and MapLibre Print Studio.
+
+### Added
+
+- **GPX / GeoJSON Auto-Strip-Map Builder & Elevation Profile (`--strip-route`, `--elevation-profile`, `POST /api/strip-plan`):**
+  - Upload or pass any `.gpx` or `.geojson` route to automatically plan minimum-count, true-scale UTM strip sheets (`S1..Sn`) with configurable overlap (`--overlap-pct`) covering 100% of the track in one locked UTM projection.
+  - Samples route elevations directly from the rendered DEMs and generates a crisp vector **Route Overview & Elevation Profile** cover page with total distance, cumulative ascent/descent, min/max elevation, and strip sheet index table.
+- **100 mm Printer Scale Calibration & True-Scale MGRS Romer Page (`--calibration-page`):**
+  - Appends a mathematically verified pure-vector calibration sheet featuring exact **`100.00 mm`** horizontal & vertical metric rulers (`0.000 mm` verified error/skew), a **`4.00 in` (`101.60 mm`)** imperial bar, cut-out **MGRS Romer Scale Corners** (`1:25,000`, `1:24,000`, `1:50,000`), and a `360° / 6400 NATO mil` compass protractor ring so users can confirm 100% / Actual Size printing before going into the field.
+- **Interactive Waypoint Markup & Tactical Route Card (`--waypoint`, `--route-card`, `POST /api/route-metrics`):**
+  - Drop numbered category-coded waypoints (`WP`, `Camp`, `Water`, `Hazard`, `LZ`) directly on the MapLibre Studio map (`⌖ Markup` / `M` hotkey) or pass repeatable `--waypoint` CLI flags, rendered directly onto the map sheet with dashed route legs.
+  - Generates a companion **Tactical Route Card** PDF page listing every waypoint's 10-digit MGRS coordinate, lat/lon, elevation, leg distance, cumulative distance, and WMM2025 Grid & Magnetic azimuths in degrees and NATO mils.
+- **GDAL Slope-Angle Avalanche Shading (`--slope-shading`):**
+  - Computes discrete steepness bands (`>30°` amber/orange/red/purple avalanche terrain in Color; high-contrast tonal bands in B&W) on the bottom raster stack above hillshade so all contours, trails, and 1 km MGRS lines remain 100% crisp vector.
+- **NSW & Victoria State Trail, Fire-Trail, Hut & Trig Overlays (`--au-overlay au-nsw-trails`, `--au-overlay au-vic-trails`):**
+  - Live CC BY 4.0 integration with **NSW Spatial Services** (`NSW_Transport_Theme`, `SurveyMarkGDA2020`, `NSW_POI`, `NSW_Features_of_Interest_Category`) and **DataVic / DEECA Vicmap** WFS (`tr_road`, `recweb_tracks`, `foi_point`, `recweb_hut`, `recweb_site`, `geomark_point`) bringing high-visibility burnt-orange fire trails, 4WD/walking tracks, alpine huts, campgrounds, and trig stations (`21` SVG icons, `72` native QGIS 3.40 `.qml` styles).
+- **Automated Verification (`196+` offline CI tests):** Extended `tests/integration/verify_pdf.py` with `verify_calibration_page()` (`100.00 mm ± 0.15 mm` vector ruler verification) and added `tests/integration/test_v11_usability.py` covering Mt Kosciuszko NSW, Grampians VIC, and Katoomba Bushwalk Strip Atlas E2E renders.
+
 ## [1.0.0] - 2026-11-26
 
 First stable public release of **GridForge** — an open-source, self-hostable military-style MGRS topographic map generator, print studio web app, and offline field device exporter.

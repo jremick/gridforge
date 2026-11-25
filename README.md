@@ -8,10 +8,10 @@
 [![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](pyproject.toml)
 [![PyQGIS 3.40 LTR](https://img.shields.io/badge/PyQGIS-3.40%20LTR-589632?logo=qgis&logoColor=white)](Dockerfile)
 [![Multi-Arch](https://img.shields.io/badge/Docker-arm64%20%7C%20amd64-2496ED?logo=docker&logoColor=white)](Dockerfile)
-[![Tests](https://img.shields.io/badge/Tests-171%2B%20passing-2ea44f)](tests/)
+[![Tests](https://img.shields.io/badge/Tests-196%2B%20passing-2ea44f)](tests/)
 [![Idle Memory](https://img.shields.io/badge/Idle%20RAM-~124%20MiB-f59e0b)](docker-compose.yml)
 
-True-scale **local UTM** 300 DPI print PDFs · **Multi-sheet Atlas PDFs** · **ATAK `.mbtiles`** · **Garmin Custom Maps `.kmz`** · **Air-gapped offline packs**
+True-scale **local UTM** 300 DPI print PDFs · **GPX Strip Atlases** · **Slope-Angle Shading** · **Tactical Route Cards & 100 mm Romer Pages** · **ATAK `.mbtiles`** · **Garmin `.kmz`**
 
 </div>
 
@@ -53,6 +53,41 @@ Every sheet below was generated directly by GridForge at 300 DPI and verified au
 ### Offline Field Device Exports — ATAK `.mbtiles` & Garmin Custom Maps `.kmz`
 
 ![ATAK MBTiles and Garmin KMZ Offline Exports](docs/images/exports-atak-garmin.jpg)
+
+---
+
+## `v1.1.0` Field Navigation & Alpine Tools
+
+GridForge `v1.1.0` adds five backcountry planning and print-verification tools across both the MapLibre Print Studio UI and CLI:
+
+- **Slope-Angle Avalanche Shading (`--slope-shading`):** Highlights steep `>30° / 35° / 45° / 50°+` alpine terrain on the bottom raster stack while keeping contours, trails, and MGRS lines 100% vector.
+- **NSW & Victoria State Trail, Fire-Trail, Hut & Trig Overlays (`--au-overlay au-nsw-trails`, `--au-overlay au-vic-trails`):** Live CC BY 4.0 fire access trails, 4WD/walking tracks, alpine huts (*Seamans Hut*, *Cleve Cole Hut*), campgrounds, and AHD trig stations directly from **NSW Spatial Services** and **DEECA / Vicmap WFS**.
+- **GPX / GeoJSON Auto-Strip-Map Builder & Elevation Profile (`--strip-route`, `--elevation-profile`):** Auto-fits minimum-count true-scale UTM strip sheets (`S1..Sn`) along any bushwalk track and generates a DEM-sampled Elevation Profile cover page.
+- **Interactive Waypoint Markup & Tactical Route Card (`⌖ Markup` / `M` hotkey, `--waypoint`, `--route-card`):** Drop categorized waypoints (`WP`, `Camp`, `Water`, `Hazard`, `LZ`) directly on the map and print a companion Tactical Route Card with 10-digit MGRS, leg distances, and WMM2025 Grid/Magnetic azimuths (`°` & NATO `mils`).
+- **100 mm Printer Scale Calibration & MGRS Romer Sheet (`--calibration-page`):** Appends an exact `100.00 mm` horizontal/vertical ruler (`0.000 mm` verified error), `4.00 in` bar, cut-out `1:24k / 1:25k / 1:50k` MGRS Romer corners, and `360° / 6400 mil` compass protractor ring.
+
+![Mt Kosciuszko NSW and Grampians VIC Slope Shading and State Trails](docs/images/v11-alpine-slope-trails.jpg)
+
+![Elevation Profile Cover, Tactical Route Card, and 100 mm Calibration and MGRS Romer Page](docs/images/v11-field-supplements.jpg)
+
+```bash
+# Mt Kosciuszko Alpine Sheet + Slope Shading + NSW Fire Trails/Huts/Trigs + Waypoints + Route Card + 100 mm Calibration
+docker run --rm -v "$(pwd)/out:/out" gridforge:dev \
+  gridforge render --center "-36.456,148.263" --scale 25000 --paper a4 \
+    --dem-source au-elvis --au-overlay au-nsw-trails --slope-shading \
+    --waypoint "Mt Kosciuszko Summit,-36.4559,148.2636,waypoint" \
+    --waypoint "Rawson Pass,-36.4631,148.2736,hazard" \
+    --waypoint "Seamans Hut,-36.4535,148.2877,camp" \
+    --route-card --calibration-page --title "MT KOSCIUSZKO — ALPINE NSW" \
+    --output /out/kosciuszko_25k_a4_alpine_color.pdf
+
+# Auto-Fit Bushwalk Strip Atlas from GPX/GeoJSON + Elevation Profile + 100 mm Calibration Page
+docker run --rm -v "$(pwd)/out:/out" -v "$(pwd)/examples:/examples:ro" gridforge:dev \
+  gridforge render --strip-route /examples/katoomba_route.geojson --scale 25000 --paper a4 \
+    --dem-source au-elvis --au-overlay au-nsw-trails --slope-shading \
+    --elevation-profile --calibration-page --title "KATOOMBA BUSHWALK STRIP ATLAS" \
+    --output /out/katoomba_strip_atlas.pdf
+```
 
 ---
 
@@ -178,7 +213,8 @@ Measured on an Apple Silicon **M5 (16 GB RAM)** host running native `linux/arm64
 | **Warm-cache A4 300 DPI render time** | **`2.25 s`** (Katoomba B&W) / **`5.92 s`** (Boulder 1 m LiDAR) | Fast interactive turnaround |
 | **1 km MGRS physical grid accuracy** | **`0.0046 mm`** (Letter 1:24k) / **`0.0185 mm`** (A4 1:25k) | `≤ 0.15 mm` protractor tolerance |
 | **MGRS grid orthogonality skew** | **`0.0000 mm`** across all tested UTM zones | `< 0.05 mm` |
-| **Automated test suite (`pytest`)** | **`171+` offline unit & integration tests passing** | Runs offline inside `gridforge:dev` |
+| **Automated test suite (`pytest`)** | **`196+` offline unit & integration tests passing** | Runs offline inside `gridforge:dev` |
+| **100 mm Calibration ruler accuracy** | **`0.0000 mm` error / `0.0000 mm` skew** (H & V) | `≤ 0.15 mm` |
 
 ---
 
@@ -198,8 +234,8 @@ src/gridforge/
 web/                       # TypeScript + Vite + MapLibre GL JS self-hosted tactical print studio SPA
 config/osmconf.ini         # Shared GDAL OSM driver schema for online & air-gapped parity
 assets/
-├── icons/                 # 18 crisp self-contained military/topo/Outback SVG symbols
-└── styles/{color,bw}/     # 62 native QGIS 3.40 Color & dedicated laser-print B&W .qml styles
+├── icons/                 # 21 crisp self-contained military/topo/Outback/alpine SVG symbols
+└── styles/{color,bw}/     # 72 native QGIS 3.40 Color & dedicated laser-print B&W .qml styles
 examples/                  # Sample Blue Mountains GeoJSON route overlay & runnable CLI cookbook
 ```
 
@@ -215,8 +251,8 @@ docker run --rm -e GRIDFORGE_RUN_LIVE=1 -v "$(pwd):/app" gridforge:dev pytest te
 
 ## Roadmap & Backlog
 
-- **`v1.1` (In Progress):** High-resolution **NSW & Victoria state trail, fire-trail, hut, campground & trig station** layers (CC BY 4.0 NSW Spatial Services / NPWS & Vicmap / DEECA), interactive route & waypoint planning tools, and corridor / multi-sheet print enhancements.
-- **Backlog:** **Air-Gapped Web Basemap Mode** (self-hosted local PMTiles/MBTiles basemap option in the MapLibre Studio UI for fully disconnected deployments), additional regional LiDAR providers, and batch/corridor strip-map generation.
+- **Shipped in `v1.1.0`:** NSW & Victoria state fire-trail/hut/trig layers, GDAL slope-angle avalanche shading, GPX/GeoJSON auto-strip-map builder + elevation profile cover, interactive waypoint markup + tactical route cards, and 100 mm printer scale calibration & MGRS Romer pages.
+- **Backlog (`v1.2+`):** **Air-Gapped Web Basemap Mode** (self-hosted local PMTiles/MBTiles basemap option in the MapLibre Studio UI for fully disconnected deployments), additional regional LiDAR providers (QLD/TAS/NZ/EU), and custom legend/collar branding profiles.
 
 ---
 
@@ -228,6 +264,8 @@ docker run --rm -e GRIDFORGE_RUN_LIVE=1 -v "$(pwd):/app" gridforge:dev pytest te
 | **OpenStreetMap** | Global roads, trails, rail, water, buildings, landcover, POIs | **ODbL** — Map data © OpenStreetMap contributors (`openstreetmap.org/copyright`) |
 | **Geoscience Australia / DEA** | Australia 5 m LiDAR (2025) & SRTM 1s (`AHD`), Surface Hydrology, Electricity/Pipelines, Aviation/Homesteads | **CC BY 4.0** — © Commonwealth of Australia (Geoscience Australia / Digital Earth Australia) |
 | **DCCEEW CAPAD 2025** | Australia National Parks, Nature Reserves, IPAs | **CC BY 4.0** — © Commonwealth of Australia (DCCEEW) |
+| **NSW Spatial Services (DCS)** | NSW Fire Trails, 4WD/Walking Tracks, Huts, Campgrounds & GDA2020 Trig Stations (`au-nsw-trails`) | **CC BY 4.0** — © State of New South Wales (Spatial Services, DCS) |
+| **Victoria DEECA / DTP Vicmap** | Victoria 4WD/Fire Access Tracks, Walking Trails, Alpine Huts, Campgrounds & Survey Marks (`au-vic-trails`) | **CC BY 4.0** — © State of Victoria (DEECA / DTP Vicmap) |
 | **Copernicus WorldDEM-30** | Global 30 m elevation (`EGM2008`) | **Copernicus DEM License** — © DLR e.V. 2010–2014 & © Airbus Defence and Space GmbH 2014–2018, EU & ESA |
 | **USGS 3DEP / NHD / FEMA / FAA / NOAA** | US 1 m & 10 m DEM (`NAVD88`), NHD streams, NFHL flood zones, DOF obstacle towers, ENC charts | **US Public Domain** |
 | **NOAA / NCEI WMM2025** | Global magnetic declination & secular variation (`2025.0–2030.0`) | **US Public Domain** |
