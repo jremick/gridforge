@@ -89,10 +89,13 @@ def test_all_svg_icons_exist_and_parse_xml() -> None:
         "water_bore.svg",
         "homestead.svg",
         "airfield.svg",
+        "hut.svg",
+        "campground.svg",
+        "trig.svg",
     )
     root = get_icons_root()
     assert root.is_dir()
-    assert len(expected) == 18
+    assert len(expected) == 21
     for name in expected:
         p = get_icon_path(name, icons_root=root)
         assert p.is_file(), f"Missing icon: {p}"
@@ -106,7 +109,7 @@ def test_multiscale_factors() -> None:
 
 
 def test_all_qml_styles_roundtrip(tmp_path: Path) -> None:
-    assert len(STYLE_ROLES) == 31
+    assert len(STYLE_ROLES) == 36
     _run_pyqgis_snippet(
         f"""
         from osgeo import gdal
@@ -120,6 +123,13 @@ def test_all_qml_styles_roundtrip(tmp_path: Path) -> None:
         ds.SetGeoTransform((250000.0, 10.0, 0.0, 6265000.0, 0.0, -10.0))
         ds.GetRasterBand(1).Fill(190)
         ds = None
+
+        slope_tif = Path({str(tmp_path / "slope.tif")!r})
+        sds = gdal.GetDriverByName("GTiff").Create(str(slope_tif), 4, 4, 4, gdal.GDT_Byte)
+        sds.SetGeoTransform((250000.0, 10.0, 0.0, 6265000.0, 0.0, -10.0))
+        for idx_b, val in ((1, 229), (2, 62), (3, 62), (4, 185)):
+            sds.GetRasterBand(idx_b).Fill(val)
+        sds = None
 
         geom_by_role = {{
             "landcover": "MultiPolygon",
@@ -135,10 +145,12 @@ def test_all_qml_styles_roundtrip(tmp_path: Path) -> None:
             "buildings": "MultiPolygon",
             "building_icons": "MultiPolygon",
             "transport": "LineString",
+            "au_state_trails": "LineString",
             "au_power_lines": "LineString",
             "au_pipelines": "LineString",
             "au_runways": "LineString",
             "points": "Point",
+            "au_state_pois": "Point",
             "au_substations": "Point",
             "au_hydro_points": "Point",
             "au_homesteads": "Point",
@@ -152,6 +164,8 @@ def test_all_qml_styles_roundtrip(tmp_path: Path) -> None:
             "overlay_polygons": "MultiPolygon",
             "overlay_lines": "LineString",
             "overlay_points": "Point",
+            "waypoint_route": "LineString",
+            "waypoint_points": "Point",
         }}
 
         for mode in (ColorMode.COLOR, ColorMode.BW):
@@ -160,8 +174,13 @@ def test_all_qml_styles_roundtrip(tmp_path: Path) -> None:
             assert apply_layer_style(rl, "hillshade", mode, prefer_qml=True) is True
             del rl
 
+            assert get_qml_path("slope_shading", mode).is_file()
+            sl = QgsRasterLayer(str(slope_tif), "slope")
+            assert apply_layer_style(sl, "slope_shading", mode, prefer_qml=True) is True
+            del sl
+
             for role in STYLE_ROLES:
-                if role == "hillshade":
+                if role in ("hillshade", "slope_shading"):
                     continue
                 assert get_qml_path(role, mode).is_file(), f"Missing QML: {{mode.value}}/{{role}}.qml"
                 vl = QgsVectorLayer(
@@ -570,3 +589,115 @@ def test_runner_dem_au_elvis_and_offline_pack_airgapped(tmp_path: Path) -> None:
         renderer=_DummyRenderer(),
     )
     assert captured_ws[0].regional_overlays == {}
+
+
+def test_v11_slope_state_trails_waypoints_styles_and_cli_parsing(tmp_path: Path) -> None:
+    from gridforge.cli import _parse_waypoints
+    from gridforge.config import WaypointCategory
+
+    wps = _parse_waypoints(
+        [
+            "Katoomba Base,-33.7190,150.3114,camp",
+            "Echo Point,-33.7322,150.3117",
+            "Steep Gully,-33.7350,150.3150,hazard,Watch loose rock",
+        ]
+    )
+    assert len(wps) == 3
+    assert wps[0].category == WaypointCategory.CAMP
+    assert wps[1].category == WaypointCategory.WAYPOINT
+    assert wps[2].category == WaypointCategory.HAZARD
+    assert wps[2].notes == "Watch loose rock"
+
+    _run_pyqgis_snippet(
+        f"""
+        from osgeo import gdal
+        from qgis.core import (
+            QgsExpression,
+            QgsExpressionContext,
+            QgsExpressionContextUtils,
+            QgsFeature,
+            QgsRasterLayer,
+            QgsVectorLayer,
+        )
+        from qgis.PyQt.QtGui import QPainter
+        from gridforge.config import ColorMode, Units
+        from gridforge.render.layout import _split_base_and_vector_layers
+        from gridforge.render.styles import apply_programmatic_style
+
+        def _eval(vl, expr_str, attrs):
+            expr = QgsExpression(expr_str)
+            assert not expr.hasParserError(), expr.parserErrorString()
+            f = QgsFeature(vl.fields())
+            for k, v in attrs.items():
+                f.setAttribute(k, v)
+            ctx = QgsExpressionContext()
+            ctx.appendScopes(QgsExpressionContextUtils.globalProjectLayerScopes(vl))
+            ctx.setFeature(f)
+            return expr.evaluate(ctx)
+
+        # 1. Slope-angle shading stays on bottom raster stack (with BlendNormal) while vectors stay pure
+        gdal.UseExceptions()
+        slope_tif = Path({str(tmp_path / "slope_rgba.tif")!r})
+        sds = gdal.GetDriverByName("GTiff").Create(str(slope_tif), 4, 4, 4, gdal.GDT_Byte)
+        sds.SetGeoTransform((250000.0, 10.0, 0.0, 6265000.0, 0.0, -10.0))
+        for b, v in ((1, 237), (2, 137), (3, 54), (4, 155)):
+            sds.GetRasterBand(b).Fill(v)
+        sds = None
+
+        sl = QgsRasterLayer(str(slope_tif), "Slope Shading")
+        apply_programmatic_style(sl, "slope_shading", ColorMode.COLOR)
+        assert sl.blendMode() == QPainter.CompositionMode_SourceOver
+        assert 0.35 <= sl.renderer().opacity() <= 0.70
+
+        vl_top = QgsVectorLayer("LineString?crs=EPSG:32756&field=name:string", "Contours", "memory")
+        vl_bot = QgsVectorLayer("MultiPolygon?crs=EPSG:32756&field=name:string", "Landcover", "memory")
+        top_lyrs, bot_lyrs = _split_base_and_vector_layers([vl_top, sl, vl_bot])
+        assert top_lyrs == [vl_top]
+        assert bot_lyrs == [sl, vl_bot]
+        del sl, vl_top, vl_bot
+
+        # 2. NSW / VIC state trails rules & fire-trail (FT) label suffix dedup
+        vl_tr = QgsVectorLayer(
+            "LineString?crs=EPSG:32756&field=name:string&field=trail_class:string&field=surface:string&field=state:string",
+            "au_state_trails",
+            "memory",
+        )
+        for mode in (ColorMode.COLOR, ColorMode.BW):
+            apply_programmatic_style(vl_tr, "au_state_trails", mode)
+            labels = {{r.label() for r in vl_tr.renderer().rootRule().children()}}
+            assert "Fire & Management Trails" in labels
+            assert "4WD Tracks" in labels
+            assert "Walking Tracks" in labels
+            ft_lbl = [r for r in vl_tr.labeling().rootRule().children() if r.description() == "Fire Trail Labels"][0]
+            expr_s = ft_lbl.settings().fieldName
+            assert _eval(vl_tr, expr_s, {{"name": "Narrow Neck Fire Trail", "trail_class": "fire_trail"}}) == "Narrow Neck Fire Trail"
+            assert _eval(vl_tr, expr_s, {{"name": "Boyd", "trail_class": "fire_trail"}}) == "Boyd (FT)"
+
+        # 3. NSW / VIC state POIs (huts, campgrounds, trigs) + metric/imperial trig elevation
+        vl_poi = QgsVectorLayer(
+            "Point?crs=EPSG:32755&field=name:string&field=poi_type:string&field=elev_m:double&field=state:string",
+            "au_state_pois",
+            "memory",
+        )
+        for units, expected_trig in [
+            (Units.METRIC, "KOSCIUSZKO\\n2229 m"),
+            (Units.IMPERIAL, "KOSCIUSZKO\\n7314 ft"),
+        ]:
+            apply_programmatic_style(vl_poi, "au_state_pois", ColorMode.COLOR, units=units)
+            trig_rule = [r for r in vl_poi.labeling().rootRule().children() if r.description() == "Trig Station Labels"][0]
+            got = _eval(vl_poi, trig_rule.settings().fieldName, {{"name": "KOSCIUSZKO", "poi_type": "trig", "elev_m": 2229.4}})
+            assert got == expected_trig, f"got={{got!r}} expected={{expected_trig!r}}"
+
+        # 4. Waypoints badge rules & WP1 · Label expression
+        vl_wp = QgsVectorLayer(
+            "Point?crs=EPSG:32756&field=seq:integer&field=code:string&field=label:string&field=category:string&field=mgrs_10m:string&field=elev_m:double",
+            "waypoint_points",
+            "memory",
+        )
+        for mode in (ColorMode.COLOR, ColorMode.BW):
+            apply_programmatic_style(vl_wp, "waypoint_points", mode)
+            wp_expr = vl_wp.labeling().settings().fieldName
+            assert _eval(vl_wp, wp_expr, {{"code": "WP1", "label": "Echo Point"}}) == "WP1 · Echo Point"
+            assert _eval(vl_wp, wp_expr, {{"code": "WP1", "label": "WP1"}}) == "WP1"
+        """
+    )

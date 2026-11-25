@@ -620,15 +620,56 @@ def _render_compact_map_key(
     has_au_parks = ("au-parks" in regional) or ("au_parks" in regional)
     has_au_hydro = ("au-hydro" in regional) or ("au_hydro" in regional)
     has_au_aviation = ("au-aviation" in regional) or ("au_aviation" in regional)
+    has_au_state_trails = any(
+        k in regional for k in ("au-nsw-trails", "au_nsw_trails", "au-vic-trails", "au_vic_trails")
+    )
+    has_slope = bool(
+        workspace is not None
+        and workspace.slope_tif is not None
+        and workspace.slope_tif.is_file()
+        and carto is not None
+        and carto.show_slope_shading
+    )
+    has_waypoints = bool(
+        workspace is not None
+        and workspace.waypoints_gpkg is not None
+        and workspace.waypoints_gpkg.is_file()
+    )
     has_infra = bool(carto is None or carto.show_power or carto.show_pipelines)
     has_us_row = has_fema or has_towers
     has_au_row = (has_au_parks or has_au_hydro or has_au_aviation) and not has_us_row
-    extra_rows = int(has_infra) + int(has_us_row or has_au_row)
+
+    # Keep total rows cleanly readable (<= 11 rows inside 31.8 mm box height)
+    dynamic_count = (
+        int(has_us_row or has_au_row)
+        + int(has_au_state_trails)
+        + int(has_slope)
+        + int(has_waypoints)
+    )
+    if 8 + int(has_infra) + dynamic_count > 11:
+        has_infra = False
+    if 8 + int(has_infra) + dynamic_count > 11 and has_au_row and has_au_state_trails:
+        has_au_row = False
+
+    extra_rows = (
+        int(has_infra)
+        + int(has_us_row or has_au_row)
+        + int(has_au_state_trails)
+        + int(has_slope)
+        + int(has_waypoints)
+    )
     total_rows = 8 + extra_rows
-    row_y0 = y_mm + 4.8
-    avail_h = h_mm - 10.6
+    meta_y = y_mm + h_mm - 4.7
+    meta_divider_y = meta_y - 0.35
+    row_y0 = y_mm + 4.55
+    avail_h = max(8.0, (meta_divider_y - 1.50) - row_y0)
     pitch = min(2.75, avail_h / max(1, total_rows - 1)) if total_rows > 1 else 2.75
-    lbl_pt = 4.9 if total_rows <= 8 else 4.5
+    if total_rows <= 8:
+        lbl_pt = 4.9
+    elif total_rows <= 10:
+        lbl_pt = 4.4
+    else:
+        lbl_pt = 4.1
 
     def _ry(idx: int) -> float:
         return row_y0 + idx * pitch
@@ -778,9 +819,72 @@ def _render_compact_map_key(
             au_tag = "Bore / Waterpt"
         _add_label(print_layout, au_tag, lbl_x, ry - 1.15, lbl_w, 2.3, size_pt=lbl_pt, valign="center")
 
+    # Row: NSW / VIC State Fire Trails, Huts & Trigs
+    if has_au_state_trails:
+        ry = _ry(idx); idx += 1
+        _add_line(
+            print_layout,
+            sx1,
+            ry,
+            sx1 + 3.8,
+            ry,
+            color_hex="#D95F02" if is_color else "#000000",
+            width_mm=0.42,
+            dash_vector=[1.4, 0.65] if is_color else [1.5, 0.55, 0.5, 0.55],
+        )
+        _add_triangle(print_layout, sx1 + 4.5, ry - 0.68, 1.35, fill_hex="#7A3E1D" if is_color else "#111111")
+        _add_label(print_layout, "Fire Trl / Hut / Trig", lbl_x, ry - 1.15, lbl_w, 2.3, size_pt=lbl_pt, valign="center")
+
+    # Row: Slope-Angle Shading (Avalanche >30 deg)
+    if has_slope:
+        ry = _ry(idx); idx += 1
+        swatches = (
+            ("#F6E05E", "#ED8936", "#E53E3E", "#805AD5")
+            if is_color
+            else ("#C0C0C0", "#888888", "#484848", "#181818")
+        )
+        sw_w = (sx2 - sx1) / len(swatches)
+        for s_idx, sw_hex in enumerate(swatches):
+            _add_rect(
+                print_layout,
+                sx1 + s_idx * sw_w,
+                ry - 0.58,
+                sw_w,
+                1.16,
+                fill_hex=sw_hex,
+                stroke_hex="#444444",
+                stroke_mm=0.08,
+            )
+        _add_label(print_layout, "Slope 30/35/45°+", lbl_x, ry - 1.15, lbl_w, 2.3, size_pt=lbl_pt, valign="center")
+
+    # Row: Custom Tactical Waypoints & Route Legs
+    if has_waypoints:
+        ry = _ry(idx); idx += 1
+        wp_c = "#C2185B" if is_color else "#111111"
+        _add_line(
+            print_layout,
+            sx1,
+            ry,
+            sx1 + 4.2,
+            ry,
+            color_hex=wp_c,
+            width_mm=0.40,
+            dash_vector=[1.5, 0.7],
+        )
+        _add_rect(
+            print_layout,
+            sx1 + 4.8,
+            ry - 0.55,
+            1.10,
+            1.10,
+            fill_hex=wp_c,
+            stroke_hex="#111111",
+            stroke_mm=0.14,
+        )
+        _add_label(print_layout, "Waypoints / Route", lbl_x, ry - 1.05, lbl_w, 2.1, size_pt=lbl_pt, valign="center")
+
     # Sheet Metadata footer inside Key Box
-    meta_y = y_mm + h_mm - 4.9
-    _add_line(print_layout, x_mm + 1.0, meta_y - 0.35, x_mm + w_mm - 1.0, meta_y - 0.35, color_hex="#BBBBBB", width_mm=0.14)
+    _add_line(print_layout, x_mm + 1.0, meta_divider_y, x_mm + w_mm - 1.0, meta_divider_y, color_hex="#BBBBBB", width_mm=0.14)
     mode_tag = "COLOR" if is_color else "B&W PRINT"
     _add_label(
         print_layout,
@@ -788,8 +892,8 @@ def _render_compact_map_key(
         x_mm + 1.0,
         meta_y,
         w_mm - 2.0,
-        2.3,
-        size_pt=4.6,
+        2.15,
+        size_pt=4.5,
         color_hex="#333333",
         halign="center",
         valign="center",
@@ -798,10 +902,10 @@ def _render_compact_map_key(
         print_layout,
         "GRIDFORGE TOPOGRAPHIC SHEET",
         x_mm + 1.0,
-        meta_y + 2.2,
+        meta_y + 2.1,
         w_mm - 2.0,
-        2.2,
-        size_pt=4.4,
+        2.1,
+        size_pt=4.3,
         color_hex="#555555",
         bold=True,
         halign="center",
@@ -828,19 +932,24 @@ def _format_attribution_footer(attributions: list[str]) -> str:
 def _split_base_and_vector_layers(ordered_layers: list[Any]) -> tuple[list[Any], list[Any]]:
     """Split top-to-bottom layers into (top_vector_layers, bottom_blended_layers).
 
-    When a map item contains a layer with a non-normal blend mode (such as
-    Multiply hillshade), QGIS rasterizes that entire ``QgsLayoutItemMap``.
-    Placing the hillshade + underlying landcover in a dedicated bottom
-    ``QgsLayoutItemMap`` and all BlendNormal layers above it in a second
-    transparent ``QgsLayoutItemMap`` preserves true Multiply shaded relief
-    while keeping contours, roads, water, labels, and the MGRS 1 km grid as
+    When a map item contains a raster layer or non-normal blend mode (such as
+    Multiply hillshade or semi-transparent slope-angle shading), placing all
+    bottom raster/landcover layers in a dedicated bottom ``QgsLayoutItemMap``
+    and all vector layers above them in a second transparent ``QgsLayoutItemMap``
+    preserves shaded relief and avalanche slope tinting while keeping contours,
+    fire trails, roads, water, labels, waypoints, and the MGRS 1 km grid as
     100% pure crisp PDF vectors.
     """
+    from qgis.core import QgsRasterLayer
     from qgis.PyQt.QtGui import QPainter
 
     split_idx: int | None = None
     for idx, lyr in enumerate(ordered_layers):
-        if hasattr(lyr, "blendMode") and lyr.blendMode() != QPainter.CompositionMode_SourceOver:
+        is_raster = isinstance(lyr, QgsRasterLayer)
+        has_non_normal_blend = (
+            hasattr(lyr, "blendMode") and lyr.blendMode() != QPainter.CompositionMode_SourceOver
+        )
+        if is_raster or has_non_normal_blend:
             split_idx = idx
             break
 

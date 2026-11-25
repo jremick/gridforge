@@ -12,18 +12,24 @@ from pathlib import Path
 
 from gridforge.config import (
     AUOverlayKind,
+    CartoOptions,
     ColorMode,
+    DeclinationInfo,
     DemSourceKind,
     ExportFormat,
     ExportResult,
     GarminProfile,
     JobWorkspace,
     MBTilesFormat,
+    Orientation,
     PackManifest,
+    PaperSize,
     RenderResult,
     SheetLayout,
     SheetSpec,
+    Units,
     USOverlayKind,
+    WaypointInput,
 )
 from gridforge.export.kmz import export_garmin_kmz
 from gridforge.export.mbtiles import export_mbtiles
@@ -35,6 +41,19 @@ from gridforge.geo.declination import (
     render_grid_ref_box_svg,
 )
 from gridforge.geo.mgrs_grid import generate_mgrs_grid
+from gridforge.geo.strip_atlas import (
+    StripAtlasPlan,
+    parse_route_file,
+    plan_strip_atlas,
+    sample_route_elevation,
+)
+from gridforge.geo.supplements import (
+    merge_pdf_pages,
+    render_calibration_pdf,
+    render_elevation_profile_pdf,
+    render_route_card_pdf,
+)
+from gridforge.geo.waypoints import compute_route_metrics, write_waypoints_gpkg
 from gridforge.pipeline.normalize import normalize_osm_to_gpkg
 from gridforge.pipeline.terrain import build_terrain_products
 from gridforge.render.base import MapRenderer
@@ -46,6 +65,7 @@ from gridforge.sources.dem_local import LocalDEMSource
 from gridforge.sources.dem_usgs3dep import AutoDEMSource, USGS3DEPSource
 from gridforge.sources.osm_overpass import OverpassOSMSource
 from gridforge.sources.osm_pbf import LocalPBFSource
+from gridforge.sources.overlay_user import UserOverlaySource
 from gridforge.sources.overlays_au import build_au_overlay_sources
 from gridforge.sources.overlays_us import build_us_overlay_sources
 
@@ -422,12 +442,26 @@ def prepare_job_workspace(
         resolved_dir / "grid_ref_box.svg",
     )
 
-    # 6. Process optional user overlays and US/AU regional thematic overlays
+    # 6. Process optional user overlays, tactical waypoints, and US/AU regional thematic overlays
     _report_progress(progress_callback, "overlays", 46)
     overlays_gpkg: Path | None = None
     overlay_attributions: list[str] = []
     if overlay_sources:
         overlays_gpkg, overlay_attributions = _merge_overlays(overlay_sources, layout, resolved_dir)
+
+    waypoints_gpkg: Path | None = None
+    if spec.waypoints:
+        wp_metrics = compute_route_metrics(
+            list(spec.waypoints),
+            units=spec.units,
+            date_iso=spec.date_iso,
+            dem_path=terrain.dem_utm_tif if terrain.dem_utm_tif.is_file() else None,
+        )
+        waypoints_gpkg = write_waypoints_gpkg(
+            wp_metrics,
+            layout.utm_epsg,
+            resolved_dir / "waypoints.gpkg",
+        )
 
     regional_overlays, regional_attributions = _fetch_regional_overlays(
         spec,
@@ -470,6 +504,8 @@ def prepare_job_workspace(
         vertical_datum=resolved_vertical_datum,
         dem_source_name=resolved_dem_name,
         regional_overlays=regional_overlays,
+        slope_tif=terrain.slope_tif,
+        waypoints_gpkg=waypoints_gpkg,
     )
 
 
@@ -531,6 +567,100 @@ def _run_workspace_exports(
     return results
 
 
+def _infer_route_file_from_overlays(
+    overlay_path: Path | str | None,
+    overlay_sources: Sequence[OverlaySource] | None,
+) -> Path | None:
+    """Locate a `.gpx`/`.geojson`/`.json` route file from explicit ``overlay_path`` or user overlay sources."""
+    if overlay_path is not None:
+        candidate = Path(overlay_path).expanduser().resolve()
+        if candidate.is_file():
+            return candidate
+    if overlay_sources:
+        for src in overlay_sources:
+            src_path = getattr(src, "path", None)
+            if src_path is not None:
+                cand = Path(src_path).expanduser().resolve()
+                if cand.is_file() and cand.suffix.lower() in (".gpx", ".geojson", ".json"):
+                    return cand
+    return None
+
+
+def _assemble_pdf_with_supplements(
+    *,
+    spec: SheetSpec,
+    map_pdfs: list[Path],
+    anchor_layout: SheetLayout,
+    anchor_declination: DeclinationInfo,
+    dem_paths: list[Path],
+    route_file: Path | None,
+    strip_plan: StripAtlasPlan | None,
+    job_dir: Path,
+    output_pdf: Path,
+) -> Path:
+    """Assemble ``[Elevation Profile?] + Map Sheet(s) + [Route Card?] + [100 mm Calibration?]``."""
+    bw = spec.color_mode == ColorMode.BW
+    supp_dir = job_dir / "supplements"
+    supp_dir.mkdir(parents=True, exist_ok=True)
+    front_pages: list[Path] = []
+    back_pages: list[Path] = []
+
+    if spec.include_elevation_profile and dem_paths:
+        route_lonlat: list[tuple[float, float]] | None = None
+        if route_file is not None and route_file.is_file():
+            try:
+                route_lonlat = parse_route_file(route_file)
+            except Exception as exc:
+                logger.warning("Could not parse '%s' as route for elevation profile (%s)", route_file, exc)
+        if route_lonlat is None and len(spec.waypoints) >= 2:
+            route_lonlat = [(w.lon, w.lat) for w in spec.waypoints]
+        if route_lonlat is None and strip_plan is not None and len(strip_plan.sheets) >= 2:
+            route_lonlat = [(s.center_lon, s.center_lat) for s in strip_plan.sheets]
+
+        if route_lonlat is not None and len(route_lonlat) >= 2:
+            profile = sample_route_elevation(route_lonlat, dem_paths, anchor_layout.utm_epsg)
+            elev_pdf = render_elevation_profile_pdf(
+                profile,
+                strip_plan,
+                anchor_layout,
+                supp_dir / "elevation_profile.pdf",
+                bw=bw,
+            )
+            front_pages.append(elev_pdf)
+
+    if spec.include_route_card and spec.waypoints:
+        dem_for_wp = dem_paths[0] if dem_paths else None
+        metrics = compute_route_metrics(
+            list(spec.waypoints),
+            units=spec.units,
+            date_iso=spec.date_iso,
+            dem_path=dem_for_wp,
+        )
+        card_pdf = render_route_card_pdf(
+            metrics,
+            anchor_layout,
+            anchor_declination,
+            supp_dir / "route_card.pdf",
+            bw=bw,
+        )
+        back_pages.append(card_pdf)
+
+    if spec.include_calibration_page:
+        cal_pdf = render_calibration_pdf(
+            anchor_layout.page_width_mm,
+            anchor_layout.page_height_mm,
+            spec.scale,
+            supp_dir / "calibration.pdf",
+            bw=bw,
+        )
+        back_pages.append(cal_pdf)
+
+    all_pages = [*front_pages, *map_pdfs, *back_pages]
+    if len(all_pages) == 1 and all_pages[0].resolve() == output_pdf.resolve():
+        return output_pdf
+    return merge_pdf_pages(all_pages, output_pdf)
+
+
 def run_render_job(
     spec: SheetSpec,
     output_pdf: Path | str,
@@ -538,6 +668,7 @@ def run_render_job(
     elevation_source: ElevationSource | None = None,
     vector_source: VectorSource | None = None,
     overlay_sources: Sequence[OverlaySource] | None = None,
+    overlay_path: Path | str | None = None,
     regional_overlay_overrides: Mapping[OverlayOverrideKey, Path | str] | None = None,
     pack_dir: Path | str | None = None,
     progress_callback: ProgressCallback | None = None,
@@ -552,10 +683,28 @@ def run_render_job(
     export_include_grid: bool | None = None,
     export_dpi: int | None = None,
 ) -> RenderResult:
-    """Execute the full GridForge pipeline from ``SheetSpec`` to print-ready PDF (+ optional exports)."""
+    """Execute the full GridForge pipeline from ``SheetSpec`` to print-ready PDF (+ optional supplements/exports)."""
     t_start = time.perf_counter()
     output_pdf_path = Path(output_pdf)
     map_renderer: MapRenderer = renderer or PyQGISRenderer()
+
+    combined_overlays: list[OverlaySource] = list(overlay_sources or [])
+    if overlay_path is not None:
+        resolved_ov = Path(overlay_path).expanduser().resolve()
+        existing_paths = {
+            Path(getattr(s, "path")).expanduser().resolve()
+            for s in combined_overlays
+            if getattr(s, "path", None) is not None
+        }
+        if resolved_ov not in existing_paths:
+            combined_overlays.insert(0, UserOverlaySource(resolved_ov))
+
+    route_file = _infer_route_file_from_overlays(overlay_path, combined_overlays)
+    wants_supplements = bool(
+        spec.include_calibration_page
+        or (spec.include_route_card and len(spec.waypoints) > 0)
+        or spec.include_elevation_profile
+    )
 
     owns_temp_dir = work_dir is None
     if work_dir is not None:
@@ -570,15 +719,33 @@ def run_render_job(
             job_dir,
             elevation_source=elevation_source,
             vector_source=vector_source,
-            overlay_sources=overlay_sources,
+            overlay_sources=combined_overlays or None,
             regional_overlay_overrides=regional_overlay_overrides,
             pack_dir=pack_dir,
             progress_callback=progress_callback,
         )
 
         # Render print-ready PDF via isolated PyQGIS subprocess
-        _report_progress(progress_callback, "rendering_pdf", 75)
-        result = map_renderer.render_pdf(workspace, output_pdf_path)
+        _report_progress(progress_callback, "rendering_pdf", 65)
+        if wants_supplements:
+            raw_map_pdf = job_dir / "map_sheet_01.pdf"
+            result = map_renderer.render_pdf(workspace, raw_map_pdf)
+            _report_progress(progress_callback, "rendering_supplements", 78)
+            dem_paths = [workspace.dem_utm_tif] if workspace.dem_utm_tif.is_file() else []
+            _assemble_pdf_with_supplements(
+                spec=spec,
+                map_pdfs=[raw_map_pdf],
+                anchor_layout=workspace.layout,
+                anchor_declination=workspace.declination,
+                dem_paths=dem_paths,
+                route_file=route_file,
+                strip_plan=None,
+                job_dir=job_dir,
+                output_pdf=output_pdf_path,
+            )
+            result = result.model_copy(update={"output_pdf": output_pdf_path})
+        else:
+            result = map_renderer.render_pdf(workspace, output_pdf_path)
 
         # Optionally produce matching offline device archives from the exact same workspace
         if mbtiles_out is not None or kmz_out is not None:
@@ -602,6 +769,182 @@ def run_render_job(
                 "elapsed_seconds": total_elapsed,
                 "workspace_dir": retained_dir,
             }
+        )
+    finally:
+        if owns_temp_dir and not keep_workspace:
+            shutil.rmtree(job_dir, ignore_errors=True)
+
+
+def run_strip_atlas_job(
+    route_file: Path | str,
+    output_pdf: Path | str,
+    *,
+    scale: int = 25000,
+    paper: PaperSize = PaperSize.A4,
+    orientation: Orientation = Orientation.PORTRAIT,
+    color_mode: ColorMode = ColorMode.COLOR,
+    units: Units = Units.METRIC,
+    title: str | None = None,
+    date_iso: str | None = None,
+    geopdf: bool = False,
+    dpi: int = 300,
+    dem_source: DemSourceKind = DemSourceKind.AUTO,
+    us_overlays: Sequence[USOverlayKind] | None = None,
+    au_overlays: Sequence[AUOverlayKind] | None = None,
+    carto: CartoOptions | None = None,
+    waypoints: Sequence[WaypointInput] | None = None,
+    include_calibration_page: bool = False,
+    include_route_card: bool = False,
+    include_elevation_profile: bool = True,
+    overlap_pct: float = 10.0,
+    max_sheets: int = 12,
+    elevation_source: ElevationSource | None = None,
+    vector_source: VectorSource | None = None,
+    overlay_sources: Sequence[OverlaySource] | None = None,
+    regional_overlay_overrides: Mapping[OverlayOverrideKey, Path | str] | None = None,
+    pack_dir: Path | str | None = None,
+    progress_callback: ProgressCallback | None = None,
+    keep_workspace: bool = False,
+    work_dir: Path | str | None = None,
+    renderer: MapRenderer | None = None,
+) -> RenderResult:
+    """Plan and sequentially render a minimum-count GPX/GeoJSON Strip Atlas PDF (+ supplements)."""
+    t_start = time.perf_counter()
+    resolved_route = Path(route_file).expanduser().resolve()
+    output_pdf_path = Path(output_pdf)
+    map_renderer: MapRenderer = renderer or PyQGISRenderer()
+
+    route_lonlat = parse_route_file(resolved_route)
+    strip_plan = plan_strip_atlas(
+        route_lonlat,
+        scale=scale,
+        paper=paper,
+        orientation=orientation,
+        units=units,
+        overlap_pct=overlap_pct,
+        max_sheets=max_sheets,
+    )
+
+    combined_overlays: list[OverlaySource] = [UserOverlaySource(resolved_route)]
+    for src in overlay_sources or []:
+        src_path = getattr(src, "path", None)
+        if src_path is not None and Path(src_path).expanduser().resolve() == resolved_route:
+            continue
+        combined_overlays.append(src)
+
+    base_title = (title.strip() if title else resolved_route.stem.replace("_", " ").replace("-", " ").upper())
+    total_sheets = len(strip_plan.sheets)
+    eff_carto = carto if carto is not None else CartoOptions()
+    eff_waypoints = list(waypoints or [])
+    eff_us = list(dict.fromkeys(us_overlays or []))
+    eff_au = list(dict.fromkeys(au_overlays or []))
+
+    owns_temp_dir = work_dir is None
+    if work_dir is not None:
+        job_dir = Path(work_dir).resolve()
+        job_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        job_dir = Path(tempfile.mkdtemp(prefix="gridforge_strip_")).resolve()
+
+    try:
+        sheet_pdfs_dir = job_dir / "strip_pdfs"
+        sheet_pdfs_dir.mkdir(parents=True, exist_ok=True)
+        saved_dems_dir = job_dir / "strip_dems"
+        saved_dems_dir.mkdir(parents=True, exist_ok=True)
+
+        rendered_sheet_pdfs: list[Path] = []
+        collected_dem_paths: list[Path] = []
+        anchor_layout: SheetLayout | None = None
+        anchor_declination: DeclinationInfo | None = None
+        anchor_spec: SheetSpec | None = None
+
+        for idx, sh in enumerate(strip_plan.sheets, start=1):
+            sheet_pct = 10 + int(((idx - 1) / max(1, total_sheets)) * 70)
+            _report_progress(progress_callback, f"rendering_sheet_{sh.sheet_id}", sheet_pct)
+
+            sheet_title = (
+                f"{base_title} — Sheet {sh.sheet_id} ({idx}/{total_sheets})"
+                if total_sheets > 1
+                else base_title
+            )
+            sheet_spec = SheetSpec(
+                center_lat=sh.center_lat,
+                center_lon=sh.center_lon,
+                center_mgrs=sh.center_mgrs_10m,
+                scale=scale,
+                paper=paper,
+                orientation=orientation,
+                color_mode=color_mode,
+                units=units,
+                title=sheet_title,
+                date_iso=date_iso,
+                geopdf=geopdf,
+                dpi=dpi,
+                carto=eff_carto,
+                dem_source=dem_source,
+                us_overlays=eff_us,
+                au_overlays=eff_au,
+                waypoints=eff_waypoints,
+                include_calibration_page=include_calibration_page,
+                include_route_card=include_route_card,
+                include_elevation_profile=include_elevation_profile,
+            )
+            if anchor_spec is None:
+                anchor_spec = sheet_spec.model_copy(update={"title": base_title})
+
+            sheet_work = job_dir / f"sheet_{idx:02d}_{sh.sheet_id}"
+            sheet_work.mkdir(parents=True, exist_ok=True)
+            try:
+                ws = prepare_job_workspace(
+                    sheet_spec,
+                    sheet_work,
+                    elevation_source=elevation_source,
+                    vector_source=vector_source,
+                    overlay_sources=combined_overlays,
+                    regional_overlay_overrides=regional_overlay_overrides,
+                    pack_dir=pack_dir,
+                )
+                if anchor_layout is None:
+                    anchor_layout = ws.layout
+                if anchor_declination is None:
+                    anchor_declination = ws.declination
+                if include_elevation_profile and ws.dem_utm_tif.is_file():
+                    dem_copy = saved_dems_dir / f"dem_{idx:02d}_{sh.sheet_id}.tif"
+                    shutil.copy2(ws.dem_utm_tif, dem_copy)
+                    collected_dem_paths.append(dem_copy)
+
+                sheet_pdf = sheet_pdfs_dir / f"sheet_{idx:02d}_{sh.sheet_id}.pdf"
+                map_renderer.render_pdf(ws, sheet_pdf)
+                rendered_sheet_pdfs.append(sheet_pdf)
+            finally:
+                if not keep_workspace:
+                    shutil.rmtree(sheet_work, ignore_errors=True)
+
+        assert anchor_layout is not None and anchor_declination is not None and anchor_spec is not None
+        _report_progress(progress_callback, "rendering_supplements", 88)
+        _assemble_pdf_with_supplements(
+            spec=anchor_spec,
+            map_pdfs=rendered_sheet_pdfs,
+            anchor_layout=anchor_layout,
+            anchor_declination=anchor_declination,
+            dem_paths=collected_dem_paths,
+            route_file=resolved_route,
+            strip_plan=strip_plan,
+            job_dir=job_dir,
+            output_pdf=output_pdf_path,
+        )
+
+        _report_progress(progress_callback, "done", 100)
+        total_elapsed = round(time.perf_counter() - t_start, 3)
+        retained_dir = job_dir if (keep_workspace or not owns_temp_dir) else None
+        return RenderResult(
+            output_pdf=output_pdf_path,
+            page_width_mm=anchor_layout.page_width_mm,
+            page_height_mm=anchor_layout.page_height_mm,
+            scale=scale,
+            utm_epsg=strip_plan.utm_epsg,
+            elapsed_seconds=total_elapsed,
+            workspace_dir=retained_dir,
         )
     finally:
         if owns_temp_dir and not keep_workspace:

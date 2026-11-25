@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 STYLE_ROLES: tuple[str, ...] = (
     "landcover",
     "hillshade",
+    "slope_shading",
     "fema_flood",
     "au_protected_areas",
     "water_polygons",
@@ -46,11 +47,13 @@ STYLE_ROLES: tuple[str, ...] = (
     "waterways",
     "buildings",
     "transport",
+    "au_state_trails",
     "au_power_lines",
     "au_pipelines",
     "au_runways",
     "building_icons",
     "points",
+    "au_state_pois",
     "au_substations",
     "au_hydro_points",
     "au_homesteads",
@@ -64,6 +67,8 @@ STYLE_ROLES: tuple[str, ...] = (
     "overlay_polygons",
     "overlay_lines",
     "overlay_points",
+    "waypoint_route",
+    "waypoint_points",
 )
 
 DEFAULT_FONT_FAMILY = "Liberation Sans"
@@ -80,9 +85,11 @@ _LABELED_ROLES: frozenset[str] = frozenset(
         "au_hydro_lines",
         "waterways",
         "transport",
+        "au_state_trails",
         "au_power_lines",
         "au_pipelines",
         "points",
+        "au_state_pois",
         "au_substations",
         "au_hydro_points",
         "au_homesteads",
@@ -90,6 +97,7 @@ _LABELED_ROLES: frozenset[str] = frozenset(
         "enc_navaids",
         "us_towers",
         "mgrs_square_labels",
+        "waypoint_points",
     }
 )
 _NATIVE_QML_MARKER = "gridforge-pyqgis-exported"
@@ -1122,6 +1130,68 @@ def _build_hillshade_style(
     if layer.brightnessFilter() is not None:
         layer.brightnessFilter().setBrightness(brightness)
         layer.brightnessFilter().setContrast(contrast)
+
+
+def _build_slope_shading_style(
+    layer: Any,
+    color_mode: ColorMode,
+) -> None:
+    """Style slope-angle avalanche shading raster (4-band RGBA or 1-band slope degrees).
+
+    Lives on the lower map stack right above ``hillshade.tif`` with ``BlendNormal``
+    so contours, trails, buildings, and the MGRS 1 km grid on the upper map stack
+    remain 100% pure un-rasterized PDF vectors.
+    """
+    from qgis.core import (
+        QgsBilinearRasterResampler,
+        QgsColorRampShader,
+        QgsMultiBandColorRenderer,
+        QgsRasterShader,
+        QgsSingleBandPseudoColorRenderer,
+    )
+    from qgis.PyQt.QtGui import QColor, QPainter
+
+    is_color = color_mode == ColorMode.COLOR
+    band_count = layer.bandCount() if hasattr(layer, "bandCount") else 4
+
+    if band_count >= 3:
+        renderer = QgsMultiBandColorRenderer(layer.dataProvider(), 1, 2, 3)
+        if band_count >= 4:
+            renderer.setAlphaBand(4)
+        # terrain.py RGBA already carries progressive band alpha (115..205 Color / 85..180 B&W);
+        # scaling to 0.58 Color / 0.65 B&W yields crisp ~26-46% effective avalanche tint over hillshade.
+        renderer.setOpacity(0.58 if is_color else 0.65)
+        layer.setRenderer(renderer)
+    else:
+        shader = QgsRasterShader()
+        ramp = QgsColorRampShader()
+        ramp.setColorRampType(QgsColorRampShader.Discrete)
+        if is_color:
+            items = [
+                QgsColorRampShader.ColorRampItem(26.999, QColor(0, 0, 0, 0), "< 27°"),
+                QgsColorRampShader.ColorRampItem(29.999, QColor(246, 224, 94, 195), "27°–30°"),
+                QgsColorRampShader.ColorRampItem(34.999, QColor(237, 137, 54, 215), "30°–35°"),
+                QgsColorRampShader.ColorRampItem(44.999, QColor(229, 62, 62, 230), "35°–45°"),
+                QgsColorRampShader.ColorRampItem(49.999, QColor(128, 90, 213, 235), "45°–50°"),
+                QgsColorRampShader.ColorRampItem(90.0, QColor(59, 7, 100, 240), ">= 50°"),
+            ]
+        else:
+            items = [
+                QgsColorRampShader.ColorRampItem(29.999, QColor(0, 0, 0, 0), "< 30°"),
+                QgsColorRampShader.ColorRampItem(34.999, QColor(120, 120, 120, 150), "30°–35°"),
+                QgsColorRampShader.ColorRampItem(44.999, QColor(55, 55, 55, 195), "35°–45°"),
+                QgsColorRampShader.ColorRampItem(90.0, QColor(15, 15, 15, 230), ">= 45°"),
+            ]
+        ramp.setColorRampItemList(items)
+        shader.setRasterShaderFunction(ramp)
+        renderer = QgsSingleBandPseudoColorRenderer(layer.dataProvider(), 1, shader)
+        renderer.setOpacity(0.42 if is_color else 0.35)
+        layer.setRenderer(renderer)
+
+    layer.setBlendMode(QPainter.CompositionMode_SourceOver)
+    if layer.resampleFilter() is not None:
+        layer.resampleFilter().setZoomedInResampler(QgsBilinearRasterResampler())
+        layer.resampleFilter().setZoomedOutResampler(QgsBilinearRasterResampler())
 
 
 def _build_fema_flood_style(
@@ -3085,6 +3155,510 @@ def _build_au_homesteads_style(
     layer.setLabelsEnabled(True)
 
 
+def _halo_dashed_line_symbol(
+    stroke_hex: str,
+    width_mm: float,
+    dash_vector: list[float],
+    *,
+    halo_hex: str = "#FFFFFF",
+    halo_width_mm: float = 0.0,
+    halo_alpha: int = 215,
+    render_pass: int = 0,
+) -> Any:
+    """Build a dashed line symbol optionally backed by a subtle contrast halo."""
+    from qgis.core import QgsLineSymbol, QgsSimpleLineSymbolLayer, QgsUnitTypes
+    from qgis.PyQt.QtCore import Qt
+    from qgis.PyQt.QtGui import QColor
+
+    sym = QgsLineSymbol()
+    sym.deleteSymbolLayer(0)
+
+    if halo_width_mm > 0:
+        hc = QColor(halo_hex)
+        hc.setAlpha(halo_alpha)
+        halo = QgsSimpleLineSymbolLayer(hc, halo_width_mm)
+        halo.setWidthUnit(QgsUnitTypes.RenderMillimeters)
+        halo.setPenCapStyle(Qt.RoundCap)
+        halo.setPenJoinStyle(Qt.RoundJoin)
+        halo.setRenderingPass(max(0, render_pass - 1))
+        sym.appendSymbolLayer(halo)
+
+    dash = QgsSimpleLineSymbolLayer(QColor(stroke_hex), width_mm)
+    dash.setWidthUnit(QgsUnitTypes.RenderMillimeters)
+    dash.setPenCapStyle(Qt.FlatCap)
+    dash.setPenJoinStyle(Qt.RoundJoin)
+    dash.setUseCustomDashPattern(True)
+    dash.setCustomDashVector(dash_vector)
+    dash.setCustomDashPatternUnit(QgsUnitTypes.RenderMillimeters)
+    dash.setRenderingPass(render_pass)
+    sym.appendSymbolLayer(dash)
+    return sym
+
+
+def _build_au_state_trails_style(
+    layer: Any,
+    color_mode: ColorMode,
+    *,
+    scale: int = 25000,
+    carto: CartoOptions = _DEFAULT_CARTO,
+) -> None:
+    """Style NSW & VIC high-res Fire Trails, Management Trails, 4WD Tracks, and Walking Tracks."""
+    from qgis.core import QgsPalLayerSettings, QgsRuleBasedLabeling, QgsRuleBasedRenderer
+
+    wf = scale_width_factor(scale)
+    fd = scale_font_delta(scale)
+    rep_mult, min_mult = _density_params(carto.label_density)
+    is_color = color_mode == ColorMode.COLOR
+    halo_c = "#FAF9F5" if is_color else "#FFFFFF"
+
+    fire_filter = "lower(coalesce(\"trail_class\", '')) IN ('fire_trail','management_trail')"
+    fourwd_filter = "lower(coalesce(\"trail_class\", '')) = '4wd_track'"
+    walk_filter = f"NOT ({fire_filter}) AND NOT ({fourwd_filter})"
+
+    root = QgsRuleBasedRenderer.Rule(None)
+    if is_color:
+        _add_rule(
+            root,
+            "Fire & Management Trails",
+            fire_filter,
+            _halo_dashed_line_symbol(
+                "#D95F02",
+                0.56 * wf,
+                [3.0, 1.1],
+                halo_hex=halo_c,
+                halo_width_mm=0.90 * wf,
+                halo_alpha=200,
+                render_pass=14,
+            ),
+        )
+        _add_rule(
+            root,
+            "4WD Tracks",
+            fourwd_filter,
+            _line_symbol("#7F4F24", 0.42 * wf, dash_vector=[2.4, 1.0], cap_round=False, render_pass=10),
+        )
+        _add_rule(
+            root,
+            "Walking Tracks",
+            walk_filter,
+            _line_symbol("#A63603", 0.30 * wf, dash_vector=[1.4, 0.9], cap_round=False, render_pass=8),
+        )
+    else:
+        _add_rule(
+            root,
+            "Fire & Management Trails",
+            fire_filter,
+            _halo_dashed_line_symbol(
+                "#000000",
+                0.55 * wf,
+                [3.2, 0.9, 1.0, 0.9],
+                halo_hex="#FFFFFF",
+                halo_width_mm=0.92 * wf,
+                halo_alpha=235,
+                render_pass=14,
+            ),
+        )
+        _add_rule(
+            root,
+            "4WD Tracks",
+            fourwd_filter,
+            _line_symbol("#1A1A1A", 0.40 * wf, dash_vector=[2.4, 1.0], cap_round=False, render_pass=10),
+        )
+        _add_rule(
+            root,
+            "Walking Tracks",
+            walk_filter,
+            _line_symbol("#1A1A1A", 0.28 * wf, dash_vector=[1.0, 0.9], cap_round=False, render_pass=8),
+        )
+
+    renderer = QgsRuleBasedRenderer(root)
+    renderer.setUsingSymbolLevels(True)
+    layer.setRenderer(renderer)
+
+    if carto.label_density == DensityLevel.LOW:
+        layer.setLabelsEnabled(False)
+        return
+
+    label_root = QgsRuleBasedLabeling.Rule(None)
+
+    ft_pal = QgsPalLayerSettings()
+    ft_pal.fieldName = (
+        "CASE "
+        "WHEN \"name\" IS NOT NULL AND length(trim(\"name\")) > 0 "
+        "AND lower(coalesce(\"trail_class\", '')) = 'fire_trail' "
+        "AND strpos(lower(\"name\"), 'fire') = 0 "
+        "AND strpos(lower(\"name\"), 'trail') = 0 "
+        "AND strpos(lower(\"name\"), ' ft') = 0 "
+        "THEN trim(\"name\") || ' (FT)' "
+        "WHEN \"name\" IS NOT NULL AND length(trim(\"name\")) > 0 THEN trim(\"name\") "
+        "ELSE '' END"
+    )
+    ft_pal.isExpression = True
+    ft_pal.priority = 7
+    _configure_curved_line_pal(ft_pal, on_line=False, repeat_mm=65.0 * rep_mult, min_feature_mm=16.0 * min_mult)
+    ft_pal.setFormat(
+        _make_text_format(
+            5.9 + fd,
+            "#A83F00" if is_color else "#000000",
+            bold=True,
+            halo_hex="#FFFFFF",
+            halo_mm=0.68,
+        )
+    )
+    ft_rule = QgsRuleBasedLabeling.Rule(ft_pal)
+    ft_rule.setDescription("Fire Trail Labels")
+    ft_rule.setFilterExpression(f"({fire_filter}) AND \"name\" IS NOT NULL AND length(trim(\"name\")) > 0")
+    label_root.appendChild(ft_rule)
+
+    trk_pal = QgsPalLayerSettings()
+    trk_pal.fieldName = "name"
+    trk_pal.isExpression = False
+    trk_pal.priority = 5
+    _configure_curved_line_pal(trk_pal, on_line=False, repeat_mm=75.0 * rep_mult, min_feature_mm=18.0 * min_mult)
+    trk_pal.setFormat(
+        _make_text_format(
+            5.5 + fd,
+            "#6B2A0A" if is_color else "#1A1A1A",
+            italic=False,
+            halo_hex=halo_c,
+            halo_mm=0.58,
+        )
+    )
+    trk_rule = QgsRuleBasedLabeling.Rule(trk_pal)
+    trk_rule.setDescription("Walking & 4WD Track Labels")
+    trk_rule.setFilterExpression(f"NOT ({fire_filter}) AND \"name\" IS NOT NULL AND length(trim(\"name\")) > 0")
+    label_root.appendChild(trk_rule)
+
+    layer.setLabeling(QgsRuleBasedLabeling(label_root))
+    layer.setLabelsEnabled(True)
+
+
+def _build_au_state_pois_style(
+    layer: Any,
+    color_mode: ColorMode,
+    *,
+    units: Units = Units.METRIC,
+    scale: int = 25000,
+    carto: CartoOptions = _DEFAULT_CARTO,
+    icons_root: Path | None = None,
+) -> None:
+    """Style NSW & VIC Alpine Huts, Campgrounds, Trig Stations, Lookouts, and Picnic Sites."""
+    from qgis.core import (
+        QgsMarkerSymbol,
+        QgsPalLayerSettings,
+        QgsRuleBasedLabeling,
+        QgsRuleBasedRenderer,
+    )
+
+    wf = scale_width_factor(scale)
+    fd = scale_font_delta(scale)
+    is_color = color_mode == ColorMode.COLOR
+    ink = "#1A1A1A" if is_color else "#000000"
+    hut_c = "#7A3E1D" if is_color else "#000000"
+    camp_c = "#1E6B3A" if is_color else "#000000"
+    lookout_c = "#1B4F72" if is_color else "#111111"
+
+    root = QgsRuleBasedRenderer.Rule(None)
+    _add_rule(
+        root,
+        "Alpine Huts & Refuges",
+        "lower(coalesce(\"poi_type\", '')) = 'hut'",
+        _svg_marker_symbol("hut", 3.1 * wf, fill_hex=hut_c, outline_hex=ink, icons_root=icons_root),
+    )
+    _add_rule(
+        root,
+        "Campgrounds",
+        "lower(coalesce(\"poi_type\", '')) = 'campground'",
+        _svg_marker_symbol("campground", 3.0 * wf, fill_hex=camp_c, outline_hex=ink, icons_root=icons_root),
+    )
+    _add_rule(
+        root,
+        "Survey Trig Stations",
+        "lower(coalesce(\"poi_type\", '')) = 'trig'",
+        _svg_marker_symbol("trig", 2.9 * wf, fill_hex=ink, outline_hex=ink, icons_root=icons_root),
+    )
+    _add_rule(
+        root,
+        "Lookouts",
+        "lower(coalesce(\"poi_type\", '')) = 'lookout'",
+        QgsMarkerSymbol.createSimple(
+            {
+                "name": "diamond",
+                "color": lookout_c,
+                "outline_color": "#FFFFFF",
+                "outline_width": f"{0.32 * wf:.3f}",
+                "outline_width_unit": "MM",
+                "size": f"{2.3 * wf:.3f}",
+                "size_unit": "MM",
+            }
+        ),
+    )
+    _add_rule(
+        root,
+        "Picnic & Rec Sites",
+        "lower(coalesce(\"poi_type\", '')) NOT IN ('hut','campground','trig','lookout')",
+        QgsMarkerSymbol.createSimple(
+            {
+                "name": "circle",
+                "color": camp_c,
+                "outline_color": "#FFFFFF",
+                "outline_width": f"{0.30 * wf:.3f}",
+                "outline_width_unit": "MM",
+                "size": f"{2.0 * wf:.3f}",
+                "size_unit": "MM",
+            }
+        ),
+    )
+    layer.setRenderer(QgsRuleBasedRenderer(root))
+
+    label_root = QgsRuleBasedLabeling.Rule(None)
+
+    if units == Units.IMPERIAL:
+        elev_fmt = "to_int(round(to_real(\"elev_m\") * 3.28084)) || ' ft'"
+    else:
+        elev_fmt = "to_int(round(to_real(\"elev_m\"))) || ' m'"
+
+    trig_pal = QgsPalLayerSettings()
+    trig_pal.fieldName = (
+        "CASE "
+        "WHEN \"name\" IS NOT NULL AND length(trim(\"name\")) > 0 "
+        "AND \"elev_m\" IS NOT NULL AND to_real(\"elev_m\") > -500 "
+        "AND regexp_match(coalesce(\"name\", ''), '(?i)[0-9]{2,4}\\\\s*(?:m|ft)\\\\b') = 0 "
+        f"THEN trim(\"name\") || '\\n' || {elev_fmt} "
+        "WHEN \"name\" IS NOT NULL AND length(trim(\"name\")) > 0 THEN trim(\"name\") "
+        f"WHEN \"elev_m\" IS NOT NULL AND to_real(\"elev_m\") > -500 THEN {elev_fmt} "
+        "ELSE '' END"
+    )
+    trig_pal.isExpression = True
+    trig_pal.priority = 8
+    _configure_point_pal(trig_pal, over_point=False, dist_mm=1.8)
+    trig_pal.setFormat(_make_text_format(5.9 + fd, ink, bold=True, halo_hex="#FFFFFF", halo_mm=0.7))
+    trig_rule = QgsRuleBasedLabeling.Rule(trig_pal)
+    trig_rule.setDescription("Trig Station Labels")
+    trig_rule.setFilterExpression("lower(coalesce(\"poi_type\", '')) = 'trig'")
+    label_root.appendChild(trig_rule)
+
+    hc_pal = QgsPalLayerSettings()
+    hc_pal.fieldName = "name"
+    hc_pal.isExpression = False
+    hc_pal.priority = 8
+    _configure_point_pal(hc_pal, over_point=False, dist_mm=1.8)
+    hc_pal.setFormat(
+        _make_text_format(
+            6.0 + fd,
+            "#4A230D" if is_color else "#000000",
+            bold=True,
+            halo_hex="#FFFFFF",
+            halo_mm=0.72,
+        )
+    )
+    hc_rule = QgsRuleBasedLabeling.Rule(hc_pal)
+    hc_rule.setDescription("Hut & Campground Labels")
+    hc_rule.setFilterExpression(
+        "lower(coalesce(\"poi_type\", '')) IN ('hut','campground') "
+        "AND \"name\" IS NOT NULL AND length(trim(\"name\")) > 0"
+    )
+    label_root.appendChild(hc_rule)
+
+    if carto.label_density != DensityLevel.LOW:
+        rec_pal = QgsPalLayerSettings()
+        rec_pal.fieldName = "name"
+        rec_pal.isExpression = False
+        rec_pal.priority = 6
+        _configure_point_pal(rec_pal, over_point=False, dist_mm=1.6)
+        rec_pal.setFormat(
+            _make_text_format(
+                5.5 + fd,
+                lookout_c if is_color else "#1A1A1A",
+                italic=True,
+                halo_hex="#FFFFFF",
+                halo_mm=0.6,
+            )
+        )
+        rec_rule = QgsRuleBasedLabeling.Rule(rec_pal)
+        rec_rule.setDescription("Lookout & Picnic Labels")
+        rec_rule.setFilterExpression(
+            "lower(coalesce(\"poi_type\", '')) NOT IN ('hut','campground','trig') "
+            "AND \"name\" IS NOT NULL AND length(trim(\"name\")) > 0"
+        )
+        label_root.appendChild(rec_rule)
+
+    layer.setLabeling(QgsRuleBasedLabeling(label_root))
+    layer.setLabelsEnabled(True)
+
+
+def _waypoint_badge_symbol(
+    shape: str,
+    fill_hex: str,
+    border_hex: str,
+    size_mm: float,
+) -> Any:
+    """Build a high-contrast double-ring tactical waypoint marker."""
+    from qgis.core import QgsMarkerSymbol, QgsSimpleMarkerSymbolLayer
+
+    sym = QgsMarkerSymbol()
+    sym.deleteSymbolLayer(0)
+
+    outer = QgsSimpleMarkerSymbolLayer.create(
+        {
+            "name": shape,
+            "color": "#FFFFFF",
+            "outline_color": border_hex,
+            "outline_width": "0.32",
+            "outline_width_unit": "MM",
+            "size": f"{size_mm + 0.95:.3f}",
+            "size_unit": "MM",
+        }
+    )
+    inner = QgsSimpleMarkerSymbolLayer.create(
+        {
+            "name": shape,
+            "color": fill_hex,
+            "outline_color": "#FFFFFF",
+            "outline_width": "0.24",
+            "outline_width_unit": "MM",
+            "size": f"{size_mm:.3f}",
+            "size_unit": "MM",
+        }
+    )
+    sym.appendSymbolLayer(outer)
+    sym.appendSymbolLayer(inner)
+    return sym
+
+
+def _build_waypoint_route_style(
+    layer: Any,
+    color_mode: ColorMode,
+    *,
+    scale: int = 25000,
+) -> None:
+    """Style tactical waypoint connecting route legs (vivid magenta in Color, bold black in B&W)."""
+    from qgis.core import QgsSingleSymbolRenderer
+
+    wf = scale_width_factor(scale)
+    is_color = color_mode == ColorMode.COLOR
+    sym = _halo_dashed_line_symbol(
+        "#C2185B" if is_color else "#111111",
+        0.55 * wf,
+        [3.2, 1.4],
+        halo_hex="#FFFFFF",
+        halo_width_mm=1.0 * wf,
+        halo_alpha=220,
+        render_pass=30,
+    )
+    layer.setRenderer(QgsSingleSymbolRenderer(sym))
+    layer.setLabelsEnabled(False)
+
+
+def _build_waypoint_points_style(
+    layer: Any,
+    color_mode: ColorMode,
+    *,
+    scale: int = 25000,
+) -> None:
+    """Style numbered tactical waypoints (WP1..WPn) with category badges and top-priority callouts."""
+    from qgis.core import QgsPalLayerSettings, QgsRuleBasedRenderer, QgsVectorLayerSimpleLabeling
+
+    wf = scale_width_factor(scale)
+    fd = scale_font_delta(scale)
+    is_color = color_mode == ColorMode.COLOR
+    sz = 2.6 * wf
+
+    root = QgsRuleBasedRenderer.Rule(None)
+    if is_color:
+        _add_rule(
+            root,
+            "Camp Waypoint",
+            "lower(coalesce(\"category\", '')) = 'camp'",
+            _waypoint_badge_symbol("circle", "#1E7E34", "#0D4D1D", sz),
+        )
+        _add_rule(
+            root,
+            "Water Waypoint",
+            "lower(coalesce(\"category\", '')) = 'water'",
+            _waypoint_badge_symbol("circle", "#1565C0", "#0A3A70", sz),
+        )
+        _add_rule(
+            root,
+            "Hazard Waypoint",
+            "lower(coalesce(\"category\", '')) = 'hazard'",
+            _waypoint_badge_symbol("diamond", "#D84315", "#7F2307", sz + 0.3),
+        )
+        _add_rule(
+            root,
+            "LZ Waypoint",
+            "lower(coalesce(\"category\", '')) = 'lz'",
+            _waypoint_badge_symbol("pentagon", "#6A1B9A", "#3B0A59", sz + 0.2),
+        )
+        _add_rule(
+            root,
+            "Standard Waypoint",
+            "lower(coalesce(\"category\", '')) NOT IN ('camp','water','hazard','lz')",
+            _waypoint_badge_symbol("circle", "#C2185B", "#7A0D38", sz),
+        )
+    else:
+        _add_rule(
+            root,
+            "Camp Waypoint",
+            "lower(coalesce(\"category\", '')) = 'camp'",
+            _waypoint_badge_symbol("square", "#111111", "#000000", sz),
+        )
+        _add_rule(
+            root,
+            "Water Waypoint",
+            "lower(coalesce(\"category\", '')) = 'water'",
+            _waypoint_badge_symbol("pentagon", "#111111", "#000000", sz + 0.15),
+        )
+        _add_rule(
+            root,
+            "Hazard Waypoint",
+            "lower(coalesce(\"category\", '')) = 'hazard'",
+            _waypoint_badge_symbol("diamond", "#000000", "#000000", sz + 0.35),
+        )
+        _add_rule(
+            root,
+            "LZ Waypoint",
+            "lower(coalesce(\"category\", '')) = 'lz'",
+            _waypoint_badge_symbol("triangle", "#000000", "#000000", sz + 0.25),
+        )
+        _add_rule(
+            root,
+            "Standard Waypoint",
+            "lower(coalesce(\"category\", '')) NOT IN ('camp','water','hazard','lz')",
+            _waypoint_badge_symbol("circle", "#111111", "#000000", sz),
+        )
+
+    layer.setRenderer(QgsRuleBasedRenderer(root))
+
+    lbl_expr = (
+        "CASE "
+        "WHEN \"code\" IS NOT NULL AND length(trim(\"code\")) > 0 "
+        "AND \"label\" IS NOT NULL AND length(trim(\"label\")) > 0 "
+        "AND lower(trim(\"label\")) != lower(trim(\"code\")) "
+        "THEN trim(\"code\") || ' · ' || trim(\"label\") "
+        "WHEN \"label\" IS NOT NULL AND length(trim(\"label\")) > 0 THEN trim(\"label\") "
+        "WHEN \"code\" IS NOT NULL AND length(trim(\"code\")) > 0 THEN trim(\"code\") "
+        "ELSE '' END"
+    )
+    pal = QgsPalLayerSettings()
+    pal.fieldName = lbl_expr
+    pal.isExpression = True
+    pal.priority = 10
+    _configure_point_pal(pal, over_point=False, dist_mm=2.2)
+    pal.setFormat(
+        _make_text_format(
+            6.5 + fd,
+            "#880E4F" if is_color else "#000000",
+            bold=True,
+            halo_hex="#FFFFFF",
+            halo_mm=0.85,
+            halo_opacity=0.98,
+        )
+    )
+    layer.setLabeling(QgsVectorLayerSimpleLabeling(pal))
+    layer.setLabelsEnabled(True)
+
+
 def apply_programmatic_style(
     layer: Any,
     role: str,
@@ -3102,6 +3676,8 @@ def apply_programmatic_style(
         _build_landcover_style(layer, color_mode, carto=opts, icons_root=icons_root)
     elif role == "hillshade":
         _build_hillshade_style(layer, color_mode, carto=opts)
+    elif role == "slope_shading":
+        _build_slope_shading_style(layer, color_mode)
     elif role == "fema_flood":
         _build_fema_flood_style(layer, color_mode, scale=scale, carto=opts)
     elif role == "au_protected_areas":
@@ -3126,6 +3702,8 @@ def apply_programmatic_style(
         _build_building_icons_style(layer, color_mode, scale=scale, carto=opts, icons_root=icons_root)
     elif role == "transport":
         _build_transport_style(layer, color_mode, scale=scale, carto=opts)
+    elif role == "au_state_trails":
+        _build_au_state_trails_style(layer, color_mode, scale=scale, carto=opts)
     elif role == "au_power_lines":
         _build_au_power_lines_style(layer, color_mode, scale=scale, carto=opts)
     elif role == "au_pipelines":
@@ -3134,6 +3712,8 @@ def apply_programmatic_style(
         _build_au_runways_style(layer, color_mode, scale=scale)
     elif role == "points":
         _build_points_style(layer, color_mode, units=units, scale=scale, carto=opts, icons_root=icons_root)
+    elif role == "au_state_pois":
+        _build_au_state_pois_style(layer, color_mode, units=units, scale=scale, carto=opts, icons_root=icons_root)
     elif role == "au_substations":
         _build_au_substations_style(layer, color_mode, scale=scale, carto=opts)
     elif role == "au_hydro_points":
@@ -3156,6 +3736,10 @@ def apply_programmatic_style(
         _build_mgrs_square_labels_style(layer, color_mode)
     elif role in ("overlay_polygons", "overlay_lines", "overlay_points"):
         _build_overlay_style(layer, role, color_mode)
+    elif role == "waypoint_route":
+        _build_waypoint_route_style(layer, color_mode, scale=scale)
+    elif role == "waypoint_points":
+        _build_waypoint_points_style(layer, color_mode, scale=scale)
     else:
         raise ValueError(f"Unknown GridForge style role: {role!r}")
 
@@ -3175,7 +3759,7 @@ def _can_use_cached_qml(
         return False
     if carto != _DEFAULT_CARTO:
         return False
-    if units == Units.IMPERIAL and role in ("points", "us_towers"):
+    if units == Units.IMPERIAL and role in ("points", "us_towers", "au_state_pois"):
         return False
     return True
 
@@ -3218,6 +3802,8 @@ def apply_layer_style(
             if renderer_ok and labeling_ok:
                 if role == "hillshade":
                     _build_hillshade_style(layer, color_mode, carto=opts)
+                elif role == "slope_shading":
+                    _build_slope_shading_style(layer, color_mode)
                 return True
             logger.warning(
                 "QML style %s incomplete (ok=%s, renderer=%s, labeling=%s, msg=%s); "
@@ -3386,6 +3972,12 @@ def populate_project_layers(
     au_aviation_path = Path(regional["au-aviation"]) if "au-aviation" in regional else (
         Path(regional["au_aviation"]) if "au_aviation" in regional else None
     )
+    au_nsw_trails_path = Path(regional["au-nsw-trails"]) if "au-nsw-trails" in regional else (
+        Path(regional["au_nsw_trails"]) if "au_nsw_trails" in regional else None
+    )
+    au_vic_trails_path = Path(regional["au-vic-trails"]) if "au-vic-trails" in regional else (
+        Path(regional["au_vic_trails"]) if "au_vic_trails" in regional else None
+    )
 
     fema_layers = set(_list_gpkg_layers(fema_path)) if fema_path else set()
     nhd_layers = set(_list_gpkg_layers(nhd_path)) if nhd_path else set()
@@ -3395,6 +3987,10 @@ def populate_project_layers(
     au_parks_layers = set(_list_gpkg_layers(au_parks_path)) if au_parks_path else set()
     au_infra_layers = set(_list_gpkg_layers(au_infra_path)) if au_infra_path else set()
     au_aviation_layers = set(_list_gpkg_layers(au_aviation_path)) if au_aviation_path else set()
+    au_nsw_layers = set(_list_gpkg_layers(au_nsw_trails_path)) if au_nsw_trails_path else set()
+    au_vic_layers = set(_list_gpkg_layers(au_vic_trails_path)) if au_vic_trails_path else set()
+    waypoints_path = workspace.waypoints_gpkg if (workspace.waypoints_gpkg and workspace.waypoints_gpkg.is_file()) else None
+    waypoints_layers = set(_list_gpkg_layers(waypoints_path)) if waypoints_path else set()
 
     ordered_top_to_bottom: list[Any] = []
 
@@ -3402,7 +3998,22 @@ def populate_project_layers(
         if layer is not None:
             ordered_top_to_bottom.append(layer)
 
-    # 1. User overlays on very top
+    # 0. Tactical Custom Waypoints & Route Legs on very top (highest visibility)
+    if waypoints_path:
+        if "waypoint_points" in waypoints_layers:
+            _push(
+                _load_vector_layer(
+                    project, waypoints_path, "waypoint_points", "Waypoints", role="waypoint_points", workspace=workspace
+                )
+            )
+        if "waypoint_route" in waypoints_layers:
+            _push(
+                _load_vector_layer(
+                    project, waypoints_path, "waypoint_route", "Waypoint Route", role="waypoint_route", workspace=workspace
+                )
+            )
+
+    # 1. User overlays (uploaded GPX/GeoJSON routes & POIs)
     ordered_top_to_bottom.extend(_load_overlay_layers(project, workspace))
 
     # 2. MGRS Grid stack (100% pure vector, BlendNormal; toggleable via carto.show_grid / include_grid)
@@ -3432,11 +4043,15 @@ def populate_project_layers(
                 )
             )
 
-    # 3. Regional Point Overlays (US Obstacles/Navaids + AU Airfields/Homesteads/Waterpoints/Substations)
+    # 3. Regional Point Overlays (US Obstacles/Navaids + AU National + AU NSW/VIC Huts/Camps/Trigs)
     if towers_path and "us_towers" in towers_layers:
         _push(_load_vector_layer(project, towers_path, "us_towers", "US Obstacle Towers", role="us_towers", workspace=workspace))
     if enc_path and "enc_navaids" in enc_layers:
         _push(_load_vector_layer(project, enc_path, "enc_navaids", "NOAA ENC Navaids", role="enc_navaids", workspace=workspace))
+    if au_nsw_trails_path and "au_state_pois" in au_nsw_layers:
+        _push(_load_vector_layer(project, au_nsw_trails_path, "au_state_pois", "NSW Huts, Camps & Trigs", role="au_state_pois", workspace=workspace))
+    if au_vic_trails_path and "au_state_pois" in au_vic_layers:
+        _push(_load_vector_layer(project, au_vic_trails_path, "au_state_pois", "VIC Huts, Camps & Trigs", role="au_state_pois", workspace=workspace))
     if au_aviation_path and "au_airfields" in au_aviation_layers:
         _push(_load_vector_layer(project, au_aviation_path, "au_airfields", "AU Airfields", role="au_airfields", workspace=workspace))
     if au_aviation_path and "au_homesteads" in au_aviation_layers:
@@ -3456,9 +4071,13 @@ def populate_project_layers(
             )
         )
 
-    # 5. OSM Transport & Infrastructure + AU Runways / HV Power / Pipelines
+    # 5. OSM Transport & Infrastructure + AU Runways / NSW-VIC Fire Trails & Tracks / HV Power / Pipelines
     if au_aviation_path and "au_runways" in au_aviation_layers:
         _push(_load_vector_layer(project, au_aviation_path, "au_runways", "AU Runways", role="au_runways", workspace=workspace))
+    if au_nsw_trails_path and "au_state_trails" in au_nsw_layers:
+        _push(_load_vector_layer(project, au_nsw_trails_path, "au_state_trails", "NSW Fire Trails & Tracks", role="au_state_trails", workspace=workspace))
+    if au_vic_trails_path and "au_state_trails" in au_vic_layers:
+        _push(_load_vector_layer(project, au_vic_trails_path, "au_state_trails", "VIC Fire Trails & Tracks", role="au_state_trails", workspace=workspace))
     if "lines" in osm_layers:
         _push(_load_vector_layer(project, workspace.osm_gpkg, "lines", "Roads & Transport", role="transport", workspace=workspace))
     if au_infra_path and "au_power_lines" in au_infra_layers and carto.show_power:
@@ -3504,6 +4123,21 @@ def populate_project_layers(
     if au_parks_path and "au_protected_areas" in au_parks_layers:
         _push(_load_vector_layer(project, au_parks_path, "au_protected_areas", "AU Protected Areas", role="au_protected_areas", workspace=workspace))
 
+    # 10.5. Slope-Angle Avalanche Shading (bottom raster stack right above hillshade; vectors stay pure!)
+    if carto.show_slope_shading and workspace.slope_tif is not None and workspace.slope_tif.is_file():
+        slope_layer = QgsRasterLayer(str(workspace.slope_tif), "Slope Shading")
+        if slope_layer.isValid():
+            apply_layer_style(
+                slope_layer,
+                "slope_shading",
+                spec.color_mode,
+                units=spec.units,
+                scale=spec.scale,
+                carto=carto,
+            )
+            project.addMapLayer(slope_layer, False)
+            ordered_top_to_bottom.append(slope_layer)
+
     # 11. Multi-directional Hillshade (Multiply blend over landcover + background; omitted if OFF)
     if carto.hillshade_strength != HillshadeStrength.OFF and workspace.hillshade_tif.is_file():
         hs_layer = QgsRasterLayer(str(workspace.hillshade_tif), "Hillshade")
@@ -3519,7 +4153,7 @@ def populate_project_layers(
             project.addMapLayer(hs_layer, False)
             ordered_top_to_bottom.append(hs_layer)
 
-    # 12. OSM Landcover Polygons (bottom layer — receives Multiply hillshade!)
+    # 12. OSM Landcover Polygons (bottom layer — receives Multiply hillshade & slope shading!)
     if "multipolygons" in osm_layers:
         _push(_load_vector_layer(project, workspace.osm_gpkg, "multipolygons", "Landcover", role="landcover", workspace=workspace))
 
@@ -3613,6 +4247,10 @@ def export_qml_styles(styles_root: Path | None = None) -> list[Path]:
             "LineString?crs=EPSG:32756&field=name:string&field=capacity_kv:double&field=status:string&field=state:string",
             "au_power_lines",
         ),
+        "au_state_trails": (
+            "LineString?crs=EPSG:32756&field=name:string&field=trail_class:string&field=surface:string&field=state:string",
+            "au_state_trails",
+        ),
         "au_pipelines": (
             "LineString?crs=EPSG:32756&field=name:string&field=pipeline_type:string&field=status:string&field=operator:string",
             "au_pipelines",
@@ -3631,6 +4269,10 @@ def export_qml_styles(styles_root: Path | None = None) -> list[Path]:
             "&field=man_made:string&field=tower:type:string&field=communication:string"
             "&field=tourism:string",
             "points",
+        ),
+        "au_state_pois": (
+            "Point?crs=EPSG:32756&field=name:string&field=poi_type:string&field=elev_m:double&field=state:string",
+            "au_state_pois",
         ),
         "au_substations": (
             "Point?crs=EPSG:32756&field=name:string&field=voltage_kv:double&field=status:string&field=state:string",
@@ -3674,6 +4316,12 @@ def export_qml_styles(styles_root: Path | None = None) -> list[Path]:
         "overlay_polygons": ("MultiPolygon?crs=EPSG:32756&field=name:string", "overlay_polygons"),
         "overlay_lines": ("LineString?crs=EPSG:32756&field=name:string", "overlay_lines"),
         "overlay_points": ("Point?crs=EPSG:32756&field=name:string", "overlay_points"),
+        "waypoint_route": ("LineString?crs=EPSG:32756&field=total_km:double", "waypoint_route"),
+        "waypoint_points": (
+            "Point?crs=EPSG:32756&field=seq:integer&field=code:string&field=label:string"
+            "&field=category:string&field=mgrs_10m:string&field=elev_m:double",
+            "waypoint_points",
+        ),
     }
 
     with tempfile.TemporaryDirectory(prefix="gridforge_qml_") as tmpdir:
@@ -3685,6 +4333,14 @@ def export_qml_styles(styles_root: Path | None = None) -> list[Path]:
         ds.GetRasterBand(1).Fill(190)
         ds.FlushCache()
         ds = None
+
+        dummy_slope_tif = Path(tmpdir) / "dummy_slope_rgba.tif"
+        sds = drv.Create(str(dummy_slope_tif), 4, 4, 4, gdal.GDT_Byte)
+        sds.SetGeoTransform((250000.0, 10.0, 0.0, 6265000.0, 0.0, -10.0))
+        for b_idx, val in ((1, 229), (2, 62), (3, 62), (4, 185)):
+            sds.GetRasterBand(b_idx).Fill(val)
+        sds.FlushCache()
+        sds = None
 
         def _tag_native_qml(path: Path) -> None:
             text = path.read_text(encoding="utf-8")
@@ -3709,6 +4365,15 @@ def export_qml_styles(styles_root: Path | None = None) -> list[Path]:
                 raise RuntimeError(f"Failed to export {hs_qml}: {msg}")
             _tag_native_qml(hs_qml)
             written.append(hs_qml)
+
+            slayer = QgsRasterLayer(str(dummy_slope_tif), "slope_shading")
+            apply_programmatic_style(slayer, "slope_shading", mode)
+            slope_qml = mode_dir / "slope_shading.qml"
+            msg, ok = slayer.saveNamedStyle(str(slope_qml))
+            if not ok:
+                raise RuntimeError(f"Failed to export {slope_qml}: {msg}")
+            _tag_native_qml(slope_qml)
+            written.append(slope_qml)
 
             for role, (uri, layer_name) in vector_specs.items():
                 vlayer = QgsVectorLayer(uri, layer_name, "memory")

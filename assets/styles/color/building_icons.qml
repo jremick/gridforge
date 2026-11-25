@@ -1,19 +1,19 @@
 <!DOCTYPE qgis PUBLIC 'http://mrcc.com/qgis.dtd' 'SYSTEM'>
 <!-- gridforge-pyqgis-exported -->
-<qgis autoRefreshTime="0" simplifyDrawingHints="1" labelsEnabled="0" styleCategories="AllStyleCategories" minScale="100000000" simplifyAlgorithm="0" readOnly="0" version="3.40.6-Bratislava" hasScaleBasedVisibilityFlag="0" maxScale="0" simplifyLocal="1" simplifyMaxScale="1" simplifyDrawingTol="1" autoRefreshMode="Disabled" symbologyReferenceScale="-1">
+<qgis autoRefreshMode="Disabled" labelsEnabled="0" version="3.40.6-Bratislava" autoRefreshTime="0" simplifyLocal="1" simplifyMaxScale="1" hasScaleBasedVisibilityFlag="0" styleCategories="AllStyleCategories" simplifyDrawingHints="1" simplifyAlgorithm="0" minScale="100000000" simplifyDrawingTol="1" symbologyReferenceScale="-1" readOnly="0" maxScale="0">
   <flags>
     <Identifiable>1</Identifiable>
     <Removable>1</Removable>
     <Searchable>1</Searchable>
     <Private>0</Private>
   </flags>
-  <temporal startExpression="" fixedDuration="0" durationUnit="min" durationField="" accumulate="0" limitMode="0" endField="" startField="" endExpression="" mode="0" enabled="0">
+  <temporal durationField="" startExpression="" endExpression="" durationUnit="min" enabled="0" mode="0" fixedDuration="0" accumulate="0" limitMode="0" endField="" startField="">
     <fixedRange>
       <start></start>
       <end></end>
     </fixedRange>
   </temporal>
-  <elevation respectLayerSymbol="1" clamping="Terrain" binding="Centroid" showMarkerSymbolInSurfacePlots="0" extrusion="0" symbology="Line" extrusionEnabled="0" type="IndividualFeatures" zoffset="0" zscale="1">
+  <elevation binding="Centroid" respectLayerSymbol="1" extrusionEnabled="0" showMarkerSymbolInSurfacePlots="0" zoffset="0" type="IndividualFeatures" zscale="1" clamping="Terrain" extrusion="0" symbology="Line">
     <data-defined-properties>
       <Option type="Map">
         <Option name="name" value="" type="QString"/>
@@ -22,7 +22,7 @@
       </Option>
     </data-defined-properties>
     <profileLineSymbol>
-      <symbol alpha="1" name="" clip_to_extent="1" force_rhr="0" frame_rate="10" type="line" is_animated="0">
+      <symbol name="" alpha="1" frame_rate="10" is_animated="0" type="line" clip_to_extent="1" force_rhr="0">
         <data_defined_properties>
           <Option type="Map">
             <Option name="name" value="" type="QString"/>
@@ -30,7 +30,7 @@
             <Option name="type" value="collection" type="QString"/>
           </Option>
         </data_defined_properties>
-        <layer locked="0" id="{d7b56f66-0221-406b-8c39-7cc4c68a9761}" class="SimpleLine" pass="0" enabled="1">
+        <layer locked="0" enabled="1" pass="0" class="SimpleLine" id="{1eb4acd1-6f78-454a-bc47-26ed01ab16e4}">
           <Option type="Map">
             <Option name="align_dash_pattern" value="0" type="QString"/>
             <Option name="capstyle" value="square" type="QString"/>
@@ -42,7 +42,7 @@
             <Option name="dash_pattern_offset_unit" value="MM" type="QString"/>
             <Option name="draw_inside_polygon" value="0" type="QString"/>
             <Option name="joinstyle" value="bevel" type="QString"/>
-            <Option name="line_color" value="141,112,106,255,hsv:0.03055555555555555,0.25098039215686274,0.55294117647058827,1" type="QString"/>
+            <Option name="line_color" value="114,223,116,255,hsv:0.33611111111111114,0.49019607843137253,0.87450980392156863,1" type="QString"/>
             <Option name="line_style" value="solid" type="QString"/>
             <Option name="line_width" value="0.6" type="QString"/>
             <Option name="line_width_unit" value="MM" type="QString"/>
@@ -71,7 +71,7 @@
       </symbol>
     </profileLineSymbol>
     <profileFillSymbol>
-      <symbol alpha="1" name="" clip_to_extent="1" force_rhr="0" frame_rate="10" type="fill" is_animated="0">
+      <symbol name="" alpha="1" frame_rate="10" is_animated="0" type="fill" clip_to_extent="1" force_rhr="0">
         <data_defined_properties>
           <Option type="Map">
             <Option name="name" value="" type="QString"/>
@@ -79,15 +79,15 @@
             <Option name="type" value="collection" type="QString"/>
           </Option>
         </data_defined_properties>
-        <layer locked="0" id="{2a4a1878-36cc-4f0a-a1ed-c35c97a93221}" class="SimpleFill" pass="0" enabled="1">
+        <layer locked="0" enabled="1" pass="0" class="SimpleFill" id="{4ac3e7a3-047f-43c9-9927-a9a44f58d459}">
           <Option type="Map">
             <Option name="border_width_map_unit_scale" value="3x:0,0,0,0,0,0" type="QString"/>
-            <Option name="color" value="141,112,106,255,hsv:0.03055555555555555,0.25098039215686274,0.55294117647058827,1" type="QString"/>
+            <Option name="color" value="114,223,116,255,hsv:0.33611111111111114,0.49019607843137253,0.87450980392156863,1" type="QString"/>
             <Option name="joinstyle" value="bevel" type="QString"/>
             <Option name="offset" value="0,0" type="QString"/>
             <Option name="offset_map_unit_scale" value="3x:0,0,0,0,0,0" type="QString"/>
             <Option name="offset_unit" value="MM" type="QString"/>
-            <Option name="outline_color" value="101,80,75,255,hsv:0.03055555555555555,0.25098039215686274,0.39494926375219347,1" type="QString"/>
+            <Option name="outline_color" value="81,159,83,255,hsv:0.33611111111111114,0.49019607843137253,0.62464332036316472,1" type="QString"/>
             <Option name="outline_style" value="solid" type="QString"/>
             <Option name="outline_width" value="0.2" type="QString"/>
             <Option name="outline_width_unit" value="MM" type="QString"/>
@@ -104,7 +104,7 @@
       </symbol>
     </profileFillSymbol>
     <profileMarkerSymbol>
-      <symbol alpha="1" name="" clip_to_extent="1" force_rhr="0" frame_rate="10" type="marker" is_animated="0">
+      <symbol name="" alpha="1" frame_rate="10" is_animated="0" type="marker" clip_to_extent="1" force_rhr="0">
         <data_defined_properties>
           <Option type="Map">
             <Option name="name" value="" type="QString"/>
@@ -112,18 +112,18 @@
             <Option name="type" value="collection" type="QString"/>
           </Option>
         </data_defined_properties>
-        <layer locked="0" id="{db176f8a-587f-4a3a-804a-73e7f726744e}" class="SimpleMarker" pass="0" enabled="1">
+        <layer locked="0" enabled="1" pass="0" class="SimpleMarker" id="{b0f4b6f7-d0e3-4754-95c3-af40f9788dc9}">
           <Option type="Map">
             <Option name="angle" value="0" type="QString"/>
             <Option name="cap_style" value="square" type="QString"/>
-            <Option name="color" value="141,112,106,255,hsv:0.03055555555555555,0.25098039215686274,0.55294117647058827,1" type="QString"/>
+            <Option name="color" value="114,223,116,255,hsv:0.33611111111111114,0.49019607843137253,0.87450980392156863,1" type="QString"/>
             <Option name="horizontal_anchor_point" value="1" type="QString"/>
             <Option name="joinstyle" value="bevel" type="QString"/>
             <Option name="name" value="diamond" type="QString"/>
             <Option name="offset" value="0,0" type="QString"/>
             <Option name="offset_map_unit_scale" value="3x:0,0,0,0,0,0" type="QString"/>
             <Option name="offset_unit" value="MM" type="QString"/>
-            <Option name="outline_color" value="101,80,75,255,hsv:0.03055555555555555,0.25098039215686274,0.39494926375219347,1" type="QString"/>
+            <Option name="outline_color" value="81,159,83,255,hsv:0.33611111111111114,0.49019607843137253,0.62464332036316472,1" type="QString"/>
             <Option name="outline_style" value="solid" type="QString"/>
             <Option name="outline_width" value="0.2" type="QString"/>
             <Option name="outline_width_map_unit_scale" value="3x:0,0,0,0,0,0" type="QString"/>
@@ -145,19 +145,19 @@
       </symbol>
     </profileMarkerSymbol>
   </elevation>
-  <renderer-v2 forceraster="0" symbollevels="0" referencescale="-1" type="RuleRenderer" enableorderby="0">
-    <rules key="{81cbe6ef-bbf5-4d62-8072-4a3c3711f66f}">
-      <rule symbol="0" key="{705afd16-1a5f-419f-8ec0-909e35f26628}" label="Hospital Buildings" filter="&quot;amenity&quot; IN ('hospital','clinic') OR &quot;building&quot; = 'hospital' OR &quot;emergency&quot; = 'ambulance_station'"/>
-      <rule symbol="1" key="{675a0576-3d98-43c9-8d4c-08b0a66b7327}" label="Fire Station Buildings" filter="&quot;amenity&quot; = 'fire_station' OR &quot;emergency&quot; = 'fire_station'"/>
-      <rule symbol="2" key="{374b1f8f-fbe3-4b22-8e42-8c647cbf89ac}" label="Police Buildings" filter="&quot;amenity&quot; = 'police'"/>
-      <rule symbol="3" key="{8f9c6b7f-b6f4-4167-aa43-bb2918aed9d1}" label="School / University Buildings" filter="&quot;amenity&quot; IN ('school','college','university') OR &quot;building&quot; = 'school'"/>
-      <rule symbol="4" key="{3b24e450-2aab-46f9-9d68-0085ed21e704}" label="Place of Worship Buildings" filter="&quot;amenity&quot; = 'place_of_worship' OR &quot;building&quot; IN ('church','chapel','cathedral','mosque','temple','synagogue')"/>
-      <rule symbol="5" key="{0adb1d3f-d33e-4300-857e-2d37bcc1dcb3}" label="Fuel Station Buildings" filter="&quot;amenity&quot; = 'fuel'"/>
-      <rule symbol="6" key="{2f802fb3-1956-4b7f-9ab3-9688269b4f07}" label="Shelter / Hut Buildings" filter="&quot;amenity&quot; = 'shelter' OR &quot;building&quot; = 'hut'"/>
-      <rule symbol="7" key="{13f55c62-24d4-43e9-b3c9-ba165f163bf5}" label="Helipad Polygons" filter="&quot;aeroway&quot; = 'helipad'"/>
+  <renderer-v2 enableorderby="0" type="RuleRenderer" symbollevels="0" referencescale="-1" forceraster="0">
+    <rules key="{e460ae02-e775-432c-aead-6923e6ab4ded}">
+      <rule key="{51944e6c-17b9-4b85-984b-2b00aedde1b9}" label="Hospital Buildings" filter="&quot;amenity&quot; IN ('hospital','clinic') OR &quot;building&quot; = 'hospital' OR &quot;emergency&quot; = 'ambulance_station'" symbol="0"/>
+      <rule key="{b15e8730-bda2-4101-8eb6-23542b58a78b}" label="Fire Station Buildings" filter="&quot;amenity&quot; = 'fire_station' OR &quot;emergency&quot; = 'fire_station'" symbol="1"/>
+      <rule key="{1b13574d-93e7-4c02-b1f9-c7bdaa86194c}" label="Police Buildings" filter="&quot;amenity&quot; = 'police'" symbol="2"/>
+      <rule key="{a5def284-8af0-4a8a-8fca-9be544a9e864}" label="School / University Buildings" filter="&quot;amenity&quot; IN ('school','college','university') OR &quot;building&quot; = 'school'" symbol="3"/>
+      <rule key="{fac06856-5acb-4806-aac6-b63e8579cdd4}" label="Place of Worship Buildings" filter="&quot;amenity&quot; = 'place_of_worship' OR &quot;building&quot; IN ('church','chapel','cathedral','mosque','temple','synagogue')" symbol="4"/>
+      <rule key="{7b41f1a3-6de4-42f8-91e7-6d59ba69896c}" label="Fuel Station Buildings" filter="&quot;amenity&quot; = 'fuel'" symbol="5"/>
+      <rule key="{d11251e6-149b-49c7-b519-60bce59b941d}" label="Shelter / Hut Buildings" filter="&quot;amenity&quot; = 'shelter' OR &quot;building&quot; = 'hut'" symbol="6"/>
+      <rule key="{8b054a35-a0f4-4eb7-865a-d4ef4fb9a786}" label="Helipad Polygons" filter="&quot;aeroway&quot; = 'helipad'" symbol="7"/>
     </rules>
     <symbols>
-      <symbol alpha="1" name="0" clip_to_extent="1" force_rhr="0" frame_rate="10" type="fill" is_animated="0">
+      <symbol name="0" alpha="1" frame_rate="10" is_animated="0" type="fill" clip_to_extent="1" force_rhr="0">
         <data_defined_properties>
           <Option type="Map">
             <Option name="name" value="" type="QString"/>
@@ -165,7 +165,7 @@
             <Option name="type" value="collection" type="QString"/>
           </Option>
         </data_defined_properties>
-        <layer locked="0" id="{4406d2bb-1f58-4c2b-becc-40ab8e77773a}" class="CentroidFill" pass="0" enabled="1">
+        <layer locked="0" enabled="1" pass="0" class="CentroidFill" id="{092b982f-54f8-46e9-8225-34c17f631c73}">
           <Option type="Map">
             <Option name="clip_on_current_part_only" value="0" type="QString"/>
             <Option name="clip_points" value="0" type="QString"/>
@@ -179,7 +179,7 @@
               <Option name="type" value="collection" type="QString"/>
             </Option>
           </data_defined_properties>
-          <symbol alpha="1" name="@0@0" clip_to_extent="1" force_rhr="0" frame_rate="10" type="marker" is_animated="0">
+          <symbol name="@0@0" alpha="1" frame_rate="10" is_animated="0" type="marker" clip_to_extent="1" force_rhr="0">
             <data_defined_properties>
               <Option type="Map">
                 <Option name="name" value="" type="QString"/>
@@ -187,7 +187,7 @@
                 <Option name="type" value="collection" type="QString"/>
               </Option>
             </data_defined_properties>
-            <layer locked="0" id="{3ebbb1c9-c6b5-4cb1-889e-6ec44e4d1743}" class="SvgMarker" pass="0" enabled="1">
+            <layer locked="0" enabled="1" pass="0" class="SvgMarker" id="{33af4797-aaa6-482e-8d1b-78971bc5b56f}">
               <Option type="Map">
                 <Option name="angle" value="0" type="QString"/>
                 <Option name="color" value="198,40,40,255,rgb:0.77647058823529413,0.15686274509803921,0.15686274509803921,1" type="QString"/>
@@ -219,7 +219,7 @@
           </symbol>
         </layer>
       </symbol>
-      <symbol alpha="1" name="1" clip_to_extent="1" force_rhr="0" frame_rate="10" type="fill" is_animated="0">
+      <symbol name="1" alpha="1" frame_rate="10" is_animated="0" type="fill" clip_to_extent="1" force_rhr="0">
         <data_defined_properties>
           <Option type="Map">
             <Option name="name" value="" type="QString"/>
@@ -227,7 +227,7 @@
             <Option name="type" value="collection" type="QString"/>
           </Option>
         </data_defined_properties>
-        <layer locked="0" id="{f4372f5c-5b0e-4cb9-b0ec-8ee8bf04d045}" class="CentroidFill" pass="0" enabled="1">
+        <layer locked="0" enabled="1" pass="0" class="CentroidFill" id="{a1ee515d-32c4-4147-8984-c49a24721d0d}">
           <Option type="Map">
             <Option name="clip_on_current_part_only" value="0" type="QString"/>
             <Option name="clip_points" value="0" type="QString"/>
@@ -241,7 +241,7 @@
               <Option name="type" value="collection" type="QString"/>
             </Option>
           </data_defined_properties>
-          <symbol alpha="1" name="@1@0" clip_to_extent="1" force_rhr="0" frame_rate="10" type="marker" is_animated="0">
+          <symbol name="@1@0" alpha="1" frame_rate="10" is_animated="0" type="marker" clip_to_extent="1" force_rhr="0">
             <data_defined_properties>
               <Option type="Map">
                 <Option name="name" value="" type="QString"/>
@@ -249,7 +249,7 @@
                 <Option name="type" value="collection" type="QString"/>
               </Option>
             </data_defined_properties>
-            <layer locked="0" id="{d3567f65-5d99-4d8c-8842-365e4cd617df}" class="SvgMarker" pass="0" enabled="1">
+            <layer locked="0" enabled="1" pass="0" class="SvgMarker" id="{df50c8fb-40c3-499b-8c86-0872b037e7b5}">
               <Option type="Map">
                 <Option name="angle" value="0" type="QString"/>
                 <Option name="color" value="198,40,40,255,rgb:0.77647058823529413,0.15686274509803921,0.15686274509803921,1" type="QString"/>
@@ -281,7 +281,7 @@
           </symbol>
         </layer>
       </symbol>
-      <symbol alpha="1" name="2" clip_to_extent="1" force_rhr="0" frame_rate="10" type="fill" is_animated="0">
+      <symbol name="2" alpha="1" frame_rate="10" is_animated="0" type="fill" clip_to_extent="1" force_rhr="0">
         <data_defined_properties>
           <Option type="Map">
             <Option name="name" value="" type="QString"/>
@@ -289,7 +289,7 @@
             <Option name="type" value="collection" type="QString"/>
           </Option>
         </data_defined_properties>
-        <layer locked="0" id="{408d3ac1-2a0b-472f-b0a1-976c5b4b7360}" class="CentroidFill" pass="0" enabled="1">
+        <layer locked="0" enabled="1" pass="0" class="CentroidFill" id="{fe67873c-d16c-4eeb-a9d3-2d2a38d7e45c}">
           <Option type="Map">
             <Option name="clip_on_current_part_only" value="0" type="QString"/>
             <Option name="clip_points" value="0" type="QString"/>
@@ -303,7 +303,7 @@
               <Option name="type" value="collection" type="QString"/>
             </Option>
           </data_defined_properties>
-          <symbol alpha="1" name="@2@0" clip_to_extent="1" force_rhr="0" frame_rate="10" type="marker" is_animated="0">
+          <symbol name="@2@0" alpha="1" frame_rate="10" is_animated="0" type="marker" clip_to_extent="1" force_rhr="0">
             <data_defined_properties>
               <Option type="Map">
                 <Option name="name" value="" type="QString"/>
@@ -311,7 +311,7 @@
                 <Option name="type" value="collection" type="QString"/>
               </Option>
             </data_defined_properties>
-            <layer locked="0" id="{9bf429cd-5d84-4f77-a0a1-e467f43da783}" class="SvgMarker" pass="0" enabled="1">
+            <layer locked="0" enabled="1" pass="0" class="SvgMarker" id="{e73df932-ccd5-4200-98b2-352fa83783f2}">
               <Option type="Map">
                 <Option name="angle" value="0" type="QString"/>
                 <Option name="color" value="27,79,114,255,rgb:0.10588235294117647,0.30980392156862746,0.44705882352941179,1" type="QString"/>
@@ -343,7 +343,7 @@
           </symbol>
         </layer>
       </symbol>
-      <symbol alpha="1" name="3" clip_to_extent="1" force_rhr="0" frame_rate="10" type="fill" is_animated="0">
+      <symbol name="3" alpha="1" frame_rate="10" is_animated="0" type="fill" clip_to_extent="1" force_rhr="0">
         <data_defined_properties>
           <Option type="Map">
             <Option name="name" value="" type="QString"/>
@@ -351,7 +351,7 @@
             <Option name="type" value="collection" type="QString"/>
           </Option>
         </data_defined_properties>
-        <layer locked="0" id="{0844891e-9523-4e67-890d-46eddaccc48b}" class="CentroidFill" pass="0" enabled="1">
+        <layer locked="0" enabled="1" pass="0" class="CentroidFill" id="{a1d9ff87-b7c4-49e5-a636-d7092fd6b0c8}">
           <Option type="Map">
             <Option name="clip_on_current_part_only" value="0" type="QString"/>
             <Option name="clip_points" value="0" type="QString"/>
@@ -365,7 +365,7 @@
               <Option name="type" value="collection" type="QString"/>
             </Option>
           </data_defined_properties>
-          <symbol alpha="1" name="@3@0" clip_to_extent="1" force_rhr="0" frame_rate="10" type="marker" is_animated="0">
+          <symbol name="@3@0" alpha="1" frame_rate="10" is_animated="0" type="marker" clip_to_extent="1" force_rhr="0">
             <data_defined_properties>
               <Option type="Map">
                 <Option name="name" value="" type="QString"/>
@@ -373,7 +373,7 @@
                 <Option name="type" value="collection" type="QString"/>
               </Option>
             </data_defined_properties>
-            <layer locked="0" id="{fb721f20-835c-4e56-8953-a80a979e0379}" class="SvgMarker" pass="0" enabled="1">
+            <layer locked="0" enabled="1" pass="0" class="SvgMarker" id="{cbb8d25d-6e00-461a-b878-57edb8fcd55f}">
               <Option type="Map">
                 <Option name="angle" value="0" type="QString"/>
                 <Option name="color" value="26,26,26,255,rgb:0.10196078431372549,0.10196078431372549,0.10196078431372549,1" type="QString"/>
@@ -405,7 +405,7 @@
           </symbol>
         </layer>
       </symbol>
-      <symbol alpha="1" name="4" clip_to_extent="1" force_rhr="0" frame_rate="10" type="fill" is_animated="0">
+      <symbol name="4" alpha="1" frame_rate="10" is_animated="0" type="fill" clip_to_extent="1" force_rhr="0">
         <data_defined_properties>
           <Option type="Map">
             <Option name="name" value="" type="QString"/>
@@ -413,7 +413,7 @@
             <Option name="type" value="collection" type="QString"/>
           </Option>
         </data_defined_properties>
-        <layer locked="0" id="{f24e9be2-6d00-4530-a6c5-e65088ae7f7c}" class="CentroidFill" pass="0" enabled="1">
+        <layer locked="0" enabled="1" pass="0" class="CentroidFill" id="{27458698-ff27-4170-90f5-08ae10f79c45}">
           <Option type="Map">
             <Option name="clip_on_current_part_only" value="0" type="QString"/>
             <Option name="clip_points" value="0" type="QString"/>
@@ -427,7 +427,7 @@
               <Option name="type" value="collection" type="QString"/>
             </Option>
           </data_defined_properties>
-          <symbol alpha="1" name="@4@0" clip_to_extent="1" force_rhr="0" frame_rate="10" type="marker" is_animated="0">
+          <symbol name="@4@0" alpha="1" frame_rate="10" is_animated="0" type="marker" clip_to_extent="1" force_rhr="0">
             <data_defined_properties>
               <Option type="Map">
                 <Option name="name" value="" type="QString"/>
@@ -435,7 +435,7 @@
                 <Option name="type" value="collection" type="QString"/>
               </Option>
             </data_defined_properties>
-            <layer locked="0" id="{b7ecb104-fbf8-4c9b-b5bb-faebecb911ef}" class="SvgMarker" pass="0" enabled="1">
+            <layer locked="0" enabled="1" pass="0" class="SvgMarker" id="{7b6683bb-eb80-499b-858f-cefb0928e339}">
               <Option type="Map">
                 <Option name="angle" value="0" type="QString"/>
                 <Option name="color" value="26,26,26,255,rgb:0.10196078431372549,0.10196078431372549,0.10196078431372549,1" type="QString"/>
@@ -467,7 +467,7 @@
           </symbol>
         </layer>
       </symbol>
-      <symbol alpha="1" name="5" clip_to_extent="1" force_rhr="0" frame_rate="10" type="fill" is_animated="0">
+      <symbol name="5" alpha="1" frame_rate="10" is_animated="0" type="fill" clip_to_extent="1" force_rhr="0">
         <data_defined_properties>
           <Option type="Map">
             <Option name="name" value="" type="QString"/>
@@ -475,7 +475,7 @@
             <Option name="type" value="collection" type="QString"/>
           </Option>
         </data_defined_properties>
-        <layer locked="0" id="{d3f3fde8-700b-45b7-8f41-ab2f6c5cc3a5}" class="CentroidFill" pass="0" enabled="1">
+        <layer locked="0" enabled="1" pass="0" class="CentroidFill" id="{e2220b69-d0cf-4f4e-b57e-92af0575fe23}">
           <Option type="Map">
             <Option name="clip_on_current_part_only" value="0" type="QString"/>
             <Option name="clip_points" value="0" type="QString"/>
@@ -489,7 +489,7 @@
               <Option name="type" value="collection" type="QString"/>
             </Option>
           </data_defined_properties>
-          <symbol alpha="1" name="@5@0" clip_to_extent="1" force_rhr="0" frame_rate="10" type="marker" is_animated="0">
+          <symbol name="@5@0" alpha="1" frame_rate="10" is_animated="0" type="marker" clip_to_extent="1" force_rhr="0">
             <data_defined_properties>
               <Option type="Map">
                 <Option name="name" value="" type="QString"/>
@@ -497,7 +497,7 @@
                 <Option name="type" value="collection" type="QString"/>
               </Option>
             </data_defined_properties>
-            <layer locked="0" id="{75ab3f77-c33f-445f-87db-a5674ad314d4}" class="SvgMarker" pass="0" enabled="1">
+            <layer locked="0" enabled="1" pass="0" class="SvgMarker" id="{76cee877-1adb-413b-b3bf-b783bc365fda}">
               <Option type="Map">
                 <Option name="angle" value="0" type="QString"/>
                 <Option name="color" value="26,26,26,255,rgb:0.10196078431372549,0.10196078431372549,0.10196078431372549,1" type="QString"/>
@@ -529,7 +529,7 @@
           </symbol>
         </layer>
       </symbol>
-      <symbol alpha="1" name="6" clip_to_extent="1" force_rhr="0" frame_rate="10" type="fill" is_animated="0">
+      <symbol name="6" alpha="1" frame_rate="10" is_animated="0" type="fill" clip_to_extent="1" force_rhr="0">
         <data_defined_properties>
           <Option type="Map">
             <Option name="name" value="" type="QString"/>
@@ -537,7 +537,7 @@
             <Option name="type" value="collection" type="QString"/>
           </Option>
         </data_defined_properties>
-        <layer locked="0" id="{b63620e8-43c2-4827-9394-b669cb8ad784}" class="CentroidFill" pass="0" enabled="1">
+        <layer locked="0" enabled="1" pass="0" class="CentroidFill" id="{3c4f07ac-3e4c-4c73-be28-e9065e12bdaf}">
           <Option type="Map">
             <Option name="clip_on_current_part_only" value="0" type="QString"/>
             <Option name="clip_points" value="0" type="QString"/>
@@ -551,7 +551,7 @@
               <Option name="type" value="collection" type="QString"/>
             </Option>
           </data_defined_properties>
-          <symbol alpha="1" name="@6@0" clip_to_extent="1" force_rhr="0" frame_rate="10" type="marker" is_animated="0">
+          <symbol name="@6@0" alpha="1" frame_rate="10" is_animated="0" type="marker" clip_to_extent="1" force_rhr="0">
             <data_defined_properties>
               <Option type="Map">
                 <Option name="name" value="" type="QString"/>
@@ -559,7 +559,7 @@
                 <Option name="type" value="collection" type="QString"/>
               </Option>
             </data_defined_properties>
-            <layer locked="0" id="{d7717ede-80dc-40af-b7d9-42fd71f78d2b}" class="SvgMarker" pass="0" enabled="1">
+            <layer locked="0" enabled="1" pass="0" class="SvgMarker" id="{6057f03e-98b0-4445-8a5b-8338943a5735}">
               <Option type="Map">
                 <Option name="angle" value="0" type="QString"/>
                 <Option name="color" value="26,26,26,255,rgb:0.10196078431372549,0.10196078431372549,0.10196078431372549,1" type="QString"/>
@@ -591,7 +591,7 @@
           </symbol>
         </layer>
       </symbol>
-      <symbol alpha="1" name="7" clip_to_extent="1" force_rhr="0" frame_rate="10" type="fill" is_animated="0">
+      <symbol name="7" alpha="1" frame_rate="10" is_animated="0" type="fill" clip_to_extent="1" force_rhr="0">
         <data_defined_properties>
           <Option type="Map">
             <Option name="name" value="" type="QString"/>
@@ -599,7 +599,7 @@
             <Option name="type" value="collection" type="QString"/>
           </Option>
         </data_defined_properties>
-        <layer locked="0" id="{2ae643b2-80df-4dc7-afa5-2f55f866cb22}" class="CentroidFill" pass="0" enabled="1">
+        <layer locked="0" enabled="1" pass="0" class="CentroidFill" id="{b5ac683a-2d8c-463a-bccc-d1bc4741eeb9}">
           <Option type="Map">
             <Option name="clip_on_current_part_only" value="0" type="QString"/>
             <Option name="clip_points" value="0" type="QString"/>
@@ -613,7 +613,7 @@
               <Option name="type" value="collection" type="QString"/>
             </Option>
           </data_defined_properties>
-          <symbol alpha="1" name="@7@0" clip_to_extent="1" force_rhr="0" frame_rate="10" type="marker" is_animated="0">
+          <symbol name="@7@0" alpha="1" frame_rate="10" is_animated="0" type="marker" clip_to_extent="1" force_rhr="0">
             <data_defined_properties>
               <Option type="Map">
                 <Option name="name" value="" type="QString"/>
@@ -621,7 +621,7 @@
                 <Option name="type" value="collection" type="QString"/>
               </Option>
             </data_defined_properties>
-            <layer locked="0" id="{8dd82097-dda1-4e38-b7b7-7d93d9e59b8d}" class="SvgMarker" pass="0" enabled="1">
+            <layer locked="0" enabled="1" pass="0" class="SvgMarker" id="{17a23a49-3c43-493c-8cd6-1ac7ad6706bc}">
               <Option type="Map">
                 <Option name="angle" value="0" type="QString"/>
                 <Option name="color" value="27,79,114,255,rgb:0.10588235294117647,0.30980392156862746,0.44705882352941179,1" type="QString"/>
@@ -677,7 +677,7 @@
     </activeChecks>
     <checkConfiguration/>
   </geometryOptions>
-  <legend showLabelLegend="0" type="default-vector"/>
+  <legend type="default-vector" showLabelLegend="0"/>
   <fieldConfiguration>
     <field name="name" configurationFlags="NoFlag">
       <editWidget type="">
@@ -747,32 +747,32 @@
     <policy field="religion" policy="Duplicate"/>
   </duplicatePolicies>
   <defaults>
-    <default field="name" expression="" applyOnUpdate="0"/>
-    <default field="building" expression="" applyOnUpdate="0"/>
-    <default field="amenity" expression="" applyOnUpdate="0"/>
-    <default field="emergency" expression="" applyOnUpdate="0"/>
-    <default field="aeroway" expression="" applyOnUpdate="0"/>
-    <default field="religion" expression="" applyOnUpdate="0"/>
+    <default field="name" applyOnUpdate="0" expression=""/>
+    <default field="building" applyOnUpdate="0" expression=""/>
+    <default field="amenity" applyOnUpdate="0" expression=""/>
+    <default field="emergency" applyOnUpdate="0" expression=""/>
+    <default field="aeroway" applyOnUpdate="0" expression=""/>
+    <default field="religion" applyOnUpdate="0" expression=""/>
   </defaults>
   <constraints>
-    <constraint field="name" exp_strength="0" constraints="0" notnull_strength="0" unique_strength="0"/>
-    <constraint field="building" exp_strength="0" constraints="0" notnull_strength="0" unique_strength="0"/>
-    <constraint field="amenity" exp_strength="0" constraints="0" notnull_strength="0" unique_strength="0"/>
-    <constraint field="emergency" exp_strength="0" constraints="0" notnull_strength="0" unique_strength="0"/>
-    <constraint field="aeroway" exp_strength="0" constraints="0" notnull_strength="0" unique_strength="0"/>
-    <constraint field="religion" exp_strength="0" constraints="0" notnull_strength="0" unique_strength="0"/>
+    <constraint constraints="0" unique_strength="0" field="name" notnull_strength="0" exp_strength="0"/>
+    <constraint constraints="0" unique_strength="0" field="building" notnull_strength="0" exp_strength="0"/>
+    <constraint constraints="0" unique_strength="0" field="amenity" notnull_strength="0" exp_strength="0"/>
+    <constraint constraints="0" unique_strength="0" field="emergency" notnull_strength="0" exp_strength="0"/>
+    <constraint constraints="0" unique_strength="0" field="aeroway" notnull_strength="0" exp_strength="0"/>
+    <constraint constraints="0" unique_strength="0" field="religion" notnull_strength="0" exp_strength="0"/>
   </constraints>
   <constraintExpressions>
-    <constraint desc="" exp="" field="name"/>
-    <constraint desc="" exp="" field="building"/>
-    <constraint desc="" exp="" field="amenity"/>
-    <constraint desc="" exp="" field="emergency"/>
-    <constraint desc="" exp="" field="aeroway"/>
-    <constraint desc="" exp="" field="religion"/>
+    <constraint field="name" exp="" desc=""/>
+    <constraint field="building" exp="" desc=""/>
+    <constraint field="amenity" exp="" desc=""/>
+    <constraint field="emergency" exp="" desc=""/>
+    <constraint field="aeroway" exp="" desc=""/>
+    <constraint field="religion" exp="" desc=""/>
   </constraintExpressions>
   <expressionfields/>
   <attributeactions/>
-  <attributetableconfig sortOrder="0" actionWidgetStyle="dropDown" sortExpression="">
+  <attributetableconfig sortExpression="" sortOrder="0" actionWidgetStyle="dropDown">
     <columns/>
   </attributetableconfig>
   <conditionalstyles>

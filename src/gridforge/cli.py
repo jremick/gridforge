@@ -26,10 +26,12 @@ from gridforge.config import (
     SheetSpec,
     Units,
     USOverlayKind,
+    WaypointCategory,
+    WaypointInput,
 )
 from gridforge.geo.crs import compute_sheet_layout, parse_center
 from gridforge.geo.declination import compute_declination
-from gridforge.pipeline.runner import run_export_job, run_render_job
+from gridforge.pipeline.runner import run_export_job, run_render_job, run_strip_atlas_job
 from gridforge.sources.base import ElevationSource, OverlaySource, VectorSource
 from gridforge.sources.dem_local import LocalDEMSource
 from gridforge.sources.osm_pbf import LocalPBFSource
@@ -73,6 +75,44 @@ def _configure_logging(verbose: bool) -> None:
     )
 
 
+def _parse_waypoints(raw_waypoints: list[str] | None) -> list[WaypointInput]:
+    """Parse repeatable ``--waypoint 'Label,lat,lon[,category[,notes]]'`` CLI strings."""
+    parsed: list[WaypointInput] = []
+    for raw in raw_waypoints or []:
+        parts = [p.strip() for p in raw.split(",")]
+        if len(parts) < 3:
+            raise typer.BadParameter(
+                f"Invalid --waypoint '{raw}'. Expected 'Label,lat,lon[,category[,notes]]'."
+            )
+        label = parts[0]
+        if not label:
+            raise typer.BadParameter(f"Waypoint label must be non-empty in '{raw}'.")
+        try:
+            lat = float(parts[1])
+            lon = float(parts[2])
+        except ValueError as exc:
+            raise typer.BadParameter(
+                f"Invalid waypoint coordinates in '{raw}'. Expected decimal degrees lat,lon."
+            ) from exc
+
+        cat = WaypointCategory.WAYPOINT
+        if len(parts) >= 4 and parts[3]:
+            try:
+                cat = WaypointCategory(parts[3].lower())
+            except ValueError as exc:
+                allowed = ", ".join(c.value for c in WaypointCategory)
+                raise typer.BadParameter(
+                    f"Invalid waypoint category '{parts[3]}' in '{raw}'. Choose: {allowed}."
+                ) from exc
+
+        notes = ",".join(parts[4:]).strip() or None if len(parts) >= 5 else None
+        try:
+            parsed.append(WaypointInput(label=label, lat=lat, lon=lon, category=cat, notes=notes))
+        except Exception as exc:
+            raise typer.BadParameter(f"Invalid waypoint '{raw}': {exc}") from exc
+    return parsed
+
+
 def _build_spec(
     *,
     center: str,
@@ -88,6 +128,10 @@ def _build_spec(
     dem_source: DemSourceKind = DemSourceKind.AUTO,
     us_overlays: list[USOverlayKind] | None = None,
     au_overlays: list[AUOverlayKind] | None = None,
+    waypoints: list[WaypointInput] | None = None,
+    include_calibration_page: bool = False,
+    include_route_card: bool = False,
+    include_elevation_profile: bool = False,
     carto: CartoOptions | None = None,
 ) -> SheetSpec:
     if scale not in VALID_SCALES:
@@ -115,17 +159,33 @@ def _build_spec(
         dem_source=dem_source,
         us_overlays=list(dict.fromkeys(us_overlays or [])),
         au_overlays=list(dict.fromkeys(au_overlays or [])),
+        waypoints=list(waypoints or []),
+        include_calibration_page=include_calibration_page,
+        include_route_card=include_route_card,
+        include_elevation_profile=include_elevation_profile,
         carto=carto if carto is not None else CartoOptions(),
     )
 
 
 @app.command("render")
 def render_cmd(
-    center: str = typer.Option(
-        ...,
+    center: Optional[str] = typer.Option(
+        None,
         "--center",
         "-c",
-        help='Center coordinate as "lat,lon" (e.g. "-33.732,150.312") or MGRS string.',
+        help='Center coordinate as "lat,lon" (e.g. "-33.732,150.312") or MGRS string (omit when using --strip-route).',
+    ),
+    strip_route: Optional[Path] = typer.Option(
+        None,
+        "--strip-route",
+        help="GPX or GeoJSON route file to auto-fit a minimum-count multi-page true-scale Strip Atlas PDF.",
+    ),
+    overlap_pct: float = typer.Option(
+        10.0,
+        "--overlap-pct",
+        min=0.0,
+        max=40.0,
+        help="Edge margin / overlap percentage for --strip-route sheets (default 10%).",
     ),
     scale: int = typer.Option(
         25000,
@@ -201,7 +261,7 @@ def render_cmd(
         None,
         "--au-overlay",
         case_sensitive=False,
-        help="Optional Australia CC BY 4.0 national overlay (au-hydro, au-parks, au-infra, au-aviation); repeatable.",
+        help="Optional Australia CC BY 4.0 overlay (au-hydro, au-parks, au-infra, au-aviation, au-nsw-trails, au-vic-trails); repeatable.",
     ),
     pack: Optional[Path] = typer.Option(
         None,
@@ -235,6 +295,31 @@ def render_cmd(
         True,
         "--river-arrows/--no-river-arrows",
         help="Show directional downstream flow arrows on rivers & streams.",
+    ),
+    slope_shading: bool = typer.Option(
+        False,
+        "--slope-shading/--no-slope-shading",
+        help="Overlay backcountry slope-angle avalanche shading (>27 deg Color / >30 deg B&W).",
+    ),
+    waypoint: Optional[list[str]] = typer.Option(
+        None,
+        "--waypoint",
+        help='Add a numbered tactical waypoint as "Label,lat,lon[,category]" (waypoint|camp|water|hazard|lz); repeatable.',
+    ),
+    calibration_page: bool = typer.Option(
+        False,
+        "--calibration-page/--no-calibration-page",
+        help="Append an exact 100.00 mm Printer Scale Verification & MGRS Romer page to the PDF.",
+    ),
+    route_card: bool = typer.Option(
+        False,
+        "--route-card/--no-route-card",
+        help="Append a Tactical Route Card page (MGRS, leg distances, Grid & WMM2025 Magnetic azimuths).",
+    ),
+    elevation_profile: bool = typer.Option(
+        False,
+        "--elevation-profile/--no-elevation-profile",
+        help="Prepend a Route Overview & DEM Elevation Profile page (from --strip-route, --overlay, or --waypoint).",
     ),
     mbtiles: Optional[Path] = typer.Option(
         None,
@@ -306,8 +391,11 @@ def render_cmd(
         help="Enable debug logging.",
     ),
 ) -> None:
-    """Render a print-ready, physically true-scale MGRS topographic PDF (+ optional MBTiles/KMZ)."""
+    """Render a print-ready, physically true-scale MGRS topographic PDF (+ optional strip atlas/supplements/exports)."""
     _configure_logging(verbose)
+
+    if strip_route is None and not center:
+        raise typer.BadParameter("Provide either --center or --strip-route.")
 
     carto = CartoOptions(
         contour_density=contour_density,
@@ -319,45 +407,85 @@ def render_cmd(
         show_pipelines=pipelines,
         show_grid=grid,
         show_river_arrows=river_arrows,
+        show_slope_shading=slope_shading,
     )
-    spec = _build_spec(
-        center=center,
-        scale=scale,
-        paper=paper,
-        orientation=orientation,
-        mode=mode,
-        units=units,
-        title=title,
-        date_iso=date_iso,
-        geopdf=geopdf,
-        dpi=dpi,
-        dem_source=dem_source,
-        us_overlays=us_overlay,
-        au_overlays=au_overlay,
-        carto=carto,
-    )
+    parsed_waypoints = _parse_waypoints(waypoint)
 
     elev_src: ElevationSource | None = LocalDEMSource(offline_dem) if offline_dem is not None else None
     vec_src: VectorSource | None = LocalPBFSource(offline_pbf) if offline_pbf is not None else None
     overlay_srcs: list[OverlaySource] = [UserOverlaySource(p) for p in (overlay or [])]
 
-    result = run_render_job(
-        spec,
-        output,
-        elevation_source=elev_src,
-        vector_source=vec_src,
-        overlay_sources=overlay_srcs or None,
-        pack_dir=pack,
-        keep_workspace=keep_workspace,
-        work_dir=work_dir,
-        mbtiles_out=mbtiles,
-        kmz_out=kmz,
-        mbtiles_format=mbtiles_format,
-        garmin_profile=garmin_profile,
-        max_tiles=max_tiles,
-        export_include_grid=grid,
-        export_dpi=dpi,
-    )
+    if strip_route is not None:
+        if scale not in VALID_SCALES:
+            allowed = ", ".join(str(s) for s in VALID_SCALES)
+            raise typer.BadParameter(f"Invalid scale {scale}. Choose one of: {allowed}")
+        result = run_strip_atlas_job(
+            strip_route,
+            output,
+            scale=scale,
+            paper=paper,
+            orientation=orientation,
+            color_mode=mode,
+            units=units,
+            title=title,
+            date_iso=date_iso,
+            geopdf=geopdf,
+            dpi=dpi,
+            dem_source=dem_source,
+            us_overlays=us_overlay,
+            au_overlays=au_overlay,
+            carto=carto,
+            waypoints=parsed_waypoints,
+            include_calibration_page=calibration_page,
+            include_route_card=route_card,
+            include_elevation_profile=elevation_profile,
+            overlap_pct=overlap_pct,
+            elevation_source=elev_src,
+            vector_source=vec_src,
+            overlay_sources=overlay_srcs or None,
+            pack_dir=pack,
+            keep_workspace=keep_workspace,
+            work_dir=work_dir,
+        )
+    else:
+        assert center is not None
+        spec = _build_spec(
+            center=center,
+            scale=scale,
+            paper=paper,
+            orientation=orientation,
+            mode=mode,
+            units=units,
+            title=title,
+            date_iso=date_iso,
+            geopdf=geopdf,
+            dpi=dpi,
+            dem_source=dem_source,
+            us_overlays=us_overlay,
+            au_overlays=au_overlay,
+            waypoints=parsed_waypoints,
+            include_calibration_page=calibration_page,
+            include_route_card=route_card,
+            include_elevation_profile=elevation_profile,
+            carto=carto,
+        )
+        result = run_render_job(
+            spec,
+            output,
+            elevation_source=elev_src,
+            vector_source=vec_src,
+            overlay_sources=overlay_srcs or None,
+            pack_dir=pack,
+            keep_workspace=keep_workspace,
+            work_dir=work_dir,
+            mbtiles_out=mbtiles,
+            kmz_out=kmz,
+            mbtiles_format=mbtiles_format,
+            garmin_profile=garmin_profile,
+            max_tiles=max_tiles,
+            export_include_grid=grid,
+            export_dpi=dpi,
+        )
 
     if json_output:
         typer.echo(result.model_dump_json(indent=2))
@@ -466,7 +594,7 @@ def export_cmd(
         None,
         "--au-overlay",
         case_sensitive=False,
-        help="Optional Australia CC BY 4.0 national overlay (au-hydro, au-parks, au-infra, au-aviation); repeatable.",
+        help="Optional Australia CC BY 4.0 overlay (au-hydro, au-parks, au-infra, au-aviation, au-nsw-trails, au-vic-trails); repeatable.",
     ),
     pack: Optional[Path] = typer.Option(
         None,
@@ -501,6 +629,16 @@ def export_cmd(
         "--river-arrows/--no-river-arrows",
         help="Show directional downstream flow arrows on rivers & streams.",
     ),
+    slope_shading: bool = typer.Option(
+        False,
+        "--slope-shading/--no-slope-shading",
+        help="Overlay backcountry slope-angle avalanche shading (>27 deg Color / >30 deg B&W).",
+    ),
+    waypoint: Optional[list[str]] = typer.Option(
+        None,
+        "--waypoint",
+        help='Add a numbered tactical waypoint as "Label,lat,lon[,category]" (waypoint|camp|water|hazard|lz); repeatable.',
+    ),
     offline_dem: Optional[Path] = typer.Option(None, "--offline-dem", help="Local GeoTIFF/VRT or directory of DEMs."),
     offline_pbf: Optional[Path] = typer.Option(None, "--offline-pbf", help="Local .osm.pbf or .osm XML file."),
     overlay: Optional[list[Path]] = typer.Option(None, "--overlay", help="Optional user overlay (.geojson, .gpx, .csv)."),
@@ -523,6 +661,7 @@ def export_cmd(
         show_pipelines=pipelines,
         show_grid=grid,
         show_river_arrows=river_arrows,
+        show_slope_shading=slope_shading,
     )
     spec = _build_spec(
         center=center,
@@ -537,6 +676,7 @@ def export_cmd(
         dem_source=dem_source,
         us_overlays=us_overlay,
         au_overlays=au_overlay,
+        waypoints=_parse_waypoints(waypoint),
         carto=carto,
     )
 
