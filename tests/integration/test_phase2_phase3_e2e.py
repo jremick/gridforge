@@ -525,7 +525,7 @@ class TestLivePhase2Phase3:
             color_mode=ColorMode.COLOR,
             units=Units.METRIC,
             title="BLUE MOUNTAINS — KATOOMBA",
-            dem_source=DemSourceKind.AUTO,
+            dem_source=DemSourceKind.GLO30,
             carto=CartoOptions(show_river_arrows=True, show_trees=True, show_buildings=True),
         )
         layout = compute_sheet_layout(color_spec)

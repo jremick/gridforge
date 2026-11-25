@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from gridforge.config import ColorMode, Orientation, PaperSize, SheetSpec, Units
+from gridforge.config import ColorMode, DemSourceKind, Orientation, PaperSize, SheetSpec, Units
 from gridforge.pipeline.runner import run_render_job
 from gridforge.sources.dem_local import LocalDEMSource
 from gridforge.sources.osm_pbf import LocalPBFSource
@@ -463,6 +463,7 @@ class TestLiveBlueMountainsRender:
             color_mode=ColorMode.COLOR,
             units=Units.METRIC,
             title="BLUE MOUNTAINS — KATOOMBA",
+            dem_source=DemSourceKind.GLO30,
         )
         res = run_render_job(spec, out_pdf)
         assert res.output_pdf == out_pdf
@@ -491,6 +492,7 @@ class TestLiveBlueMountainsRender:
             color_mode=ColorMode.BW,
             units=Units.METRIC,
             title="BLUE MOUNTAINS — KATOOMBA (B&W)",
+            dem_source=DemSourceKind.GLO30,
         )
         res = run_render_job(spec, out_pdf)
         assert res.output_pdf == out_pdf
@@ -519,6 +521,7 @@ class TestLiveBlueMountainsRender:
             color_mode=ColorMode.COLOR,
             units=Units.IMPERIAL,
             title="BLUE MOUNTAINS — KATOOMBA",
+            dem_source=DemSourceKind.GLO30,
         )
         res = run_render_job(spec, out_pdf)
         assert res.output_pdf == out_pdf
