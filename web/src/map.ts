@@ -478,6 +478,10 @@ export class GridForgeMap {
     }
   }
 
+  clearFootprint(): void {
+    this.updateFootprint(EMPTY_FC, EMPTY_FC);
+  }
+
   updateFootprint(
     footprint: FeatureCollection,
     grid: FeatureCollection,

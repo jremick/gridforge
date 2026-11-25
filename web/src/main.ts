@@ -518,8 +518,8 @@ class GridForgeApp {
           paper: this.state.paper,
           orientation: this.state.orientation,
           units: this.state.units,
-          grid_cols: this.state.grid_cols,
-          grid_rows: this.state.grid_rows,
+          grid_cols: this.state.outputs.pdf ? this.state.grid_cols : 1,
+          grid_rows: this.state.outputs.pdf ? this.state.grid_rows : 1,
         },
         controller.signal
       );
@@ -548,6 +548,9 @@ class GridForgeApp {
       if (controller.signal.aborted) return;
       const msg =
         err instanceof Error ? err.message : "Failed to compute footprint";
+      this.latestFootprint = null;
+      this.telemetry.updateFootprint(null);
+      this.map.clearFootprint();
       this.setFootprintError(msg);
     }
   }

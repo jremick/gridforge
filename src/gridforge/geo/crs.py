@@ -233,10 +233,18 @@ def _utm_bbox_to_wgs84(utm_bbox: BBox, utm_epsg: int, samples_per_edge: int = 5)
         ys.extend((utm_bbox.min_y, utm_bbox.max_y, y, y))
 
     lons, lats = to_wgs84.transform(xs, ys)
+    west, east = float(min(lons)), float(max(lons))
+    # Each supported paper footprint is local. A near-global interval here means
+    # the projected edges wrapped across ±180°, which a single BBox cannot encode.
+    if east - west > 180.0:
+        raise ValueError(
+            "The sheet or its data-fetch margin crosses the antimeridian. "
+            "Move the center farther from 180° longitude or reduce the sheet extent."
+        )
     return BBox(
-        min_x=float(min(lons)),
+        min_x=west,
         min_y=float(min(lats)),
-        max_x=float(max(lons)),
+        max_x=east,
         max_y=float(max(lats)),
     )
 
@@ -317,3 +325,32 @@ def compute_sheet_layout(
         wgs84_bbox=wgs84_bbox,
         wgs84_fetch_bbox=wgs84_fetch_bbox,
     )
+
+
+def compute_atlas_layouts(
+    anchor: SheetLayout, cols: int, rows: int
+) -> list[tuple[str, SheetLayout]]:
+    """Lay out native-UTM sheets in row-major order, checking they share the anchor CRS."""
+    if cols == rows == 1:
+        return [("A1", anchor)]
+
+    to_wgs84 = _get_transformer(f"EPSG:{anchor.utm_epsg}", "EPSG:4326")
+    sheets = []
+    for row in range(rows):
+        for col in range(cols):
+            sheet_id = f"{chr(ord('A') + row)}{col + 1}"
+            x = anchor.center_easting + (col - (cols - 1) / 2) * anchor.utm_bbox.width
+            y = anchor.center_northing + ((rows - 1) / 2 - row) * anchor.utm_bbox.height
+            lon, lat = to_wgs84.transform(x, y)
+            spec = anchor.spec.model_copy(
+                update={"center_lat": lat, "center_lon": lon, "center_mgrs": None}
+            )
+            page = compute_sheet_layout(spec, anchor.margins_mm)
+            if page.utm_epsg != anchor.utm_epsg:
+                raise ValueError(
+                    f"Atlas sheet {sheet_id} uses EPSG:{page.utm_epsg}, while the atlas center "
+                    f"uses EPSG:{anchor.utm_epsg}. Choose a smaller grid, move the center, "
+                    "or render single sheets so each atlas uses one UTM zone and hemisphere."
+                )
+            sheets.append((sheet_id, page))
+    return sheets

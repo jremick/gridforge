@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 from pypdf import PdfReader, PdfWriter
+from pyproj import Transformer
 
 from gridforge.config import (
     BBox,
@@ -20,6 +21,7 @@ from gridforge.config import (
     PaperSize,
     RenderResult,
 )
+from gridforge.geo.crs import compute_sheet_layout
 from gridforge.web import db
 from gridforge.web.app import create_app
 from gridforge.web.schemas import JobStatus
@@ -519,13 +521,9 @@ class TestSQLiteStoreAndWorker:
         assert not seen_work_dirs[0].exists()
 
     def test_process_multi_sheet_2x2_atlas_merges_4_pages(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, client_and_dirs, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        data_dir = tmp_path / "jobs"
-        packs_dir = tmp_path / "packs"
-        db_path = data_dir / "gridforge_jobs.sqlite3"
-        db.init_db(db_path)
-        packs_dir.mkdir(parents=True)
+        client, data_dir, packs_dir, db_path = client_and_dirs
 
         req_json = json.dumps(
             {
@@ -559,13 +557,13 @@ class TestSQLiteStoreAndWorker:
         assert claimed is not None
         assert claimed.record.grid_cols == 2 and claimed.record.grid_rows == 2
 
-        rendered_titles: list[str] = []
+        rendered_layouts = []
 
         def _fake_prepare(spec, job_dir, **kwargs):
-            rendered_titles.append(spec.title or "")
-            return spec
+            return compute_sheet_layout(spec)
 
         def _fake_render_pdf(self, workspace, output_pdf: Path):
+            rendered_layouts.append(workspace)
             # Write a real valid 1-page A4 PDF so pypdf merges cleanly
             w = PdfWriter()
             w.add_blank_page(width=595.28, height=841.89)
@@ -592,7 +590,19 @@ class TestSQLiteStoreAndWorker:
         )
         assert done is not None
         assert done.status == JobStatus.SUCCEEDED
-        assert len(rendered_titles) == 4
+        preview = client.post("/api/footprint", json=json.loads(req_json))
+        assert preview.status_code == 200
+        features = preview.json()["footprint_geojson"]["features"]
+        assert len(rendered_layouts) == len(features) == 4
+        for layout, feature in zip(rendered_layouts, features, strict=True):
+            assert layout.utm_epsg == feature["properties"]["utm_epsg"]
+            project = Transformer.from_crs(4326, layout.utm_epsg, always_xy=True)
+            ring = feature["geometry"]["coordinates"][0]
+            xs, ys = project.transform(*zip(*ring))
+            assert layout.utm_bbox.as_tuple() == pytest.approx(
+                (min(xs), min(ys), max(xs), max(ys)), abs=0.02, rel=0
+            )
+        rendered_titles = [layout.spec.title for layout in rendered_layouts]
         assert "Sheet A1 (1/4)" in rendered_titles[0]
         assert "Sheet A2 (2/4)" in rendered_titles[1]
         assert "Sheet B1 (3/4)" in rendered_titles[2]
@@ -604,3 +614,66 @@ class TestSQLiteStoreAndWorker:
         merged_pdf = data_dir / "atlasjob0001" / "artifacts" / done.artifacts[0].filename
         reader = PdfReader(str(merged_pdf))
         assert len(reader.pages) == 4
+
+
+@pytest.mark.parametrize(
+    ("center", "cols", "rows"), [("45,6", 2, 1), ("0,3", 1, 2), ("60,3", 2, 1)]
+)
+def test_incompatible_atlas_projections_rejected_before_enqueue(client_and_dirs, center, cols, rows):
+    client, _, _, _ = client_and_dirs
+    request = {"center": center, "grid_cols": cols, "grid_rows": rows}
+    preview = client.post("/api/footprint", json=request)
+    job = client.post("/api/jobs", json=request)
+    assert preview.status_code == job.status_code == 422
+    assert "Atlas sheet" in preview.json()["detail"]
+    assert preview.json()["detail"] == job.json()["detail"]
+    assert client.get("/api/jobs").json()["jobs"] == []
+
+    # Device-only exports use the center sheet, regardless of the PDF grid setting.
+    digital = client.post("/api/jobs", json={**request, "outputs": {"pdf": False, "kmz": True}})
+    assert digital.status_code == 202
+
+
+def test_atlas_across_latitude_band_keeps_native_page_labels(client_and_dirs):
+    client, _, _, _ = client_and_dirs
+    preview = client.post("/api/footprint", json={"center": "48,3", "grid_rows": 2})
+    assert preview.status_code == 200
+    pages = preview.json()["footprint_geojson"]["features"]
+    assert [page["properties"]["gzd"] for page in pages] == ["31U", "31T"]
+    assert all(page["properties"]["utm_epsg"] == 32631 for page in pages)
+
+
+def test_worker_rechecks_previously_queued_incompatible_atlas(client_and_dirs, monkeypatch):
+    _, data_dir, packs_dir, db_path = client_and_dirs
+    center = "45,6"
+    db.create_job(
+        db_path, job_id="atlaszone0001", title=None, center=center, center_mgrs=None,
+        scale=25000, paper=PaperSize.A4, orientation=Orientation.PORTRAIT,
+        color_mode=ColorMode.COLOR, grid_cols=2,
+        request_json=json.dumps({"center": center, "grid_cols": 2}),
+    )
+    claimed = db.claim_next_job(db_path)
+    assert claimed is not None
+    monkeypatch.setattr(
+        "gridforge.web.worker.runner.prepare_job_workspace",
+        lambda *a, **kw: pytest.fail("An incompatible atlas must fail before preparing any page"),
+    )
+    job = process_single_job(claimed, db_path=db_path, data_dir=data_dir, packs_dir=packs_dir)
+    assert job is not None and job.status == JobStatus.FAILED
+    assert "Atlas sheet" in job.error
+    assert job.artifacts == []
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_antimeridian_extents_refused_before_fetch(client_and_dirs, sign):
+    client, _, _, _ = client_and_dirs
+    for lon, cols in [(179.98, 1), (179.94, 3)]:
+        # In the three-column case the center is safe but an outer page wraps.
+        payload = {"center": f"45,{sign * lon}", "grid_cols": cols}
+        for endpoint in ("/api/footprint", "/api/jobs"):
+            response = client.post(endpoint, json=payload)
+            assert response.status_code == 422
+            assert "antimeridian" in response.json()["detail"]
+    assert client.get("/api/jobs").json()["jobs"] == []
+    nearby = client.post("/api/footprint", json={"center": f"45,{sign * 179.8}", "grid_cols": 3})
+    assert nearby.status_code == 200

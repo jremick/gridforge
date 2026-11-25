@@ -21,14 +21,13 @@ import time
 from pathlib import Path
 from typing import Any
 
-from pyproj import Transformer
 from pypdf import PdfWriter
 
 from gridforge.config import SheetSpec
 from gridforge.export.kmz import export_garmin_kmz
 from gridforge.export.mbtiles import export_mbtiles
 from gridforge.export.raster import render_collarless_geotiff
-from gridforge.geo.crs import compute_sheet_layout, parse_center
+from gridforge.geo.crs import compute_atlas_layouts, compute_sheet_layout, parse_center
 from gridforge.packs.builder import discover_packs, load_pack_manifest
 from gridforge.pipeline import runner
 from gridforge.render.pyqgis_worker import PyQGISRenderer
@@ -132,42 +131,6 @@ def _merge_pdfs(sheet_pdfs: list[Path], output_pdf: Path) -> Path:
     finally:
         writer.close()
     return output_pdf
-
-
-def _iter_atlas_sheet_specs(
-    anchor_spec: SheetSpec,
-    grid_cols: int,
-    grid_rows: int,
-    base_title: str,
-) -> list[tuple[str, SheetSpec]]:
-    """Generate ordered (sheet_id, SheetSpec) pairs for an edge-matched UTM multi-sheet atlas."""
-    anchor_layout = compute_sheet_layout(anchor_spec)
-    ground_w = anchor_layout.utm_bbox.width
-    ground_h = anchor_layout.utm_bbox.height
-    to_wgs84 = Transformer.from_crs(
-        f"EPSG:{anchor_layout.utm_epsg}", "EPSG:4326", always_xy=True
-    )
-    total = grid_cols * grid_rows
-    sheets: list[tuple[str, SheetSpec]] = []
-    idx = 0
-    for r in range(grid_rows):
-        row_letter = chr(ord("A") + r)
-        for c in range(grid_cols):
-            idx += 1
-            sheet_id = f"{row_letter}{c + 1}"
-            sheet_cx = anchor_layout.center_easting + (c - (grid_cols - 1) / 2.0) * ground_w
-            sheet_cy = anchor_layout.center_northing + ((grid_rows - 1) / 2.0 - r) * ground_h
-            sheet_lon, sheet_lat = to_wgs84.transform(sheet_cx, sheet_cy)
-            sheet_spec = anchor_spec.model_copy(
-                update={
-                    "center_lat": float(sheet_lat),
-                    "center_lon": float(sheet_lon),
-                    "center_mgrs": None,
-                    "title": f"{base_title} — Sheet {sheet_id} ({idx}/{total})",
-                }
-            )
-            sheets.append((sheet_id, sheet_spec))
-    return sheets
 
 
 def _build_prep_kwargs(
@@ -274,16 +237,16 @@ def process_single_job(
         else:
             # Multi-sheet UTM Atlas: render sheets A1..C3 sequentially (1 at a time -> < 1.5 GB RSS)
             base_title = req.title or claimed.record.center_mgrs or "GRIDFORGE ATLAS"
-            atlas_sheets = _iter_atlas_sheet_specs(
-                spec, req.grid_cols, req.grid_rows, base_title
-            )
             sheet_pdfs_dir = tmp_work_dir / "atlas_pdfs"
             sheet_pdfs_dir.mkdir(parents=True, exist_ok=True)
             rendered_sheet_pdfs: list[Path] = []
             pdf_budget_pct = 72 if (outputs.mbtiles or outputs.kmz) else 90
 
             if outputs.pdf:
-                for idx, (sheet_id, sheet_spec) in enumerate(atlas_sheets, start=1):
+                sheets = compute_atlas_layouts(compute_sheet_layout(spec), req.grid_cols, req.grid_rows)
+                for idx, (sheet_id, page) in enumerate(sheets, start=1):
+                    title = f"{base_title} — Sheet {sheet_id} ({idx}/{total_sheets})"
+                    sheet_spec = page.spec.model_copy(update={"title": title})
                     if _is_cancelled(db_path, job_id):
                         return db.get_job(db_path, job_id)
 

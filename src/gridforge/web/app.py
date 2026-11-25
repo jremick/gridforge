@@ -22,7 +22,13 @@ from pydantic import ValidationError
 from pyproj import Transformer
 
 from gridforge.config import BBox, SheetSpec
-from gridforge.geo.crs import MAX_UTM_LAT, MIN_UTM_LAT, compute_sheet_layout, parse_center
+from gridforge.geo.crs import (
+    MAX_UTM_LAT,
+    MIN_UTM_LAT,
+    compute_atlas_layouts,
+    compute_sheet_layout,
+    parse_center,
+)
 from gridforge.geo.declination import compute_declination
 from gridforge.packs.builder import discover_packs
 from gridforge.web import db
@@ -198,6 +204,7 @@ def _build_footprint_preview(req: FootprintRequest) -> FootprintResponse:
             date_iso=req.date_iso,
         )
         layout = compute_sheet_layout(spec)
+        sheets = compute_atlas_layouts(layout, req.grid_cols, req.grid_rows)
         declination = compute_declination(layout, elevation_m=0.0)
     except ValueError as exc:
         raise HTTPException(status_code=_HTTP_422, detail=str(exc)) from exc
@@ -212,40 +219,30 @@ def _build_footprint_preview(req: FootprintRequest) -> FootprintResponse:
 
     # 1. Edge-matched multi-sheet UTM polygons in shared EPSG:{layout.utm_epsg}
     sheet_features: list[dict[str, Any]] = []
-    for r in range(rows):
-        row_letter = chr(ord("A") + r)
-        for c in range(cols):
-            sheet_id = f"{row_letter}{c + 1}"
-            sheet_cx = layout.center_easting + (c - (cols - 1) / 2.0) * ground_w
-            sheet_cy = layout.center_northing + ((rows - 1) / 2.0 - r) * ground_h
-            sheet_bbox = BBox(
-                min_x=sheet_cx - ground_w / 2.0,
-                min_y=sheet_cy - ground_h / 2.0,
-                max_x=sheet_cx + ground_w / 2.0,
-                max_y=sheet_cy + ground_h / 2.0,
-            )
-            ring_coords = _utm_box_to_ring(sheet_bbox, to_wgs84)
-            sheet_features.append(
-                {
-                    "type": "Feature",
-                    "properties": {
-                        "sheet_id": sheet_id,
-                        "label": sheet_id,
-                        "row": r,
-                        "col": c,
-                        "is_primary": (r == primary_row and c == primary_col),
-                        "scale": spec.scale,
-                        "paper": spec.paper.value,
-                        "orientation": spec.orientation.value,
-                        "utm_epsg": layout.utm_epsg,
-                        "gzd": layout.gzd,
-                    },
-                    "geometry": {
-                        "type": "Polygon",
-                        "coordinates": [ring_coords],
-                    },
-                }
-            )
+    for idx, (sheet_id, page) in enumerate(sheets):
+        r, c = divmod(idx, cols)
+        ring_coords = _utm_box_to_ring(page.utm_bbox, to_wgs84)
+        sheet_features.append(
+            {
+                "type": "Feature",
+                "properties": {
+                    "sheet_id": sheet_id,
+                    "label": sheet_id,
+                    "row": r,
+                    "col": c,
+                    "is_primary": (r == primary_row and c == primary_col),
+                    "scale": spec.scale,
+                    "paper": spec.paper.value,
+                    "orientation": spec.orientation.value,
+                    "utm_epsg": layout.utm_epsg,
+                    "gzd": page.gzd,
+                },
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [ring_coords],
+                },
+            }
+        )
 
     footprint_geojson: dict[str, Any] = {
         "type": "FeatureCollection",
@@ -541,7 +538,7 @@ def create_app(
         try:
             lat, lon, canonical_mgrs = parse_center(job_req.center)
             # Validate full SheetSpec bounds early before enqueueing.
-            SheetSpec(
+            spec = SheetSpec(
                 center_lat=lat,
                 center_lon=lon,
                 center_mgrs=canonical_mgrs,
@@ -559,6 +556,9 @@ def create_app(
                 us_overlays=job_req.us_overlays,
                 au_overlays=job_req.au_overlays,
             )
+            anchor = compute_sheet_layout(spec)
+            if job_req.outputs.pdf and job_req.grid_cols * job_req.grid_rows > 1:
+                compute_atlas_layouts(anchor, job_req.grid_cols, job_req.grid_rows)
         except (ValueError, ValidationError) as exc:
             raise HTTPException(
                 status_code=_HTTP_422,

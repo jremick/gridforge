@@ -849,12 +849,12 @@ export class SidebarPanel {
       } else {
         this.setFormError(null);
       }
-      this.callbacks.onStateChange();
     };
 
     this.outPdfCheck.addEventListener("change", () => {
       this.state.outputs.pdf = this.outPdfCheck.checked;
       syncOutputControls();
+      this.callbacks.onFootprintParamsChange();
     });
 
     this.outGeoPdfCheck.addEventListener("change", () => {
@@ -865,6 +865,7 @@ export class SidebarPanel {
     this.outMbtilesCheck.addEventListener("change", () => {
       this.state.outputs.mbtiles = this.outMbtilesCheck.checked;
       syncOutputControls();
+      this.callbacks.onStateChange();
     });
 
     this.outMbtilesFmt.addEventListener("change", () => {
@@ -876,6 +877,7 @@ export class SidebarPanel {
     this.outKmzCheck.addEventListener("change", () => {
       this.state.outputs.kmz = this.outKmzCheck.checked;
       syncOutputControls();
+      this.callbacks.onStateChange();
     });
 
     this.outGarminProfile.addEventListener("change", () => {
