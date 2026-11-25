@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import re
+import time
 import uuid
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
+import httpx
 import mgrs
 from fastapi import FastAPI, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,8 +21,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 from pyproj import Transformer
 
-from gridforge.config import SheetSpec
-from gridforge.geo.crs import compute_sheet_layout, parse_center
+from gridforge.config import BBox, SheetSpec
+from gridforge.geo.crs import MAX_UTM_LAT, MIN_UTM_LAT, compute_sheet_layout, parse_center
 from gridforge.geo.declination import compute_declination
 from gridforge.packs.builder import discover_packs
 from gridforge.web import db
@@ -26,6 +30,8 @@ from gridforge.web.schemas import (
     CreateJobRequest,
     FootprintRequest,
     FootprintResponse,
+    GeocodeResponse,
+    GeocodeResult,
     HealthResponse,
     JobRecord,
     JobsListResponse,
@@ -33,17 +39,91 @@ from gridforge.web.schemas import (
     PackSummary,
 )
 
+logger = logging.getLogger(__name__)
+
+_HTTP_422: int = getattr(status, "HTTP_422_UNPROCESSABLE_CONTENT", 422)
 MAX_UPLOAD_BYTES: int = 25 * 1024 * 1024  # 25 MiB
 ALLOWED_OVERLAY_EXTS: frozenset[str] = frozenset({".geojson", ".json", ".gpx", ".csv"})
 _JOB_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{8,64}$")
 _PACK_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 _MGRS_SPLIT_RE = re.compile(r"^0?([1-9]|[1-5]\d|60)([C-HJ-NP-X])([A-HJ-NP-Z]{2})(\d*)$")
 
+NOMINATIM_URL: str = "https://nominatim.openstreetmap.org/search"
+NOMINATIM_USER_AGENT: str = "gridforge/0.1 (+https://github.com/jremick/gridforge)"
+_GEOCODE_CACHE_TTL_S: float = 300.0
+_GEOCODE_CACHE_MAX: int = 256
+_geocode_cache: OrderedDict[tuple[str, int], tuple[float, list[GeocodeResult]]] = OrderedDict()
+
 _MEDIA_TYPES: dict[str, str] = {
     ".pdf": "application/pdf",
     ".mbtiles": "application/vnd.sqlite3",
     ".kmz": "application/vnd.google-earth.kmz",
 }
+
+
+def _search_nominatim(query: str, limit: int = 5) -> list[GeocodeResult]:
+    """Search OSM Nominatim with in-memory LRU/TTL cache and graceful offline fallback."""
+    cleaned = query.strip()
+    if len(cleaned) < 2:
+        return []
+
+    cache_key = (cleaned.lower(), limit)
+    now = time.monotonic()
+    cached = _geocode_cache.get(cache_key)
+    if cached is not None:
+        ts, items = cached
+        if now - ts <= _GEOCODE_CACHE_TTL_S:
+            _geocode_cache.move_to_end(cache_key)
+            return list(items)
+        _geocode_cache.pop(cache_key, None)
+
+    url = os.environ.get("GRIDFORGE_NOMINATIM_URL", NOMINATIM_URL).strip()
+    try:
+        resp = httpx.get(
+            url,
+            params={"format": "jsonv2", "limit": str(limit), "q": cleaned},
+            headers={"User-Agent": NOMINATIM_USER_AGENT, "Accept": "application/json"},
+            timeout=5.0,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+    except Exception as exc:
+        logger.debug("Geocode lookup unavailable for %r (%s); returning empty results", cleaned, exc)
+        return []
+
+    if not isinstance(payload, list):
+        return []
+
+    results: list[GeocodeResult] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        try:
+            lat = float(item["lat"])
+            lon = float(item["lon"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not (MIN_UTM_LAT <= lat <= MAX_UTM_LAT and -180.0 <= lon <= 180.0):
+            continue
+        display_name = str(item.get("display_name") or "").strip()
+        if not display_name:
+            continue
+        short_name = str(item.get("name") or "").strip() or display_name.split(",", 1)[0].strip()
+        place_type = str(item.get("type") or item.get("class") or "place").strip() or "place"
+        results.append(
+            GeocodeResult(
+                display_name=display_name,
+                short_name=short_name,
+                lat=round(lat, 6),
+                lon=round(lon, 6),
+                type=place_type,
+            )
+        )
+
+    _geocode_cache[cache_key] = (now, results)
+    while len(_geocode_cache) > _GEOCODE_CACHE_MAX:
+        _geocode_cache.popitem(last=False)
+    return list(results)
 
 
 def _decode_mgrs(raw: str | bytes) -> str:
@@ -72,34 +152,8 @@ def _sanitize_upload_filename(raw_name: str | None) -> str:
     return safe
 
 
-def _build_footprint_preview(req: FootprintRequest) -> FootprintResponse:
-    """Compute live true-scale UTM footprint, 1 km MGRS preview lines, and WMM2025 telemetry."""
-    try:
-        lat, lon, canonical_mgrs = parse_center(req.center)
-    except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
-
-    try:
-        spec = SheetSpec(
-            center_lat=lat,
-            center_lon=lon,
-            center_mgrs=canonical_mgrs,
-            scale=req.scale,
-            paper=req.paper,
-            orientation=req.orientation,
-            units=req.units,
-            date_iso=req.date_iso,
-        )
-        layout = compute_sheet_layout(spec)
-        declination = compute_declination(layout, elevation_m=0.0)
-    except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
-
-    to_wgs84 = Transformer.from_crs(f"EPSG:{layout.utm_epsg}", "EPSG:4326", always_xy=True)
-    bbox = layout.utm_bbox
-
-    # 1. Densified perimeter ring of layout.utm_bbox (CCW in WGS84: SW -> SE -> NE -> NW -> SW)
-    edge_steps = 8
+def _utm_box_to_ring(bbox: BBox, to_wgs84: Transformer, edge_steps: int = 8) -> list[list[float]]:
+    """Build a closed densified WGS84 polygon exterior ring (CCW) for a UTM BBox."""
     ring_xs: list[float] = []
     ring_ys: list[float] = []
     # Bottom (SW -> SE)
@@ -122,39 +176,105 @@ def _build_footprint_preview(req: FootprintRequest) -> FootprintResponse:
     ring_lons, ring_lats = to_wgs84.transform(ring_xs, ring_ys)
     ring_coords = [[round(float(lo), 7), round(float(la), 7)] for lo, la in zip(ring_lons, ring_lats)]
     ring_coords.append(ring_coords[0])
+    return ring_coords
+
+
+def _build_footprint_preview(req: FootprintRequest) -> FootprintResponse:
+    """Compute live true-scale UTM footprint (single or multi-sheet atlas), 1 km MGRS preview, and WMM2025."""
+    try:
+        lat, lon, canonical_mgrs = parse_center(req.center)
+    except ValueError as exc:
+        raise HTTPException(status_code=_HTTP_422, detail=str(exc)) from exc
+
+    try:
+        spec = SheetSpec(
+            center_lat=lat,
+            center_lon=lon,
+            center_mgrs=canonical_mgrs,
+            scale=req.scale,
+            paper=req.paper,
+            orientation=req.orientation,
+            units=req.units,
+            date_iso=req.date_iso,
+        )
+        layout = compute_sheet_layout(spec)
+        declination = compute_declination(layout, elevation_m=0.0)
+    except ValueError as exc:
+        raise HTTPException(status_code=_HTTP_422, detail=str(exc)) from exc
+
+    to_wgs84 = Transformer.from_crs(f"EPSG:{layout.utm_epsg}", "EPSG:4326", always_xy=True)
+    ground_w = layout.utm_bbox.width
+    ground_h = layout.utm_bbox.height
+    cols = req.grid_cols
+    rows = req.grid_rows
+    primary_row = rows // 2
+    primary_col = cols // 2
+
+    # 1. Edge-matched multi-sheet UTM polygons in shared EPSG:{layout.utm_epsg}
+    sheet_features: list[dict[str, Any]] = []
+    for r in range(rows):
+        row_letter = chr(ord("A") + r)
+        for c in range(cols):
+            sheet_id = f"{row_letter}{c + 1}"
+            sheet_cx = layout.center_easting + (c - (cols - 1) / 2.0) * ground_w
+            sheet_cy = layout.center_northing + ((rows - 1) / 2.0 - r) * ground_h
+            sheet_bbox = BBox(
+                min_x=sheet_cx - ground_w / 2.0,
+                min_y=sheet_cy - ground_h / 2.0,
+                max_x=sheet_cx + ground_w / 2.0,
+                max_y=sheet_cy + ground_h / 2.0,
+            )
+            ring_coords = _utm_box_to_ring(sheet_bbox, to_wgs84)
+            sheet_features.append(
+                {
+                    "type": "Feature",
+                    "properties": {
+                        "sheet_id": sheet_id,
+                        "label": sheet_id,
+                        "row": r,
+                        "col": c,
+                        "is_primary": (r == primary_row and c == primary_col),
+                        "scale": spec.scale,
+                        "paper": spec.paper.value,
+                        "orientation": spec.orientation.value,
+                        "utm_epsg": layout.utm_epsg,
+                        "gzd": layout.gzd,
+                    },
+                    "geometry": {
+                        "type": "Polygon",
+                        "coordinates": [ring_coords],
+                    },
+                }
+            )
 
     footprint_geojson: dict[str, Any] = {
         "type": "FeatureCollection",
-        "features": [
-            {
-                "type": "Feature",
-                "properties": {
-                    "scale": spec.scale,
-                    "paper": spec.paper.value,
-                    "orientation": spec.orientation.value,
-                    "utm_epsg": layout.utm_epsg,
-                    "gzd": layout.gzd,
-                },
-                "geometry": {
-                    "type": "Polygon",
-                    "coordinates": [ring_coords],
-                },
-            }
-        ],
+        "features": sheet_features,
     }
 
-    # 2. Pure in-memory 1 km MGRS Easting & Northing preview lines
-    e_start = int(math.ceil(bbox.min_x / 1000.0)) * 1000
-    e_end = int(math.floor(bbox.max_x / 1000.0)) * 1000
-    n_start = int(math.ceil(bbox.min_y / 1000.0)) * 1000
-    n_end = int(math.floor(bbox.max_y / 1000.0)) * 1000
+    # Combined atlas UTM bbox for continuous 1 km MGRS preview grid lines
+    atlas_bbox = BBox(
+        min_x=layout.center_easting - (cols * ground_w) / 2.0,
+        min_y=layout.center_northing - (rows * ground_h) / 2.0,
+        max_x=layout.center_easting + (cols * ground_w) / 2.0,
+        max_y=layout.center_northing + (rows * ground_h) / 2.0,
+    )
+
+    # 2. Pure in-memory 1 km MGRS Easting & Northing preview lines across full atlas extent
+    e_start = int(math.ceil(atlas_bbox.min_x / 1000.0)) * 1000
+    e_end = int(math.floor(atlas_bbox.max_x / 1000.0)) * 1000
+    n_start = int(math.ceil(atlas_bbox.min_y / 1000.0)) * 1000
+    n_end = int(math.floor(atlas_bbox.max_y / 1000.0)) * 1000
 
     grid_features: list[dict[str, Any]] = []
-    line_samples = 6
+    line_samples = max(6, 4 * max(cols, rows))
 
     for e in range(e_start, e_end + 1, 1000):
         xs = [float(e)] * line_samples
-        ys = [bbox.min_y + bbox.height * i / (line_samples - 1) for i in range(line_samples)]
+        ys = [
+            atlas_bbox.min_y + atlas_bbox.height * i / (line_samples - 1)
+            for i in range(line_samples)
+        ]
         lons, lats = to_wgs84.transform(xs, ys)
         principal = f"{(e // 1000) % 100:02d}"
         grid_features.append(
@@ -178,7 +298,10 @@ def _build_footprint_preview(req: FootprintRequest) -> FootprintResponse:
         )
 
     for n in range(n_start, n_end + 1, 1000):
-        xs = [bbox.min_x + bbox.width * i / (line_samples - 1) for i in range(line_samples)]
+        xs = [
+            atlas_bbox.min_x + atlas_bbox.width * i / (line_samples - 1)
+            for i in range(line_samples)
+        ]
         ys = [float(n)] * line_samples
         lons, lats = to_wgs84.transform(xs, ys)
         eff_n = n if n >= 0 else 10_000_000 + n
@@ -208,7 +331,7 @@ def _build_footprint_preview(req: FootprintRequest) -> FootprintResponse:
         "features": grid_features,
     }
 
-    # 3. Center 10 m MGRS & visible 100 km square IDs (fast in-memory sampling)
+    # 3. Center 10 m MGRS & visible 100 km square IDs across the full atlas extent
     converter = mgrs.MGRS()
     c_gzd, c_sq, c_digits = _split_mgrs(
         _decode_mgrs(converter.toMGRS(lat, lon, MGRSPrecision=4))
@@ -218,15 +341,18 @@ def _build_footprint_preview(req: FootprintRequest) -> FootprintResponse:
     square_ids: list[str] = [c_sq]
     for fx in (0.05, 0.5, 0.95):
         for fy in (0.05, 0.5, 0.95):
-            px = bbox.min_x + fx * bbox.width
-            py = bbox.min_y + fy * bbox.height
+            px = atlas_bbox.min_x + fx * atlas_bbox.width
+            py = atlas_bbox.min_y + fy * atlas_bbox.height
             plon, plat = to_wgs84.transform(px, py)
-            if -80.0 <= plat <= 84.0:
+            if MIN_UTM_LAT <= plat <= MAX_UTM_LAT:
                 _, sq, _ = _split_mgrs(
                     _decode_mgrs(converter.toMGRS(plat, plon, MGRSPrecision=0))
                 )
                 if sq not in square_ids:
                     square_ids.append(sq)
+
+    ground_w_km = round(ground_w / 1000.0, 3)
+    ground_h_km = round(ground_h / 1000.0, 3)
 
     return FootprintResponse(
         center_lat=round(lat, 6),
@@ -241,8 +367,13 @@ def _build_footprint_preview(req: FootprintRequest) -> FootprintResponse:
         page_height_mm=layout.page_height_mm,
         frame_width_mm=layout.frame_width_mm,
         frame_height_mm=layout.frame_height_mm,
-        ground_width_km=round(bbox.width / 1000.0, 3),
-        ground_height_km=round(bbox.height / 1000.0, 3),
+        ground_width_km=ground_w_km,
+        ground_height_km=ground_h_km,
+        grid_cols=cols,
+        grid_rows=rows,
+        sheet_count=cols * rows,
+        total_ground_width_km=round((ground_w * cols) / 1000.0, 3),
+        total_ground_height_km=round((ground_h * rows) / 1000.0, 3),
         grid_spacing_mm=round(1000.0 / spec.scale * 1000.0, 3),
         declination=declination,
         footprint_geojson=footprint_geojson,
@@ -353,6 +484,13 @@ def create_app(
         ]
         return PacksResponse(packs=summaries)
 
+    @application.get("/api/geocode", response_model=GeocodeResponse)
+    def api_geocode(
+        q: str = Query(default="", max_length=200),
+        limit: int = Query(default=5, ge=1, le=10),
+    ) -> GeocodeResponse:
+        return GeocodeResponse(results=_search_nominatim(q, limit=limit))
+
     @application.post("/api/footprint", response_model=FootprintResponse)
     def api_footprint(req: FootprintRequest) -> FootprintResponse:
         return _build_footprint_preview(req)
@@ -374,14 +512,14 @@ def create_app(
             raw_payload = form.get("payload")
             if raw_payload is None or not isinstance(raw_payload, str):
                 raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    status_code=_HTTP_422,
                     detail="Form request must include a JSON string 'payload' field.",
                 )
             try:
                 job_req = CreateJobRequest.model_validate_json(raw_payload)
             except ValidationError as exc:
                 raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    status_code=_HTTP_422,
                     detail=exc.errors(),
                 ) from exc
             maybe_file = form.get("overlay_file")
@@ -395,7 +533,7 @@ def create_app(
                 job_req = CreateJobRequest.model_validate_json(raw_body)
             except ValidationError as exc:
                 raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    status_code=_HTTP_422,
                     detail=exc.errors(),
                 ) from exc
 
@@ -423,7 +561,7 @@ def create_app(
             )
         except (ValueError, ValidationError) as exc:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=_HTTP_422,
                 detail=str(exc),
             ) from exc
 
@@ -490,6 +628,8 @@ def create_app(
             paper=job_req.paper,
             orientation=job_req.orientation,
             color_mode=job_req.color_mode,
+            grid_cols=job_req.grid_cols,
+            grid_rows=job_req.grid_rows,
             request_json=job_req.model_dump_json(),
             overlay_path=saved_overlay,
         )
@@ -526,7 +666,11 @@ def create_app(
         return {"deleted": True, "job_id": job_id}
 
     @application.get("/api/jobs/{job_id}/artifacts/{filename:path}")
-    def api_download_artifact(job_id: str, filename: str) -> FileResponse:
+    def api_download_artifact(
+        job_id: str,
+        filename: str,
+        inline: bool = Query(default=False),
+    ) -> FileResponse:
         if not _JOB_ID_RE.match(job_id):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid job_id.")
         # Strictly reject path separators, null bytes, and parent directory references.
@@ -557,6 +701,12 @@ def create_app(
             )
 
         media_type = _MEDIA_TYPES.get(candidate.suffix.lower(), "application/octet-stream")
+        if inline:
+            return FileResponse(
+                path=candidate,
+                media_type=media_type,
+                headers={"Content-Disposition": f'inline; filename="{candidate.name}"'},
+            )
         return FileResponse(
             path=candidate,
             media_type=media_type,

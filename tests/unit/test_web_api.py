@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from pypdf import PdfReader, PdfWriter
 
 from gridforge.config import (
     BBox,
@@ -162,6 +163,119 @@ class TestFootprintEndpoint:
         resp = client.post("/api/footprint", json={"center": "85.0, 0.0"})
         assert resp.status_code == 422
 
+    def test_footprint_2x2_edge_matched_utm_atlas(self, client_and_dirs) -> None:
+        client, _, _, _ = client_and_dirs
+        resp = client.post(
+            "/api/footprint",
+            json={
+                "center": "-33.732, 150.312",
+                "scale": 25000,
+                "paper": "a4",
+                "orientation": "portrait",
+                "units": "metric",
+                "grid_cols": 2,
+                "grid_rows": 2,
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["grid_cols"] == 2
+        assert data["grid_rows"] == 2
+        assert data["sheet_count"] == 4
+        assert data["total_ground_width_km"] == pytest.approx(data["ground_width_km"] * 2.0, abs=0.01)
+        assert data["total_ground_height_km"] == pytest.approx(data["ground_height_km"] * 2.0, abs=0.01)
+
+        feats = data["footprint_geojson"]["features"]
+        assert len(feats) == 4
+        by_id = {f["properties"]["sheet_id"]: f for f in feats}
+        assert set(by_id.keys()) == {"A1", "A2", "B1", "B2"}
+
+        # Edge-match invariant: A1's SE corner matches A2's SW corner and B1's NE corner!
+        # Ring layout (edge_steps=8): idx 0=SW, 8=SE, 16=NE, 24=NW
+        a1_ring = by_id["A1"]["geometry"]["coordinates"][0]
+        a2_ring = by_id["A2"]["geometry"]["coordinates"][0]
+        b1_ring = by_id["B1"]["geometry"]["coordinates"][0]
+        b2_ring = by_id["B2"]["geometry"]["coordinates"][0]
+        assert a1_ring[8] == a2_ring[0]  # A1 SE == A2 SW
+        assert a1_ring[16] == a2_ring[24]  # A1 NE == A2 NW
+        assert a1_ring[0] == b1_ring[24]  # A1 SW == B1 NW
+        assert a1_ring[8] == b1_ring[16] == b2_ring[24]  # Central 4-way corner exact!
+
+        # Combined 1 km MGRS preview grid covers full 2x2 atlas (~9.3 x 11.75 km)
+        e_lines = [f for f in data["grid_geojson"]["features"] if f["properties"]["axis"] == "E"]
+        n_lines = [f for f in data["grid_geojson"]["features"] if f["properties"]["axis"] == "N"]
+        assert len(e_lines) >= 9
+        assert len(n_lines) >= 11
+
+
+class TestGeocodeEndpoint:
+    def test_geocode_mock_cache_and_offline_fallback(
+        self, client_and_dirs, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from gridforge.web import app as app_mod
+
+        app_mod._geocode_cache.clear()
+        client, _, _, _ = client_and_dirs
+        calls = {"n": 0}
+
+        class _FakeResp:
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self):
+                return [
+                    {
+                        "name": "Mount Kosciuszko",
+                        "display_name": "Mount Kosciuszko, Snowy Monaro, New South Wales, Australia",
+                        "lat": "-36.4559",
+                        "lon": "148.2636",
+                        "type": "peak",
+                    },
+                    {
+                        "name": "North Pole",
+                        "display_name": "North Pole, Arctic",
+                        "lat": "89.9",
+                        "lon": "0.0",
+                        "type": "place",
+                    },
+                ]
+
+        def _fake_get(url, **kwargs):
+            calls["n"] += 1
+            assert "User-Agent" in kwargs.get("headers", {})
+            return _FakeResp()
+
+        monkeypatch.setattr("gridforge.web.app.httpx.get", _fake_get)
+
+        r1 = client.get("/api/geocode", params={"q": "Kosciuszko", "limit": 5})
+        assert r1.status_code == 200
+        results = r1.json()["results"]
+        assert len(results) == 1  # Polar result filtered out!
+        assert results[0]["short_name"] == "Mount Kosciuszko"
+        assert results[0]["lat"] == pytest.approx(-36.4559)
+        assert results[0]["lon"] == pytest.approx(148.2636)
+        assert results[0]["type"] == "peak"
+
+        # Second identical lookup hits in-memory cache (no second HTTP call)
+        r2 = client.get("/api/geocode", params={"q": "kosciuszko", "limit": 5})
+        assert r2.status_code == 200
+        assert len(r2.json()["results"]) == 1
+        assert calls["n"] == 1
+
+        # Offline / network failure returns clean 200 empty results (never 500)
+        def _offline_get(url, **kwargs):
+            raise ConnectionError("network unreachable")
+
+        monkeypatch.setattr("gridforge.web.app.httpx.get", _offline_get)
+        r_off = client.get("/api/geocode", params={"q": "Freycinet"})
+        assert r_off.status_code == 200
+        assert r_off.json() == {"results": []}
+
+        # Short query returns empty without network call
+        r_short = client.get("/api/geocode", params={"q": "a"})
+        assert r_short.status_code == 200
+        assert r_short.json() == {"results": []}
+
 
 class TestJobsLifecycleAndSecurity:
     def test_create_list_cancel_delete_job_json(self, client_and_dirs) -> None:
@@ -269,6 +383,10 @@ class TestJobsLifecycleAndSecurity:
         assert ok.status_code == 200
         assert ok.headers["content-type"].startswith("application/pdf")
         assert ok.content.startswith(b"%PDF-1.4")
+
+        ok_inline = client.get(f"/api/jobs/{job_id}/artifacts/sample.pdf?inline=1")
+        assert ok_inline.status_code == 200
+        assert "inline" in ok_inline.headers.get("content-disposition", "")
 
         # Encoded and unencoded path traversal attempts must all be rejected cleanly
         for attack in (
@@ -399,3 +517,90 @@ class TestSQLiteStoreAndWorker:
         # Temp workspace must be reclaimed!
         assert len(seen_work_dirs) == 1
         assert not seen_work_dirs[0].exists()
+
+    def test_process_multi_sheet_2x2_atlas_merges_4_pages(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        data_dir = tmp_path / "jobs"
+        packs_dir = tmp_path / "packs"
+        db_path = data_dir / "gridforge_jobs.sqlite3"
+        db.init_db(db_path)
+        packs_dir.mkdir(parents=True)
+
+        req_json = json.dumps(
+            {
+                "center": "-33.732, 150.312",
+                "scale": 25000,
+                "paper": "a4",
+                "orientation": "portrait",
+                "color_mode": "color",
+                "units": "metric",
+                "title": "Blue Mountains Atlas",
+                "grid_cols": 2,
+                "grid_rows": 2,
+                "outputs": {"pdf": True, "kmz": False, "mbtiles": False},
+            }
+        )
+        db.create_job(
+            db_path,
+            job_id="atlasjob0001",
+            title="Blue Mountains Atlas",
+            center="-33.732, 150.312",
+            center_mgrs="56H KH 5095 6431",
+            scale=25000,
+            paper=PaperSize.A4,
+            orientation=Orientation.PORTRAIT,
+            color_mode=ColorMode.COLOR,
+            grid_cols=2,
+            grid_rows=2,
+            request_json=req_json,
+        )
+        claimed = db.claim_next_job(db_path)
+        assert claimed is not None
+        assert claimed.record.grid_cols == 2 and claimed.record.grid_rows == 2
+
+        rendered_titles: list[str] = []
+
+        def _fake_prepare(spec, job_dir, **kwargs):
+            rendered_titles.append(spec.title or "")
+            return spec
+
+        def _fake_render_pdf(self, workspace, output_pdf: Path):
+            # Write a real valid 1-page A4 PDF so pypdf merges cleanly
+            w = PdfWriter()
+            w.add_blank_page(width=595.28, height=841.89)
+            with output_pdf.open("wb") as fh:
+                w.write(fh)
+            w.close()
+            return RenderResult(
+                output_pdf=output_pdf,
+                page_width_mm=210.0,
+                page_height_mm=297.0,
+                scale=25000,
+                utm_epsg=32756,
+                elapsed_seconds=0.05,
+            )
+
+        monkeypatch.setattr("gridforge.web.worker.runner.prepare_job_workspace", _fake_prepare)
+        monkeypatch.setattr("gridforge.web.worker.PyQGISRenderer.render_pdf", _fake_render_pdf)
+
+        done = process_single_job(
+            claimed,
+            db_path=db_path,
+            data_dir=data_dir,
+            packs_dir=packs_dir,
+        )
+        assert done is not None
+        assert done.status == JobStatus.SUCCEEDED
+        assert len(rendered_titles) == 4
+        assert "Sheet A1 (1/4)" in rendered_titles[0]
+        assert "Sheet A2 (2/4)" in rendered_titles[1]
+        assert "Sheet B1 (3/4)" in rendered_titles[2]
+        assert "Sheet B2 (4/4)" in rendered_titles[3]
+        assert len(done.artifacts) == 1
+        assert done.artifacts[0].kind == "pdf"
+        assert "atlas_2x2.pdf" in done.artifacts[0].filename
+
+        merged_pdf = data_dir / "atlasjob0001" / "artifacts" / done.artifacts[0].filename
+        reader = PdfReader(str(merged_pdf))
+        assert len(reader.pages) == 4

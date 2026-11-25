@@ -21,11 +21,14 @@ import time
 from pathlib import Path
 from typing import Any
 
+from pyproj import Transformer
+from pypdf import PdfWriter
+
 from gridforge.config import SheetSpec
 from gridforge.export.kmz import export_garmin_kmz
 from gridforge.export.mbtiles import export_mbtiles
 from gridforge.export.raster import render_collarless_geotiff
-from gridforge.geo.crs import parse_center
+from gridforge.geo.crs import compute_sheet_layout, parse_center
 from gridforge.packs.builder import discover_packs, load_pack_manifest
 from gridforge.pipeline import runner
 from gridforge.render.pyqgis_worker import PyQGISRenderer
@@ -117,6 +120,100 @@ def _is_cancelled(db_path: Path, job_id: str) -> bool:
     return rec is None or rec.status == JobStatus.CANCELLED
 
 
+def _merge_pdfs(sheet_pdfs: list[Path], output_pdf: Path) -> Path:
+    """Losslessly merge per-sheet vector PDFs into a single multi-page Atlas PDF."""
+    output_pdf.parent.mkdir(parents=True, exist_ok=True)
+    writer = PdfWriter()
+    try:
+        for pdf_path in sheet_pdfs:
+            writer.append(str(pdf_path))
+        with output_pdf.open("wb") as fh:
+            writer.write(fh)
+    finally:
+        writer.close()
+    return output_pdf
+
+
+def _iter_atlas_sheet_specs(
+    anchor_spec: SheetSpec,
+    grid_cols: int,
+    grid_rows: int,
+    base_title: str,
+) -> list[tuple[str, SheetSpec]]:
+    """Generate ordered (sheet_id, SheetSpec) pairs for an edge-matched UTM multi-sheet atlas."""
+    anchor_layout = compute_sheet_layout(anchor_spec)
+    ground_w = anchor_layout.utm_bbox.width
+    ground_h = anchor_layout.utm_bbox.height
+    to_wgs84 = Transformer.from_crs(
+        f"EPSG:{anchor_layout.utm_epsg}", "EPSG:4326", always_xy=True
+    )
+    total = grid_cols * grid_rows
+    sheets: list[tuple[str, SheetSpec]] = []
+    idx = 0
+    for r in range(grid_rows):
+        row_letter = chr(ord("A") + r)
+        for c in range(grid_cols):
+            idx += 1
+            sheet_id = f"{row_letter}{c + 1}"
+            sheet_cx = anchor_layout.center_easting + (c - (grid_cols - 1) / 2.0) * ground_w
+            sheet_cy = anchor_layout.center_northing + ((grid_rows - 1) / 2.0 - r) * ground_h
+            sheet_lon, sheet_lat = to_wgs84.transform(sheet_cx, sheet_cy)
+            sheet_spec = anchor_spec.model_copy(
+                update={
+                    "center_lat": float(sheet_lat),
+                    "center_lon": float(sheet_lon),
+                    "center_mgrs": None,
+                    "title": f"{base_title} — Sheet {sheet_id} ({idx}/{total})",
+                }
+            )
+            sheets.append((sheet_id, sheet_spec))
+    return sheets
+
+
+def _build_prep_kwargs(
+    req: CreateJobRequest,
+    *,
+    claimed: db.ClaimedJob,
+    packs_dir: Path,
+    progress_cb: Any | None = None,
+) -> dict[str, Any]:
+    overlay_sources = (
+        [UserOverlaySource(claimed.overlay_path)]
+        if claimed.overlay_path is not None and claimed.overlay_path.is_file()
+        else None
+    )
+
+    prep_sig = inspect.signature(runner.prepare_job_workspace)
+    prep_kwargs: dict[str, Any] = {
+        "overlay_sources": overlay_sources,
+    }
+
+    if progress_cb is not None and "progress_callback" in prep_sig.parameters:
+        prep_kwargs["progress_callback"] = progress_cb
+
+    if req.pack_id is not None:
+        pack_dir = _resolve_pack_dir(packs_dir, req.pack_id)
+        if "pack_dir" in prep_sig.parameters:
+            prep_kwargs["pack_dir"] = pack_dir
+        else:
+            manifest = load_pack_manifest(pack_dir)
+            if manifest.dem_path:
+                prep_kwargs["elevation_source"] = _PackLocalDEMSource(
+                    pack_dir / manifest.dem_path,
+                    vertical_datum=manifest.vertical_datum,
+                    attribution=manifest.dem_attribution,
+                )
+            if manifest.osm_pbf_path:
+                prep_kwargs["vector_source"] = LocalPBFSource(
+                    pack_dir / manifest.osm_pbf_path
+                )
+            if manifest.overlays:
+                prep_kwargs["regional_overlay_overrides"] = {
+                    k: (pack_dir / rel) for k, rel in manifest.overlays.items()
+                }
+    return prep_kwargs
+
+
 def process_single_job(
     claimed: db.ClaimedJob,
     *,
@@ -125,7 +222,7 @@ def process_single_job(
     packs_dir: Path,
     worker_id: str = "worker-1",
 ) -> JobRecord | None:
-    """Execute one claimed job end-to-end and record artifacts or failure in SQLite."""
+    """Execute one claimed job end-to-end (single sheet or multi-sheet UTM atlas)."""
     t0 = time.perf_counter()
     job_id = claimed.record.job_id
     artifacts_dir = data_dir / job_id / "artifacts"
@@ -140,131 +237,165 @@ def process_single_job(
         req = CreateJobRequest.model_validate_json(claimed.request_json)
         spec = _build_spec_from_request(req)
         stem = _artifact_stem(req, claimed.record.center_mgrs)
-
-        _report_stage("fetching_data", 15)
-
-        overlay_sources = (
-            [UserOverlaySource(claimed.overlay_path)]
-            if claimed.overlay_path is not None and claimed.overlay_path.is_file()
-            else None
-        )
-
-        # Build kwargs for runner.prepare_job_workspace, cleanly supporting pack_dir & progress_callback
-        prep_sig = inspect.signature(runner.prepare_job_workspace)
-        prep_kwargs: dict[str, Any] = {
-            "overlay_sources": overlay_sources,
-        }
-
-        if "progress_callback" in prep_sig.parameters:
-            prep_kwargs["progress_callback"] = _report_stage
-
-        if req.pack_id is not None:
-            pack_dir = _resolve_pack_dir(packs_dir, req.pack_id)
-            if "pack_dir" in prep_sig.parameters:
-                prep_kwargs["pack_dir"] = pack_dir
-            else:
-                manifest = load_pack_manifest(pack_dir)
-                if manifest.dem_path:
-                    prep_kwargs["elevation_source"] = _PackLocalDEMSource(
-                        pack_dir / manifest.dem_path,
-                        vertical_datum=manifest.vertical_datum,
-                        attribution=manifest.dem_attribution,
-                    )
-                if manifest.osm_pbf_path:
-                    prep_kwargs["vector_source"] = LocalPBFSource(
-                        pack_dir / manifest.osm_pbf_path
-                    )
-                if manifest.overlays:
-                    prep_kwargs["regional_overlay_overrides"] = {
-                        k: (pack_dir / rel) for k, rel in manifest.overlays.items()
-                    }
-
-        workspace = runner.prepare_job_workspace(spec, tmp_work_dir, **prep_kwargs)
-
-        if _is_cancelled(db_path, job_id):
-            return db.get_job(db_path, job_id)
-
-        artifacts: list[JobArtifact] = []
+        total_sheets = req.grid_cols * req.grid_rows
         outputs = req.outputs
+        artifacts: list[JobArtifact] = []
 
-        # 1. Print PDF
-        if outputs.pdf:
-            _report_stage("rendering_pdf", 50)
-            pdf_name = f"{stem}.pdf"
-            pdf_path = artifacts_dir / pdf_name
-            PyQGISRenderer().render_pdf(workspace, pdf_path)
-            artifacts.append(
-                JobArtifact(
-                    kind="pdf",
-                    filename=pdf_name,
-                    size_bytes=pdf_path.stat().st_size,
-                    download_url=f"/api/jobs/{job_id}/artifacts/{pdf_name}",
-                )
+        if total_sheets == 1:
+            _report_stage("fetching_data", 15)
+            prep_kwargs = _build_prep_kwargs(
+                req, claimed=claimed, packs_dir=packs_dir, progress_cb=_report_stage
             )
+            workspace = runner.prepare_job_workspace(spec, tmp_work_dir, **prep_kwargs)
 
-        if _is_cancelled(db_path, job_id):
-            return db.get_job(db_path, job_id)
-
-        # 2. Digital exports (share one collarless GeoTIFF when both MBTiles & KMZ requested)
-        eff_dpi = outputs.export_dpi or spec.dpi
-        eff_grid = outputs.include_grid_on_digital
-        shared_tif: Path | None = None
-
-        if outputs.mbtiles and outputs.kmz:
-            _report_stage("rendering_digital_raster", 68)
-            shared_tif = render_collarless_geotiff(
-                workspace,
-                tmp_work_dir / "collarless_export.tif",
-                dpi=eff_dpi,
-                include_grid=eff_grid,
-            )
-
-        if outputs.mbtiles:
             if _is_cancelled(db_path, job_id):
                 return db.get_job(db_path, job_id)
-            _report_stage("exporting_mbtiles", 78)
-            mbt_name = f"{stem}.mbtiles"
-            mbt_path = artifacts_dir / mbt_name
-            export_mbtiles(
-                workspace,
-                mbt_path,
-                tile_format=outputs.mbtiles_format,
-                dpi=eff_dpi,
-                include_grid=eff_grid,
-                collarless_tif=shared_tif,
-            )
-            artifacts.append(
-                JobArtifact(
-                    kind="mbtiles",
-                    filename=mbt_name,
-                    size_bytes=mbt_path.stat().st_size,
-                    download_url=f"/api/jobs/{job_id}/artifacts/{mbt_name}",
-                )
-            )
 
-        if outputs.kmz:
+            # 1. Print PDF
+            if outputs.pdf:
+                _report_stage("rendering_pdf", 50)
+                pdf_name = f"{stem}.pdf"
+                pdf_path = artifacts_dir / pdf_name
+                PyQGISRenderer().render_pdf(workspace, pdf_path)
+                artifacts.append(
+                    JobArtifact(
+                        kind="pdf",
+                        filename=pdf_name,
+                        size_bytes=pdf_path.stat().st_size,
+                        download_url=f"/api/jobs/{job_id}/artifacts/{pdf_name}",
+                    )
+                )
+
             if _is_cancelled(db_path, job_id):
                 return db.get_job(db_path, job_id)
-            _report_stage("exporting_kmz", 90)
-            kmz_name = f"{stem}.kmz"
-            kmz_path = artifacts_dir / kmz_name
-            export_garmin_kmz(
-                workspace,
-                kmz_path,
-                profile=outputs.garmin_profile,
-                max_tiles=outputs.max_tiles,
-                dpi=eff_dpi,
-                include_grid=eff_grid,
-                collarless_tif=shared_tif,
+
+            # 2. Digital exports (share one collarless GeoTIFF when both MBTiles & KMZ requested)
+            anchor_workspace = workspace
+        else:
+            # Multi-sheet UTM Atlas: render sheets A1..C3 sequentially (1 at a time -> < 1.5 GB RSS)
+            base_title = req.title or claimed.record.center_mgrs or "GRIDFORGE ATLAS"
+            atlas_sheets = _iter_atlas_sheet_specs(
+                spec, req.grid_cols, req.grid_rows, base_title
             )
-            artifacts.append(
-                JobArtifact(
-                    kind="kmz",
-                    filename=kmz_name,
-                    size_bytes=kmz_path.stat().st_size,
-                    download_url=f"/api/jobs/{job_id}/artifacts/{kmz_name}",
+            sheet_pdfs_dir = tmp_work_dir / "atlas_pdfs"
+            sheet_pdfs_dir.mkdir(parents=True, exist_ok=True)
+            rendered_sheet_pdfs: list[Path] = []
+            pdf_budget_pct = 72 if (outputs.mbtiles or outputs.kmz) else 90
+
+            if outputs.pdf:
+                for idx, (sheet_id, sheet_spec) in enumerate(atlas_sheets, start=1):
+                    if _is_cancelled(db_path, job_id):
+                        return db.get_job(db_path, job_id)
+
+                    sheet_pct = 10 + int(((idx - 1) / total_sheets) * (pdf_budget_pct - 10))
+                    _report_stage(f"rendering_sheet_{sheet_id} ({idx}/{total_sheets})", sheet_pct)
+
+                    sheet_work = tmp_work_dir / f"sheet_{sheet_id}"
+                    sheet_work.mkdir(parents=True, exist_ok=True)
+                    try:
+                        prep_kwargs = _build_prep_kwargs(
+                            req, claimed=claimed, packs_dir=packs_dir, progress_cb=None
+                        )
+                        sheet_ws = runner.prepare_job_workspace(
+                            sheet_spec, sheet_work, **prep_kwargs
+                        )
+                        sheet_pdf = sheet_pdfs_dir / f"sheet_{idx:02d}_{sheet_id}.pdf"
+                        PyQGISRenderer().render_pdf(sheet_ws, sheet_pdf)
+                        rendered_sheet_pdfs.append(sheet_pdf)
+                    finally:
+                        shutil.rmtree(sheet_work, ignore_errors=True)
+
+                if _is_cancelled(db_path, job_id):
+                    return db.get_job(db_path, job_id)
+
+                _report_stage("merging_atlas_pdf", pdf_budget_pct)
+                atlas_name = f"{stem}_atlas_{req.grid_cols}x{req.grid_rows}.pdf"
+                atlas_pdf_path = artifacts_dir / atlas_name
+                _merge_pdfs(rendered_sheet_pdfs, atlas_pdf_path)
+                artifacts.append(
+                    JobArtifact(
+                        kind="pdf",
+                        filename=atlas_name,
+                        size_bytes=atlas_pdf_path.stat().st_size,
+                        download_url=f"/api/jobs/{job_id}/artifacts/{atlas_name}",
+                    )
                 )
-            )
+
+            anchor_workspace = None
+            if outputs.mbtiles or outputs.kmz:
+                if _is_cancelled(db_path, job_id):
+                    return db.get_job(db_path, job_id)
+                _report_stage("preparing_center_sheet_export", 74)
+                center_work = tmp_work_dir / "center_export_ws"
+                center_work.mkdir(parents=True, exist_ok=True)
+                prep_kwargs = _build_prep_kwargs(
+                    req, claimed=claimed, packs_dir=packs_dir, progress_cb=None
+                )
+                anchor_workspace = runner.prepare_job_workspace(
+                    spec, center_work, **prep_kwargs
+                )
+
+        if outputs.mbtiles or outputs.kmz:
+            assert anchor_workspace is not None
+            eff_dpi = outputs.export_dpi or spec.dpi
+            eff_grid = outputs.include_grid_on_digital
+            shared_tif: Path | None = None
+
+            if outputs.mbtiles and outputs.kmz:
+                _report_stage("rendering_digital_raster", 76)
+                shared_tif = render_collarless_geotiff(
+                    anchor_workspace,
+                    tmp_work_dir / "collarless_export.tif",
+                    dpi=eff_dpi,
+                    include_grid=eff_grid,
+                )
+
+            if outputs.mbtiles:
+                if _is_cancelled(db_path, job_id):
+                    return db.get_job(db_path, job_id)
+                _report_stage("exporting_mbtiles", 82)
+                mbt_name = f"{stem}.mbtiles"
+                mbt_path = artifacts_dir / mbt_name
+                export_mbtiles(
+                    anchor_workspace,
+                    mbt_path,
+                    tile_format=outputs.mbtiles_format,
+                    dpi=eff_dpi,
+                    include_grid=eff_grid,
+                    collarless_tif=shared_tif,
+                )
+                artifacts.append(
+                    JobArtifact(
+                        kind="mbtiles",
+                        filename=mbt_name,
+                        size_bytes=mbt_path.stat().st_size,
+                        download_url=f"/api/jobs/{job_id}/artifacts/{mbt_name}",
+                    )
+                )
+
+            if outputs.kmz:
+                if _is_cancelled(db_path, job_id):
+                    return db.get_job(db_path, job_id)
+                _report_stage("exporting_kmz", 92)
+                kmz_name = f"{stem}.kmz"
+                kmz_path = artifacts_dir / kmz_name
+                export_garmin_kmz(
+                    anchor_workspace,
+                    kmz_path,
+                    profile=outputs.garmin_profile,
+                    max_tiles=outputs.max_tiles,
+                    dpi=eff_dpi,
+                    include_grid=eff_grid,
+                    collarless_tif=shared_tif,
+                )
+                artifacts.append(
+                    JobArtifact(
+                        kind="kmz",
+                        filename=kmz_name,
+                        size_bytes=kmz_path.stat().st_size,
+                        download_url=f"/api/jobs/{job_id}/artifacts/{kmz_name}",
+                    )
+                )
 
         if _is_cancelled(db_path, job_id):
             return db.get_job(db_path, job_id)

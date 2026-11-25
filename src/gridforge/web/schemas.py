@@ -57,6 +57,8 @@ class JobRecord(BaseModel):
     paper: PaperSize
     orientation: Orientation
     color_mode: ColorMode
+    grid_cols: int = 1
+    grid_rows: int = 1
     created_at: str
     started_at: str | None = None
     finished_at: str | None = None
@@ -81,6 +83,8 @@ class FootprintRequest(BaseModel):
     orientation: Orientation = Orientation.PORTRAIT
     units: Units = Units.METRIC
     date_iso: str | None = None
+    grid_cols: int = Field(default=1, ge=1, le=3)
+    grid_rows: int = Field(default=1, ge=1, le=3)
 
     @field_validator("scale")
     @classmethod
@@ -108,10 +112,31 @@ class FootprintResponse(BaseModel):
     frame_height_mm: float
     ground_width_km: float
     ground_height_km: float
+    grid_cols: int = 1
+    grid_rows: int = 1
+    sheet_count: int = 1
+    total_ground_width_km: float
+    total_ground_height_km: float
     grid_spacing_mm: float
     declination: DeclinationInfo
     footprint_geojson: dict[str, Any]
     grid_geojson: dict[str, Any]
+
+
+class GeocodeResult(BaseModel):
+    """Single place-name search match returned by ``GET /api/geocode``."""
+
+    display_name: str
+    short_name: str
+    lat: float
+    lon: float
+    type: str = "place"
+
+
+class GeocodeResponse(BaseModel):
+    """Response envelope for ``GET /api/geocode``."""
+
+    results: list[GeocodeResult] = Field(default_factory=list)
 
 
 class OutputOptions(BaseModel):
@@ -163,6 +188,8 @@ class CreateJobRequest(BaseModel):
     au_overlays: list[AUOverlayKind] = Field(default_factory=list)
     carto: CartoOptions = Field(default_factory=CartoOptions)
     outputs: OutputOptions = Field(default_factory=OutputOptions)
+    grid_cols: int = Field(default=1, ge=1, le=3)
+    grid_rows: int = Field(default=1, ge=1, le=3)
 
     @field_validator("scale")
     @classmethod

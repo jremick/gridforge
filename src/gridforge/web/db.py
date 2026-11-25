@@ -49,6 +49,7 @@ class ClaimedJob:
 def _row_to_record(row: sqlite3.Row) -> JobRecord:
     raw_artifacts = json.loads(row["artifacts_json"]) if row["artifacts_json"] else []
     artifacts = [JobArtifact.model_validate(item) for item in raw_artifacts]
+    keys = set(row.keys())
     return JobRecord(
         job_id=str(row["job_id"]),
         status=JobStatus(row["status"]),
@@ -61,6 +62,8 @@ def _row_to_record(row: sqlite3.Row) -> JobRecord:
         paper=PaperSize(row["paper"]),
         orientation=Orientation(row["orientation"]),
         color_mode=ColorMode(row["color_mode"]),
+        grid_cols=int(row["grid_cols"]) if "grid_cols" in keys and row["grid_cols"] is not None else 1,
+        grid_rows=int(row["grid_rows"]) if "grid_rows" in keys and row["grid_rows"] is not None else 1,
         created_at=str(row["created_at"]),
         started_at=row["started_at"],
         finished_at=row["finished_at"],
@@ -89,6 +92,8 @@ def init_db(db_path: Path) -> None:
                 paper TEXT NOT NULL,
                 orientation TEXT NOT NULL,
                 color_mode TEXT NOT NULL,
+                grid_cols INTEGER NOT NULL DEFAULT 1,
+                grid_rows INTEGER NOT NULL DEFAULT 1,
                 request_json TEXT NOT NULL,
                 overlay_path TEXT,
                 created_at TEXT NOT NULL,
@@ -111,6 +116,14 @@ def init_db(db_path: Path) -> None:
             );
             """
         )
+        # Lightweight additive migration for existing SQLite databases created pre-atlas.
+        existing_cols = {
+            str(r["name"]) for r in conn.execute("PRAGMA table_info(jobs)").fetchall()
+        }
+        if "grid_cols" not in existing_cols:
+            conn.execute("ALTER TABLE jobs ADD COLUMN grid_cols INTEGER NOT NULL DEFAULT 1")
+        if "grid_rows" not in existing_cols:
+            conn.execute("ALTER TABLE jobs ADD COLUMN grid_rows INTEGER NOT NULL DEFAULT 1")
     finally:
         conn.close()
 
@@ -128,6 +141,8 @@ def create_job(
     color_mode: ColorMode,
     request_json: str,
     overlay_path: Path | None = None,
+    grid_cols: int = 1,
+    grid_rows: int = 1,
 ) -> JobRecord:
     """Insert a new queued job and return its JobRecord."""
     now = _utc_now_iso()
@@ -138,10 +153,10 @@ def create_job(
             """
             INSERT INTO jobs (
                 job_id, status, stage, progress_pct, title, center, center_mgrs,
-                scale, paper, orientation, color_mode, request_json, overlay_path,
-                created_at, artifacts_json
+                scale, paper, orientation, color_mode, grid_cols, grid_rows,
+                request_json, overlay_path, created_at, artifacts_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]')
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]')
             """,
             (
                 job_id,
@@ -155,6 +170,8 @@ def create_job(
                 paper.value,
                 orientation.value,
                 color_mode.value,
+                int(grid_cols),
+                int(grid_rows),
                 request_json,
                 str(overlay_path) if overlay_path is not None else None,
                 now,
