@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gridforge"
-version = "0.1.0"
+version = "1.0.0"
 description = "Open-source military-style MGRS topographic map generator using headless PyQGIS"
 readme = "README.md"
 license = { text = "GPL-3.0-or-later" }
@@ -14,7 +14,7 @@ authors = [
 ]
 keywords = ["gis", "topographic", "mgrs", "utm", "qgis", "cartography", "pdf", "wmm"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 5 - Production/Stable",
     "Environment :: Console",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",

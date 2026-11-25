@@ -213,6 +213,13 @@ docker run --rm -e GRIDFORGE_RUN_LIVE=1 -v "$(pwd):/app" gridforge:dev pytest te
 
 ---
 
+## Roadmap & Backlog
+
+- **`v1.1` (In Progress):** High-resolution **NSW & Victoria state trail, fire-trail, hut, campground & trig station** layers (CC BY 4.0 NSW Spatial Services / NPWS & Vicmap / DEECA), interactive route & waypoint planning tools, and corridor / multi-sheet print enhancements.
+- **Backlog:** **Air-Gapped Web Basemap Mode** (self-hosted local PMTiles/MBTiles basemap option in the MapLibre Studio UI for fully disconnected deployments), additional regional LiDAR providers, and batch/corridor strip-map generation.
+
+---
+
 ## Data Sources, Attributions & License
 
 | Dataset / Component | Scope & Vertical Datum | License & Attribution |
