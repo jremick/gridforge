@@ -47,6 +47,82 @@ class Units(str, Enum):
     IMPERIAL = "imperial"
 
 
+class DensityLevel(str, Enum):
+    """Relative cartographic detail density for contours and labels."""
+
+    LOW = "low"
+    NORMAL = "normal"
+    HIGH = "high"
+
+
+class HillshadeStrength(str, Enum):
+    """Multi-directional shaded relief intensity."""
+
+    OFF = "off"
+    LIGHT = "light"
+    NORMAL = "normal"
+    STRONG = "strong"
+
+
+class DemSourceKind(str, Enum):
+    """Elevation source selection strategy."""
+
+    AUTO = "auto"
+    GLO30 = "glo30"
+    USGS3DEP = "usgs3dep"
+
+
+class USOverlayKind(str, Enum):
+    """Optional US public-domain thematic overlay layers."""
+
+    FEMA = "fema"
+    NHD = "nhd"
+    TOWERS = "towers"
+    ENC = "enc"
+
+
+class ExportFormat(str, Enum):
+    """Offline handheld/ATAK map archive export formats."""
+
+    MBTILES = "mbtiles"
+    KMZ = "kmz"
+    BOTH = "both"
+
+
+class GarminProfile(str, Enum):
+    """Garmin Custom Maps tile-count cap profiles."""
+
+    STANDARD = "standard"
+    MODERN = "modern"
+
+
+GARMIN_PROFILE_MAX_TILES: dict[GarminProfile, int] = {
+    GarminProfile.STANDARD: 100,
+    GarminProfile.MODERN: 500,
+}
+
+
+class MBTilesFormat(str, Enum):
+    """Raster tile encoding inside ATAK MBTiles archives."""
+
+    PNG = "png"
+    JPG = "jpg"
+
+
+class CartoOptions(BaseModel):
+    """Phase 2 cartographic density and layer visibility controls."""
+
+    contour_density: DensityLevel = DensityLevel.NORMAL
+    hillshade_strength: HillshadeStrength = HillshadeStrength.NORMAL
+    label_density: DensityLevel = DensityLevel.NORMAL
+    show_buildings: bool = True
+    show_trees: bool = True
+    show_power: bool = True
+    show_pipelines: bool = True
+    show_grid: bool = True
+    show_river_arrows: bool = True
+
+
 VALID_SCALES: tuple[int, ...] = (15000, 24000, 25000, 48000, 50000)
 
 
@@ -72,6 +148,9 @@ class SheetSpec(BaseModel):
     geopdf: bool = False
     dpi: int = Field(default=300, ge=72, le=1200)
     wmm_cof_path: Path | None = None
+    carto: CartoOptions = Field(default_factory=CartoOptions)
+    dem_source: DemSourceKind = DemSourceKind.AUTO
+    us_overlays: list[USOverlayKind] = Field(default_factory=list)
 
     @field_validator("center_lat")
     @classmethod
@@ -209,6 +288,9 @@ class JobWorkspace(BaseModel):
     grid_ref_svg: Path
     contour_interval_display: str
     attributions: list[str]
+    vertical_datum: str = "EGM2008"
+    dem_source_name: str = "copernicus-glo30"
+    regional_overlays: dict[str, Path] = Field(default_factory=dict)
 
 
 class RenderResult(BaseModel):
@@ -221,3 +303,17 @@ class RenderResult(BaseModel):
     utm_epsg: int
     elapsed_seconds: float
     workspace_dir: Path | None = None
+
+
+class ExportResult(BaseModel):
+    """Output metadata returned by an offline device archive exporter (MBTiles / Garmin KMZ)."""
+
+    format: ExportFormat
+    output_path: Path
+    file_size_bytes: int
+    tile_count: int
+    min_zoom: int | None = None
+    max_zoom: int | None = None
+    max_tile_px: tuple[int, int] | None = None
+    max_tile_bytes: int | None = None
+    elapsed_seconds: float
