@@ -403,9 +403,14 @@ def test_normalize_guarantees_all_core_layers_when_sparse(tmp_path: Path) -> Non
     assert info["points"][1] == 1
     assert info["lines"][1] == 0
     assert info["multipolygons"][1] == 0
-    # Cartographic columns exist even on 0-feature layers so PyQGIS rules never fail
-    assert {"highway", "waterway", "intermittent", "railway", "power"}.issubset(info["lines"][0])
-    assert {"natural", "landuse", "leaf_type", "building", "water"}.issubset(
+    # Cartographic columns (including Phase 2 columns & literal "tower:type") exist even on 0-feature layers
+    assert {"exit_to", "junction", "building", "emergency", "tower:type", "communication"}.issubset(
+        info["points"][0]
+    )
+    assert {"highway", "waterway", "intermittent", "railway", "power", "voltage", "substance"}.issubset(
+        info["lines"][0]
+    )
+    assert {"natural", "landuse", "leaf_type", "wood", "leaf_cycle", "building", "water", "emergency"}.issubset(
         info["multipolygons"][0]
     )
 

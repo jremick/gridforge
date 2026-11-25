@@ -10,8 +10,11 @@ import pytest
 
 from gridforge.config import (
     BBox,
+    CartoOptions,
     ColorMode,
+    DensityLevel,
     FrameMarginsMM,
+    HillshadeStrength,
     Orientation,
     PaperSize,
     SheetLayout,
@@ -21,6 +24,7 @@ from gridforge.config import (
 from gridforge.pipeline.terrain import (
     build_terrain_products,
     choose_contour_interval,
+    choose_warp_resolution_and_z,
 )
 
 FIXTURES_DIR = Path(__file__).resolve().parents[1] / "fixtures"
@@ -203,3 +207,81 @@ def test_build_terrain_products_50k_metric(tmp_path: Path) -> None:
             assert abs(elev - round(elev / 20.0) * 20.0) < 1e-3
             expected_index = 1 if abs(elev - round(elev / 100.0) * 100.0) < 1e-3 else 0
             assert is_index == expected_index
+
+
+def test_contour_density_and_lidar_resolution_selection() -> None:
+    # Contour density scaling (LOW = 2x, HIGH = 0.5x clamped at 5m / 10ft)
+    assert choose_contour_interval(25000, Units.METRIC, 600.0, DensityLevel.LOW) == (
+        20.0,
+        5,
+        "20 m (index 100 m)",
+    )
+    assert choose_contour_interval(25000, Units.METRIC, 600.0, DensityLevel.HIGH) == (
+        5.0,
+        5,
+        "5 m (index 25 m)",
+    )
+    assert choose_contour_interval(15000, Units.METRIC, 400.0, DensityLevel.HIGH) == (
+        5.0,
+        5,
+        "5 m (index 25 m)",
+    )
+    assert choose_contour_interval(24000, Units.IMPERIAL, 600.0, DensityLevel.LOW) == (
+        80.0,
+        5,
+        "80 ft (index 400 ft)",
+    )
+    assert choose_contour_interval(24000, Units.IMPERIAL, 600.0, DensityLevel.HIGH) == (
+        20.0,
+        5,
+        "20 ft (index 100 ft)",
+    )
+    assert choose_contour_interval(15000, Units.IMPERIAL, 400.0, DensityLevel.HIGH) == (
+        10.0,
+        5,
+        "10 ft (index 50 ft)",
+    )
+
+    # LiDAR resolution & vertical exaggeration selection
+    assert choose_warp_resolution_and_z(1.0) == (2.0, 1.0)
+    assert choose_warp_resolution_and_z(2.0) == (2.0, 1.0)
+    assert choose_warp_resolution_and_z(3.0) == (3.0, 1.0)
+    assert choose_warp_resolution_and_z(5.0) == (5.0, 1.15)
+    assert choose_warp_resolution_and_z(30.0) == (10.0, 1.15)
+
+
+@pytest.mark.skipif(not HAS_GDAL_TERRAIN, reason="GDAL CLI tools required for terrain pipeline tests")
+def test_build_terrain_products_high_density_and_hillshade_off(tmp_path: Path) -> None:
+    from osgeo import gdal  # type: ignore[import-untyped]
+
+    base = _blue_mountains_layout(units=Units.METRIC, scale=25000)
+    spec = base.spec.model_copy(
+        update={
+            "carto": CartoOptions(
+                contour_density=DensityLevel.HIGH,
+                hillshade_strength=HillshadeStrength.OFF,
+            )
+        }
+    )
+    layout = base.model_copy(update={"spec": spec})
+    result = build_terrain_products(FIXTURES_DIR / "synthetic_dem.tif", layout, tmp_path / "high_off")
+
+    assert result.contour_interval == 5.0
+    assert result.index_interval == 25.0
+    assert result.contour_interval_display == "5 m (index 25 m)"
+
+    # Neutral flat-255 hillshade produced when OFF
+    hs_ds = gdal.Open(str(result.hillshade_tif))
+    assert hs_ds is not None
+    hs_min, hs_max, _, _ = hs_ds.GetRasterBand(1).ComputeStatistics(False)
+    assert hs_min == 255.0 and hs_max == 255.0
+    hs_ds = None
+
+    with sqlite3.connect(str(result.terrain_gpkg)) as conn:
+        rows = conn.execute("SELECT elev, is_index FROM contours").fetchall()
+        assert len(rows) > 40
+        for elev, is_index in rows:
+            assert abs(elev - round(elev / 5.0) * 5.0) < 1e-3
+            expected_index = 1 if abs(elev - round(elev / 25.0) * 25.0) < 1e-3 else 0
+            assert is_index == expected_index
+

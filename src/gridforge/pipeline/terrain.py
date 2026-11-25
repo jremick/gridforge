@@ -12,7 +12,7 @@ from typing import Final
 
 from pydantic import BaseModel
 
-from gridforge.config import SheetLayout, Units
+from gridforge.config import DensityLevel, HillshadeStrength, SheetLayout, Units
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +20,7 @@ FEET_PER_METER: Final[float] = 3.280839895013123
 DEM_NODATA: Final[float] = -9999.0
 DEFAULT_TARGET_RES_M: Final[float] = 10.0
 MIN_TARGET_RES_M: Final[float] = 2.0
+LIDAR_NATIVE_THRESHOLD_M: Final[float] = 3.0
 
 
 class TerrainResult(BaseModel):
@@ -40,8 +41,14 @@ def choose_contour_interval(
     scale: int,
     units: Units,
     relief_m: float,
+    density: DensityLevel = DensityLevel.NORMAL,
 ) -> tuple[float, int, str]:
     """Select military topographic contour interval, index multiplier, and collar display text.
+
+    Honors ``density``:
+    - ``LOW``: ``2x`` normal interval
+    - ``NORMAL``: standard military topographic interval
+    - ``HIGH``: ``0.5x`` normal interval (clamped to minimum ``5 m`` / ``10 ft``)
 
     Returns:
         ``(interval_in_unit, index_multiplier, display_str)`` where ``index_multiplier`` is ``5``.
@@ -50,27 +57,51 @@ def choose_contour_interval(
 
     if units == Units.IMPERIAL:
         if scale <= 15000:
-            interval = 20.0
+            base = 20.0
         elif scale <= 25000:
-            interval = 40.0
+            base = 40.0
         else:
-            interval = 80.0
-        index_val = int(round(interval * index_mult))
-        return (interval, index_mult, f"{int(round(interval))} ft (index {index_val} ft)")
-
-    # Metric defaults
-    if scale <= 15000:
-        interval = 10.0
-    elif scale <= 25000:
-        interval = 20.0 if relief_m > 1200.0 else 10.0
+            base = 80.0
+        min_interval = 10.0
+        unit_label = "ft"
     else:
-        interval = 20.0
+        if scale <= 15000:
+            base = 10.0
+        elif scale <= 25000:
+            base = 20.0 if relief_m > 1200.0 else 10.0
+        else:
+            base = 20.0
+        min_interval = 5.0
+        unit_label = "m"
+
+    if density == DensityLevel.LOW:
+        interval = base * 2.0
+    elif density == DensityLevel.HIGH:
+        interval = max(min_interval, base * 0.5)
+    else:
+        interval = base
+
     index_val = int(round(interval * index_mult))
-    return (interval, index_mult, f"{int(round(interval))} m (index {index_val} m)")
+    return (interval, index_mult, f"{int(round(interval))} {unit_label} (index {index_val} {unit_label})")
 
 
-def _estimate_target_resolution_m(dem_raw_path: Path, center_lat: float) -> float:
-    """Choose UTM warp pixel resolution (10 m for 30 m GLO-30; preserve finer local DEMs)."""
+def choose_warp_resolution_and_z(native_res_m: float) -> tuple[float, float]:
+    """Choose ``(target_res_m, hillshade_z_factor)`` from input DEM native pixel resolution.
+
+    Preserves crisp 2.0 m LiDAR micro-terrain (with ``z=1.0``) when input DEM resolution
+    is ``<= 3.0 m`` (e.g., USGS 3DEP 1 m), preserves finer intermediate DEMs (3–10 m),
+    and upsamples 30 m GLO-30 / 10 m DEMs smoothly to ``10.0 m`` (with ``z=1.15``).
+    """
+    if native_res_m <= LIDAR_NATIVE_THRESHOLD_M:
+        target = max(MIN_TARGET_RES_M, round(native_res_m, 2))
+        return (target, 1.0)
+    if native_res_m < DEFAULT_TARGET_RES_M:
+        return (round(native_res_m, 2), 1.15)
+    return (DEFAULT_TARGET_RES_M, 1.15)
+
+
+def _estimate_native_resolution_m(dem_raw_path: Path, center_lat: float) -> float:
+    """Estimate native horizontal pixel size of ``dem_raw_path`` in meters."""
     from osgeo import gdal, osr  # type: ignore[import-untyped]
 
     gdal.UseExceptions()
@@ -92,14 +123,10 @@ def _estimate_target_resolution_m(dem_raw_path: Path, center_lat: float) -> floa
 
         if srs.IsGeographic():
             cos_lat = max(0.1, math.cos(math.radians(center_lat)))
-            native_m = min(px_x * 111320.0 * cos_lat, px_y * 111320.0)
-        else:
-            linear_units = srs.GetLinearUnits() or 1.0
-            native_m = min(px_x, px_y) * linear_units
+            return min(px_x * 111320.0 * cos_lat, px_y * 111320.0)
 
-        if native_m < DEFAULT_TARGET_RES_M:
-            return max(MIN_TARGET_RES_M, round(native_m, 2))
-        return DEFAULT_TARGET_RES_M
+        linear_units = srs.GetLinearUnits() or 1.0
+        return min(px_x, px_y) * linear_units
     finally:
         ds = None
 
@@ -142,6 +169,46 @@ def _compute_dem_stats_and_center(
         return (float(min_elev), float(max_elev), center_val)
     finally:
         ds = None
+
+
+def _write_neutral_hillshade(dem_utm_tif: Path, hillshade_tif: Path) -> Path:
+    """Write a lightweight flat-white (255) Byte hillshade raster for ``HillshadeStrength.OFF``."""
+    from osgeo import gdal  # type: ignore[import-untyped]
+
+    gdal.UseExceptions()
+    src = gdal.Open(str(dem_utm_tif), gdal.GA_ReadOnly)
+    if src is None:
+        raise RuntimeError(f"Could not open UTM DEM for neutral hillshade: {dem_utm_tif}")
+    try:
+        gt = src.GetGeoTransform()
+        proj = src.GetProjection()
+        width_m = src.RasterXSize * gt[1]
+        height_m = src.RasterYSize * abs(gt[5])
+    finally:
+        src = None
+
+    size = 16
+    driver = gdal.GetDriverByName("GTiff")
+    dst = driver.Create(
+        str(hillshade_tif),
+        size,
+        size,
+        1,
+        gdal.GDT_Byte,
+        options=["COMPRESS=DEFLATE"],
+    )
+    if dst is None:
+        raise RuntimeError(f"Could not create neutral hillshade GeoTIFF at {hillshade_tif}")
+    try:
+        dst.SetGeoTransform((gt[0], width_m / size, 0.0, gt[3], 0.0, -(height_m / size)))
+        dst.SetProjection(proj)
+        band = dst.GetRasterBand(1)
+        band.WriteRaster(0, 0, size, size, bytes([255] * (size * size)))
+        band.FlushCache()
+        dst.FlushCache()
+    finally:
+        dst = None
+    return hillshade_tif
 
 
 def _scale_dem_meters_to_feet(dem_utm_m: Path, dem_utm_ft: Path) -> Path:
@@ -272,10 +339,9 @@ def build_terrain_products(
 ) -> TerrainResult:
     """Warp DEM to local UTM, generate multi-directional hillshade, and build indexed contours.
 
-    Outputs inside ``work_dir`` (all in ``EPSG:{layout.utm_epsg}``):
-    - ``dem_utm.tif``: Float32 cubic-warped UTM elevation raster covering ``layout.utm_fetch_bbox``
-    - ``hillshade.tif``: Byte multi-directional hillshade (``gdaldem hillshade -multidirectional``)
-    - ``terrain.gpkg``: GeoPackage layer ``contours`` with ``elev``, ``is_index``, and ``elev_label``
+    Honors ``layout.spec.carto.contour_density``, ``layout.spec.carto.hillshade_strength``,
+    and preserves fine LiDAR resolution (``2.0 m``, ``-z 1.0``) when input DEM pixels are
+    ``<= 3.0 m`` (e.g. USGS 3DEP 1 m).
     """
     src_dem = Path(dem_raw_path).expanduser().resolve()
     if not src_dem.is_file():
@@ -286,7 +352,8 @@ def build_terrain_products(
     hillshade_tif = work_dir / "hillshade.tif"
     terrain_gpkg = work_dir / "terrain.gpkg"
 
-    target_res = _estimate_target_resolution_m(src_dem, layout.spec.center_lat)
+    native_res_m = _estimate_native_resolution_m(src_dem, layout.spec.center_lat)
+    target_res, z_factor = choose_warp_resolution_and_z(native_res_m)
     b = layout.utm_fetch_bbox
 
     # 1. Warp raw DEM to exact sheet UTM CRS with smooth cubic resampling
@@ -317,7 +384,8 @@ def build_terrain_products(
         str(dem_utm_tif),
     ]
     logger.info(
-        "Warping DEM to EPSG:%d at %.2f m resolution -> %s",
+        "Warping DEM (native %.2f m) to EPSG:%d at %.2f m resolution -> %s",
+        native_res_m,
         layout.utm_epsg,
         target_res,
         dem_utm_tif,
@@ -332,31 +400,40 @@ def build_terrain_products(
     )
     relief_m = max(0.0, max_elev - min_elev)
 
-    # 3. Multi-directional hillshade (NOTE: -multidirectional and -combined are mutually exclusive in GDAL)
-    hillshade_cmd = [
-        "gdaldem",
-        "hillshade",
-        "-multidirectional",
-        "-z",
-        "1.15",
-        "-compute_edges",
-        "-of",
-        "GTiff",
-        "-co",
-        "COMPRESS=DEFLATE",
-        "-co",
-        "TILED=YES",
-        str(dem_utm_tif),
-        str(hillshade_tif),
-    ]
-    logger.info("Generating multi-directional hillshade -> %s", hillshade_tif)
-    _run_subprocess(hillshade_cmd, context="gdaldem hillshade")
+    # 3. Multi-directional hillshade (skip cleanly with flat-white neutral raster when OFF)
+    if layout.spec.carto.hillshade_strength == HillshadeStrength.OFF:
+        logger.info("Hillshade strength is OFF; writing neutral white raster -> %s", hillshade_tif)
+        _write_neutral_hillshade(dem_utm_tif, hillshade_tif)
+    else:
+        hillshade_cmd = [
+            "gdaldem",
+            "hillshade",
+            "-multidirectional",
+            "-z",
+            f"{z_factor:g}",
+            "-compute_edges",
+            "-of",
+            "GTiff",
+            "-co",
+            "COMPRESS=DEFLATE",
+            "-co",
+            "TILED=YES",
+            str(dem_utm_tif),
+            str(hillshade_tif),
+        ]
+        logger.info(
+            "Generating multi-directional hillshade (z=%g) -> %s",
+            z_factor,
+            hillshade_tif,
+        )
+        _run_subprocess(hillshade_cmd, context="gdaldem hillshade")
 
-    # 4. Generate contours in metric (m) or imperial (ft) units
+    # 4. Generate contours honoring units + carto.contour_density
     interval, index_mult, interval_display = choose_contour_interval(
         layout.spec.scale,
         layout.spec.units,
         relief_m,
+        density=layout.spec.carto.contour_density,
     )
     index_interval = interval * index_mult
 
