@@ -22,13 +22,25 @@ from pathlib import Path
 from typing import Any
 
 from pyproj import Transformer
-from pypdf import PdfWriter
 
-from gridforge.config import SheetSpec
+from gridforge.config import ColorMode, DeclinationInfo, SheetLayout, SheetSpec
 from gridforge.export.kmz import export_garmin_kmz
 from gridforge.export.mbtiles import export_mbtiles
 from gridforge.export.raster import render_collarless_geotiff
 from gridforge.geo.crs import compute_sheet_layout, parse_center
+from gridforge.geo.strip_atlas import (
+    StripAtlasPlan,
+    parse_route_file,
+    plan_strip_atlas,
+    sample_route_elevation,
+)
+from gridforge.geo.supplements import (
+    merge_pdf_pages,
+    render_calibration_pdf,
+    render_elevation_profile_pdf,
+    render_route_card_pdf,
+)
+from gridforge.geo.waypoints import compute_route_metrics
 from gridforge.packs.builder import discover_packs, load_pack_manifest
 from gridforge.pipeline import runner
 from gridforge.render.pyqgis_worker import PyQGISRenderer
@@ -112,6 +124,10 @@ def _build_spec_from_request(req: CreateJobRequest) -> SheetSpec:
         dem_source=req.dem_source,
         us_overlays=req.us_overlays,
         au_overlays=req.au_overlays,
+        waypoints=req.waypoints,
+        include_calibration_page=req.include_calibration_page,
+        include_route_card=req.include_route_card,
+        include_elevation_profile=req.include_elevation_profile,
     )
 
 
@@ -122,16 +138,86 @@ def _is_cancelled(db_path: Path, job_id: str) -> bool:
 
 def _merge_pdfs(sheet_pdfs: list[Path], output_pdf: Path) -> Path:
     """Losslessly merge per-sheet vector PDFs into a single multi-page Atlas PDF."""
-    output_pdf.parent.mkdir(parents=True, exist_ok=True)
-    writer = PdfWriter()
-    try:
-        for pdf_path in sheet_pdfs:
-            writer.append(str(pdf_path))
-        with output_pdf.open("wb") as fh:
-            writer.write(fh)
-    finally:
-        writer.close()
-    return output_pdf
+    return merge_pdf_pages(sheet_pdfs, output_pdf)
+
+
+def _assemble_supplemental_pages(
+    *,
+    req: CreateJobRequest,
+    spec: SheetSpec,
+    map_pdfs: list[Path],
+    anchor_layout: SheetLayout,
+    anchor_declination: DeclinationInfo,
+    dem_paths: list[Path],
+    overlay_path: Path | None,
+    strip_plan: StripAtlasPlan | None,
+    tmp_dir: Path,
+    final_pdf: Path,
+) -> Path:
+    """Build requested Elevation Profile, Route Card, and 100 mm Calibration pages and merge."""
+    bw = spec.color_mode == ColorMode.BW
+    front_pages: list[Path] = []
+    back_pages: list[Path] = []
+    supp_dir = tmp_dir / "supplements"
+    supp_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Optional Route Overview & Elevation Profile cover page
+    if req.include_elevation_profile and dem_paths:
+        route_lonlat: list[tuple[float, float]] | None = None
+        if overlay_path is not None and overlay_path.is_file():
+            try:
+                route_lonlat = parse_route_file(overlay_path)
+            except Exception as exc:
+                logger.warning("Could not parse overlay as route for elevation profile (%s)", exc)
+        if route_lonlat is None and len(req.waypoints) >= 2:
+            route_lonlat = [(w.lon, w.lat) for w in req.waypoints]
+        if route_lonlat is None and len(req.strip_sheets) >= 2:
+            route_lonlat = [(s.center_lon, s.center_lat) for s in req.strip_sheets]
+
+        if route_lonlat is not None and len(route_lonlat) >= 2:
+            profile = sample_route_elevation(route_lonlat, dem_paths, anchor_layout.utm_epsg)
+            elev_pdf = render_elevation_profile_pdf(
+                profile,
+                strip_plan,
+                anchor_layout,
+                supp_dir / "elevation_profile.pdf",
+                bw=bw,
+            )
+            front_pages.append(elev_pdf)
+
+    # 2. Optional Tactical Route Card page
+    if req.include_route_card and req.waypoints:
+        dem_for_wp = dem_paths[0] if dem_paths else None
+        route_metrics = compute_route_metrics(
+            req.waypoints,
+            units=spec.units,
+            date_iso=spec.date_iso,
+            dem_path=dem_for_wp,
+        )
+        card_pdf = render_route_card_pdf(
+            route_metrics,
+            anchor_layout,
+            anchor_declination,
+            supp_dir / "route_card.pdf",
+            bw=bw,
+        )
+        back_pages.append(card_pdf)
+
+    # 3. Optional 100 mm Scale Calibration & MGRS Romer page
+    if req.include_calibration_page:
+        cal_pdf = render_calibration_pdf(
+            anchor_layout.page_width_mm,
+            anchor_layout.page_height_mm,
+            spec.scale,
+            supp_dir / "calibration.pdf",
+            bw=bw,
+        )
+        back_pages.append(cal_pdf)
+
+    all_pages = [*front_pages, *map_pdfs, *back_pages]
+    if len(all_pages) == 1 and all_pages[0].resolve() == final_pdf.resolve():
+        return final_pdf
+    return merge_pdf_pages(all_pages, final_pdf)
 
 
 def _iter_atlas_sheet_specs(
@@ -237,11 +323,17 @@ def process_single_job(
         req = CreateJobRequest.model_validate_json(claimed.request_json)
         spec = _build_spec_from_request(req)
         stem = _artifact_stem(req, claimed.record.center_mgrs)
-        total_sheets = req.grid_cols * req.grid_rows
+        is_strip = len(req.strip_sheets) > 0
+        total_sheets = len(req.strip_sheets) if is_strip else (req.grid_cols * req.grid_rows)
         outputs = req.outputs
         artifacts: list[JobArtifact] = []
+        has_supplements = (
+            req.include_calibration_page
+            or (req.include_route_card and len(req.waypoints) > 0)
+            or req.include_elevation_profile
+        )
 
-        if total_sheets == 1:
+        if not is_strip and total_sheets == 1:
             _report_stage("fetching_data", 15)
             prep_kwargs = _build_prep_kwargs(
                 req, claimed=claimed, packs_dir=packs_dir, progress_cb=_report_stage
@@ -251,12 +343,31 @@ def process_single_job(
             if _is_cancelled(db_path, job_id):
                 return db.get_job(db_path, job_id)
 
-            # 1. Print PDF
+            # 1. Print PDF (+ optional supplemental pages)
             if outputs.pdf:
                 _report_stage("rendering_pdf", 50)
                 pdf_name = f"{stem}.pdf"
                 pdf_path = artifacts_dir / pdf_name
-                PyQGISRenderer().render_pdf(workspace, pdf_path)
+                if has_supplements:
+                    raw_map_pdf = tmp_work_dir / "map_sheet_01.pdf"
+                    PyQGISRenderer().render_pdf(workspace, raw_map_pdf)
+                    _report_stage("rendering_supplements", 70)
+                    dem_list = [workspace.dem_utm_tif] if workspace.dem_utm_tif.is_file() else []
+                    _assemble_supplemental_pages(
+                        req=req,
+                        spec=spec,
+                        map_pdfs=[raw_map_pdf],
+                        anchor_layout=workspace.layout,
+                        anchor_declination=workspace.declination,
+                        dem_paths=dem_list,
+                        overlay_path=claimed.overlay_path,
+                        strip_plan=None,
+                        tmp_dir=tmp_work_dir,
+                        final_pdf=pdf_path,
+                    )
+                else:
+                    PyQGISRenderer().render_pdf(workspace, pdf_path)
+
                 artifacts.append(
                     JobArtifact(
                         kind="pdf",
@@ -272,15 +383,48 @@ def process_single_job(
             # 2. Digital exports (share one collarless GeoTIFF when both MBTiles & KMZ requested)
             anchor_workspace = workspace
         else:
-            # Multi-sheet UTM Atlas: render sheets A1..C3 sequentially (1 at a time -> < 1.5 GB RSS)
-            base_title = req.title or claimed.record.center_mgrs or "GRIDFORGE ATLAS"
-            atlas_sheets = _iter_atlas_sheet_specs(
-                spec, req.grid_cols, req.grid_rows, base_title
+            # Multi-sheet UTM Atlas OR Route Strip Atlas: render sheets sequentially (1 at a time -> < 1.5 GB RSS)
+            base_title = req.title or claimed.record.center_mgrs or (
+                "GRIDFORGE STRIP ATLAS" if is_strip else "GRIDFORGE ATLAS"
             )
+            strip_plan_obj: StripAtlasPlan | None = None
+            if is_strip:
+                atlas_sheets: list[tuple[str, SheetSpec]] = []
+                for idx_s, sh in enumerate(req.strip_sheets, start=1):
+                    sheet_spec = spec.model_copy(
+                        update={
+                            "center_lat": float(sh.center_lat),
+                            "center_lon": float(sh.center_lon),
+                            "center_mgrs": None,
+                            "title": f"{base_title} — Sheet {sh.sheet_id} ({idx_s}/{total_sheets})",
+                        }
+                    )
+                    atlas_sheets.append((sh.sheet_id, sheet_spec))
+                if claimed.overlay_path is not None and claimed.overlay_path.is_file():
+                    try:
+                        strip_plan_obj = plan_strip_atlas(
+                            parse_route_file(claimed.overlay_path),
+                            scale=spec.scale,
+                            paper=spec.paper,
+                            orientation=spec.orientation,
+                            units=spec.units,
+                        )
+                    except Exception:
+                        strip_plan_obj = None
+            else:
+                atlas_sheets = _iter_atlas_sheet_specs(
+                    spec, req.grid_cols, req.grid_rows, base_title
+                )
+
             sheet_pdfs_dir = tmp_work_dir / "atlas_pdfs"
             sheet_pdfs_dir.mkdir(parents=True, exist_ok=True)
+            saved_dems_dir = tmp_work_dir / "atlas_dems"
+            saved_dems_dir.mkdir(parents=True, exist_ok=True)
             rendered_sheet_pdfs: list[Path] = []
-            pdf_budget_pct = 72 if (outputs.mbtiles or outputs.kmz) else 90
+            collected_dem_paths: list[Path] = []
+            anchor_layout: SheetLayout | None = None
+            anchor_declination: DeclinationInfo | None = None
+            pdf_budget_pct = 72 if (outputs.mbtiles or outputs.kmz) else 88
 
             if outputs.pdf:
                 for idx, (sheet_id, sheet_spec) in enumerate(atlas_sheets, start=1):
@@ -290,7 +434,7 @@ def process_single_job(
                     sheet_pct = 10 + int(((idx - 1) / total_sheets) * (pdf_budget_pct - 10))
                     _report_stage(f"rendering_sheet_{sheet_id} ({idx}/{total_sheets})", sheet_pct)
 
-                    sheet_work = tmp_work_dir / f"sheet_{sheet_id}"
+                    sheet_work = tmp_work_dir / f"sheet_{idx:02d}_{sheet_id}"
                     sheet_work.mkdir(parents=True, exist_ok=True)
                     try:
                         prep_kwargs = _build_prep_kwargs(
@@ -299,6 +443,19 @@ def process_single_job(
                         sheet_ws = runner.prepare_job_workspace(
                             sheet_spec, sheet_work, **prep_kwargs
                         )
+                        if anchor_layout is None and hasattr(sheet_ws, "layout"):
+                            anchor_layout = sheet_ws.layout
+                        if anchor_declination is None and hasattr(sheet_ws, "declination"):
+                            anchor_declination = sheet_ws.declination
+                        if (
+                            req.include_elevation_profile
+                            and hasattr(sheet_ws, "dem_utm_tif")
+                            and Path(sheet_ws.dem_utm_tif).is_file()
+                        ):
+                            dst_dem = saved_dems_dir / f"dem_{idx:02d}_{sheet_id}.tif"
+                            shutil.copy2(sheet_ws.dem_utm_tif, dst_dem)
+                            collected_dem_paths.append(dst_dem)
+
                         sheet_pdf = sheet_pdfs_dir / f"sheet_{idx:02d}_{sheet_id}.pdf"
                         PyQGISRenderer().render_pdf(sheet_ws, sheet_pdf)
                         rendered_sheet_pdfs.append(sheet_pdf)
@@ -309,9 +466,34 @@ def process_single_job(
                     return db.get_job(db_path, job_id)
 
                 _report_stage("merging_atlas_pdf", pdf_budget_pct)
-                atlas_name = f"{stem}_atlas_{req.grid_cols}x{req.grid_rows}.pdf"
+                atlas_name = (
+                    f"{stem}_strip_{total_sheets}sheets.pdf"
+                    if is_strip
+                    else f"{stem}_atlas_{req.grid_cols}x{req.grid_rows}.pdf"
+                )
                 atlas_pdf_path = artifacts_dir / atlas_name
-                _merge_pdfs(rendered_sheet_pdfs, atlas_pdf_path)
+                if has_supplements:
+                    if anchor_layout is None:
+                        anchor_layout = compute_sheet_layout(spec)
+                    if anchor_declination is None:
+                        from gridforge.geo.declination import compute_declination
+
+                        anchor_declination = compute_declination(anchor_layout)
+                    _assemble_supplemental_pages(
+                        req=req,
+                        spec=spec,
+                        map_pdfs=rendered_sheet_pdfs,
+                        anchor_layout=anchor_layout,
+                        anchor_declination=anchor_declination,
+                        dem_paths=collected_dem_paths,
+                        overlay_path=claimed.overlay_path,
+                        strip_plan=strip_plan_obj,
+                        tmp_dir=tmp_work_dir,
+                        final_pdf=atlas_pdf_path,
+                    )
+                else:
+                    _merge_pdfs(rendered_sheet_pdfs, atlas_pdf_path)
+
                 artifacts.append(
                     JobArtifact(
                         kind="pdf",

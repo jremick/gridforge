@@ -21,9 +21,16 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 from pyproj import Transformer
 
-from gridforge.config import BBox, SheetSpec
+from gridforge import __version__
+from gridforge.config import BBox, Orientation, PaperSize, SheetSpec, Units
 from gridforge.geo.crs import MAX_UTM_LAT, MIN_UTM_LAT, compute_sheet_layout, parse_center
 from gridforge.geo.declination import compute_declination
+from gridforge.geo.strip_atlas import (
+    parse_route_bytes,
+    parse_route_geojson,
+    plan_strip_atlas,
+)
+from gridforge.geo.waypoints import compute_route_metrics
 from gridforge.packs.builder import discover_packs
 from gridforge.web import db
 from gridforge.web.schemas import (
@@ -37,6 +44,10 @@ from gridforge.web.schemas import (
     JobsListResponse,
     PacksResponse,
     PackSummary,
+    RouteMetricsRequest,
+    RouteMetricsResponse,
+    StripPlanRequest,
+    StripPlanResponse,
 )
 
 logger = logging.getLogger(__name__)
@@ -436,7 +447,7 @@ def create_app(
 
     application = FastAPI(
         title="GridForge Map Studio API",
-        version="0.4.0",
+        version=__version__,
         description="Self-hosted military-style MGRS topographic map generator & offline pack studio.",
     )
     application.add_middleware(
@@ -494,6 +505,80 @@ def create_app(
     @application.post("/api/footprint", response_model=FootprintResponse)
     def api_footprint(req: FootprintRequest) -> FootprintResponse:
         return _build_footprint_preview(req)
+
+    @application.post("/api/strip-plan", response_model=StripPlanResponse)
+    async def api_strip_plan(request: Request) -> StripPlanResponse:
+        content_type = request.headers.get("content-type", "").lower()
+        if "multipart/form-data" in content_type:
+            form = await request.form()
+            route_file = form.get("route_file")
+            if route_file is None or not hasattr(route_file, "read"):
+                raise HTTPException(
+                    status_code=_HTTP_422,
+                    detail="Multipart /api/strip-plan requires a 'route_file' (.gpx or .geojson) upload.",
+                )
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                chunk = await route_file.read(65536)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        detail=f"Route file exceeds maximum size of {MAX_UPLOAD_BYTES // (1024 * 1024)} MB.",
+                    )
+                chunks.append(chunk)
+            raw_bytes = b"".join(chunks)
+            filename = str(getattr(route_file, "filename", None) or "route.geojson")
+
+            try:
+                scale = int(form.get("scale", 25000))
+                paper = PaperSize(str(form.get("paper", "a4")).lower())
+                orientation = Orientation(str(form.get("orientation", "portrait")).lower())
+                units = Units(str(form.get("units", "metric")).lower())
+                overlap_pct = float(form.get("overlap_pct", 10.0))
+                max_sheets = int(form.get("max_sheets", 12))
+                route_lonlat = parse_route_bytes(raw_bytes, filename)
+                return plan_strip_atlas(
+                    route_lonlat,
+                    scale=scale,
+                    paper=paper,
+                    orientation=orientation,
+                    units=units,
+                    overlap_pct=overlap_pct,
+                    max_sheets=max_sheets,
+                )
+            except (ValueError, ValidationError) as exc:
+                raise HTTPException(status_code=_HTTP_422, detail=str(exc)) from exc
+
+        try:
+            raw_body = await request.body()
+            plan_req = StripPlanRequest.model_validate_json(raw_body)
+            route_lonlat = parse_route_geojson(plan_req.route_geojson)
+            return plan_strip_atlas(
+                route_lonlat,
+                scale=plan_req.scale,
+                paper=plan_req.paper,
+                orientation=plan_req.orientation,
+                units=plan_req.units,
+                overlap_pct=plan_req.overlap_pct,
+                max_sheets=plan_req.max_sheets,
+            )
+        except (ValueError, ValidationError) as exc:
+            raise HTTPException(status_code=_HTTP_422, detail=str(exc)) from exc
+
+    @application.post("/api/route-metrics", response_model=RouteMetricsResponse)
+    def api_route_metrics(req: RouteMetricsRequest) -> RouteMetricsResponse:
+        try:
+            return compute_route_metrics(
+                req.waypoints,
+                units=req.units,
+                date_iso=req.date_iso,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=_HTTP_422, detail=str(exc)) from exc
 
     @application.post(
         "/api/jobs",
@@ -558,6 +643,10 @@ def create_app(
                 dem_source=job_req.dem_source,
                 us_overlays=job_req.us_overlays,
                 au_overlays=job_req.au_overlays,
+                waypoints=job_req.waypoints,
+                include_calibration_page=job_req.include_calibration_page,
+                include_route_card=job_req.include_route_card,
+                include_elevation_profile=job_req.include_elevation_profile,
             )
         except (ValueError, ValidationError) as exc:
             raise HTTPException(

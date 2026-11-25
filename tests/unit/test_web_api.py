@@ -277,6 +277,66 @@ class TestGeocodeEndpoint:
         assert r_short.json() == {"results": []}
 
 
+class TestV11StripPlanAndRouteMetricsAPI:
+    def test_strip_plan_multipart_and_json_endpoints(self, client_and_dirs) -> None:
+        client, _, _, _ = client_and_dirs
+        route_path = Path(__file__).resolve().parents[2] / "examples" / "katoomba_route.geojson"
+        route_bytes = route_path.read_bytes()
+
+        # 1. Multipart upload (Web Studio drag-and-drop flow)
+        r_mp = client.post(
+            "/api/strip-plan",
+            data={"scale": "25000", "paper": "a4", "orientation": "portrait", "units": "metric"},
+            files={"route_file": ("katoomba_route.geojson", route_bytes, "application/geo+json")},
+        )
+        assert r_mp.status_code == 200, r_mp.text
+        body = r_mp.json()
+        assert body["utm_epsg"] == 32756
+        assert body["gzd"] == "56H"
+        assert body["sheet_count"] >= 1
+        assert body["sheets"][0]["sheet_id"] == "S1"
+        assert body["route_geojson"]["type"] == "FeatureCollection"
+        assert body["footprint_geojson"]["type"] == "FeatureCollection"
+        assert body["grid_geojson"]["type"] == "FeatureCollection"
+
+        # 2. Direct JSON body
+        r_json = client.post(
+            "/api/strip-plan",
+            json={
+                "route_geojson": json.loads(route_bytes.decode("utf-8")),
+                "scale": 25000,
+                "paper": "a4",
+                "orientation": "portrait",
+            },
+        )
+        assert r_json.status_code == 200
+        assert r_json.json()["sheet_count"] == body["sheet_count"]
+
+    def test_route_metrics_endpoint_and_no_qt_import(self, client_and_dirs) -> None:
+        client, _, _, _ = client_and_dirs
+        resp = client.post(
+            "/api/route-metrics",
+            json={
+                "waypoints": [
+                    {"label": "Katoomba", "lat": -33.7133, "lon": 150.3113, "category": "waypoint"},
+                    {"label": "Echo Point", "lat": -33.7322, "lon": 150.3117, "category": "camp"},
+                ],
+                "units": "metric",
+                "date_iso": "2026-06-15",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert len(data["waypoints"]) == 2
+        assert len(data["legs"]) == 1
+        assert data["waypoints"][0]["code"] == "WP1"
+        assert data["waypoints"][0]["mgrs_10m"].startswith("56H KH ")
+        assert data["total_distance_km"] > 2.0
+        assert 0.0 <= data["legs"][0]["mag_az_deg"] < 360.0
+        assert "PyQt5" not in sys.modules
+        assert "qgis" not in sys.modules
+
+
 class TestJobsLifecycleAndSecurity:
     def test_create_list_cancel_delete_job_json(self, client_and_dirs) -> None:
         client, _, _, _ = client_and_dirs
@@ -604,3 +664,97 @@ class TestSQLiteStoreAndWorker:
         merged_pdf = data_dir / "atlasjob0001" / "artifacts" / done.artifacts[0].filename
         reader = PdfReader(str(merged_pdf))
         assert len(reader.pages) == 4
+
+    def test_process_strip_atlas_with_route_card_and_calibration(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from gridforge import __version__
+
+        assert create_app(data_dir=tmp_path / "v_chk", packs_dir=tmp_path / "p_chk").version == __version__
+
+        data_dir = tmp_path / "jobs"
+        packs_dir = tmp_path / "packs"
+        db_path = data_dir / "gridforge_jobs.sqlite3"
+        db.init_db(db_path)
+        packs_dir.mkdir(parents=True)
+
+        req_json = json.dumps(
+            {
+                "center": "-33.732, 150.312",
+                "scale": 25000,
+                "paper": "a4",
+                "orientation": "portrait",
+                "color_mode": "color",
+                "units": "metric",
+                "title": "Strip With Supplements",
+                "date_iso": "2026-06-15",
+                "strip_sheets": [
+                    {"sheet_id": "S1", "index": 1, "center_lat": -33.720, "center_lon": 150.311},
+                    {"sheet_id": "S2", "index": 2, "center_lat": -33.740, "center_lon": 150.311},
+                ],
+                "waypoints": [
+                    {"label": "Start", "lat": -33.720, "lon": 150.311, "category": "waypoint"},
+                    {"label": "Finish", "lat": -33.740, "lon": 150.311, "category": "camp"},
+                ],
+                "include_route_card": True,
+                "include_calibration_page": True,
+                "outputs": {"pdf": True, "kmz": False, "mbtiles": False},
+            }
+        )
+        db.create_job(
+            db_path,
+            job_id="stripjob0001",
+            title="Strip With Supplements",
+            center="-33.732, 150.312",
+            center_mgrs="56H KH 5095 6431",
+            scale=25000,
+            paper=PaperSize.A4,
+            orientation=Orientation.PORTRAIT,
+            color_mode=ColorMode.COLOR,
+            request_json=req_json,
+        )
+        claimed = db.claim_next_job(db_path)
+        assert claimed is not None
+
+        def _fake_prepare(spec, job_dir, **kwargs):
+            return spec
+
+        def _fake_render_pdf(self, workspace, output_pdf: Path):
+            w = PdfWriter()
+            w.add_blank_page(width=595.28, height=841.89)
+            with output_pdf.open("wb") as fh:
+                w.write(fh)
+            w.close()
+            return RenderResult(
+                output_pdf=output_pdf,
+                page_width_mm=210.0,
+                page_height_mm=297.0,
+                scale=25000,
+                utm_epsg=32756,
+                elapsed_seconds=0.05,
+            )
+
+        monkeypatch.setattr("gridforge.web.worker.runner.prepare_job_workspace", _fake_prepare)
+        monkeypatch.setattr("gridforge.web.worker.PyQGISRenderer.render_pdf", _fake_render_pdf)
+
+        done = process_single_job(
+            claimed,
+            db_path=db_path,
+            data_dir=data_dir,
+            packs_dir=packs_dir,
+        )
+        assert done is not None
+        assert done.status == JobStatus.SUCCEEDED
+        assert len(done.artifacts) == 1
+        assert "strip_2sheets.pdf" in done.artifacts[0].filename
+
+        merged_pdf = data_dir / "stripjob0001" / "artifacts" / done.artifacts[0].filename
+        reader = PdfReader(str(merged_pdf))
+        # 2 strip map sheets + 1 Route Card + 1 100 mm Calibration page = 4 pages!
+        assert len(reader.pages) == 4
+        import re
+
+        rc_text = re.sub(r"\s+", " ", reader.pages[2].extract_text() or "")
+        cal_text = re.sub(r"\s+", " ", reader.pages[3].extract_text() or "")
+        assert "TACTICAL ROUTE CARD" in rc_text
+        assert "PRINTER SCALE VERIFICATION" in cal_text

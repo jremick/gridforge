@@ -5,7 +5,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from gridforge.config import (
     VALID_SCALES,
@@ -21,7 +21,10 @@ from gridforge.config import (
     PaperSize,
     Units,
     USOverlayKind,
+    WaypointInput,
 )
+from gridforge.geo.strip_atlas import StripAtlasPlan
+from gridforge.geo.waypoints import RouteMetrics
 
 
 class JobStatus(str, Enum):
@@ -139,6 +142,51 @@ class GeocodeResponse(BaseModel):
     results: list[GeocodeResult] = Field(default_factory=list)
 
 
+class StripSheetInput(BaseModel):
+    """Strip sheet center passed from Studio Strip Atlas preview to ``POST /api/jobs``."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    sheet_id: str = Field(..., min_length=1, max_length=16)
+    center_lat: float = Field(..., ge=-80.0, le=84.0)
+    center_lon: float = Field(..., ge=-180.0, le=180.0)
+    index: int | None = None
+
+
+class StripPlanRequest(BaseModel):
+    """JSON request payload for ``POST /api/strip-plan``."""
+
+    route_geojson: dict[str, Any]
+    scale: int = 25000
+    paper: PaperSize = PaperSize.A4
+    orientation: Orientation = Orientation.PORTRAIT
+    units: Units = Units.METRIC
+    overlap_pct: float = Field(default=10.0, ge=0.0, le=40.0)
+    max_sheets: int = Field(default=12, ge=1, le=24)
+
+    @field_validator("scale")
+    @classmethod
+    def _validate_scale(cls, value: int) -> int:
+        if value not in VALID_SCALES:
+            allowed = ", ".join(f"1:{s:,}" for s in VALID_SCALES)
+            raise ValueError(f"Unsupported scale {value}. Allowed scales: {allowed}.")
+        return value
+
+
+StripPlanResponse = StripAtlasPlan
+
+
+class RouteMetricsRequest(BaseModel):
+    """Request payload for ``POST /api/route-metrics``."""
+
+    waypoints: list[WaypointInput] = Field(default_factory=list)
+    units: Units = Units.METRIC
+    date_iso: str | None = None
+
+
+RouteMetricsResponse = RouteMetrics
+
+
 class OutputOptions(BaseModel):
     """Requested print and offline digital export outputs for a job."""
 
@@ -151,6 +199,9 @@ class OutputOptions(BaseModel):
     max_tiles: int | None = Field(default=None, ge=1, le=500)
     include_grid_on_digital: bool = True
     export_dpi: int | None = Field(default=None, ge=72, le=600)
+    include_calibration_page: bool = False
+    include_route_card: bool = False
+    include_elevation_profile: bool = False
 
     @model_validator(mode="before")
     @classmethod
@@ -190,6 +241,11 @@ class CreateJobRequest(BaseModel):
     outputs: OutputOptions = Field(default_factory=OutputOptions)
     grid_cols: int = Field(default=1, ge=1, le=3)
     grid_rows: int = Field(default=1, ge=1, le=3)
+    waypoints: list[WaypointInput] = Field(default_factory=list)
+    strip_sheets: list[StripSheetInput] = Field(default_factory=list)
+    include_calibration_page: bool = False
+    include_route_card: bool = False
+    include_elevation_profile: bool = False
 
     @field_validator("scale")
     @classmethod
@@ -201,6 +257,19 @@ class CreateJobRequest(BaseModel):
 
     @model_validator(mode="after")
     def _ensure_center_present(self) -> CreateJobRequest:
+        # Sync supplemental page flags whether provided top-level or inside outputs.
+        self.include_calibration_page = (
+            self.include_calibration_page or self.outputs.include_calibration_page
+        )
+        self.include_route_card = (
+            self.include_route_card or self.outputs.include_route_card
+        )
+        self.include_elevation_profile = (
+            self.include_elevation_profile or self.outputs.include_elevation_profile
+        )
+        if not self.center and self.strip_sheets:
+            s0 = self.strip_sheets[0]
+            self.center = f"{s0.center_lat:.6f}, {s0.center_lon:.6f}"
         if not self.center and (self.center_lat is None or self.center_lon is None):
             raise ValueError("Provide either 'center' ('lat,lon' or MGRS) or both 'center_lat' and 'center_lon'.")
         if not self.center and self.center_lat is not None and self.center_lon is not None:
