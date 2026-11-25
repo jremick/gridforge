@@ -1,0 +1,239 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<osm version="0.6" generator="gridforge-synthetic-fixture">
+  <bounds minlat="-33.790" minlon="150.250" maxlat="-33.670" maxlon="150.380"/>
+  <!-- Strictly sorted: nodes (ascending ID) -> ways (ascending ID) -> relations (ascending ID) -->
+
+  <!-- Point features (peaks, town, shelter, viewpoint) -->
+  <node id="101" lat="-33.7260" lon="150.3060" version="1">
+    <tag k="natural" v="peak"/>
+    <tag k="name" v="Mount Solitary"/>
+    <tag k="ele" v="950"/>
+  </node>
+  <node id="102" lat="-33.7380" lon="150.3200" version="1">
+    <tag k="natural" v="peak"/>
+    <tag k="name" v="Echo Ridge"/>
+    <tag k="ele" v="845"/>
+  </node>
+  <node id="103" lat="-33.7190" lon="150.3110" version="1">
+    <tag k="place" v="town"/>
+    <tag k="name" v="Katoomba"/>
+  </node>
+  <node id="104" lat="-33.7320" lon="150.3130" version="1">
+    <tag k="amenity" v="shelter"/>
+    <tag k="name" v="Cliff View Shelter"/>
+  </node>
+  <node id="105" lat="-33.7340" lon="150.3150" version="1">
+    <tag k="tourism" v="viewpoint"/>
+    <tag k="name" v="Jamison Lookout"/>
+  </node>
+
+  <!-- Primary highway nodes (extends past sheet frame to test clipping) -->
+  <node id="201" lat="-33.7160" lon="150.2600" version="1"/>
+  <node id="202" lat="-33.7175" lon="150.2950" version="1"/>
+  <node id="203" lat="-33.7185" lon="150.3120" version="1"/>
+  <node id="204" lat="-33.7170" lon="150.3350" version="1"/>
+  <node id="205" lat="-33.7155" lon="150.3700" version="1"/>
+
+  <!-- Secondary road nodes -->
+  <node id="211" lat="-33.7185" lon="150.3120" version="1"/>
+  <node id="212" lat="-33.7280" lon="150.3140" version="1"/>
+  <node id="213" lat="-33.7330" lon="150.3100" version="1"/>
+  <node id="214" lat="-33.7360" lon="150.3010" version="1"/>
+
+  <!-- Unpaved track nodes -->
+  <node id="221" lat="-33.7330" lon="150.3100" version="1"/>
+  <node id="222" lat="-33.7410" lon="150.3080" version="1"/>
+  <node id="223" lat="-33.7480" lon="150.3040" version="1"/>
+
+  <!-- Hiking trail nodes -->
+  <node id="231" lat="-33.7310" lon="150.3050" version="1"/>
+  <node id="232" lat="-33.7335" lon="150.3125" version="1"/>
+  <node id="233" lat="-33.7350" lon="150.3210" version="1"/>
+
+  <!-- Railway nodes -->
+  <node id="241" lat="-33.7145" lon="150.2600" version="1"/>
+  <node id="242" lat="-33.7160" lon="150.3120" version="1"/>
+  <node id="243" lat="-33.7140" lon="150.3700" version="1"/>
+
+  <!-- Perennial stream nodes -->
+  <node id="251" lat="-33.7240" lon="150.3240" version="1"/>
+  <node id="252" lat="-33.7320" lon="150.3220" version="1"/>
+  <node id="253" lat="-33.7420" lon="150.3190" version="1"/>
+  <node id="254" lat="-33.7550" lon="150.3160" version="1"/>
+
+  <!-- Intermittent stream nodes -->
+  <node id="261" lat="-33.7290" lon="150.2980" version="1"/>
+  <node id="262" lat="-33.7370" lon="150.2960" version="1"/>
+  <node id="263" lat="-33.7450" lon="150.2940" version="1"/>
+
+  <!-- Power line nodes -->
+  <node id="271" lat="-33.7120" lon="150.2900" version="1"/>
+  <node id="272" lat="-33.7220" lon="150.3020" version="1"/>
+  <node id="273" lat="-33.7320" lon="150.3140" version="1"/>
+
+  <!-- Broadleaved forest polygon nodes -->
+  <node id="301" lat="-33.7460" lon="150.2980" version="1"/>
+  <node id="302" lat="-33.7460" lon="150.3260" version="1"/>
+  <node id="303" lat="-33.7300" lon="150.3260" version="1"/>
+  <node id="304" lat="-33.7300" lon="150.2980" version="1"/>
+
+  <!-- Needleleaved forest polygon nodes -->
+  <node id="311" lat="-33.7280" lon="150.2950" version="1"/>
+  <node id="312" lat="-33.7280" lon="150.3050" version="1"/>
+  <node id="313" lat="-33.7210" lon="150.3050" version="1"/>
+  <node id="314" lat="-33.7210" lon="150.2950" version="1"/>
+
+  <!-- Waterbody polygon nodes -->
+  <node id="321" lat="-33.7250" lon="150.3160" version="1"/>
+  <node id="322" lat="-33.7250" lon="150.3210" version="1"/>
+  <node id="323" lat="-33.7215" lon="150.3210" version="1"/>
+  <node id="324" lat="-33.7215" lon="150.3160" version="1"/>
+
+  <!-- Building 1 polygon nodes -->
+  <node id="331" lat="-33.7200" lon="150.3100" version="1"/>
+  <node id="332" lat="-33.7200" lon="150.3112" version="1"/>
+  <node id="333" lat="-33.7192" lon="150.3112" version="1"/>
+  <node id="334" lat="-33.7192" lon="150.3100" version="1"/>
+
+  <!-- Building 2 polygon nodes -->
+  <node id="341" lat="-33.7205" lon="150.3125" version="1"/>
+  <node id="342" lat="-33.7205" lon="150.3134" version="1"/>
+  <node id="343" lat="-33.7198" lon="150.3134" version="1"/>
+  <node id="344" lat="-33.7198" lon="150.3125" version="1"/>
+
+  <!-- Ways (strictly ascending IDs) -->
+  <way id="1001" version="1">
+    <nd ref="201"/>
+    <nd ref="202"/>
+    <nd ref="203"/>
+    <nd ref="204"/>
+    <nd ref="205"/>
+    <tag k="highway" v="primary"/>
+    <tag k="ref" v="B59"/>
+    <tag k="name" v="Great Western Highway"/>
+    <tag k="surface" v="asphalt"/>
+  </way>
+
+  <way id="1002" version="1">
+    <nd ref="211"/>
+    <nd ref="212"/>
+    <nd ref="213"/>
+    <nd ref="214"/>
+    <tag k="highway" v="secondary"/>
+    <tag k="name" v="Cliff Drive"/>
+    <tag k="surface" v="asphalt"/>
+  </way>
+
+  <way id="1003" version="1">
+    <nd ref="221"/>
+    <nd ref="222"/>
+    <nd ref="223"/>
+    <tag k="highway" v="track"/>
+    <tag k="tracktype" v="grade3"/>
+    <tag k="surface" v="unpaved"/>
+    <tag k="name" v="Valley Fire Trail"/>
+  </way>
+
+  <way id="1004" version="1">
+    <nd ref="231"/>
+    <nd ref="232"/>
+    <nd ref="233"/>
+    <tag k="highway" v="path"/>
+    <tag k="name" v="Prince Henry Cliff Walk"/>
+  </way>
+
+  <way id="1005" version="1">
+    <nd ref="241"/>
+    <nd ref="242"/>
+    <nd ref="243"/>
+    <tag k="railway" v="rail"/>
+    <tag k="name" v="Blue Mountains Line"/>
+  </way>
+
+  <way id="1006" version="1">
+    <nd ref="251"/>
+    <nd ref="252"/>
+    <nd ref="253"/>
+    <nd ref="254"/>
+    <tag k="waterway" v="stream"/>
+    <tag k="name" v="Kedumba Creek"/>
+  </way>
+
+  <way id="1007" version="1">
+    <nd ref="261"/>
+    <nd ref="262"/>
+    <nd ref="263"/>
+    <tag k="waterway" v="stream"/>
+    <tag k="intermittent" v="yes"/>
+    <tag k="name" v="Dry Gully"/>
+  </way>
+
+  <way id="1008" version="1">
+    <nd ref="271"/>
+    <nd ref="272"/>
+    <nd ref="273"/>
+    <tag k="power" v="line"/>
+  </way>
+
+  <way id="1009" version="1">
+    <nd ref="301"/>
+    <nd ref="302"/>
+    <nd ref="303"/>
+    <nd ref="304"/>
+    <nd ref="301"/>
+    <tag k="natural" v="wood"/>
+    <tag k="leaf_type" v="broadleaved"/>
+    <tag k="name" v="Jamison Forest"/>
+  </way>
+
+  <way id="1010" version="1">
+    <nd ref="311"/>
+    <nd ref="312"/>
+    <nd ref="313"/>
+    <nd ref="314"/>
+    <nd ref="311"/>
+    <tag k="natural" v="wood"/>
+    <tag k="leaf_type" v="needleleaved"/>
+    <tag k="name" v="Pine Stand"/>
+  </way>
+
+  <way id="1011" version="1">
+    <nd ref="321"/>
+    <nd ref="322"/>
+    <nd ref="323"/>
+    <nd ref="324"/>
+    <nd ref="321"/>
+    <tag k="natural" v="water"/>
+    <tag k="water" v="lake"/>
+    <tag k="name" v="Katoomba Cascades Reservoir"/>
+  </way>
+
+  <way id="1012" version="1">
+    <nd ref="331"/>
+    <nd ref="332"/>
+    <nd ref="333"/>
+    <nd ref="334"/>
+    <nd ref="331"/>
+    <tag k="building" v="yes"/>
+    <tag k="amenity" v="fire_station"/>
+    <tag k="name" v="Katoomba Fire Station"/>
+  </way>
+
+  <way id="1013" version="1">
+    <nd ref="341"/>
+    <nd ref="342"/>
+    <nd ref="343"/>
+    <nd ref="344"/>
+    <nd ref="341"/>
+    <tag k="building" v="yes"/>
+  </way>
+
+  <!-- Relation (hiking multilinestring) -->
+  <relation id="2001" version="1">
+    <member type="way" ref="1003" role=""/>
+    <member type="way" ref="1004" role=""/>
+    <tag k="type" v="route"/>
+    <tag k="route" v="hiking"/>
+    <tag k="name" v="Six Foot Track"/>
+  </relation>
+</osm>

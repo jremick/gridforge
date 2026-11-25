@@ -1,0 +1,36 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": { "name": "LZ Alpha", "kind": "waypoint" },
+      "geometry": { "type": "Point", "coordinates": [150.312, -33.732] }
+    },
+    {
+      "type": "Feature",
+      "properties": { "name": "Patrol Route 1", "kind": "route" },
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [150.305, -33.730],
+          [150.312, -33.732],
+          [150.318, -33.735]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": { "name": "AO Bravo", "kind": "zone" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[
+          [150.308, -33.736],
+          [150.315, -33.736],
+          [150.315, -33.731],
+          [150.308, -33.731],
+          [150.308, -33.736]
+        ]]
+      }
+    }
+  ]
+}
