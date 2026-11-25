@@ -584,9 +584,12 @@ def _render_compact_map_key(
     *,
     color_mode: ColorMode,
     date_str: str,
+    workspace: JobWorkspace | None = None,
 ) -> None:
     """Draw a deterministic, non-overlapping vector cartographic key legend in Col 4."""
     is_color = color_mode == ColorMode.COLOR
+    regional = (workspace.regional_overlays or {}) if workspace is not None else {}
+    carto = workspace.layout.spec.carto if workspace is not None else None
 
     # Outer box frame
     _add_rect(print_layout, x_mm, y_mm, w_mm, h_mm, fill_hex="#FFFFFF", stroke_hex="#333333", stroke_mm=0.20)
@@ -596,38 +599,50 @@ def _render_compact_map_key(
         print_layout,
         "MAP KEY",
         x_mm + 1.2,
-        y_mm + 0.6,
+        y_mm + 0.4,
         w_mm - 2.4,
-        3.0,
-        size_pt=5.8,
+        2.8,
+        size_pt=5.6,
         color_hex="#111111",
         bold=True,
         halign="center",
         valign="center",
     )
-    _add_line(print_layout, x_mm + 1.0, y_mm + 3.7, x_mm + w_mm - 1.0, y_mm + 3.7, color_hex="#888888", width_mm=0.14)
+    _add_line(print_layout, x_mm + 1.0, y_mm + 3.4, x_mm + w_mm - 1.0, y_mm + 3.4, color_hex="#888888", width_mm=0.14)
 
-    sx1 = x_mm + 1.6
-    sx2 = x_mm + 8.0
-    lbl_x = x_mm + 9.2
-    lbl_w = max(10.0, w_mm - 10.2)
-    row_y0 = y_mm + 5.3
-    pitch = 2.75
+    sx1 = x_mm + 1.5
+    sx2 = x_mm + 7.6
+    lbl_x = x_mm + 8.7
+    lbl_w = max(10.0, w_mm - 9.6)
 
-    # Row 0: Major Highway / Road
-    ry = row_y0 + 0 * pitch
-    _add_line(print_layout, sx1, ry, sx2, ry, color_hex="#5E1D12" if is_color else "#000000", width_mm=1.05)
-    _add_line(print_layout, sx1 + 0.15, ry, sx2 - 0.15, ry, color_hex="#D97925" if is_color else "#C8C8C8", width_mm=0.65)
-    _add_label(print_layout, "Major Road", lbl_x, ry - 1.25, lbl_w, 2.5, size_pt=5.0, valign="center")
+    has_fema = "fema" in regional
+    has_towers = "towers" in regional
+    has_infra = bool(carto is None or carto.show_power or carto.show_pipelines)
+    extra_rows = int(has_infra) + int(has_fema or has_towers)
+    total_rows = 8 + extra_rows
+    row_y0 = y_mm + 4.8
+    avail_h = h_mm - 10.6
+    pitch = min(2.75, avail_h / max(1, total_rows - 1)) if total_rows > 1 else 2.75
+    lbl_pt = 4.9 if total_rows <= 8 else 4.5
 
-    # Row 1: Secondary / Minor Road
-    ry = row_y0 + 1 * pitch
-    _add_line(print_layout, sx1, ry, sx2, ry, color_hex="#4A4A4A" if is_color else "#222222", width_mm=0.72)
-    _add_line(print_layout, sx1 + 0.15, ry, sx2 - 0.15, ry, color_hex="#FFFFFF", width_mm=0.42)
-    _add_label(print_layout, "Minor Road", lbl_x, ry - 1.25, lbl_w, 2.5, size_pt=5.0, valign="center")
+    def _ry(idx: int) -> float:
+        return row_y0 + idx * pitch
 
-    # Row 2: Track / Trail
-    ry = row_y0 + 2 * pitch
+    idx = 0
+    # Row: Major Highway / Road
+    ry = _ry(idx); idx += 1
+    _add_line(print_layout, sx1, ry, sx2, ry, color_hex="#5E1D12" if is_color else "#000000", width_mm=1.0)
+    _add_line(print_layout, sx1 + 0.15, ry, sx2 - 0.15, ry, color_hex="#D97925" if is_color else "#C8C8C8", width_mm=0.60)
+    _add_label(print_layout, "Major Road", lbl_x, ry - 1.15, lbl_w, 2.3, size_pt=lbl_pt, valign="center")
+
+    # Row: Secondary / Minor Road
+    ry = _ry(idx); idx += 1
+    _add_line(print_layout, sx1, ry, sx2, ry, color_hex="#4A4A4A" if is_color else "#222222", width_mm=0.68)
+    _add_line(print_layout, sx1 + 0.15, ry, sx2 - 0.15, ry, color_hex="#FFFFFF", width_mm=0.38)
+    _add_label(print_layout, "Minor Road", lbl_x, ry - 1.15, lbl_w, 2.3, size_pt=lbl_pt, valign="center")
+
+    # Row: Track / Trail
+    ry = _ry(idx); idx += 1
     _add_line(
         print_layout,
         sx1,
@@ -635,58 +650,96 @@ def _render_compact_map_key(
         sx2,
         ry,
         color_hex="#5E442B" if is_color else "#1A1A1A",
-        width_mm=0.30,
+        width_mm=0.28,
         dash_vector=[1.4, 0.8],
     )
-    _add_label(print_layout, "Track / Trail", lbl_x, ry - 1.25, lbl_w, 2.5, size_pt=5.0, valign="center")
+    _add_label(print_layout, "Track / Trail", lbl_x, ry - 1.15, lbl_w, 2.3, size_pt=lbl_pt, valign="center")
 
-    # Row 3: Railway (line + tiny ticks)
-    ry = row_y0 + 3 * pitch
-    _add_line(print_layout, sx1, ry, sx2, ry, color_hex="#1A1A1A", width_mm=0.28)
-    for tx in (sx1 + 1.4, sx1 + 3.2, sx1 + 5.0):
-        _add_line(print_layout, tx, ry - 0.65, tx, ry + 0.65, color_hex="#1A1A1A", width_mm=0.22)
-    _add_label(print_layout, "Railway", lbl_x, ry - 1.25, lbl_w, 2.5, size_pt=5.0, valign="center")
+    # Row: Railway (line + tiny ticks)
+    ry = _ry(idx); idx += 1
+    _add_line(print_layout, sx1, ry, sx2, ry, color_hex="#1A1A1A", width_mm=0.26)
+    for tx in (sx1 + 1.3, sx1 + 3.0, sx1 + 4.7):
+        _add_line(print_layout, tx, ry - 0.55, tx, ry + 0.55, color_hex="#1A1A1A", width_mm=0.20)
+    _add_label(print_layout, "Railway", lbl_x, ry - 1.15, lbl_w, 2.3, size_pt=lbl_pt, valign="center")
 
-    # Row 4: Water / Stream
-    ry = row_y0 + 4 * pitch
+    # Row: Water / Stream
+    ry = _ry(idx); idx += 1
     if is_color:
-        _add_rect(print_layout, sx1, ry - 0.8, 2.6, 1.6, fill_hex="#A6D1EC", stroke_hex="#3A82B5", stroke_mm=0.16)
-        _add_line(print_layout, sx1 + 3.2, ry, sx2, ry, color_hex="#2B79B3", width_mm=0.38)
+        _add_rect(print_layout, sx1, ry - 0.7, 2.4, 1.4, fill_hex="#A6D1EC", stroke_hex="#3A82B5", stroke_mm=0.15)
+        _add_line(print_layout, sx1 + 3.0, ry, sx2, ry, color_hex="#2B79B3", width_mm=0.35)
     else:
-        _add_rect(print_layout, sx1, ry - 0.8, 2.6, 1.6, fill_hex="#FFFFFF", stroke_hex="#1A1A1A", stroke_mm=0.20)
-        _add_line(print_layout, sx1 + 0.2, ry, sx1 + 2.4, ry, color_hex="#666666", width_mm=0.14)
-        _add_line(print_layout, sx1 + 3.2, ry, sx2, ry, color_hex="#1A1A1A", width_mm=0.38)
-    _add_label(print_layout, "Water / Stream", lbl_x, ry - 1.25, lbl_w, 2.5, size_pt=5.0, valign="center")
+        _add_rect(print_layout, sx1, ry - 0.7, 2.4, 1.4, fill_hex="#FFFFFF", stroke_hex="#1A1A1A", stroke_mm=0.18)
+        _add_line(print_layout, sx1 + 0.2, ry, sx1 + 2.2, ry, color_hex="#666666", width_mm=0.12)
+        _add_line(print_layout, sx1 + 3.0, ry, sx2, ry, color_hex="#1A1A1A", width_mm=0.35)
+    _add_label(print_layout, "Water / Stream", lbl_x, ry - 1.15, lbl_w, 2.3, size_pt=lbl_pt, valign="center")
 
-    # Row 5: Index / Minor Contour
-    ry = row_y0 + 5 * pitch
-    _add_line(print_layout, sx1, ry - 0.35, sx2, ry - 0.35, color_hex="#8F5B28" if is_color else "#1A1A1A", width_mm=0.32)
-    _add_line(print_layout, sx1, ry + 0.45, sx2, ry + 0.45, color_hex="#A87846" if is_color else "#555555", width_mm=0.15)
-    _add_label(print_layout, "Index / Contour", lbl_x, ry - 1.25, lbl_w, 2.5, size_pt=5.0, valign="center")
+    # Row: Index / Minor Contour
+    ry = _ry(idx); idx += 1
+    _add_line(print_layout, sx1, ry - 0.3, sx2, ry - 0.3, color_hex="#8F5B28" if is_color else "#1A1A1A", width_mm=0.30)
+    _add_line(print_layout, sx1, ry + 0.4, sx2, ry + 0.4, color_hex="#A87846" if is_color else "#555555", width_mm=0.14)
+    _add_label(print_layout, "Index / Contour", lbl_x, ry - 1.15, lbl_w, 2.3, size_pt=lbl_pt, valign="center")
 
-    # Row 6: MGRS 1 km Grid
-    ry = row_y0 + 6 * pitch
-    _add_line(print_layout, sx1, ry, sx2, ry, color_hex="#1B4F72" if is_color else "#000000", width_mm=0.22)
-    _add_label(print_layout, "MGRS 1 km Grid", lbl_x, ry - 1.25, lbl_w, 2.5, size_pt=5.0, valign="center")
+    # Row: MGRS 1 km Grid
+    ry = _ry(idx); idx += 1
+    _add_line(print_layout, sx1, ry, sx2, ry, color_hex="#1B4F72" if is_color else "#000000", width_mm=0.20)
+    _add_label(print_layout, "MGRS 1 km Grid", lbl_x, ry - 1.15, lbl_w, 2.3, size_pt=lbl_pt, valign="center")
 
-    # Row 7: Peak & Building
-    ry = row_y0 + 7 * pitch
-    _add_triangle(print_layout, sx1 + 0.3, ry - 0.9, 1.8, fill_hex="#111111")
+    # Row: Peak & Building
+    ry = _ry(idx); idx += 1
+    _add_triangle(print_layout, sx1 + 0.3, ry - 0.8, 1.6, fill_hex="#111111")
     _add_rect(
         print_layout,
-        sx1 + 3.6,
-        ry - 0.75,
-        1.8,
-        1.5,
+        sx1 + 3.4,
+        ry - 0.65,
+        1.6,
+        1.3,
         fill_hex="#6E6E6E" if is_color else "#262626",
         stroke_hex="#222222",
         stroke_mm=0.10,
     )
-    _add_label(print_layout, "Peak / Building", lbl_x, ry - 1.25, lbl_w, 2.5, size_pt=5.0, valign="center")
+    _add_label(print_layout, "Peak / Building", lbl_x, ry - 1.15, lbl_w, 2.3, size_pt=lbl_pt, valign="center")
+
+    # Row: Power / Pipeline (when active)
+    if has_infra:
+        ry = _ry(idx); idx += 1
+        _add_line(print_layout, sx1, ry, sx2, ry, color_hex="#555555" if is_color else "#222222", width_mm=0.18)
+        for tx in (sx1 + 1.8, sx1 + 4.2):
+            _add_line(print_layout, tx, ry - 0.5, tx, ry + 0.5, color_hex="#555555" if is_color else "#222222", width_mm=0.18)
+        _add_label(print_layout, "Power / Pipe", lbl_x, ry - 1.15, lbl_w, 2.3, size_pt=lbl_pt, valign="center")
+
+    # Row: Active US Regional Overlay (FEMA Flood / FAA Towers)
+    if has_fema or has_towers:
+        ry = _ry(idx); idx += 1
+        if has_fema:
+            _add_rect(
+                print_layout,
+                sx1,
+                ry - 0.65,
+                2.5,
+                1.3,
+                fill_hex="#DCEEFF" if is_color else "#FFFFFF",
+                stroke_hex="#1565C0" if is_color else "#333333",
+                stroke_mm=0.18,
+            )
+            _add_line(
+                print_layout,
+                sx1 + 0.3,
+                ry + 0.5,
+                sx1 + 2.2,
+                ry - 0.5,
+                color_hex="#1976D2" if is_color else "#444444",
+                width_mm=0.14,
+            )
+        if has_towers:
+            tx = sx1 + (4.4 if has_fema else 3.0)
+            _add_line(print_layout, tx, ry - 0.75, tx - 0.6, ry + 0.65, color_hex="#1B4F72" if is_color else "#000000", width_mm=0.22)
+            _add_line(print_layout, tx, ry - 0.75, tx + 0.6, ry + 0.65, color_hex="#1B4F72" if is_color else "#000000", width_mm=0.22)
+        tag = "Flood / Tower" if (has_fema and has_towers) else ("FEMA Flood" if has_fema else "FAA Obstacle")
+        _add_label(print_layout, tag, lbl_x, ry - 1.15, lbl_w, 2.3, size_pt=lbl_pt, valign="center")
 
     # Sheet Metadata footer inside Key Box
-    meta_y = y_mm + h_mm - 5.2
-    _add_line(print_layout, x_mm + 1.0, meta_y - 0.4, x_mm + w_mm - 1.0, meta_y - 0.4, color_hex="#BBBBBB", width_mm=0.14)
+    meta_y = y_mm + h_mm - 4.9
+    _add_line(print_layout, x_mm + 1.0, meta_y - 0.35, x_mm + w_mm - 1.0, meta_y - 0.35, color_hex="#BBBBBB", width_mm=0.14)
     mode_tag = "COLOR" if is_color else "B&W PRINT"
     _add_label(
         print_layout,
@@ -694,8 +747,8 @@ def _render_compact_map_key(
         x_mm + 1.0,
         meta_y,
         w_mm - 2.0,
-        2.4,
-        size_pt=4.7,
+        2.3,
+        size_pt=4.6,
         color_hex="#333333",
         halign="center",
         valign="center",
@@ -704,10 +757,10 @@ def _render_compact_map_key(
         print_layout,
         "GRIDFORGE TOPOGRAPHIC SHEET",
         x_mm + 1.0,
-        meta_y + 2.3,
+        meta_y + 2.2,
         w_mm - 2.0,
-        2.3,
-        size_pt=4.5,
+        2.2,
+        size_pt=4.4,
         color_hex="#555555",
         bold=True,
         halign="center",
@@ -938,7 +991,8 @@ def build_print_layout(
     )
 
     # 4. MGRS 1 km Collar Ticks & Military Principal-Digit Labels on all 4 edges
-    _render_mgrs_ticks(print_layout, layout, mgrs_meta.ticks, spec.color_mode)
+    if spec.carto.show_grid:
+        _render_mgrs_ticks(print_layout, layout, mgrs_meta.ticks, spec.color_mode)
 
     # 5. Bottom Collar Band (non-overlapping 4-column layout adapting cleanly to A4/Letter/Legal/A3)
     f_bottom = layout.frame_y_mm + layout.frame_height_mm
@@ -1012,9 +1066,10 @@ def build_print_layout(
         halign="center",
         valign="center",
     )
+    v_datum = (workspace.vertical_datum or "EGM2008").strip()
     _add_label(
         print_layout,
-        "DATUM: WGS84 / VERTICAL: EGM2008",
+        f"DATUM: WGS84 / VERTICAL: {v_datum}",
         x_col2,
         collar_y + 25.8,
         w_col2,
@@ -1053,20 +1108,27 @@ def build_print_layout(
         collar_h,
         color_mode=spec.color_mode,
         date_str=date_str,
+        workspace=workspace,
     )
 
-    # 6. Bottom-most Mandatory Attribution Footer Band
-    footer_rule_y = f_bottom + 40.2
+    # 6. Bottom-most Mandatory Attribution Footer Band (adaptive sizing for US overlays)
+    footer_rule_y = f_bottom + 40.0
     _add_line(print_layout, fx, footer_rule_y, fx + fw, footer_rule_y, color_hex="#999999", width_mm=0.15)
     footer_text = _format_attribution_footer(workspace.attributions)
+    if len(footer_text) <= 220:
+        footer_pt = 5.0
+    elif len(footer_text) <= 360:
+        footer_pt = 4.4
+    else:
+        footer_pt = 4.0
     _add_label(
         print_layout,
         footer_text,
         fx,
-        footer_rule_y + 0.5,
+        footer_rule_y + 0.35,
         fw,
-        max(5.2, layout.page_height_mm - footer_rule_y - 1.5),
-        size_pt=5.1,
+        max(6.2, layout.page_height_mm - footer_rule_y - 1.1),
+        size_pt=footer_pt,
         color_hex="#333333",
         halign="left",
         valign="top",

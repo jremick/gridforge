@@ -1,4 +1,4 @@
-"""GridForge Typer CLI (``gridforge render`` and ``gridforge inspect``)."""
+"""GridForge Typer CLI (``gridforge render``, ``gridforge export``, and ``gridforge inspect``)."""
 
 from __future__ import annotations
 
@@ -11,15 +11,23 @@ import typer
 
 from gridforge.config import (
     VALID_SCALES,
+    CartoOptions,
     ColorMode,
+    DemSourceKind,
+    DensityLevel,
+    ExportFormat,
+    GarminProfile,
+    HillshadeStrength,
+    MBTilesFormat,
     Orientation,
     PaperSize,
     SheetSpec,
     Units,
+    USOverlayKind,
 )
 from gridforge.geo.crs import compute_sheet_layout, parse_center
 from gridforge.geo.declination import compute_declination
-from gridforge.pipeline.runner import run_render_job
+from gridforge.pipeline.runner import run_export_job, run_render_job
 from gridforge.sources.base import ElevationSource, OverlaySource, VectorSource
 from gridforge.sources.dem_local import LocalDEMSource
 from gridforge.sources.osm_pbf import LocalPBFSource
@@ -27,7 +35,7 @@ from gridforge.sources.overlay_user import UserOverlaySource
 
 app = typer.Typer(
     name="gridforge",
-    help="GridForge — Military-style true-scale MGRS topographic map generator.",
+    help="GridForge — Military-style true-scale MGRS topographic map generator & device exporter.",
     no_args_is_help=True,
 )
 
@@ -52,6 +60,9 @@ def _build_spec(
     date_iso: str | None = None,
     geopdf: bool = False,
     dpi: int = 300,
+    dem_source: DemSourceKind = DemSourceKind.AUTO,
+    us_overlays: list[USOverlayKind] | None = None,
+    carto: CartoOptions | None = None,
 ) -> SheetSpec:
     if scale not in VALID_SCALES:
         allowed = ", ".join(str(s) for s in VALID_SCALES)
@@ -75,6 +86,9 @@ def _build_spec(
         date_iso=date_iso,
         geopdf=geopdf,
         dpi=dpi,
+        dem_source=dem_source,
+        us_overlays=list(dict.fromkeys(us_overlays or [])),
+        carto=carto if carto is not None else CartoOptions(),
     )
 
 
@@ -144,6 +158,74 @@ def render_cmd(
         max=1200,
         help="Export DPI (default 300).",
     ),
+    dem_source: DemSourceKind = typer.Option(
+        DemSourceKind.AUTO,
+        "--dem-source",
+        case_sensitive=False,
+        help="Elevation source selection (auto, glo30, usgs3dep).",
+    ),
+    us_overlay: Optional[list[USOverlayKind]] = typer.Option(
+        None,
+        "--us-overlay",
+        case_sensitive=False,
+        help="Optional US public-domain overlay (fema, nhd, towers, enc); repeatable.",
+    ),
+    contour_density: DensityLevel = typer.Option(
+        DensityLevel.NORMAL,
+        "--contour-density",
+        case_sensitive=False,
+        help="Contour interval density (low, normal, high).",
+    ),
+    hillshade_strength: HillshadeStrength = typer.Option(
+        HillshadeStrength.NORMAL,
+        "--hillshade-strength",
+        case_sensitive=False,
+        help="Multi-directional hillshade intensity (off, light, normal, strong).",
+    ),
+    label_density: DensityLevel = typer.Option(
+        DensityLevel.NORMAL,
+        "--label-density",
+        case_sensitive=False,
+        help="Cartographic label density (low, normal, high).",
+    ),
+    buildings: bool = typer.Option(True, "--buildings/--no-buildings", help="Show building footprints & usage icons."),
+    trees: bool = typer.Option(True, "--trees/--no-trees", help="Show evergreen/deciduous/mixed tree cover."),
+    power: bool = typer.Option(True, "--power/--no-power", help="Show power lines, towers, and substations."),
+    pipelines: bool = typer.Option(True, "--pipelines/--no-pipelines", help="Show pipelines."),
+    grid: bool = typer.Option(True, "--grid/--no-grid", help="Show MGRS 1 km grid & neatline ticks."),
+    river_arrows: bool = typer.Option(
+        True,
+        "--river-arrows/--no-river-arrows",
+        help="Show directional downstream flow arrows on rivers & streams.",
+    ),
+    mbtiles: Optional[Path] = typer.Option(
+        None,
+        "--mbtiles",
+        help="Also export an ATAK-ready MBTiles archive of the exact same map area.",
+    ),
+    kmz: Optional[Path] = typer.Option(
+        None,
+        "--kmz",
+        help="Also export a Garmin Custom Maps KMZ archive of the exact same map area.",
+    ),
+    garmin_profile: GarminProfile = typer.Option(
+        GarminProfile.STANDARD,
+        "--garmin-profile",
+        case_sensitive=False,
+        help="Garmin KMZ tile cap profile (standard=100 tiles, modern=500 tiles).",
+    ),
+    max_tiles: Optional[int] = typer.Option(
+        None,
+        "--max-tiles",
+        min=1,
+        help="Override Garmin KMZ maximum tile count.",
+    ),
+    mbtiles_format: MBTilesFormat = typer.Option(
+        MBTilesFormat.PNG,
+        "--mbtiles-format",
+        case_sensitive=False,
+        help="MBTiles tile encoding format (png, jpg).",
+    ),
     offline_dem: Optional[Path] = typer.Option(
         None,
         "--offline-dem",
@@ -186,9 +268,20 @@ def render_cmd(
         help="Enable debug logging.",
     ),
 ) -> None:
-    """Render a print-ready, physically true-scale MGRS topographic PDF."""
+    """Render a print-ready, physically true-scale MGRS topographic PDF (+ optional MBTiles/KMZ)."""
     _configure_logging(verbose)
 
+    carto = CartoOptions(
+        contour_density=contour_density,
+        hillshade_strength=hillshade_strength,
+        label_density=label_density,
+        show_buildings=buildings,
+        show_trees=trees,
+        show_power=power,
+        show_pipelines=pipelines,
+        show_grid=grid,
+        show_river_arrows=river_arrows,
+    )
     spec = _build_spec(
         center=center,
         scale=scale,
@@ -200,6 +293,9 @@ def render_cmd(
         date_iso=date_iso,
         geopdf=geopdf,
         dpi=dpi,
+        dem_source=dem_source,
+        us_overlays=us_overlay,
+        carto=carto,
     )
 
     elev_src: ElevationSource | None = LocalDEMSource(offline_dem) if offline_dem is not None else None
@@ -214,6 +310,13 @@ def render_cmd(
         overlay_sources=overlay_srcs or None,
         keep_workspace=keep_workspace,
         work_dir=work_dir,
+        mbtiles_out=mbtiles,
+        kmz_out=kmz,
+        mbtiles_format=mbtiles_format,
+        garmin_profile=garmin_profile,
+        max_tiles=max_tiles,
+        export_include_grid=grid,
+        export_dpi=dpi,
     )
 
     if json_output:
@@ -224,8 +327,206 @@ def render_cmd(
             f"({result.page_width_mm:.1f}x{result.page_height_mm:.1f} mm, "
             f"1:{result.scale:,}, EPSG:{result.utm_epsg}) in {result.elapsed_seconds:.2f}s"
         )
+        if mbtiles is not None:
+            typer.echo(f"Exported ATAK MBTiles: {mbtiles}")
+        if kmz is not None:
+            typer.echo(f"Exported Garmin KMZ: {kmz}")
         if result.workspace_dir is not None:
             typer.echo(f"Workspace retained at: {result.workspace_dir}")
+
+
+@app.command("export")
+def export_cmd(
+    center: str = typer.Option(
+        ...,
+        "--center",
+        "-c",
+        help='Center coordinate as "lat,lon" (e.g. "-33.732,150.312") or MGRS string.',
+    ),
+    scale: int = typer.Option(
+        25000,
+        "--scale",
+        "-s",
+        help="Map scale denominator (15000, 24000, 25000, 48000, 50000).",
+    ),
+    paper: PaperSize = typer.Option(
+        PaperSize.A4,
+        "--paper",
+        "-p",
+        case_sensitive=False,
+        help="Physical sheet footprint size (letter, a4, legal, a3).",
+    ),
+    orientation: Orientation = typer.Option(
+        Orientation.PORTRAIT,
+        "--orientation",
+        "-o",
+        case_sensitive=False,
+        help="Sheet footprint orientation (portrait, landscape).",
+    ),
+    mode: ColorMode = typer.Option(
+        ColorMode.COLOR,
+        "--mode",
+        "-m",
+        case_sensitive=False,
+        help="Cartographic theme (color, bw).",
+    ),
+    units: Units = typer.Option(
+        Units.METRIC,
+        "--units",
+        "-u",
+        case_sensitive=False,
+        help="Contour & elevation units (metric, imperial).",
+    ),
+    export_format: ExportFormat = typer.Option(
+        ExportFormat.MBTILES,
+        "--format",
+        "-f",
+        case_sensitive=False,
+        help="Offline device archive format (mbtiles, kmz, both).",
+    ),
+    output: Path = typer.Option(
+        ...,
+        "--output",
+        "-O",
+        help="Destination file path (or output prefix/directory when --format both).",
+    ),
+    title: Optional[str] = typer.Option(None, "--title", "-t", help="Optional map name/title metadata."),
+    dpi: int = typer.Option(300, "--dpi", min=72, max=1200, help="Collarless rasterization DPI (default 300)."),
+    garmin_profile: GarminProfile = typer.Option(
+        GarminProfile.STANDARD,
+        "--garmin-profile",
+        case_sensitive=False,
+        help="Garmin KMZ tile cap profile (standard=100 tiles, modern=500 tiles).",
+    ),
+    max_tiles: Optional[int] = typer.Option(
+        None,
+        "--max-tiles",
+        min=1,
+        help="Override Garmin KMZ maximum tile count.",
+    ),
+    mbtiles_format: MBTilesFormat = typer.Option(
+        MBTilesFormat.PNG,
+        "--mbtiles-format",
+        case_sensitive=False,
+        help="MBTiles tile encoding format (png, jpg).",
+    ),
+    dem_source: DemSourceKind = typer.Option(
+        DemSourceKind.AUTO,
+        "--dem-source",
+        case_sensitive=False,
+        help="Elevation source selection (auto, glo30, usgs3dep).",
+    ),
+    us_overlay: Optional[list[USOverlayKind]] = typer.Option(
+        None,
+        "--us-overlay",
+        case_sensitive=False,
+        help="Optional US public-domain overlay (fema, nhd, towers, enc); repeatable.",
+    ),
+    contour_density: DensityLevel = typer.Option(
+        DensityLevel.NORMAL,
+        "--contour-density",
+        case_sensitive=False,
+        help="Contour interval density (low, normal, high).",
+    ),
+    hillshade_strength: HillshadeStrength = typer.Option(
+        HillshadeStrength.NORMAL,
+        "--hillshade-strength",
+        case_sensitive=False,
+        help="Multi-directional hillshade intensity (off, light, normal, strong).",
+    ),
+    label_density: DensityLevel = typer.Option(
+        DensityLevel.NORMAL,
+        "--label-density",
+        case_sensitive=False,
+        help="Cartographic label density (low, normal, high).",
+    ),
+    buildings: bool = typer.Option(True, "--buildings/--no-buildings", help="Show building footprints & usage icons."),
+    trees: bool = typer.Option(True, "--trees/--no-trees", help="Show evergreen/deciduous/mixed tree cover."),
+    power: bool = typer.Option(True, "--power/--no-power", help="Show power lines, towers, and substations."),
+    pipelines: bool = typer.Option(True, "--pipelines/--no-pipelines", help="Show pipelines."),
+    grid: bool = typer.Option(True, "--grid/--no-grid", help="Include MGRS 1 km grid on exported map."),
+    river_arrows: bool = typer.Option(
+        True,
+        "--river-arrows/--no-river-arrows",
+        help="Show directional downstream flow arrows on rivers & streams.",
+    ),
+    offline_dem: Optional[Path] = typer.Option(None, "--offline-dem", help="Local GeoTIFF/VRT or directory of DEMs."),
+    offline_pbf: Optional[Path] = typer.Option(None, "--offline-pbf", help="Local .osm.pbf or .osm XML file."),
+    overlay: Optional[list[Path]] = typer.Option(None, "--overlay", help="Optional user overlay (.geojson, .gpx, .csv)."),
+    date_iso: Optional[str] = typer.Option(None, "--date", help="ISO date (YYYY-MM-DD) for metadata."),
+    keep_workspace: bool = typer.Option(False, "--keep-workspace/--no-keep-workspace", help="Retain temp workspace."),
+    work_dir: Optional[Path] = typer.Option(None, "--work-dir", help="Explicit workspace directory."),
+    json_output: bool = typer.Option(False, "--json/--no-json", help="Print ExportResult list as JSON."),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging."),
+) -> None:
+    """Export an offline ATAK ``.mbtiles`` and/or Garmin Custom Maps ``.kmz`` archive."""
+    _configure_logging(verbose)
+
+    carto = CartoOptions(
+        contour_density=contour_density,
+        hillshade_strength=hillshade_strength,
+        label_density=label_density,
+        show_buildings=buildings,
+        show_trees=trees,
+        show_power=power,
+        show_pipelines=pipelines,
+        show_grid=grid,
+        show_river_arrows=river_arrows,
+    )
+    spec = _build_spec(
+        center=center,
+        scale=scale,
+        paper=paper,
+        orientation=orientation,
+        mode=mode,
+        units=units,
+        title=title,
+        date_iso=date_iso,
+        dpi=dpi,
+        dem_source=dem_source,
+        us_overlays=us_overlay,
+        carto=carto,
+    )
+
+    elev_src: ElevationSource | None = LocalDEMSource(offline_dem) if offline_dem is not None else None
+    vec_src: VectorSource | None = LocalPBFSource(offline_pbf) if offline_pbf is not None else None
+    overlay_srcs: list[OverlaySource] = [UserOverlaySource(p) for p in (overlay or [])]
+
+    results = run_export_job(
+        spec,
+        export_format,
+        output,
+        elevation_source=elev_src,
+        vector_source=vec_src,
+        overlay_sources=overlay_srcs or None,
+        mbtiles_format=mbtiles_format,
+        garmin_profile=garmin_profile,
+        max_tiles=max_tiles,
+        include_grid=grid,
+        dpi=dpi,
+        keep_workspace=keep_workspace,
+        work_dir=work_dir,
+    )
+
+    if json_output:
+        typer.echo(json.dumps([json.loads(r.model_dump_json()) for r in results], indent=2))
+    else:
+        for res in results:
+            zoom_info = (
+                f", zooms z{res.min_zoom}..z{res.max_zoom}"
+                if res.min_zoom is not None and res.max_zoom is not None
+                else ""
+            )
+            px_info = (
+                f", max_tile={res.max_tile_px[0]}x{res.max_tile_px[1]}px"
+                if res.max_tile_px is not None
+                else ""
+            )
+            typer.echo(
+                f"Exported {res.format.value.upper()} {res.output_path} "
+                f"({res.file_size_bytes:,} bytes, {res.tile_count} tiles{zoom_info}{px_info}) "
+                f"in {res.elapsed_seconds:.2f}s"
+            )
 
 
 @app.command("inspect")
