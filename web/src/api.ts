@@ -2,6 +2,7 @@ import type {
   CreateJobPayload,
   FootprintRequest,
   FootprintResponse,
+  GeocodeResponse,
   HealthResponse,
   JobRecord,
   PacksResponse,
@@ -50,10 +51,7 @@ async function parseErrorDetail(res: Response): Promise<string> {
   return `HTTP ${res.status} ${res.statusText}`;
 }
 
-async function requestJson<T>(
-  url: string,
-  init?: RequestInit
-): Promise<T> {
+async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, init);
   if (!res.ok) {
     const detail = await parseErrorDetail(res);
@@ -68,6 +66,20 @@ export function fetchHealth(): Promise<HealthResponse> {
 
 export function fetchPacks(): Promise<PacksResponse> {
   return requestJson<PacksResponse>("/api/packs");
+}
+
+export function fetchGeocode(
+  query: string,
+  limit = 5,
+  signal?: AbortSignal
+): Promise<GeocodeResponse> {
+  const params = new URLSearchParams({
+    q: query,
+    limit: String(limit),
+  });
+  return requestJson<GeocodeResponse>(`/api/geocode?${params.toString()}`, {
+    signal,
+  });
 }
 
 export function fetchFootprint(
@@ -130,4 +142,14 @@ export function artifactDownloadUrl(
     return explicitUrl;
   }
   return `/api/jobs/${encodeURIComponent(jobId)}/artifacts/${encodeURIComponent(filename)}`;
+}
+
+export function artifactPreviewUrl(
+  jobId: string,
+  filename: string,
+  explicitUrl?: string
+): string {
+  const base = artifactDownloadUrl(jobId, filename, explicitUrl);
+  const sep = base.includes("?") ? "&" : "?";
+  return `${base}${sep}inline=1`;
 }

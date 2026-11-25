@@ -72,6 +72,18 @@ export interface PacksResponse {
   packs: PackSummary[];
 }
 
+export interface GeocodeResult {
+  display_name: string;
+  short_name: string;
+  lat: number;
+  lon: number;
+  type: string;
+}
+
+export interface GeocodeResponse {
+  results: GeocodeResult[];
+}
+
 export interface DeclinationResponse {
   magnetic_declination_deg: number;
   annual_change_deg: number;
@@ -89,6 +101,8 @@ export interface FootprintRequest {
   orientation: Orientation;
   units: Units;
   date_iso?: string | null;
+  grid_cols?: number;
+  grid_rows?: number;
 }
 
 export interface FootprintResponse {
@@ -106,6 +120,11 @@ export interface FootprintResponse {
   frame_height_mm: number;
   ground_width_km: number;
   ground_height_km: number;
+  grid_cols?: number;
+  grid_rows?: number;
+  sheet_count?: number;
+  total_ground_width_km?: number;
+  total_ground_height_km?: number;
   grid_spacing_mm: number;
   declination: DeclinationResponse;
   footprint_geojson: FeatureCollection;
@@ -127,6 +146,8 @@ export interface CreateJobPayload {
   us_overlays: USOverlayKind[];
   carto: CartoOptions;
   outputs: OutputOptions;
+  grid_cols: number;
+  grid_rows: number;
 }
 
 export interface JobArtifact {
@@ -148,6 +169,8 @@ export interface JobRecord {
   paper: PaperSize;
   orientation: Orientation;
   color_mode: ColorMode;
+  grid_cols?: number;
+  grid_rows?: number;
   created_at: string;
   started_at?: string | null;
   finished_at?: string | null;
@@ -167,6 +190,8 @@ export interface AppFormState {
   orientation: Orientation;
   color_mode: ColorMode;
   units: Units;
+  grid_cols: number;
+  grid_rows: number;
   dem_source: DemSourceKind;
   pack_id: string;
   au_overlays: AUOverlayKind[];
@@ -185,6 +210,15 @@ export interface LocationPreset {
   scale: number;
   paper: PaperSize;
   units: Units;
+  dem_source?: DemSourceKind;
+  au_overlays?: AUOverlayKind[];
   defaultTitle: string;
   zoom: number;
+}
+
+export interface AtlasGridOption {
+  id: string;
+  label: string;
+  cols: number;
+  rows: number;
 }

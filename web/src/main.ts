@@ -13,23 +13,129 @@ import { SidebarPanel } from "./components/sidebar";
 import { TelemetryBar } from "./components/telemetry";
 import { GridForgeMap } from "./map";
 import {
+  AU_OVERLAY_OPTIONS,
   BASEMAP_OPTIONS,
+  DEM_SOURCE_OPTIONS,
+  PAPER_OPTIONS,
+  SCALE_OPTIONS,
+  US_OVERLAY_OPTIONS,
+  buildCliCommand,
   createInitialFormState,
   escapeHtml,
   formatCoords,
+  parseLatLon,
 } from "./presets";
 import type {
+  AUOverlayKind,
+  AppFormState,
   BasemapId,
+  ColorMode,
   CreateJobPayload,
+  DemSourceKind,
   FootprintResponse,
+  GeocodeResult,
   JobRecord,
   LocationPreset,
+  Orientation,
+  PaperSize,
+  USOverlayKind,
+  Units,
 } from "./types";
 
 const FOOTPRINT_DEBOUNCE_MS = 180;
 const ACTIVE_JOBS_POLL_MS = 2000;
 const IDLE_JOBS_POLL_MS = 10000;
 const HEALTH_POLL_MS = 5000;
+
+const VALID_SCALES = new Set(SCALE_OPTIONS.map((s) => s.value));
+const VALID_PAPERS = new Set<string>(PAPER_OPTIONS.map((p) => p.value));
+const VALID_DEMS = new Set<string>(DEM_SOURCE_OPTIONS.map((d) => d.value));
+const VALID_AU_OV = new Set<string>(AU_OVERLAY_OPTIONS.map((o) => o.value));
+const VALID_US_OV = new Set<string>(US_OVERLAY_OPTIONS.map((o) => o.value));
+
+function hydrateStateFromUrl(state: AppFormState): {
+  hasCustomCenter: boolean;
+  needsFlyToResolvedCenter: boolean;
+} {
+  const params = new URLSearchParams(window.location.search);
+  let hasCustomCenter = false;
+  let needsFlyToResolvedCenter = false;
+
+  const centerParam = params.get("center")?.trim();
+  if (centerParam) {
+    hasCustomCenter = true;
+    state.center = centerParam;
+    const parsed = parseLatLon(centerParam);
+    if (parsed) {
+      state.lat = parsed.lat;
+      state.lon = parsed.lon;
+    } else {
+      needsFlyToResolvedCenter = true;
+    }
+  }
+
+  const scaleParam = Number(params.get("scale"));
+  if (VALID_SCALES.has(scaleParam)) {
+    state.scale = scaleParam;
+  }
+
+  const paperParam = params.get("paper")?.toLowerCase();
+  if (paperParam && VALID_PAPERS.has(paperParam)) {
+    state.paper = paperParam as PaperSize;
+  }
+
+  const orientParam = params.get("orientation")?.toLowerCase();
+  if (orientParam === "portrait" || orientParam === "landscape") {
+    state.orientation = orientParam as Orientation;
+  }
+
+  const modeParam = params.get("mode")?.toLowerCase();
+  if (modeParam === "color" || modeParam === "bw") {
+    state.color_mode = modeParam as ColorMode;
+  }
+
+  const unitsParam = params.get("units")?.toLowerCase();
+  if (unitsParam === "metric" || unitsParam === "imperial") {
+    state.units = unitsParam as Units;
+  }
+
+  const demParam = params.get("dem")?.toLowerCase();
+  if (demParam && VALID_DEMS.has(demParam)) {
+    state.dem_source = demParam as DemSourceKind;
+  }
+
+  const gridParam = params.get("grid")?.toLowerCase();
+  if (gridParam) {
+    const match = /^([1-3])x([1-3])$/.exec(gridParam);
+    if (match) {
+      state.grid_cols = Number(match[1]);
+      state.grid_rows = Number(match[2]);
+    }
+  }
+
+  const titleParam = params.get("title")?.trim();
+  if (titleParam) {
+    state.title = titleParam.slice(0, 80);
+  }
+
+  const auParam = params.get("au")?.trim();
+  if (auParam) {
+    state.au_overlays = auParam
+      .split(",")
+      .map((s) => s.trim().toLowerCase())
+      .filter((s): s is AUOverlayKind => VALID_AU_OV.has(s));
+  }
+
+  const usParam = params.get("us")?.trim();
+  if (usParam) {
+    state.us_overlays = usParam
+      .split(",")
+      .map((s) => s.trim().toLowerCase())
+      .filter((s): s is USOverlayKind => VALID_US_OV.has(s));
+  }
+
+  return { hasCustomCenter, needsFlyToResolvedCenter };
+}
 
 class GridForgeApp {
   private readonly state = createInitialFormState();
@@ -48,12 +154,16 @@ class GridForgeApp {
   private activeBasemap: BasemapId = "opentopo";
   private latestFootprint: FootprintResponse | null = null;
   private jobs: JobRecord[] = [];
+  private readonly initialFlyToResolved: boolean;
 
   private footprintTimer: number | null = null;
   private footprintAbort: AbortController | null = null;
   private jobsPollTimer: number | null = null;
 
   constructor(root: HTMLElement) {
+    const urlHydration = hydrateStateFromUrl(this.state);
+    this.initialFlyToResolved = urlHydration.needsFlyToResolvedCenter;
+
     root.innerHTML = `
       <div class="gf-shell" data-role="shell">
         <header data-role="topbar"></header>
@@ -78,7 +188,7 @@ class GridForgeApp {
               ).join("")}
             </div>
             <div class="gf-map-actions">
-              <button type="button" class="gf-map-icon-btn" data-map-action="fit" title="Fit sheet footprint">⌖ Fit</button>
+              <button type="button" class="gf-map-icon-btn" data-map-action="fit" title="Fit sheet footprint (F)">⌖ Fit</button>
               <button type="button" class="gf-map-icon-btn" data-map-action="zoom-in" title="Zoom in">+</button>
               <button type="button" class="gf-map-icon-btn" data-map-action="zoom-out" title="Zoom out">−</button>
               <button type="button" class="gf-map-icon-btn" data-map-action="north" title="Reset north">N</button>
@@ -88,7 +198,7 @@ class GridForgeApp {
           <div class="gf-footprint-banner hidden" data-role="footprint-banner"></div>
 
           <div class="gf-map-hint">
-            <span>Click map or drag reticle to move sheet</span>
+            <span>Click map or drag reticle · F to fit</span>
             <span class="mono" data-role="cursor-coords">—</span>
           </div>
 
@@ -118,11 +228,30 @@ class GridForgeApp {
       {
         onCenterSubmit: (centerText) => {
           this.state.center = centerText;
-          this.requestFootprintImmediate({ flyToResult: true, syncMarker: true });
+          this.syncUrlFromState();
+          this.requestFootprintImmediate({
+            flyToResult: true,
+            syncMarker: true,
+          });
         },
+        onPlaceSelect: (place) => this.applyPlaceResult(place),
+        onPlaceNotFound: (query) =>
+          this.showToast(`No place found for "${query}"`, "error"),
         onPresetSelect: (preset) => this.applyPreset(preset),
-        onFootprintParamsChange: () => this.scheduleFootprint(),
+        onFootprintParamsChange: (opts) => {
+          this.syncUrlFromState();
+          if (opts?.fitAfterLoad) {
+            this.requestFootprintImmediate({
+              flyToResult: false,
+              syncMarker: false,
+              fitAfterLoad: true,
+            });
+          } else {
+            this.scheduleFootprint();
+          }
+        },
         onStateChange: () => {
+          this.syncUrlFromState();
           if (this.latestFootprint) {
             this.map.updateFootprint(
               this.latestFootprint.footprint_geojson,
@@ -133,7 +262,12 @@ class GridForgeApp {
         },
         onRefreshPacks: () => void this.loadPacks(true),
         onSubmitJob: () => void this.handleSubmitJob(),
-      }
+        onCopyCli: () => {
+          const cmd = buildCliCommand(this.state);
+          this.copyText(cmd, "Copied CLI command!");
+        },
+      },
+      urlHydration.hasCustomCenter ? null : "blue-mountains"
     );
 
     this.drawer = new JobsDrawer(this.q(root, "[data-role='drawer']"), {
@@ -143,25 +277,33 @@ class GridForgeApp {
       onDeleteJob: (jobId) => void this.handleDeleteJob(jobId),
     });
 
-    this.map = new GridForgeMap(this.q(root, "[data-role='map']"), {
-      onCenterDrag: (lat, lon) => {
-        this.state.lat = lat;
-        this.state.lon = lon;
-        this.state.center = formatCoords(lat, lon);
-        this.sidebar.setCenterInput(this.state.center, true);
-        this.scheduleFootprint();
+    this.map = new GridForgeMap(
+      this.q(root, "[data-role='map']"),
+      {
+        onCenterDrag: (lat, lon) => {
+          this.state.lat = lat;
+          this.state.lon = lon;
+          this.state.center = formatCoords(lat, lon);
+          this.sidebar.setCenterInput(this.state.center, true);
+          this.scheduleFootprint();
+        },
+        onCenterCommit: (lat, lon) => {
+          this.state.lat = lat;
+          this.state.lon = lon;
+          this.state.center = formatCoords(lat, lon);
+          this.sidebar.setCenterInput(this.state.center, true);
+          this.syncUrlFromState();
+          this.scheduleFootprint();
+        },
+        onCursorMove: (lat, lon) => {
+          this.cursorCoordsEl.textContent = `${lat.toFixed(4)}, ${lon.toFixed(4)}`;
+        },
       },
-      onCenterCommit: (lat, lon) => {
-        this.state.lat = lat;
-        this.state.lon = lon;
-        this.state.center = formatCoords(lat, lon);
-        this.sidebar.setCenterInput(this.state.center, true);
-        this.scheduleFootprint();
-      },
-      onCursorMove: (lat, lon) => {
-        this.cursorCoordsEl.textContent = `${lat.toFixed(4)}, ${lon.toFixed(4)}`;
-      },
-    });
+      {
+        initialLat: this.state.lat,
+        initialLon: this.state.lon,
+      }
+    );
 
     this.bindChromeEvents(root);
     this.bootstrap();
@@ -203,7 +345,7 @@ class GridForgeApp {
         btn.addEventListener("click", () => {
           const action = btn.dataset.mapAction;
           if (action === "fit") {
-            this.map.fitFootprint(this.sidebarCollapsed ? 24 : 368);
+            this.fitSheetOnMap();
           } else if (action === "zoom-in") {
             this.map.zoomIn();
           } else if (action === "zoom-out") {
@@ -215,29 +357,93 @@ class GridForgeApp {
       });
 
     window.addEventListener("keydown", (e) => {
-      const tag = (e.target as HTMLElement | null)?.tagName;
+      const target = e.target as HTMLElement | null;
+      const tag = target?.tagName;
       const inInput =
-        tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
+        tag === "INPUT" ||
+        tag === "TEXTAREA" ||
+        tag === "SELECT" ||
+        Boolean(target?.isContentEditable);
+
       if (e.key === "/" && !inInput) {
         e.preventDefault();
         if (this.sidebarCollapsed) {
           this.collapseBtnEl.click();
         }
         this.sidebar.focusCenterInput();
+      } else if (
+        (e.key === "f" || e.key === "F") &&
+        !inInput &&
+        !e.ctrlKey &&
+        !e.metaKey &&
+        !e.altKey
+      ) {
+        e.preventDefault();
+        this.fitSheetOnMap();
       } else if (e.key === "Escape" && this.drawerOpen) {
         this.setDrawerOpen(false);
       }
     });
   }
 
+  private fitSheetOnMap(): void {
+    this.map.fitFootprint(this.sidebarCollapsed ? 24 : 368);
+  }
+
   private bootstrap(): void {
-    this.requestFootprintImmediate({ flyToResult: false, syncMarker: true });
+    this.requestFootprintImmediate({
+      flyToResult: this.initialFlyToResolved,
+      syncMarker: true,
+      fitAfterLoad: this.state.grid_cols * this.state.grid_rows > 1,
+    });
     void this.loadHealth();
     void this.loadPacks(false);
     void this.pollJobsOnce();
 
     window.setInterval(() => void this.loadHealth(), HEALTH_POLL_MS);
     window.setInterval(() => this.drawer.tickElapsed(), 1000);
+  }
+
+  private syncUrlFromState(): void {
+    const params = new URLSearchParams();
+    params.set("center", this.state.center.replace(/\s*,\s*/, ","));
+    params.set("scale", String(this.state.scale));
+    params.set("paper", this.state.paper);
+    params.set("orientation", this.state.orientation);
+    params.set("mode", this.state.color_mode);
+    params.set("units", this.state.units);
+    if (this.state.dem_source !== "auto") {
+      params.set("dem", this.state.dem_source);
+    }
+    if (this.state.grid_cols !== 1 || this.state.grid_rows !== 1) {
+      params.set("grid", `${this.state.grid_cols}x${this.state.grid_rows}`);
+    }
+    if (this.state.title.trim()) {
+      params.set("title", this.state.title.trim());
+    }
+    if (this.state.au_overlays.length > 0) {
+      params.set("au", this.state.au_overlays.join(","));
+    }
+    if (this.state.us_overlays.length > 0) {
+      params.set("us", this.state.us_overlays.join(","));
+    }
+    const nextUrl = `${window.location.pathname}?${params.toString()}`;
+    window.history.replaceState(null, "", nextUrl);
+  }
+
+  private applyPlaceResult(place: GeocodeResult): void {
+    this.state.lat = place.lat;
+    this.state.lon = place.lon;
+    this.state.center = formatCoords(place.lat, place.lon);
+    this.sidebar.setCenterInput(this.state.center, true);
+    this.sidebar.setTitlePlaceholder(place.short_name.toUpperCase());
+    this.syncUrlFromState();
+    this.map.setCenter(place.lat, place.lon, { fly: true, zoom: 12 });
+    this.requestFootprintImmediate({
+      flyToResult: false,
+      syncMarker: false,
+    });
+    this.showToast(`Centered on ${place.short_name}`, "info");
   }
 
   private applyPreset(preset: LocationPreset): void {
@@ -247,10 +453,21 @@ class GridForgeApp {
     this.state.scale = preset.scale;
     this.state.paper = preset.paper;
     this.state.units = preset.units;
+    if (preset.dem_source) {
+      this.state.dem_source = preset.dem_source;
+    }
+    if (preset.au_overlays) {
+      this.state.au_overlays = [...preset.au_overlays];
+      this.state.us_overlays = [];
+    }
     this.sidebar.setTitlePlaceholder(preset.defaultTitle);
     this.sidebar.syncControlsFromState();
+    this.syncUrlFromState();
     this.map.setCenter(preset.lat, preset.lon, { fly: true, zoom: preset.zoom });
-    this.requestFootprintImmediate({ flyToResult: false, syncMarker: false });
+    this.requestFootprintImmediate({
+      flyToResult: false,
+      syncMarker: false,
+    });
   }
 
   private setDrawerOpen(open: boolean): void {
@@ -265,13 +482,17 @@ class GridForgeApp {
     }
     this.footprintTimer = window.setTimeout(() => {
       this.footprintTimer = null;
-      void this.loadFootprint({ flyToResult: false, syncMarker: false });
+      void this.loadFootprint({
+        flyToResult: false,
+        syncMarker: false,
+      });
     }, FOOTPRINT_DEBOUNCE_MS);
   }
 
   private requestFootprintImmediate(options: {
     flyToResult: boolean;
     syncMarker: boolean;
+    fitAfterLoad?: boolean;
   }): void {
     if (this.footprintTimer !== null) {
       window.clearTimeout(this.footprintTimer);
@@ -283,6 +504,7 @@ class GridForgeApp {
   private async loadFootprint(options: {
     flyToResult: boolean;
     syncMarker: boolean;
+    fitAfterLoad?: boolean;
   }): Promise<void> {
     this.footprintAbort?.abort();
     const controller = new AbortController();
@@ -296,6 +518,8 @@ class GridForgeApp {
           paper: this.state.paper,
           orientation: this.state.orientation,
           units: this.state.units,
+          grid_cols: this.state.grid_cols,
+          grid_rows: this.state.grid_rows,
         },
         controller.signal
       );
@@ -315,6 +539,9 @@ class GridForgeApp {
         this.map.setCenter(fp.center_lat, fp.center_lon, {
           fly: options.flyToResult,
         });
+      }
+      if (options.fitAfterLoad) {
+        this.fitSheetOnMap();
       }
       this.setFootprintError(null);
     } catch (err) {
@@ -401,7 +628,8 @@ class GridForgeApp {
 
   private buildJobPayload(): CreateJobPayload {
     return {
-      center: this.state.center.trim() || formatCoords(this.state.lat, this.state.lon),
+      center:
+        this.state.center.trim() || formatCoords(this.state.lat, this.state.lon),
       scale: this.state.scale,
       paper: this.state.paper,
       orientation: this.state.orientation,
@@ -414,6 +642,8 @@ class GridForgeApp {
       us_overlays: [...this.state.us_overlays],
       carto: { ...this.state.carto },
       outputs: { ...this.state.outputs },
+      grid_cols: this.state.grid_cols,
+      grid_rows: this.state.grid_rows,
     };
   }
 
@@ -475,8 +705,10 @@ class GridForgeApp {
     if (navigator.clipboard?.writeText) {
       navigator.clipboard
         .writeText(text)
-        .then(() => this.showToast(label, "info"))
+        .then(() => this.showToast(label, "success"))
         .catch(() => this.showToast("Clipboard unavailable", "error"));
+    } else {
+      this.showToast("Clipboard unavailable", "error");
     }
   }
 

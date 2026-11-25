@@ -1,6 +1,6 @@
 import maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
-import type { FeatureCollection, Position } from "geojson";
+import type { Feature, FeatureCollection, Point, Position } from "geojson";
 import {
   DEFAULT_CENTER_LAT,
   DEFAULT_CENTER_LON,
@@ -17,6 +17,12 @@ export interface GridForgeMapCallbacks {
   onCenterDrag: (lat: number, lon: number) => void;
   onCenterCommit: (lat: number, lon: number) => void;
   onCursorMove?: (lat: number, lon: number) => void;
+}
+
+export interface GridForgeMapOptions {
+  initialLat?: number;
+  initialLon?: number;
+  initialZoom?: number;
 }
 
 function buildInitialStyle(): maplibregl.StyleSpecification {
@@ -39,7 +45,8 @@ function buildInitialStyle(): maplibregl.StyleSpecification {
         tiles: ["https://tile.opentopomap.org/{z}/{x}/{y}.png"],
         tileSize: 256,
         maxzoom: 17,
-        attribution: "Map data: © OpenStreetMap contributors, SRTM | Style: © OpenTopoMap (CC-BY-SA)",
+        attribution:
+          "Map data: © OpenStreetMap contributors, SRTM | Style: © OpenTopoMap (CC-BY-SA)",
       },
       "esri-imagery": {
         type: "raster",
@@ -55,6 +62,10 @@ function buildInitialStyle(): maplibregl.StyleSpecification {
         data: EMPTY_FC,
       },
       "mgrs-grid": {
+        type: "geojson",
+        data: EMPTY_FC,
+      },
+      "sheet-labels": {
         type: "geojson",
         data: EMPTY_FC,
       },
@@ -159,6 +170,16 @@ function buildInitialStyle(): maplibregl.StyleSpecification {
           "line-opacity": 0.98,
         },
       },
+      {
+        id: "sheet-labels-layer",
+        type: "symbol",
+        source: "sheet-labels",
+        layout: {
+          "icon-image": ["get", "icon_id"],
+          "icon-allow-overlap": true,
+          "icon-ignore-placement": true,
+        },
+      },
     ],
   };
 }
@@ -183,6 +204,106 @@ function createReticleElement(): HTMLDivElement {
     </svg>
   `;
   return el;
+}
+
+function renderSheetBadgeImage(label: string): {
+  width: number;
+  height: number;
+  data: Uint8Array;
+} | null {
+  const scale = 2;
+  const w = 36 * scale;
+  const h = 22 * scale;
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return null;
+
+  const r = 5 * scale;
+  const inset = 1.5 * scale;
+  ctx.beginPath();
+  ctx.roundRect(inset, inset, w - inset * 2, h - inset * 2, r);
+  ctx.fillStyle = "rgba(15, 20, 25, 0.88)";
+  ctx.fill();
+  ctx.lineWidth = 1.5 * scale;
+  ctx.strokeStyle = "#F59E0B";
+  ctx.stroke();
+
+  ctx.fillStyle = "#FBBF24";
+  ctx.font = `700 ${12 * scale}px "JetBrains Mono", "SF Mono", ui-monospace, monospace`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(label, w / 2, h / 2 + 0.5 * scale);
+
+  const img = ctx.getImageData(0, 0, w, h);
+  return { width: w, height: h, data: new Uint8Array(img.data.buffer) };
+}
+
+function polygonCentroid(ring: Position[]): [number, number] | null {
+  if (ring.length === 0) return null;
+  const count =
+    ring.length > 1 &&
+    ring[0]?.[0] === ring[ring.length - 1]?.[0] &&
+    ring[0]?.[1] === ring[ring.length - 1]?.[1]
+      ? ring.length - 1
+      : ring.length;
+  if (count <= 0) return null;
+
+  let sumX = 0;
+  let sumY = 0;
+  for (let i = 0; i < count; i += 1) {
+    const p = ring[i];
+    if (!p || typeof p[0] !== "number" || typeof p[1] !== "number") continue;
+    sumX += p[0];
+    sumY += p[1];
+  }
+  return [sumX / count, sumY / count];
+}
+
+function buildSheetLabelsGeoJson(
+  footprint: FeatureCollection
+): { fc: FeatureCollection<Point>; labels: string[] } {
+  if (footprint.features.length <= 1) {
+    return { fc: { type: "FeatureCollection", features: [] }, labels: [] };
+  }
+
+  const labelFeatures: Feature<Point>[] = [];
+  const labels: string[] = [];
+
+  for (let idx = 0; idx < footprint.features.length; idx += 1) {
+    const feat = footprint.features[idx];
+    if (!feat || !feat.geometry || feat.geometry.type !== "Polygon") continue;
+    const outerRing = feat.geometry.coordinates[0];
+    if (!outerRing) continue;
+    const centroid = polygonCentroid(outerRing);
+    if (!centroid) continue;
+
+    const props = (feat.properties ?? {}) as Record<string, unknown>;
+    const rawLabel =
+      typeof props.label === "string"
+        ? props.label
+        : typeof props.sheet_id === "string"
+          ? props.sheet_id
+          : `S${idx + 1}`;
+    const label = rawLabel.trim().toUpperCase().slice(0, 4);
+    const iconId = `sheet-label-${label}`;
+    labels.push(label);
+
+    labelFeatures.push({
+      type: "Feature",
+      properties: { label, icon_id: iconId },
+      geometry: {
+        type: "Point",
+        coordinates: centroid,
+      },
+    });
+  }
+
+  return {
+    fc: { type: "FeatureCollection", features: labelFeatures },
+    labels,
+  };
 }
 
 function collectPositions(fc: FeatureCollection): Position[] {
@@ -220,12 +341,20 @@ export class GridForgeMap {
   private suppressClickUntil = 0;
   private draggingMarker = false;
 
-  constructor(container: HTMLElement, callbacks: GridForgeMapCallbacks) {
+  constructor(
+    container: HTMLElement,
+    callbacks: GridForgeMapCallbacks,
+    options?: GridForgeMapOptions
+  ) {
+    const initLat = options?.initialLat ?? DEFAULT_CENTER_LAT;
+    const initLon = options?.initialLon ?? DEFAULT_CENTER_LON;
+    const initZoom = options?.initialZoom ?? DEFAULT_MAP_ZOOM;
+
     this.map = new maplibregl.Map({
       container,
       style: buildInitialStyle(),
-      center: [DEFAULT_CENTER_LON, DEFAULT_CENTER_LAT],
-      zoom: DEFAULT_MAP_ZOOM,
+      center: [initLon, initLat],
+      zoom: initZoom,
       attributionControl: false,
       pitchWithRotate: false,
     });
@@ -244,7 +373,7 @@ export class GridForgeMap {
       draggable: true,
       anchor: "center",
     })
-      .setLngLat([DEFAULT_CENTER_LON, DEFAULT_CENTER_LAT])
+      .setLngLat([initLon, initLat])
       .addTo(this.map);
 
     this.marker.on("dragstart", () => {
@@ -318,11 +447,26 @@ export class GridForgeMap {
     );
   }
 
+  private ensureSheetLabelImages(labels: string[]): void {
+    for (const label of labels) {
+      const iconId = `sheet-label-${label}`;
+      if (this.map.hasImage(iconId)) continue;
+      const rendered = renderSheetBadgeImage(label);
+      if (rendered) {
+        this.map.addImage(iconId, rendered, { pixelRatio: 2 });
+      }
+    }
+  }
+
   isDragging(): boolean {
     return this.draggingMarker;
   }
 
-  setCenter(lat: number, lon: number, options?: { fly?: boolean; zoom?: number }): void {
+  setCenter(
+    lat: number,
+    lon: number,
+    options?: { fly?: boolean; zoom?: number }
+  ): void {
     this.marker.setLngLat([lon, lat]);
     if (options?.fly) {
       this.map.flyTo({
@@ -359,12 +503,19 @@ export class GridForgeMap {
     const gridSource = this.map.getSource("mgrs-grid") as
       | maplibregl.GeoJSONSource
       | undefined;
+    const labelSource = this.map.getSource("sheet-labels") as
+      | maplibregl.GeoJSONSource
+      | undefined;
+
+    const { fc: labelsFc, labels } = buildSheetLabelsGeoJson(footprint);
+    this.ensureSheetLabelImages(labels);
 
     fpSource?.setData(footprint);
     gridSource?.setData(grid);
+    labelSource?.setData(labelsFc);
   }
 
-  fitFootprint(sidebarWidthPx = 360): void {
+  fitFootprint(sidebarWidthPx = 368): void {
     if (!this.currentFootprint) return;
     const positions = collectPositions(this.currentFootprint);
     if (positions.length === 0) return;
@@ -382,9 +533,12 @@ export class GridForgeMap {
     this.map.fitBounds(bounds, {
       padding: {
         top: 84,
-        bottom: 72,
-        left: Math.min(sidebarWidthPx + 56, Math.floor(window.innerWidth * 0.42)),
-        right: 84,
+        bottom: 84,
+        left: Math.min(
+          sidebarWidthPx + 48,
+          Math.floor(window.innerWidth * 0.44)
+        ),
+        right: 72,
       },
       duration: 500,
       maxZoom: 15,

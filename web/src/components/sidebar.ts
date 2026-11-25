@@ -1,4 +1,6 @@
+import { fetchGeocode } from "../api";
 import {
+  ATLAS_GRID_OPTIONS,
   AU_OVERLAY_OPTIONS,
   CARTO_TOGGLES,
   DEM_SOURCE_OPTIONS,
@@ -10,6 +12,7 @@ import {
   US_OVERLAY_OPTIONS,
   escapeHtml,
   formatBytes,
+  looksLikeCoordOrMgrs,
 } from "../presets";
 import type {
   AUOverlayKind,
@@ -18,6 +21,7 @@ import type {
   DemSourceKind,
   DensityLevel,
   GarminProfile,
+  GeocodeResult,
   HillshadeStrength,
   LocationPreset,
   MBTilesFormat,
@@ -30,13 +34,17 @@ import type {
 
 export interface SidebarCallbacks {
   onCenterSubmit: (centerText: string) => void;
+  onPlaceSelect: (place: GeocodeResult) => void;
+  onPlaceNotFound: (query: string) => void;
   onPresetSelect: (preset: LocationPreset) => void;
-  onFootprintParamsChange: () => void;
+  onFootprintParamsChange: (options?: { fitAfterLoad?: boolean }) => void;
   onStateChange: () => void;
   onRefreshPacks: () => void;
   onSubmitJob: () => void;
+  onCopyCli: () => void;
 }
 
+const GEOCODE_DEBOUNCE_MS = 300;
 const CHEVRON_SVG = `<svg class="gf-chevron" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
 
 export class SidebarPanel {
@@ -45,9 +53,12 @@ export class SidebarPanel {
   private readonly callbacks: SidebarCallbacks;
 
   private centerInput!: HTMLInputElement;
+  private geocodeWrapEl!: HTMLElement;
+  private geocodeMenuEl!: HTMLElement;
   private titleInput!: HTMLInputElement;
   private scaleSelect!: HTMLSelectElement;
   private paperSelect!: HTMLSelectElement;
+  private atlasSublabelEl!: HTMLElement;
   private demSelect!: HTMLSelectElement;
   private packSelect!: HTMLSelectElement;
   private contourSelect!: HTMLSelectElement;
@@ -73,14 +84,21 @@ export class SidebarPanel {
   private cartoPillEl!: HTMLElement;
   private activePresetId: string | null = "blue-mountains";
 
+  private geocodeTimer: number | null = null;
+  private geocodeAbort: AbortController | null = null;
+  private geocodeResults: GeocodeResult[] = [];
+  private geocodeHighlightIdx = -1;
+
   constructor(
     container: HTMLElement,
     state: AppFormState,
-    callbacks: SidebarCallbacks
+    callbacks: SidebarCallbacks,
+    initialPresetId: string | null = "blue-mountains"
   ) {
     this.root = container;
     this.state = state;
     this.callbacks = callbacks;
+    this.activePresetId = initialPresetId;
     this.root.className = "gf-sidebar";
     this.render();
     this.bindEvents();
@@ -104,6 +122,11 @@ export class SidebarPanel {
     const paperOptsHtml = PAPER_OPTIONS.map(
       (p) =>
         `<option value="${p.value}">${escapeHtml(p.label)} (${escapeHtml(p.dims)})</option>`
+    ).join("");
+
+    const atlasBtnsHtml = ATLAS_GRID_OPTIONS.map(
+      (a) =>
+        `<button type="button" class="gf-atlas-btn" data-atlas-cols="${a.cols}" data-atlas-rows="${a.rows}" title="${a.cols * a.rows === 1 ? "Single sheet" : `${a.cols * a.rows} edge-matched sheets`}">${escapeHtml(a.label)}</button>`
     ).join("");
 
     const demOptsHtml = DEM_SOURCE_OPTIONS.map(
@@ -167,19 +190,22 @@ export class SidebarPanel {
           <div class="gf-section-body">
             <div class="gf-field">
               <label class="gf-label" for="gf-center-input">
-                <span>Center Coordinate or MGRS</span>
-                <span class="gf-sublabel">Press / to focus</span>
+                <span>Coordinate, MGRS, or Place Name</span>
+                <span class="gf-sublabel">/ to search</span>
               </label>
-              <div class="gf-input-group">
-                <input
-                  id="gf-center-input"
-                  class="gf-input mono"
-                  type="text"
-                  placeholder="-33.732, 150.312 or 56HLH4360266466"
-                  autocomplete="off"
-                  spellcheck="false"
-                />
-                <button type="button" class="gf-btn-secondary" data-role="go-center">Go</button>
+              <div class="gf-geocode-wrap" data-role="geocode-wrap">
+                <div class="gf-input-group">
+                  <input
+                    id="gf-center-input"
+                    class="gf-input mono"
+                    type="text"
+                    placeholder="Kosciuszko, -33.732, 150.312, or 56HLH…"
+                    autocomplete="off"
+                    spellcheck="false"
+                  />
+                  <button type="button" class="gf-btn-secondary" data-role="go-center">Go</button>
+                </div>
+                <div class="gf-geocode-menu hidden" data-role="geocode-menu" role="listbox"></div>
               </div>
             </div>
             <div class="gf-field">
@@ -199,7 +225,7 @@ export class SidebarPanel {
               <span class="gf-section-title">Sheet &amp; Print</span>
             </span>
             <span class="gf-section-meta">
-              <span class="gf-section-pill" data-role="sheet-pill">1:25k · A4</span>
+              <span class="gf-section-pill" data-role="sheet-pill">1:25k · A4 P</span>
               ${CHEVRON_SVG}
             </span>
           </summary>
@@ -230,6 +256,16 @@ export class SidebarPanel {
                 <select id="gf-paper-select" class="gf-select">
                   ${paperOptsHtml}
                 </select>
+              </div>
+            </div>
+
+            <div class="gf-field">
+              <span class="gf-label">
+                <span>Atlas Grid</span>
+                <span class="gf-sublabel" data-role="atlas-sublabel">Single sheet</span>
+              </span>
+              <div class="gf-atlas-grid" data-role="atlas-grid">
+                ${atlasBtnsHtml}
               </div>
             </div>
 
@@ -414,16 +450,32 @@ export class SidebarPanel {
 
         <div class="gf-form-error hidden" data-role="form-error"></div>
 
-        <button type="button" class="gf-generate-btn" data-role="generate-btn">
-          <span>Generate Map Sheet</span>
-        </button>
+        <div class="gf-footer-actions">
+          <button type="button" class="gf-generate-btn" data-role="generate-btn">
+            <span>Generate Map Sheet</span>
+          </button>
+          <button
+            type="button"
+            class="gf-cli-btn"
+            data-role="copy-cli"
+            title="Copy reproducible docker compose CLI command"
+          >
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <path d="M2.5 4.5L6 8L2.5 11.5M7.5 11.5H13.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+            <span>CLI</span>
+          </button>
+        </div>
       </div>
     `;
 
     this.centerInput = this.q<HTMLInputElement>("#gf-center-input");
+    this.geocodeWrapEl = this.q("[data-role='geocode-wrap']");
+    this.geocodeMenuEl = this.q("[data-role='geocode-menu']");
     this.titleInput = this.q<HTMLInputElement>("#gf-title-input");
     this.scaleSelect = this.q<HTMLSelectElement>("#gf-scale-select");
     this.paperSelect = this.q<HTMLSelectElement>("#gf-paper-select");
+    this.atlasSublabelEl = this.q("[data-role='atlas-sublabel']");
     this.demSelect = this.q<HTMLSelectElement>("#gf-dem-select");
     this.packSelect = this.q<HTMLSelectElement>("#gf-pack-select");
     this.contourSelect = this.q<HTMLSelectElement>("#gf-contour-select");
@@ -437,10 +489,16 @@ export class SidebarPanel {
     this.outPdfCheck = this.q<HTMLInputElement>("[data-role='out-pdf']");
     this.outGeoPdfCheck = this.q<HTMLInputElement>("[data-role='out-geopdf']");
     this.outMbtilesCheck = this.q<HTMLInputElement>("[data-role='out-mbtiles']");
-    this.outMbtilesFmt = this.q<HTMLSelectElement>("[data-role='out-mbtiles-fmt']");
+    this.outMbtilesFmt = this.q<HTMLSelectElement>(
+      "[data-role='out-mbtiles-fmt']"
+    );
     this.outKmzCheck = this.q<HTMLInputElement>("[data-role='out-kmz']");
-    this.outGarminProfile = this.q<HTMLSelectElement>("[data-role='out-garmin-profile']");
-    this.outDigitalGridCheck = this.q<HTMLInputElement>("[data-role='out-digital-grid']");
+    this.outGarminProfile = this.q<HTMLSelectElement>(
+      "[data-role='out-garmin-profile']"
+    );
+    this.outDigitalGridCheck = this.q<HTMLInputElement>(
+      "[data-role='out-digital-grid']"
+    );
     this.digitalGridRow = this.q("[data-role='digital-grid-row']");
     this.generateBtn = this.q<HTMLButtonElement>("[data-role='generate-btn']");
     this.formErrorEl = this.q("[data-role='form-error']");
@@ -456,19 +514,117 @@ export class SidebarPanel {
   }
 
   private bindEvents(): void {
-    const submitCenter = () => {
+    const submitCenterOrPlace = async () => {
       const value = this.centerInput.value.trim();
       if (!value) return;
-      this.activePresetId = null;
-      this.updatePresetButtons();
-      this.callbacks.onCenterSubmit(value);
+
+      if (
+        !this.geocodeMenuEl.classList.contains("hidden") &&
+        this.geocodeHighlightIdx >= 0 &&
+        this.geocodeResults[this.geocodeHighlightIdx]
+      ) {
+        const picked = this.geocodeResults[this.geocodeHighlightIdx]!;
+        this.choosePlace(picked);
+        return;
+      }
+
+      if (looksLikeCoordOrMgrs(value)) {
+        this.closeGeocodeMenu();
+        this.activePresetId = null;
+        this.updatePresetButtons();
+        this.callbacks.onCenterSubmit(value);
+        return;
+      }
+
+      if (this.geocodeResults.length > 0 && this.geocodeResults[0]) {
+        this.choosePlace(this.geocodeResults[0]);
+        return;
+      }
+
+      // Immediate place lookup on Enter/Go
+      this.cancelPendingGeocode();
+      const controller = new AbortController();
+      this.geocodeAbort = controller;
+      this.showGeocodeStatus("Searching places…");
+      try {
+        const res = await fetchGeocode(value, 5, controller.signal);
+        if (controller.signal.aborted) return;
+        if (res.results.length > 0 && res.results[0]) {
+          this.choosePlace(res.results[0]);
+        } else {
+          this.closeGeocodeMenu();
+          this.callbacks.onPlaceNotFound(value);
+        }
+      } catch {
+        if (!controller.signal.aborted) {
+          this.closeGeocodeMenu();
+          this.callbacks.onPlaceNotFound(value);
+        }
+      }
     };
 
-    this.q("[data-role='go-center']").addEventListener("click", submitCenter);
+    this.q("[data-role='go-center']").addEventListener("click", () => {
+      void submitCenterOrPlace();
+    });
+
+    this.centerInput.addEventListener("input", () => {
+      const value = this.centerInput.value.trim();
+      if (value.length < 2 || looksLikeCoordOrMgrs(value)) {
+        this.closeGeocodeMenu();
+        return;
+      }
+      this.scheduleGeocode(value);
+    });
+
     this.centerInput.addEventListener("keydown", (e) => {
+      const menuOpen = !this.geocodeMenuEl.classList.contains("hidden");
+      if (e.key === "ArrowDown" && menuOpen && this.geocodeResults.length > 0) {
+        e.preventDefault();
+        this.geocodeHighlightIdx =
+          (this.geocodeHighlightIdx + 1) % this.geocodeResults.length;
+        this.renderGeocodeResults();
+        return;
+      }
+      if (e.key === "ArrowUp" && menuOpen && this.geocodeResults.length > 0) {
+        e.preventDefault();
+        this.geocodeHighlightIdx =
+          (this.geocodeHighlightIdx - 1 + this.geocodeResults.length) %
+          this.geocodeResults.length;
+        this.renderGeocodeResults();
+        return;
+      }
+      if (e.key === "Escape" && menuOpen) {
+        e.preventDefault();
+        e.stopPropagation();
+        this.closeGeocodeMenu();
+        return;
+      }
       if (e.key === "Enter") {
         e.preventDefault();
-        submitCenter();
+        void submitCenterOrPlace();
+      }
+    });
+
+    this.geocodeMenuEl.addEventListener("mousedown", (e) => {
+      // Prevent input blur before click registers
+      e.preventDefault();
+    });
+
+    this.geocodeMenuEl.addEventListener("click", (e) => {
+      const target = e.target as HTMLElement | null;
+      const item = target?.closest<HTMLButtonElement>("[data-geocode-idx]");
+      if (!item) return;
+      const idx = Number(item.dataset.geocodeIdx);
+      const picked = this.geocodeResults[idx];
+      if (picked) {
+        this.choosePlace(picked);
+      }
+    });
+
+    document.addEventListener("click", (e) => {
+      const target = e.target as Node | null;
+      if (target && !this.geocodeWrapEl.contains(target)) {
+        this.closeGeocodeMenu();
       }
     });
 
@@ -480,6 +636,7 @@ export class SidebarPanel {
             (p) => p.id === btn.dataset.preset
           );
           if (!preset) return;
+          this.closeGeocodeMenu();
           this.activePresetId = preset.id;
           this.callbacks.onPresetSelect(preset);
         });
@@ -501,6 +658,26 @@ export class SidebarPanel {
       this.updateSectionPills();
       this.callbacks.onFootprintParamsChange();
     });
+
+    this.root
+      .querySelectorAll<HTMLButtonElement>("[data-atlas-cols]")
+      .forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const cols = Number(btn.dataset.atlasCols);
+          const rows = Number(btn.dataset.atlasRows);
+          if (
+            this.state.grid_cols === cols &&
+            this.state.grid_rows === rows
+          ) {
+            return;
+          }
+          this.state.grid_cols = cols;
+          this.state.grid_rows = rows;
+          this.updateAtlasButtons();
+          this.updateSectionPills();
+          this.callbacks.onFootprintParamsChange({ fitAfterLoad: true });
+        });
+      });
 
     this.bindSegmented("orientation", (val) => {
       this.state.orientation = val as Orientation;
@@ -725,6 +902,95 @@ export class SidebarPanel {
       this.setFormError(null);
       this.callbacks.onSubmitJob();
     });
+
+    this.q("[data-role='copy-cli']").addEventListener("click", () => {
+      this.callbacks.onCopyCli();
+    });
+  }
+
+  private cancelPendingGeocode(): void {
+    if (this.geocodeTimer !== null) {
+      window.clearTimeout(this.geocodeTimer);
+      this.geocodeTimer = null;
+    }
+    this.geocodeAbort?.abort();
+    this.geocodeAbort = null;
+  }
+
+  private scheduleGeocode(query: string): void {
+    this.cancelPendingGeocode();
+    this.geocodeTimer = window.setTimeout(() => {
+      this.geocodeTimer = null;
+      void this.runGeocode(query);
+    }, GEOCODE_DEBOUNCE_MS);
+  }
+
+  private async runGeocode(query: string): Promise<void> {
+    const controller = new AbortController();
+    this.geocodeAbort = controller;
+    this.showGeocodeStatus("Searching places…");
+
+    try {
+      const res = await fetchGeocode(query, 5, controller.signal);
+      if (controller.signal.aborted) return;
+      this.geocodeResults = res.results;
+      this.geocodeHighlightIdx = res.results.length > 0 ? 0 : -1;
+      if (res.results.length === 0) {
+        this.showGeocodeStatus("No matching places found");
+      } else {
+        this.renderGeocodeResults();
+      }
+    } catch {
+      if (!controller.signal.aborted) {
+        this.closeGeocodeMenu();
+      }
+    }
+  }
+
+  private showGeocodeStatus(text: string): void {
+    this.geocodeMenuEl.innerHTML = `<div class="gf-geocode-status">${escapeHtml(text)}</div>`;
+    this.geocodeMenuEl.classList.remove("hidden");
+  }
+
+  private renderGeocodeResults(): void {
+    this.geocodeMenuEl.innerHTML = this.geocodeResults
+      .map((r, idx) => {
+        const activeClass =
+          idx === this.geocodeHighlightIdx ? " highlighted" : "";
+        return `
+          <button
+            type="button"
+            class="gf-geocode-item${activeClass}"
+            data-geocode-idx="${idx}"
+            role="option"
+            aria-selected="${idx === this.geocodeHighlightIdx}"
+          >
+            <span class="gf-geocode-head">
+              <span class="gf-geocode-name">${escapeHtml(r.short_name)}</span>
+              <span class="gf-geocode-type">${escapeHtml(r.type)}</span>
+            </span>
+            <span class="gf-geocode-sub">${escapeHtml(r.display_name)}</span>
+            <span class="gf-geocode-coords">${r.lat.toFixed(4)}, ${r.lon.toFixed(4)}</span>
+          </button>
+        `;
+      })
+      .join("");
+    this.geocodeMenuEl.classList.remove("hidden");
+  }
+
+  private choosePlace(place: GeocodeResult): void {
+    this.closeGeocodeMenu();
+    this.activePresetId = null;
+    this.updatePresetButtons();
+    this.callbacks.onPlaceSelect(place);
+  }
+
+  closeGeocodeMenu(): void {
+    this.cancelPendingGeocode();
+    this.geocodeResults = [];
+    this.geocodeHighlightIdx = -1;
+    this.geocodeMenuEl.classList.add("hidden");
+    this.geocodeMenuEl.innerHTML = "";
   }
 
   private bindSegmented(name: string, onChange: (val: string) => void): void {
@@ -748,6 +1014,22 @@ export class SidebarPanel {
     group
       .querySelectorAll<HTMLButtonElement>(".gf-seg-btn")
       .forEach((b) => b.classList.toggle("active", b.dataset.value === value));
+  }
+
+  private updateAtlasButtons(): void {
+    this.root
+      .querySelectorAll<HTMLButtonElement>("[data-atlas-cols]")
+      .forEach((btn) => {
+        const active =
+          Number(btn.dataset.atlasCols) === this.state.grid_cols &&
+          Number(btn.dataset.atlasRows) === this.state.grid_rows;
+        btn.classList.toggle("active", active);
+      });
+    const count = this.state.grid_cols * this.state.grid_rows;
+    this.atlasSublabelEl.textContent =
+      count === 1
+        ? "Single sheet"
+        : `${count} edge-matched sheets (multi-page PDF)`;
   }
 
   private updatePresetButtons(): void {
@@ -775,20 +1057,23 @@ export class SidebarPanel {
     const scaleK = `1:${Math.round(this.state.scale / 1000)}k`;
     const paperLbl = this.state.paper.toUpperCase();
     const orientShort = this.state.orientation === "landscape" ? "L" : "P";
-    this.sheetPillEl.textContent = `${scaleK} · ${paperLbl} ${orientShort}`;
+    const atlasSuffix =
+      this.state.grid_cols * this.state.grid_rows > 1
+        ? ` · ${this.state.grid_cols}×${this.state.grid_rows}`
+        : "";
+    this.sheetPillEl.textContent = `${scaleK} · ${paperLbl} ${orientShort}${atlasSuffix}`;
 
     const overlayCount =
       this.state.au_overlays.length + this.state.us_overlays.length;
-    const demShort =
-      this.state.pack_id
-        ? "Pack"
-        : this.state.dem_source === "auto"
-          ? "Auto"
-          : this.state.dem_source === "au-elvis"
-            ? "AU GA"
-            : this.state.dem_source === "usgs3dep"
-              ? "3DEP"
-              : "GLO-30";
+    const demShort = this.state.pack_id
+      ? "Pack"
+      : this.state.dem_source === "auto"
+        ? "Auto"
+        : this.state.dem_source === "au-elvis"
+          ? "AU GA"
+          : this.state.dem_source === "usgs3dep"
+            ? "3DEP"
+            : "GLO-30";
     this.overlayPillEl.textContent =
       overlayCount > 0 ? `${demShort} · +${overlayCount}` : demShort;
 
@@ -865,6 +1150,7 @@ export class SidebarPanel {
     this.digitalGridRow.style.opacity = anyDigital ? "1" : "0.45";
 
     this.syncFileDisplay();
+    this.updateAtlasButtons();
     this.updatePresetButtons();
     this.updateSectionPills();
   }

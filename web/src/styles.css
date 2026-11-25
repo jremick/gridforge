@@ -91,7 +91,7 @@ button {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  gap: 10px;
   padding: 0 12px;
   background: #0c1116;
   border-bottom: 1px solid var(--border-subtle);
@@ -101,7 +101,7 @@ button {
 .gf-brand {
   display: flex;
   align-items: center;
-  gap: 9px;
+  gap: 8px;
   flex-shrink: 0;
 }
 
@@ -114,8 +114,8 @@ button {
 
 .gf-brand-name {
   font-weight: 700;
-  font-size: 13.5px;
-  letter-spacing: 0.12em;
+  font-size: 13px;
+  letter-spacing: 0.11em;
   text-transform: uppercase;
   color: var(--text-primary);
 }
@@ -136,7 +136,7 @@ button {
   display: flex;
   align-items: center;
   gap: 0;
-  flex: 1;
+  flex: 1 1 auto;
   min-width: 0;
   overflow-x: auto;
   scrollbar-width: none;
@@ -154,9 +154,10 @@ button {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 0 11px;
+  padding: 0 10px;
   height: 100%;
   white-space: nowrap;
+  flex-shrink: 0;
   border-right: 1px solid var(--border-subtle);
   font-size: 12px;
 }
@@ -177,7 +178,7 @@ button {
 .gf-telemetry-label {
   font-size: 10px;
   font-weight: 600;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.07em;
   text-transform: uppercase;
   color: var(--text-muted);
 }
@@ -197,24 +198,33 @@ button {
   color: var(--accent-amber-bright);
 }
 
+.gf-mils-short {
+  display: none;
+}
+
 .gf-topbar-right {
   display: flex;
   align-items: center;
   gap: 8px;
   flex-shrink: 0;
+  position: relative;
+  z-index: 2;
+  background: #0c1116;
+  padding-left: 2px;
 }
 
 .gf-status-pill {
   display: inline-flex;
   align-items: center;
-  gap: 7px;
+  gap: 6px;
   height: 32px;
-  padding: 0 11px;
+  padding: 0 10px;
   border-radius: var(--radius-md);
   background: var(--bg-panel);
   border: 1px solid var(--border-subtle);
-  font-size: 12px;
+  font-size: 11.5px;
   color: var(--text-secondary);
+  white-space: nowrap;
   transition: border-color 0.15s ease, background 0.15s ease;
 }
 
@@ -260,15 +270,16 @@ button {
 .gf-queue-toggle {
   display: inline-flex;
   align-items: center;
-  gap: 7px;
+  gap: 6px;
   height: 32px;
-  padding: 0 12px;
+  padding: 0 10px;
   border-radius: var(--radius-md);
   background: var(--bg-elevated);
   border: 1px solid var(--border-strong);
   color: var(--text-primary);
   font-weight: 600;
-  font-size: 12px;
+  font-size: 11.5px;
+  white-space: nowrap;
   transition: all 0.14s ease;
 }
 
@@ -320,9 +331,33 @@ button {
   height: 100%;
 }
 
-/* MapLibre dark theme tweaks */
+/* MapLibre dark theme & dynamic sidebar/drawer offsets */
+.gf-map-container .maplibregl-ctrl-bottom-left {
+  left: calc(var(--sidebar-w) + 12px);
+  bottom: 10px;
+  transition: left 0.22s ease;
+}
+
+.gf-shell.sidebar-collapsed .gf-map-container .maplibregl-ctrl-bottom-left {
+  left: 12px;
+}
+
+.gf-map-container .maplibregl-ctrl-bottom-left .maplibregl-ctrl {
+  margin: 0;
+}
+
+.gf-map-container .maplibregl-ctrl-bottom-right {
+  right: 10px;
+  bottom: 8px;
+  transition: right 0.22s ease;
+}
+
+.gf-shell.drawer-open .gf-map-container .maplibregl-ctrl-bottom-right {
+  right: calc(var(--drawer-w) + 10px);
+}
+
 .maplibregl-ctrl-attrib {
-  background: rgba(15, 20, 25, 0.78) !important;
+  background: rgba(15, 20, 25, 0.8) !important;
   color: var(--text-secondary) !important;
   font-size: 10.5px !important;
   border-radius: 4px !important;
@@ -333,11 +368,13 @@ button {
 }
 
 .maplibregl-ctrl-scale {
-  background: rgba(15, 20, 25, 0.82) !important;
+  background: rgba(15, 20, 25, 0.86) !important;
   border-color: var(--accent-amber) !important;
   color: var(--text-primary) !important;
   font-family: var(--font-mono) !important;
   font-size: 10.5px !important;
+  padding: 1px 6px !important;
+  border-radius: 2px !important;
 }
 
 .gf-center-reticle {
@@ -434,15 +471,16 @@ button {
   color: var(--accent-amber-bright);
 }
 
+/* Positioned cleanly above the MapLibre scale bar so it never collides with attribution */
 .gf-map-hint {
   position: absolute;
-  bottom: 12px;
-  left: calc(var(--sidebar-w) + 16px);
+  bottom: 42px;
+  left: calc(var(--sidebar-w) + 12px);
   z-index: 12;
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  gap: 12px;
-  padding: 5px 10px;
+  gap: 10px;
+  padding: 4px 9px;
   border-radius: var(--radius-md);
   background: rgba(15, 20, 25, 0.86);
   backdrop-filter: blur(8px);
@@ -450,11 +488,12 @@ button {
   font-size: 11px;
   color: var(--text-secondary);
   pointer-events: none;
+  white-space: nowrap;
   transition: left 0.22s ease;
 }
 
 .gf-shell.sidebar-collapsed .gf-map-hint {
-  left: 56px;
+  left: 12px;
 }
 
 .gf-footprint-banner {
@@ -555,7 +594,7 @@ button {
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-lg);
   margin-bottom: 10px;
-  overflow: hidden;
+  overflow: visible;
 }
 
 .gf-section:last-child {
@@ -571,6 +610,7 @@ button {
   cursor: pointer;
   user-select: none;
   background: rgba(255, 255, 255, 0.015);
+  border-radius: var(--radius-lg);
   transition: background 0.14s ease;
 }
 
@@ -729,7 +769,102 @@ details[open] > .gf-section-summary .gf-chevron {
   color: var(--accent-amber-bright);
 }
 
-/* Segmented Toggle */
+/* Place Search Autocomplete Dropdown */
+
+.gf-geocode-wrap {
+  position: relative;
+}
+
+.gf-geocode-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  z-index: 40;
+  background: #10171f;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-panel);
+  overflow: hidden;
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.gf-geocode-menu.hidden {
+  display: none;
+}
+
+.gf-geocode-status {
+  padding: 8px 10px;
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+.gf-geocode-item {
+  width: 100%;
+  border: none;
+  border-bottom: 1px solid var(--border-subtle);
+  background: transparent;
+  text-align: left;
+  padding: 7px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  transition: background 0.12s ease;
+}
+
+.gf-geocode-item:last-child {
+  border-bottom: none;
+}
+
+.gf-geocode-item:hover,
+.gf-geocode-item.highlighted {
+  background: var(--bg-elevated);
+}
+
+.gf-geocode-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.gf-geocode-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gf-geocode-type {
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--accent-cyan);
+  background: var(--accent-cyan-soft);
+  padding: 1px 5px;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+
+.gf-geocode-sub {
+  font-size: 10.5px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gf-geocode-coords {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-secondary);
+}
+
+/* Segmented Toggle & Atlas Grid Picker */
 
 .gf-segmented {
   display: grid;
@@ -763,6 +898,38 @@ details[open] > .gf-section-summary .gf-chevron {
   box-shadow: inset 0 0 0 1px rgba(245, 158, 11, 0.45);
 }
 
+.gf-atlas-grid {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  background: var(--bg-base);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 2px;
+  gap: 2px;
+}
+
+.gf-atlas-btn {
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  height: 26px;
+  border-radius: 3px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  transition: all 0.14s ease;
+}
+
+.gf-atlas-btn:hover {
+  color: var(--text-primary);
+}
+
+.gf-atlas-btn.active {
+  background: var(--bg-elevated);
+  color: var(--accent-amber-bright);
+  box-shadow: inset 0 0 0 1px rgba(245, 158, 11, 0.48);
+}
+
 /* Presets Grid */
 
 .gf-preset-grid {
@@ -777,6 +944,7 @@ details[open] > .gf-section-summary .gf-chevron {
   align-items: flex-start;
   gap: 1px;
   padding: 6px 8px;
+  min-width: 0;
   border-radius: var(--radius-sm);
   background: var(--bg-base);
   border: 1px solid var(--border-subtle);
@@ -795,10 +963,14 @@ details[open] > .gf-section-summary .gf-chevron {
 }
 
 .gf-preset-name {
+  width: 100%;
   font-size: 11.5px;
   font-weight: 600;
   color: var(--text-primary);
   line-height: 1.25;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .gf-preset-tag {
@@ -1036,16 +1208,23 @@ details[open] > .gf-section-summary .gf-chevron {
   font-family: var(--font-mono);
 }
 
+.gf-footer-actions {
+  display: flex;
+  align-items: stretch;
+  gap: 7px;
+}
+
 .gf-generate-btn {
-  width: 100%;
+  flex: 1;
+  min-width: 0;
   height: 40px;
   border: none;
   border-radius: var(--radius-md);
   background: linear-gradient(180deg, #fbbf24 0%, #f59e0b 100%);
   color: #0c1116;
-  font-size: 13px;
+  font-size: 12.5px;
   font-weight: 800;
-  letter-spacing: 0.06em;
+  letter-spacing: 0.05em;
   text-transform: uppercase;
   display: flex;
   align-items: center;
@@ -1067,6 +1246,30 @@ details[open] > .gf-section-summary .gf-chevron {
 .gf-generate-btn:disabled {
   opacity: 0.52;
   cursor: not-allowed;
+}
+
+.gf-cli-btn {
+  flex-shrink: 0;
+  height: 40px;
+  padding: 0 11px;
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  color: var(--text-secondary);
+  font-size: 11.5px;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  white-space: nowrap;
+  transition: all 0.14s ease;
+}
+
+.gf-cli-btn:hover {
+  background: var(--bg-hover);
+  border-color: var(--accent-cyan);
+  color: var(--accent-cyan);
 }
 
 .gf-form-error {
@@ -1324,6 +1527,34 @@ details[open] > .gf-section-summary .gf-chevron {
   gap: 6px;
 }
 
+.gf-artifact-group {
+  display: inline-flex;
+  align-items: stretch;
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-elevated);
+}
+
+.gf-artifact-preview-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 8px;
+  background: rgba(56, 189, 248, 0.12);
+  border-right: 1px solid var(--border-strong);
+  color: var(--accent-cyan);
+  text-decoration: none;
+  font-size: 11.5px;
+  font-weight: 600;
+  transition: background 0.14s ease, color 0.14s ease;
+}
+
+.gf-artifact-preview-btn:hover {
+  background: rgba(56, 189, 248, 0.24);
+  color: #7dd3fc;
+}
+
 .gf-artifact-btn {
   display: inline-flex;
   align-items: center;
@@ -1337,6 +1568,11 @@ details[open] > .gf-section-summary .gf-chevron {
   font-size: 11.5px;
   font-weight: 600;
   transition: all 0.14s ease;
+}
+
+.gf-artifact-group .gf-artifact-btn {
+  border: none;
+  border-radius: 0;
 }
 
 .gf-artifact-btn:hover {
@@ -1432,14 +1668,107 @@ details[open] > .gf-section-summary .gf-chevron {
 
 /* ---------- Responsive ---------- */
 
-@media (max-width: 960px) {
-  :root {
-    --sidebar-w: 320px;
-    --drawer-w: 330px;
+/* Compact split-screen desktop (e.g. 1024px–1280px): keep all 5 telemetry fields visible with zero overlap */
+@media (max-width: 1280px) {
+  .gf-topbar {
+    gap: 8px;
+    padding: 0 10px;
   }
 
   .gf-brand-sub {
     display: none;
+  }
+
+  .gf-telemetry-item {
+    padding: 0 7px;
+    gap: 4px;
+    font-size: 11px;
+  }
+
+  .gf-telemetry-label {
+    font-size: 9.5px;
+  }
+
+  .gf-mils-full {
+    display: none;
+  }
+
+  .gf-mils-short {
+    display: inline;
+  }
+
+  .gf-topbar-right {
+    gap: 6px;
+  }
+
+  .gf-status-pill {
+    padding: 0 8px;
+    font-size: 11px;
+  }
+
+  .gf-queue-toggle {
+    padding: 0 9px;
+    font-size: 11px;
+  }
+}
+
+/* Tighter split-screen (<=1180px, e.g. 1048px): guarantee 0px clipping on all 5 metrics even in 2×2/3×3 atlas mode */
+@media (max-width: 1180px) {
+  .gf-topbar {
+    gap: 6px;
+    padding: 0 8px;
+  }
+
+  .gf-brand {
+    gap: 6px;
+  }
+
+  .gf-brand-mark,
+  .gf-brand-mark svg {
+    width: 20px;
+    height: 20px;
+  }
+
+  .gf-brand-name {
+    font-size: 11.5px;
+    letter-spacing: 0.06em;
+  }
+
+  .gf-telemetry-item {
+    padding: 0 6px;
+    gap: 4px;
+  }
+
+  .gf-telemetry-label {
+    font-size: 9px;
+    letter-spacing: 0.04em;
+  }
+
+  .gf-telemetry-value {
+    font-size: 10.5px;
+  }
+
+  .gf-topbar-right {
+    gap: 5px;
+  }
+
+  .gf-status-pill {
+    padding: 0 7px;
+    gap: 5px;
+    font-size: 10.5px;
+  }
+
+  .gf-queue-toggle {
+    padding: 0 7px;
+    gap: 5px;
+    font-size: 10.5px;
+  }
+}
+
+@media (max-width: 960px) {
+  :root {
+    --sidebar-w: 320px;
+    --drawer-w: 330px;
   }
 
   .gf-map-hint {

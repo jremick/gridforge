@@ -1,4 +1,4 @@
-import { artifactDownloadUrl } from "../api";
+import { artifactDownloadUrl, artifactPreviewUrl } from "../api";
 import {
   escapeHtml,
   formatArtifactLabel,
@@ -36,6 +36,13 @@ function formatShortTime(iso: string): string {
     minute: "2-digit",
     second: "2-digit",
   });
+}
+
+function isPdfArtifact(kind: string, filename: string): boolean {
+  return (
+    kind.toLowerCase().includes("pdf") ||
+    filename.toLowerCase().endsWith(".pdf")
+  );
 }
 
 export class JobsDrawer {
@@ -151,6 +158,9 @@ export class JobsDrawer {
     const scaleStr = `1:${job.scale.toLocaleString()}`;
     const paperStr = `${job.paper.toUpperCase()} ${job.orientation === "landscape" ? "Landscape" : "Portrait"}`;
     const modeStr = job.color_mode === "bw" ? "B&W" : "Color";
+    const cols = job.grid_cols ?? 1;
+    const rows = job.grid_rows ?? 1;
+    const atlasStr = cols * rows > 1 ? ` · ${cols}×${rows} Atlas` : "";
     const pct = Math.max(0, Math.min(100, Math.round(job.progress_pct ?? 0)));
     const elapsed = computeElapsedSeconds(job);
     const isActive = job.status === "queued" || job.status === "running";
@@ -187,16 +197,45 @@ export class JobsDrawer {
           <div class="gf-artifact-list">
             ${job.artifacts
               .map((art) => {
-                const href = artifactDownloadUrl(
+                const downloadHref = artifactDownloadUrl(
                   job.job_id,
                   art.filename,
                   art.download_url
                 );
                 const label = formatArtifactLabel(art.kind, art.filename);
+                if (isPdfArtifact(art.kind, art.filename)) {
+                  const previewHref = artifactPreviewUrl(
+                    job.job_id,
+                    art.filename,
+                    art.download_url
+                  );
+                  return `
+                    <div class="gf-artifact-group">
+                      <a
+                        class="gf-artifact-preview-btn"
+                        href="${escapeHtml(previewHref)}"
+                        target="_blank"
+                        rel="noopener"
+                        title="Open ${escapeHtml(art.filename)} in new tab"
+                      >
+                        <span>↗ Preview</span>
+                      </a>
+                      <a
+                        class="gf-artifact-btn"
+                        href="${escapeHtml(downloadHref)}"
+                        download="${escapeHtml(art.filename)}"
+                        title="Download ${escapeHtml(art.filename)}"
+                      >
+                        <span>↓ ${escapeHtml(label)}</span>
+                        <span class="gf-artifact-size">${escapeHtml(formatBytes(art.size_bytes))}</span>
+                      </a>
+                    </div>
+                  `;
+                }
                 return `
                   <a
                     class="gf-artifact-btn"
-                    href="${escapeHtml(href)}"
+                    href="${escapeHtml(downloadHref)}"
                     download="${escapeHtml(art.filename)}"
                     target="_blank"
                     rel="noopener"
@@ -224,7 +263,7 @@ export class JobsDrawer {
         <div class="gf-job-head">
           <div>
             <div class="gf-job-title">${escapeHtml(displayTitle)}</div>
-            <div class="gf-job-sub">${escapeHtml(job.center_mgrs ?? job.center)} · ${escapeHtml(scaleStr)} · ${escapeHtml(paperStr)} · ${escapeHtml(modeStr)}</div>
+            <div class="gf-job-sub">${escapeHtml(job.center_mgrs ?? job.center)} · ${escapeHtml(scaleStr)} · ${escapeHtml(paperStr)} · ${escapeHtml(modeStr)}${escapeHtml(atlasStr)}</div>
           </div>
           <span class="gf-badge ${escapeHtml(job.status)}">${escapeHtml(job.status)}</span>
         </div>
