@@ -1,0 +1,22 @@
+services:
+  gridforge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: gridforge:dev
+    volumes:
+      - .:/app
+      - ./output:/output
+      - gridforge-cache:/tmp/gridforge-cache
+    environment:
+      - QT_QPA_PLATFORM=offscreen
+      - GDAL_CACHEMAX=256
+      - OMP_THREAD_LIMIT=1
+      - GRIDFORGE_CACHE_DIR=/tmp/gridforge-cache
+      - OVERPASS_URL=${OVERPASS_URL:-https://overpass-api.de/api/interpreter}
+    # Cap memory cleanly for local workstations (16 GB hosts running 300 DPI A3 sheets)
+    mem_limit: 4g
+    command: ["gridforge", "--help"]
+
+volumes:
+  gridforge-cache:
