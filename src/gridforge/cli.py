@@ -1,16 +1,18 @@
-"""GridForge Typer CLI (``gridforge render``, ``gridforge export``, and ``gridforge inspect``)."""
+"""GridForge Typer CLI (``render``, ``export``, ``inspect``, ``pack``, and ``serve``)."""
 
 from __future__ import annotations
 
+from enum import Enum
 import json
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional, cast
 
 import typer
 
 from gridforge.config import (
     VALID_SCALES,
+    AUOverlayKind,
     CartoOptions,
     ColorMode,
     DemSourceKind,
@@ -35,9 +37,32 @@ from gridforge.sources.overlay_user import UserOverlaySource
 
 app = typer.Typer(
     name="gridforge",
-    help="GridForge — Military-style true-scale MGRS topographic map generator & device exporter.",
+    help="GridForge — Military-style true-scale MGRS topographic map generator, offline pack builder & web server.",
     no_args_is_help=True,
 )
+pack_app = typer.Typer(
+    name="pack",
+    help="Build and inspect air-gapped offline regional data packs (Australia states & tactical regions).",
+    no_args_is_help=True,
+)
+app.add_typer(pack_app, name="pack")
+
+
+class PackDemTier(str, Enum):
+    """Supported DEM tiers when building an offline regional pack."""
+
+    SRTM_1S = "srtm-1s"
+    GLO30 = "glo30"
+    AU_ELVIS = "au-elvis"
+
+
+def _format_bytes(num_bytes: int) -> str:
+    value = float(max(0, num_bytes))
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024.0 or unit == "TB":
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1024.0
+    return f"{num_bytes} B"
 
 
 def _configure_logging(verbose: bool) -> None:
@@ -62,6 +87,7 @@ def _build_spec(
     dpi: int = 300,
     dem_source: DemSourceKind = DemSourceKind.AUTO,
     us_overlays: list[USOverlayKind] | None = None,
+    au_overlays: list[AUOverlayKind] | None = None,
     carto: CartoOptions | None = None,
 ) -> SheetSpec:
     if scale not in VALID_SCALES:
@@ -88,6 +114,7 @@ def _build_spec(
         dpi=dpi,
         dem_source=dem_source,
         us_overlays=list(dict.fromkeys(us_overlays or [])),
+        au_overlays=list(dict.fromkeys(au_overlays or [])),
         carto=carto if carto is not None else CartoOptions(),
     )
 
@@ -162,13 +189,24 @@ def render_cmd(
         DemSourceKind.AUTO,
         "--dem-source",
         case_sensitive=False,
-        help="Elevation source selection (auto, glo30, usgs3dep).",
+        help="Elevation source selection (auto, glo30, usgs3dep, au-elvis).",
     ),
     us_overlay: Optional[list[USOverlayKind]] = typer.Option(
         None,
         "--us-overlay",
         case_sensitive=False,
         help="Optional US public-domain overlay (fema, nhd, towers, enc); repeatable.",
+    ),
+    au_overlay: Optional[list[AUOverlayKind]] = typer.Option(
+        None,
+        "--au-overlay",
+        case_sensitive=False,
+        help="Optional Australia CC BY 4.0 national overlay (au-hydro, au-parks, au-infra, au-aviation); repeatable.",
+    ),
+    pack: Optional[Path] = typer.Option(
+        None,
+        "--pack",
+        help="Path to an air-gapped offline regional pack directory containing pack.json.",
     ),
     contour_density: DensityLevel = typer.Option(
         DensityLevel.NORMAL,
@@ -295,6 +333,7 @@ def render_cmd(
         dpi=dpi,
         dem_source=dem_source,
         us_overlays=us_overlay,
+        au_overlays=au_overlay,
         carto=carto,
     )
 
@@ -308,6 +347,7 @@ def render_cmd(
         elevation_source=elev_src,
         vector_source=vec_src,
         overlay_sources=overlay_srcs or None,
+        pack_dir=pack,
         keep_workspace=keep_workspace,
         work_dir=work_dir,
         mbtiles_out=mbtiles,
@@ -414,13 +454,24 @@ def export_cmd(
         DemSourceKind.AUTO,
         "--dem-source",
         case_sensitive=False,
-        help="Elevation source selection (auto, glo30, usgs3dep).",
+        help="Elevation source selection (auto, glo30, usgs3dep, au-elvis).",
     ),
     us_overlay: Optional[list[USOverlayKind]] = typer.Option(
         None,
         "--us-overlay",
         case_sensitive=False,
         help="Optional US public-domain overlay (fema, nhd, towers, enc); repeatable.",
+    ),
+    au_overlay: Optional[list[AUOverlayKind]] = typer.Option(
+        None,
+        "--au-overlay",
+        case_sensitive=False,
+        help="Optional Australia CC BY 4.0 national overlay (au-hydro, au-parks, au-infra, au-aviation); repeatable.",
+    ),
+    pack: Optional[Path] = typer.Option(
+        None,
+        "--pack",
+        help="Path to an air-gapped offline regional pack directory containing pack.json.",
     ),
     contour_density: DensityLevel = typer.Option(
         DensityLevel.NORMAL,
@@ -485,6 +536,7 @@ def export_cmd(
         dpi=dpi,
         dem_source=dem_source,
         us_overlays=us_overlay,
+        au_overlays=au_overlay,
         carto=carto,
     )
 
@@ -499,6 +551,7 @@ def export_cmd(
         elevation_source=elev_src,
         vector_source=vec_src,
         overlay_sources=overlay_srcs or None,
+        pack_dir=pack,
         mbtiles_format=mbtiles_format,
         garmin_profile=garmin_profile,
         max_tiles=max_tiles,
@@ -670,6 +723,251 @@ def inspect_cmd(
     width = max(len(k) for k, _ in rows)
     for key, val in rows:
         typer.echo(f"{key:<{width}} : {val}")
+
+
+@pack_app.command("list-regions")
+def pack_list_regions_cmd(
+    category: Optional[str] = typer.Option(
+        None,
+        "--category",
+        help="Optional filter: 'state' (8 AU states/territories) or 'tactical' (7 tactical regions).",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json/--table",
+        help="Output machine-readable JSON instead of a formatted table.",
+    ),
+) -> None:
+    """List curated Australian states/territories and tactical region presets for offline packs."""
+    from gridforge.packs.catalog import list_regions
+
+    regions = list_regions()
+    if category is not None:
+        cat_norm = category.strip().lower()
+        if cat_norm not in ("state", "tactical"):
+            raise typer.BadParameter("Invalid --category. Choose 'state' or 'tactical'.")
+        regions = [r for r in regions if r.category == cat_norm]
+
+    if json_output:
+        typer.echo(json.dumps([json.loads(r.model_dump_json()) for r in regions], indent=2))
+        return
+
+    header = ("REGION ID", "CATEGORY", "NAME", "UTM ZONES", "EST. SIZE")
+    table_rows = [
+        (
+            r.region_id,
+            r.category,
+            r.name,
+            ",".join(r.utm_zones),
+            r.estimated_size_hint or "-",
+        )
+        for r in regions
+    ]
+    widths = [
+        max(len(header[i]), *(len(row[i]) for row in table_rows)) if table_rows else len(header[i])
+        for i in range(len(header))
+    ]
+    fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+    typer.echo(fmt.format(*header))
+    typer.echo("  ".join("-" * w for w in widths))
+    for row in table_rows:
+        typer.echo(fmt.format(*row))
+
+
+@pack_app.command("build")
+def pack_build_cmd(
+    region: str = typer.Option(
+        ...,
+        "--region",
+        "-r",
+        help='Catalog region ID (e.g. "tas", "blue-mountains", "red-centre") or custom "w,s,e,n" WGS84 bbox.',
+    ),
+    output: Path = typer.Option(
+        ...,
+        "--output",
+        "-O",
+        help="Destination directory for the offline regional pack (writes pack.json + data files).",
+    ),
+    name: Optional[str] = typer.Option(
+        None,
+        "--name",
+        "-n",
+        help="Optional display name override stored in pack.json.",
+    ),
+    source_pbf: Optional[Path] = typer.Option(
+        None,
+        "--source-pbf",
+        help="Optional local .osm.pbf/.osm file to extract from instead of downloading Geofabrik Australia.",
+    ),
+    source_dem: Optional[Path] = typer.Option(
+        None,
+        "--source-dem",
+        help="Optional local GeoTIFF/VRT DEM to clip from instead of streaming cloud elevation.",
+    ),
+    dem_tier: PackDemTier = typer.Option(
+        PackDemTier.SRTM_1S,
+        "--dem-tier",
+        case_sensitive=False,
+        help="Elevation source tier (srtm-1s, glo30, au-elvis).",
+    ),
+    include_osm: bool = typer.Option(True, "--osm/--no-osm", help="Include clipped OSM PBF in pack."),
+    include_dem: bool = typer.Option(True, "--dem/--no-dem", help="Include compressed DEM GeoTIFF in pack."),
+    include_overlays: bool = typer.Option(
+        True,
+        "--overlays/--no-overlays",
+        help="Include Australian CC BY 4.0 national overlays (hydro, parks, infra, aviation).",
+    ),
+    overlay_tile_deg: float = typer.Option(
+        1.0,
+        "--overlay-tile-deg",
+        min=0.1,
+        max=5.0,
+        help="Maximum spatial tile size (degrees) for low-RAM overlay chunking.",
+    ),
+    cache_dir: Optional[Path] = typer.Option(
+        None,
+        "--cache-dir",
+        help="Optional download cache directory (defaults to GRIDFORGE_CACHE_DIR).",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json/--no-json",
+        help="Print resulting PackManifest as JSON.",
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging."),
+) -> None:
+    """Build a self-contained, air-gapped offline regional data pack disk-to-disk."""
+    from gridforge.packs.builder import build_offline_pack
+
+    _configure_logging(verbose)
+
+    try:
+        manifest = build_offline_pack(
+            region,
+            output,
+            name=name,
+            include_osm=include_osm,
+            include_dem=include_dem,
+            include_overlays=include_overlays,
+            source_pbf=source_pbf,
+            source_dem=source_dem,
+            dem_tier=cast(Literal["srtm-1s", "glo30", "au-elvis"], dem_tier.value),
+            cache_dir=cache_dir,
+            overlay_tile_deg=overlay_tile_deg,
+        )
+    except (ValueError, FileNotFoundError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    if json_output:
+        typer.echo(manifest.model_dump_json(indent=2))
+        return
+
+    typer.echo(
+        f"Built offline pack '{manifest.pack_id}' ({manifest.name}) at {output.resolve()} "
+        f"[{_format_bytes(manifest.size_bytes)}, UTM {', '.join(manifest.utm_zones)}, "
+        f"datum={manifest.vertical_datum}, overlays={len(manifest.overlays)}]"
+    )
+
+
+@pack_app.command("inspect")
+def pack_inspect_cmd(
+    pack_dir: Path = typer.Argument(
+        ...,
+        help="Directory containing pack.json.",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json/--table",
+        help="Output raw PackManifest JSON instead of a formatted summary.",
+    ),
+) -> None:
+    """Inspect metadata, bounds, UTM zones, and bundled layers of an offline regional pack."""
+    from gridforge.packs.builder import load_pack_manifest
+
+    try:
+        manifest = load_pack_manifest(pack_dir)
+    except FileNotFoundError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    if json_output:
+        typer.echo(manifest.model_dump_json(indent=2))
+        return
+
+    b = manifest.bbox_wgs84
+    overlays_str = (
+        ", ".join(f"{k} ({v})" for k, v in sorted(manifest.overlays.items()))
+        if manifest.overlays
+        else "none"
+    )
+    rows = [
+        ("Pack ID", manifest.pack_id),
+        ("Name", manifest.name),
+        ("Region", manifest.region),
+        ("Created (UTC)", manifest.created_at),
+        ("Total Size", f"{_format_bytes(manifest.size_bytes)} ({manifest.size_bytes:,} bytes)"),
+        ("UTM Zones", ", ".join(manifest.utm_zones) or "-"),
+        (
+            "WGS84 BBox",
+            f"W {b.min_x:.4f}, S {b.min_y:.4f}, E {b.max_x:.4f}, N {b.max_y:.4f}",
+        ),
+        (
+            "DEM",
+            f"{manifest.dem_path} (vertical datum: {manifest.vertical_datum})"
+            if manifest.dem_path
+            else "none",
+        ),
+        ("OSM PBF", manifest.osm_pbf_path or "none"),
+        ("Overlays", overlays_str),
+        ("Attributions", " | ".join(manifest.attributions) if manifest.attributions else "none"),
+    ]
+    width = max(len(k) for k, _ in rows)
+    for key, val in rows:
+        typer.echo(f"{key:<{width}} : {val}")
+
+
+@app.command("serve")
+def serve_cmd(
+    host: str = typer.Option(
+        "0.0.0.0",
+        "--host",
+        help="Bind interface for the GridForge self-hosted web server.",
+    ),
+    port: int = typer.Option(
+        8080,
+        "--port",
+        min=1,
+        max=65535,
+        help="TCP port to listen on (default 8080).",
+    ),
+    reload: bool = typer.Option(
+        False,
+        "--reload/--no-reload",
+        help="Enable Uvicorn auto-reload (development only).",
+    ),
+    log_level: str = typer.Option(
+        "info",
+        "--log-level",
+        help="Uvicorn log level (critical, error, warning, info, debug).",
+    ),
+) -> None:
+    """Launch the GridForge self-hosted FastAPI web interface via Uvicorn."""
+    try:
+        import uvicorn  # type: ignore[import-not-found]
+    except ImportError as exc:
+        typer.echo(
+            "Error: 'uvicorn' is not installed in this environment. "
+            "Install GridForge web dependencies or run inside the GridForge Docker image.",
+            err=True,
+        )
+        raise typer.Exit(code=1) from exc
+
+    uvicorn.run(
+        "gridforge.web.app:app",
+        host=host,
+        port=port,
+        reload=reload,
+        log_level=log_level.lower(),
+    )
 
 
 def main() -> None:

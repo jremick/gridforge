@@ -1,4 +1,4 @@
-"""Unit tests for Phase 2 military cartography, icons, CartoOptions toggles, and regional styling.
+"""Unit tests for military cartography, icons, CartoOptions toggles, AU overlays, and pack runner wiring.
 
 Note: PyQGIS tests execute inside spawned subprocesses so ``QgsApplication.exitQgis()``
 never calls ``GDALDestroyDriverManager()`` inside the shared ``pytest`` runner process.
@@ -13,12 +13,24 @@ import textwrap
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+from gridforge.config import (
+    AUOverlayKind,
+    BBox,
+    ColorMode,
+    DemSourceKind,
+    PackManifest,
+    RenderResult,
+    SheetSpec,
+)
+from gridforge.pipeline.runner import _resolve_elevation_source, run_render_job
 from gridforge.render.styles import (
+    STYLE_ROLES,
     get_icon_path,
     get_icons_root,
     scale_font_delta,
     scale_width_factor,
 )
+from gridforge.sources.dem_au_elvis import AUElvisDEMSource
 
 
 def _run_pyqgis_snippet(body: str) -> None:
@@ -74,9 +86,13 @@ def test_all_svg_icons_exist_and_parse_xml() -> None:
         "conifer.svg",
         "deciduous.svg",
         "navaid.svg",
+        "water_bore.svg",
+        "homestead.svg",
+        "airfield.svg",
     )
     root = get_icons_root()
     assert root.is_dir()
+    assert len(expected) == 18
     for name in expected:
         p = get_icon_path(name, icons_root=root)
         assert p.is_file(), f"Missing icon: {p}"
@@ -90,6 +106,7 @@ def test_multiscale_factors() -> None:
 
 
 def test_all_qml_styles_roundtrip(tmp_path: Path) -> None:
+    assert len(STYLE_ROLES) == 31
     _run_pyqgis_snippet(
         f"""
         from osgeo import gdal
@@ -107,15 +124,25 @@ def test_all_qml_styles_roundtrip(tmp_path: Path) -> None:
         geom_by_role = {{
             "landcover": "MultiPolygon",
             "fema_flood": "MultiPolygon",
+            "au_protected_areas": "MultiPolygon",
             "water_polygons": "MultiPolygon",
+            "au_hydro_polys": "MultiPolygon",
             "contours": "LineString",
             "enc_depth_contours": "LineString",
             "nhd_flowlines": "LineString",
+            "au_hydro_lines": "LineString",
             "waterways": "LineString",
             "buildings": "MultiPolygon",
             "building_icons": "MultiPolygon",
             "transport": "LineString",
+            "au_power_lines": "LineString",
+            "au_pipelines": "LineString",
+            "au_runways": "LineString",
             "points": "Point",
+            "au_substations": "Point",
+            "au_hydro_points": "Point",
+            "au_homesteads": "Point",
+            "au_airfields": "Point",
             "us_towers": "Point",
             "enc_navaids": "Point",
             "mgrs_grid_1km": "LineString",
@@ -285,3 +312,261 @@ def test_peak_dedup_and_tower_unit_expressions() -> None:
             assert tw_expr.evaluate(ctx) == expected_lbl
         """
     )
+
+
+def test_au_overlay_styles_and_label_expressions() -> None:
+    _run_pyqgis_snippet(
+        """
+        from qgis.core import (
+            QgsExpression,
+            QgsExpressionContext,
+            QgsExpressionContextUtils,
+            QgsFeature,
+            QgsVectorLayer,
+        )
+        from gridforge.config import CartoOptions, ColorMode, DensityLevel
+        from gridforge.render.styles import apply_programmatic_style
+
+        def _eval(vl, expr_str, attrs):
+            expr = QgsExpression(expr_str)
+            assert not expr.hasParserError(), expr.parserErrorString()
+            f = QgsFeature(vl.fields())
+            for k, v in attrs.items():
+                f.setAttribute(k, v)
+            ctx = QgsExpressionContext()
+            ctx.appendScopes(QgsExpressionContextUtils.globalProjectLayerScopes(vl))
+            ctx.setFeature(f)
+            return expr.evaluate(ctx)
+
+        # 1. AU Hydro Points (Outback bores/waterholes deduplication)
+        vl_hp = QgsVectorLayer(
+            "Point?crs=EPSG:32752&field=name:string&field=featuretype:string&field=type:string&field=perenniality:string",
+            "au_hp",
+            "memory",
+        )
+        for mode in (ColorMode.COLOR, ColorMode.BW):
+            apply_programmatic_style(vl_hp, "au_hydro_points", mode)
+            expr_str = vl_hp.labeling().settings().fieldName
+            assert _eval(vl_hp, expr_str, {"name": "Mutitjulu Waterhole", "featuretype": "Waterhole"}) == "Mutitjulu Waterhole"
+            assert _eval(vl_hp, expr_str, {"name": "Currie", "featuretype": "Bore"}) == "Currie (Bore)"
+            assert _eval(vl_hp, expr_str, {"name": "", "featuretype": "Bore"}) == "Bore"
+
+        # 2. AU Protected Areas (CAPAD National Parks + IPA rules & uppercase label)
+        vl_pk = QgsVectorLayer(
+            "MultiPolygon?crs=EPSG:32752&field=name:string&field=park_type:string&field=type_abbr:string&field=iucn:string&field=state:string",
+            "au_pk",
+            "memory",
+        )
+        for mode in (ColorMode.COLOR, ColorMode.BW):
+            apply_programmatic_style(vl_pk, "au_protected_areas", mode)
+            rule_labels = {r.label() for r in vl_pk.renderer().rootRule().children()}
+            assert "Indigenous Protected Areas (IPA)" in rule_labels
+            assert "National Parks & Reserves (CAPAD)" in rule_labels
+            lbl_rule = vl_pk.labeling().rootRule().children()[0]
+            expr_str = lbl_rule.settings().fieldName
+            assert _eval(vl_pk, expr_str, {"name": "Uluru-Kata Tjuta", "type_abbr": "NPC"}) == "ULURU-KATA TJUTA (NPC)"
+            assert _eval(vl_pk, expr_str, {"name": "Katiti Petermann", "type_abbr": "IPA"}) == "KATITI PETERMANN (IPA)"
+
+        # 3. AU Power Lines & Substations & Pipelines
+        vl_pl = QgsVectorLayer(
+            "LineString?crs=EPSG:32756&field=name:string&field=capacity_kv:double&field=status:string&field=state:string",
+            "au_pl",
+            "memory",
+        )
+        apply_programmatic_style(vl_pl, "au_power_lines", ColorMode.COLOR)
+        pl_expr = vl_pl.labeling().settings().fieldName
+        assert _eval(vl_pl, pl_expr, {"name": "Sydney West - Wallerawang", "capacity_kv": 330.0}) == "330 kV"
+        assert _eval(vl_pl, pl_expr, {"name": "Feeder Line", "capacity_kv": None}) == "Feeder Line"
+
+        vl_sub = QgsVectorLayer(
+            "Point?crs=EPSG:32756&field=name:string&field=voltage_kv:double&field=status:string&field=state:string",
+            "au_sub",
+            "memory",
+        )
+        apply_programmatic_style(vl_sub, "au_substations", ColorMode.BW)
+        sub_expr = vl_sub.labeling().settings().fieldName
+        assert _eval(vl_sub, sub_expr, {"name": "Katoomba", "voltage_kv": 132.0}) == "Katoomba (132 kV)"
+
+        vl_pipe = QgsVectorLayer(
+            "LineString?crs=EPSG:32756&field=name:string&field=pipeline_type:string&field=status:string&field=operator:string",
+            "au_pipe",
+            "memory",
+        )
+        apply_programmatic_style(vl_pipe, "au_pipelines", ColorMode.COLOR)
+        pipe_expr = vl_pipe.labeling().settings().fieldName
+        assert _eval(vl_pipe, pipe_expr, {"name": "Moomba-Sydney", "pipeline_type": "gas"}) == "Moomba-Sydney"
+        assert _eval(vl_pipe, pipe_expr, {"name": "", "pipeline_type": "gas"}) == "GAS PIPELINE"
+
+        # 4. AU Hydro Lines river arrows toggle
+        vl_hl_on = QgsVectorLayer(
+            "LineString?crs=EPSG:32752&field=name:string&field=featuretype:string&field=perenniality:string&field=hierarchy:string",
+            "au_hl_on",
+            "memory",
+        )
+        apply_programmatic_style(vl_hl_on, "au_hydro_lines", ColorMode.COLOR, carto=CartoOptions(show_river_arrows=True))
+        maj_on = [r for r in vl_hl_on.renderer().rootRule().children() if "Major" in r.label()][0]
+        assert maj_on.symbol().symbolLayerCount() == 2
+
+        vl_hl_off = QgsVectorLayer(
+            "LineString?crs=EPSG:32752&field=name:string&field=featuretype:string&field=perenniality:string&field=hierarchy:string",
+            "au_hl_off",
+            "memory",
+        )
+        apply_programmatic_style(vl_hl_off, "au_hydro_lines", ColorMode.COLOR, carto=CartoOptions(show_river_arrows=False))
+        maj_off = [r for r in vl_hl_off.renderer().rootRule().children() if "Major" in r.label()][0]
+        assert maj_off.symbol().symbolLayerCount() == 1
+
+        # 5. AU Airfields, Runways, Homesteads + LOW label density suppression
+        vl_hs = QgsVectorLayer("Point?crs=EPSG:32752&field=name:string&field=featuretype:string", "au_hs", "memory")
+        apply_programmatic_style(vl_hs, "au_homesteads", ColorMode.COLOR, carto=CartoOptions(label_density=DensityLevel.LOW))
+        assert vl_hs.labelsEnabled() is False
+        apply_programmatic_style(vl_hs, "au_homesteads", ColorMode.BW, carto=CartoOptions(label_density=DensityLevel.NORMAL))
+        assert vl_hs.labelsEnabled() is True
+        """
+    )
+
+
+def test_runner_dem_au_elvis_and_offline_pack_airgapped(tmp_path: Path) -> None:
+    # 1. Verify DemSourceKind.AU_ELVIS resolves directly to AUElvisDEMSource
+    au_spec = SheetSpec(
+        center_lat=-33.732,
+        center_lon=150.312,
+        scale=25000,
+        dem_source=DemSourceKind.AU_ELVIS,
+    )
+    assert isinstance(_resolve_elevation_source(au_spec, None), AUElvisDEMSource)
+
+    # 2. Create a minimal self-contained synthetic offline pack on disk (zero network!)
+    from osgeo import gdal, ogr, osr
+
+    gdal.UseExceptions()
+    ogr.UseExceptions()
+
+    pack_dir = tmp_path / "mini-au-pack"
+    overlays_dir = pack_dir / "overlays"
+    overlays_dir.mkdir(parents=True)
+
+    # Synthetic GeoTIFF covering Katoomba (-33.732, 150.312) in WGS84
+    dem_path = pack_dir / "dem.tif"
+    drv = gdal.GetDriverByName("GTiff")
+    ds = drv.Create(str(dem_path), 64, 64, 1, gdal.GDT_Float32)
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(4326)
+    ds.SetProjection(srs.ExportToWkt())
+    ds.SetGeoTransform((150.20, 0.25 / 64.0, 0.0, -33.62, 0.0, -0.25 / 64.0))
+    ds.GetRasterBand(1).Fill(950.0)
+    ds = None
+
+    # Minimal valid OSM XML clipped via LocalPBFSource -> osmium
+    osm_src = tmp_path / "mini.osm"
+    osm_src.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<osm version="0.6" generator="gridforge-test">\n'
+        '  <node id="1" lat="-33.732" lon="150.312" version="1">\n'
+        '    <tag k="name" v="Katoomba Test Peak"/>\n'
+        '    <tag k="natural" v="peak"/>\n'
+        '    <tag k="ele" v="1010"/>\n'
+        '  </node>\n'
+        '</osm>\n',
+        encoding="utf-8",
+    )
+    pbf_path = pack_dir / "osm.osm.pbf"
+    subprocess.run(["osmium", "cat", str(osm_src), "-o", str(pbf_path), "--overwrite"], check=True)
+
+    # Minimal WGS84 AU Hydro GeoPackage with one bore point
+    hydro_gpkg = overlays_dir / "au_hydro.gpkg"
+    gpkg_drv = ogr.GetDriverByName("GPKG")
+    gds = gpkg_drv.CreateDataSource(str(hydro_gpkg))
+    wgs84 = osr.SpatialReference()
+    wgs84.ImportFromEPSG(4326)
+    wgs84.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    lyr = gds.CreateLayer("au_hydro_points", srs=wgs84, geom_type=ogr.wkbPoint)
+    for fname in ("name", "featuretype", "type", "perenniality"):
+        lyr.CreateField(ogr.FieldDefn(fname, ogr.OFTString))
+    feat = ogr.Feature(lyr.GetLayerDefn())
+    pt = ogr.Geometry(ogr.wkbPoint)
+    pt.AddPoint(150.312, -33.732)
+    feat.SetGeometry(pt)
+    feat.SetField("name", "Blue Mtn Spring")
+    feat.SetField("featuretype", "Spring")
+    feat.SetField("type", "Natural")
+    feat.SetField("perenniality", "Perennial")
+    lyr.CreateFeature(feat)
+    feat = None
+    gds = None
+
+    manifest = PackManifest(
+        pack_id="mini-blue-mountains",
+        name="Mini Blue Mountains Test Pack",
+        region="blue-mountains",
+        bbox_wgs84=BBox(min_x=150.20, min_y=-33.87, max_x=150.45, max_y=-33.62),
+        utm_zones=["56H"],
+        dem_path="dem.tif",
+        vertical_datum="AHD",
+        dem_attribution="Elevation data: © Commonwealth of Australia (Geoscience Australia) (CC BY 4.0)",
+        osm_pbf_path="osm.osm.pbf",
+        overlays={"au-hydro": "overlays/au_hydro.gpkg"},
+        attributions=[],
+        created_at="2026-11-26T00:00:00Z",
+        size_bytes=1024,
+    )
+    (pack_dir / "pack.json").write_text(manifest.model_dump_json(indent=2), encoding="utf-8")
+
+    captured_ws = []
+    progress_events: list[tuple[str, int]] = []
+
+    class _DummyRenderer:
+        def render_pdf(self, workspace, output_pdf: Path) -> RenderResult:
+            captured_ws.append(workspace)
+            output_pdf.parent.mkdir(parents=True, exist_ok=True)
+            output_pdf.write_bytes(b"%PDF-1.4\n%%EOF\n")
+            return RenderResult(
+                output_pdf=output_pdf,
+                page_width_mm=workspace.layout.page_width_mm,
+                page_height_mm=workspace.layout.page_height_mm,
+                scale=workspace.layout.spec.scale,
+                utm_epsg=workspace.layout.utm_epsg,
+                elapsed_seconds=0.05,
+            )
+
+    spec = SheetSpec(
+        center_lat=-33.732,
+        center_lon=150.312,
+        scale=25000,
+        color_mode=ColorMode.COLOR,
+    )
+    out_pdf = tmp_path / "out.pdf"
+    res = run_render_job(
+        spec,
+        out_pdf,
+        pack_dir=pack_dir,
+        progress_callback=lambda stage, pct: progress_events.append((stage, pct)),
+        renderer=_DummyRenderer(),
+    )
+
+    assert res.output_pdf == out_pdf
+    assert len(captured_ws) == 1
+    ws = captured_ws[0]
+    assert ws.vertical_datum == "AHD"
+    assert ws.dem_source_name == "pack:mini-blue-mountains"
+    assert "au-hydro" in ws.regional_overlays
+    assert any("Geoscience Australia" in a for a in ws.attributions)
+    assert any("Surface Hydrology" in a for a in ws.attributions)
+
+    # Progress events must be non-empty, strictly monotonic, and terminate at ("done", 100)
+    assert progress_events[0][0] == "fetching_data"
+    assert progress_events[-1] == ("done", 100)
+    pcts = [pct for _, pct in progress_events]
+    assert pcts == sorted(pcts)
+    assert len(set(pcts)) == len(pcts)
+
+    # Requesting an overlay NOT bundled in the pack stays strictly air-gapped (skipped cleanly)
+    captured_ws.clear()
+    spec_missing_ov = spec.model_copy(update={"au_overlays": [AUOverlayKind.AU_PARKS]})
+    run_render_job(
+        spec_missing_ov,
+        tmp_path / "out2.pdf",
+        pack_dir=pack_dir,
+        renderer=_DummyRenderer(),
+    )
+    assert captured_ws[0].regional_overlays == {}

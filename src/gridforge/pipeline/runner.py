@@ -1,4 +1,4 @@
-"""End-to-end GridForge pipeline orchestrator for Phases 1, 2, and 3."""
+"""End-to-end GridForge pipeline orchestrator for Phases 1–4 and Australia-wide mapping."""
 
 from __future__ import annotations
 
@@ -7,10 +7,11 @@ import shutil
 import subprocess
 import tempfile
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 from gridforge.config import (
+    AUOverlayKind,
     ColorMode,
     DemSourceKind,
     ExportFormat,
@@ -18,6 +19,7 @@ from gridforge.config import (
     GarminProfile,
     JobWorkspace,
     MBTilesFormat,
+    PackManifest,
     RenderResult,
     SheetLayout,
     SheetSpec,
@@ -38,12 +40,26 @@ from gridforge.pipeline.terrain import build_terrain_products
 from gridforge.render.base import MapRenderer
 from gridforge.render.pyqgis_worker import PyQGISRenderer
 from gridforge.sources.base import ElevationSource, OverlaySource, VectorSource
+from gridforge.sources.dem_au_elvis import AUElvisDEMSource
 from gridforge.sources.dem_copernicus import CopernicusGLO30Source
+from gridforge.sources.dem_local import LocalDEMSource
 from gridforge.sources.dem_usgs3dep import AutoDEMSource, USGS3DEPSource
 from gridforge.sources.osm_overpass import OverpassOSMSource
+from gridforge.sources.osm_pbf import LocalPBFSource
+from gridforge.sources.overlays_au import build_au_overlay_sources
 from gridforge.sources.overlays_us import build_us_overlay_sources
 
 logger = logging.getLogger(__name__)
+
+ProgressCallback = Callable[[str, int], None]
+OverlayOverrideKey = str | USOverlayKind | AUOverlayKind
+
+
+def _report_progress(callback: ProgressCallback | None, stage: str, pct: int) -> None:
+    """Invoke optional progress callback with clamped percentage (propagating cancellation)."""
+    if callback is None:
+        return
+    callback(stage, max(0, min(100, int(pct))))
 
 
 def _resolve_elevation_source(
@@ -55,9 +71,136 @@ def _resolve_elevation_source(
         return explicit_source
     if spec.dem_source == DemSourceKind.USGS3DEP:
         return USGS3DEPSource()
+    if spec.dem_source == DemSourceKind.AU_ELVIS:
+        return AUElvisDEMSource()
     if spec.dem_source == DemSourceKind.GLO30:
         return CopernicusGLO30Source()
     return AutoDEMSource()
+
+
+def _bboxes_intersect(
+    a: tuple[float, float, float, float],
+    b: tuple[float, float, float, float],
+) -> bool:
+    return not (a[2] <= b[0] or a[0] >= b[2] or a[3] <= b[1] or a[1] >= b[3])
+
+
+def _resolve_pack_sources(
+    pack_dir: Path | str,
+    spec: SheetSpec,
+    layout: SheetLayout,
+    *,
+    elevation_source: ElevationSource | None,
+    vector_source: VectorSource | None,
+    regional_overlay_overrides: Mapping[OverlayOverrideKey, Path | str] | None,
+) -> tuple[
+    PackManifest,
+    ElevationSource | None,
+    bool,
+    VectorSource | None,
+    dict[str, Path],
+    list[USOverlayKind],
+    list[AUOverlayKind],
+]:
+    """Load an offline regional pack and wire air-gapped DEM, PBF, and overlay GPKGs."""
+    from gridforge.packs.builder import load_pack_manifest
+
+    resolved_pack_dir = Path(pack_dir).expanduser().resolve()
+    manifest = load_pack_manifest(resolved_pack_dir)
+
+    if not _bboxes_intersect(layout.wgs84_bbox.as_tuple(), manifest.bbox_wgs84.as_tuple()):
+        logger.warning(
+            "Requested sheet footprint %s does not intersect offline pack '%s' bounds %s",
+            layout.wgs84_bbox.as_tuple(),
+            manifest.pack_id,
+            manifest.bbox_wgs84.as_tuple(),
+        )
+
+    pack_used_dem = False
+    resolved_elev = elevation_source
+    if resolved_elev is None and manifest.dem_path:
+        dem_file = (resolved_pack_dir / manifest.dem_path).resolve()
+        if not dem_file.exists():
+            raise FileNotFoundError(
+                f"Offline pack '{manifest.pack_id}' DEM not found at '{dem_file}'"
+            )
+        resolved_elev = LocalDEMSource(dem_file, attribution=manifest.dem_attribution)
+        pack_used_dem = True
+
+    resolved_vec = vector_source
+    if resolved_vec is None and manifest.osm_pbf_path:
+        pbf_file = (resolved_pack_dir / manifest.osm_pbf_path).resolve()
+        if not pbf_file.is_file():
+            raise FileNotFoundError(
+                f"Offline pack '{manifest.pack_id}' OSM PBF not found at '{pbf_file}'"
+            )
+        resolved_vec = LocalPBFSource(pbf_file)
+
+    merged_overrides: dict[str, Path] = {}
+    pack_au_kinds: list[AUOverlayKind] = []
+    for raw_key, rel_path in manifest.overlays.items():
+        norm_key = str(raw_key).lower().replace("_", "-")
+        ov_path = (resolved_pack_dir / rel_path).resolve()
+        if not ov_path.is_file():
+            logger.warning(
+                "Offline pack '%s' overlay '%s' missing at '%s'; skipping",
+                manifest.pack_id,
+                norm_key,
+                ov_path,
+            )
+            continue
+        merged_overrides[norm_key] = ov_path
+        try:
+            au_kind = AUOverlayKind(norm_key)
+        except ValueError:
+            continue
+        if au_kind not in pack_au_kinds:
+            pack_au_kinds.append(au_kind)
+
+    if regional_overlay_overrides:
+        for raw_key, raw_path in regional_overlay_overrides.items():
+            norm_key = (
+                raw_key.value
+                if isinstance(raw_key, (USOverlayKind, AUOverlayKind))
+                else str(raw_key).lower().replace("_", "-")
+            )
+            merged_overrides[norm_key] = Path(raw_path).expanduser().resolve()
+
+    # In --pack mode, keep overlays strictly air-gapped: never fall through to live HTTP.
+    if spec.au_overlays:
+        effective_au_kinds: list[AUOverlayKind] = []
+        for kind in spec.au_overlays:
+            if kind.value in merged_overrides:
+                effective_au_kinds.append(kind)
+            else:
+                logger.warning(
+                    "Requested AU overlay '%s' is not bundled in offline pack '%s'; skipping in air-gapped mode",
+                    kind.value,
+                    manifest.pack_id,
+                )
+    else:
+        effective_au_kinds = pack_au_kinds
+
+    effective_us_kinds: list[USOverlayKind] = []
+    for kind in spec.us_overlays:
+        if kind.value in merged_overrides:
+            effective_us_kinds.append(kind)
+        else:
+            logger.warning(
+                "Requested US overlay '%s' is not bundled in offline pack '%s'; skipping in air-gapped mode",
+                kind.value,
+                manifest.pack_id,
+            )
+
+    return (
+        manifest,
+        resolved_elev,
+        pack_used_dem,
+        resolved_vec,
+        merged_overrides,
+        effective_us_kinds,
+        effective_au_kinds,
+    )
 
 
 def _merge_overlays(
@@ -115,15 +258,43 @@ def _fetch_regional_overlays(
     spec: SheetSpec,
     layout: SheetLayout,
     job_dir: Path,
-    local_overrides: Mapping[str | USOverlayKind, Path | str] | None = None,
+    local_overrides: Mapping[OverlayOverrideKey, Path | str] | None = None,
+    *,
+    us_kinds_override: Sequence[USOverlayKind] | None = None,
+    au_kinds_override: Sequence[AUOverlayKind] | None = None,
 ) -> tuple[dict[str, Path], list[str]]:
-    """Fetch opt-in US regional overlays, retaining non-empty GeoPackages and their attributions."""
-    if not spec.us_overlays:
+    """Fetch opt-in US and Australia regional overlays, retaining non-empty GeoPackages."""
+    us_kinds = list(spec.us_overlays) if us_kinds_override is None else list(us_kinds_override)
+    au_kinds = list(spec.au_overlays) if au_kinds_override is None else list(au_kinds_override)
+
+    if not us_kinds and not au_kinds:
         return {}, []
+
+    us_overrides: dict[str | USOverlayKind, Path | str] = {}
+    au_overrides: dict[str | AUOverlayKind, Path | str] = {}
+    if local_overrides:
+        us_values = {k.value for k in USOverlayKind}
+        au_values = {k.value for k in AUOverlayKind}
+        for raw_key, raw_path in local_overrides.items():
+            if isinstance(raw_key, USOverlayKind):
+                us_overrides[raw_key] = raw_path
+            elif isinstance(raw_key, AUOverlayKind):
+                au_overrides[raw_key] = raw_path
+            else:
+                norm = str(raw_key).lower().replace("_", "-")
+                if norm in us_values:
+                    us_overrides[norm] = raw_path
+                elif norm in au_values:
+                    au_overrides[norm] = raw_path
 
     overlay_dir = job_dir / "regional_overlays"
     overlay_dir.mkdir(parents=True, exist_ok=True)
-    sources = build_us_overlay_sources(spec.us_overlays, local_overrides=local_overrides)
+
+    sources: dict[str, OverlaySource] = {}
+    if us_kinds:
+        sources.update(build_us_overlay_sources(us_kinds, local_overrides=us_overrides or None))
+    if au_kinds:
+        sources.update(build_au_overlay_sources(au_kinds, local_overrides=au_overrides or None))
 
     resolved_paths: dict[str, Path] = {}
     attributions: list[str] = []
@@ -148,7 +319,9 @@ def prepare_job_workspace(
     elevation_source: ElevationSource | None = None,
     vector_source: VectorSource | None = None,
     overlay_sources: Sequence[OverlaySource] | None = None,
-    regional_overlay_overrides: Mapping[str | USOverlayKind, Path | str] | None = None,
+    regional_overlay_overrides: Mapping[OverlayOverrideKey, Path | str] | None = None,
+    pack_dir: Path | str | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> JobWorkspace:
     """Build a complete, render-ready ``JobWorkspace`` inside ``job_dir``.
 
@@ -159,11 +332,36 @@ def prepare_job_workspace(
     resolved_dir.mkdir(parents=True, exist_ok=True)
 
     layout = compute_sheet_layout(spec)
+
+    pack_manifest: PackManifest | None = None
+    pack_used_dem = False
+    effective_overrides: Mapping[OverlayOverrideKey, Path | str] | None = regional_overlay_overrides
+    us_kinds_override: list[USOverlayKind] | None = None
+    au_kinds_override: list[AUOverlayKind] | None = None
+
+    if pack_dir is not None:
+        (
+            pack_manifest,
+            elevation_source,
+            pack_used_dem,
+            vector_source,
+            effective_overrides,
+            us_kinds_override,
+            au_kinds_override,
+        ) = _resolve_pack_sources(
+            pack_dir,
+            spec,
+            layout,
+            elevation_source=elevation_source,
+            vector_source=vector_source,
+            regional_overlay_overrides=regional_overlay_overrides,
+        )
+
     elev_src = _resolve_elevation_source(spec, elevation_source)
     vec_src: VectorSource = vector_source or OverpassOSMSource()
 
     logger.info(
-        "Preparing GridForge workspace: EPSG:%s (%s) scale=1:%s paper=%s %s mode=%s dem=%s",
+        "Preparing GridForge workspace: EPSG:%s (%s) scale=1:%s paper=%s %s mode=%s dem=%s%s",
         layout.utm_epsg,
         layout.gzd,
         spec.scale,
@@ -171,31 +369,43 @@ def prepare_job_workspace(
         spec.orientation.value,
         spec.color_mode.value,
         getattr(elev_src, "name", spec.dem_source.value),
+        f" pack={pack_manifest.pack_id}" if pack_manifest is not None else "",
     )
 
     # 1. Fetch raw DEM & OSM data
+    _report_progress(progress_callback, "fetching_data", 15)
     dem_raw_path = elev_src.fetch_dem(layout, resolved_dir)
     osm_raw_path = vec_src.fetch_osm(layout, resolved_dir)
 
-    resolved_dem_name = str(
-        getattr(elev_src, "resolved_source_name", None) or getattr(elev_src, "name", "unknown-dem")
-    )
-    resolved_vertical_datum = str(
-        getattr(elev_src, "resolved_vertical_datum", None)
-        or getattr(elev_src, "vertical_datum", None)
-        or "EGM2008"
-    )
-    resolved_dem_attr = str(
-        getattr(elev_src, "resolved_attribution", None) or getattr(elev_src, "attribution", "")
-    )
+    if pack_used_dem and pack_manifest is not None:
+        resolved_dem_name = f"pack:{pack_manifest.pack_id}"
+        resolved_vertical_datum = pack_manifest.vertical_datum or "AHD"
+        resolved_dem_attr = str(
+            pack_manifest.dem_attribution or getattr(elev_src, "attribution", "")
+        )
+    else:
+        resolved_dem_name = str(
+            getattr(elev_src, "resolved_source_name", None) or getattr(elev_src, "name", "unknown-dem")
+        )
+        resolved_vertical_datum = str(
+            getattr(elev_src, "resolved_vertical_datum", None)
+            or getattr(elev_src, "vertical_datum", None)
+            or "EGM2008"
+        )
+        resolved_dem_attr = str(
+            getattr(elev_src, "resolved_attribution", None) or getattr(elev_src, "attribution", "")
+        )
 
     # 2. Normalize OSM vectors to sheet UTM GeoPackage
+    _report_progress(progress_callback, "normalizing_osm", 24)
     osm_gpkg = normalize_osm_to_gpkg(osm_raw_path, layout, resolved_dir / "osm.gpkg")
 
     # 3. Build UTM DEM, multi-directional hillshade, and density-aware elevation contours
+    _report_progress(progress_callback, "terrain", 32)
     terrain = build_terrain_products(dem_raw_path, layout, resolved_dir)
 
     # 4. Generate MGRS 1 km / 100 km grid & neatline ticks
+    _report_progress(progress_callback, "mgrs_grid", 40)
     mgrs_gpkg = resolved_dir / "mgrs_grid.gpkg"
     mgrs_meta = generate_mgrs_grid(layout, mgrs_gpkg)
 
@@ -212,7 +422,8 @@ def prepare_job_workspace(
         resolved_dir / "grid_ref_box.svg",
     )
 
-    # 6. Process optional user overlays and US regional thematic overlays
+    # 6. Process optional user overlays and US/AU regional thematic overlays
+    _report_progress(progress_callback, "overlays", 46)
     overlays_gpkg: Path | None = None
     overlay_attributions: list[str] = []
     if overlay_sources:
@@ -222,7 +433,9 @@ def prepare_job_workspace(
         spec,
         layout,
         resolved_dir,
-        local_overrides=regional_overlay_overrides,
+        local_overrides=effective_overrides,
+        us_kinds_override=us_kinds_override,
+        au_kinds_override=au_kinds_override,
     )
 
     # 7. Assemble mandatory attributions (deduplicated, preserving order)
@@ -270,6 +483,7 @@ def _run_workspace_exports(
     max_tiles: int | None = None,
     include_grid: bool | None = None,
     dpi: int | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> list[ExportResult]:
     """Run requested MBTiles and/or Garmin KMZ exports sharing one collarless GeoTIFF render."""
     if mbtiles_out is None and kmz_out is None:
@@ -280,6 +494,7 @@ def _run_workspace_exports(
 
     shared_tif: Path | None = None
     if mbtiles_out is not None and kmz_out is not None:
+        _report_progress(progress_callback, "rendering_raster", 84)
         shared_tif = render_collarless_geotiff(
             workspace,
             workspace.job_dir / "collarless_export.tif",
@@ -289,6 +504,7 @@ def _run_workspace_exports(
 
     results: list[ExportResult] = []
     if mbtiles_out is not None:
+        _report_progress(progress_callback, "exporting_mbtiles", 88)
         results.append(
             export_mbtiles(
                 workspace,
@@ -300,6 +516,7 @@ def _run_workspace_exports(
             )
         )
     if kmz_out is not None:
+        _report_progress(progress_callback, "exporting_kmz", 94)
         results.append(
             export_garmin_kmz(
                 workspace,
@@ -321,7 +538,9 @@ def run_render_job(
     elevation_source: ElevationSource | None = None,
     vector_source: VectorSource | None = None,
     overlay_sources: Sequence[OverlaySource] | None = None,
-    regional_overlay_overrides: Mapping[str | USOverlayKind, Path | str] | None = None,
+    regional_overlay_overrides: Mapping[OverlayOverrideKey, Path | str] | None = None,
+    pack_dir: Path | str | None = None,
+    progress_callback: ProgressCallback | None = None,
     keep_workspace: bool = False,
     work_dir: Path | str | None = None,
     renderer: MapRenderer | None = None,
@@ -353,9 +572,12 @@ def run_render_job(
             vector_source=vector_source,
             overlay_sources=overlay_sources,
             regional_overlay_overrides=regional_overlay_overrides,
+            pack_dir=pack_dir,
+            progress_callback=progress_callback,
         )
 
         # Render print-ready PDF via isolated PyQGIS subprocess
+        _report_progress(progress_callback, "rendering_pdf", 75)
         result = map_renderer.render_pdf(workspace, output_pdf_path)
 
         # Optionally produce matching offline device archives from the exact same workspace
@@ -369,8 +591,10 @@ def run_render_job(
                 max_tiles=max_tiles,
                 include_grid=export_include_grid,
                 dpi=export_dpi,
+                progress_callback=progress_callback,
             )
 
+        _report_progress(progress_callback, "done", 100)
         total_elapsed = round(time.perf_counter() - t_start, 3)
         retained_dir = job_dir if (keep_workspace or not owns_temp_dir) else None
         return result.model_copy(
@@ -392,7 +616,9 @@ def run_export_job(
     elevation_source: ElevationSource | None = None,
     vector_source: VectorSource | None = None,
     overlay_sources: Sequence[OverlaySource] | None = None,
-    regional_overlay_overrides: Mapping[str | USOverlayKind, Path | str] | None = None,
+    regional_overlay_overrides: Mapping[OverlayOverrideKey, Path | str] | None = None,
+    pack_dir: Path | str | None = None,
+    progress_callback: ProgressCallback | None = None,
     mbtiles_format: MBTilesFormat = MBTilesFormat.PNG,
     garmin_profile: GarminProfile = GarminProfile.STANDARD,
     max_tiles: int | None = None,
@@ -437,8 +663,10 @@ def run_export_job(
             vector_source=vector_source,
             overlay_sources=overlay_sources,
             regional_overlay_overrides=regional_overlay_overrides,
+            pack_dir=pack_dir,
+            progress_callback=progress_callback,
         )
-        return _run_workspace_exports(
+        results = _run_workspace_exports(
             workspace,
             mbtiles_out=mbt_out,
             kmz_out=kmz_out,
@@ -447,7 +675,10 @@ def run_export_job(
             max_tiles=max_tiles,
             include_grid=include_grid,
             dpi=dpi,
+            progress_callback=progress_callback,
         )
+        _report_progress(progress_callback, "done", 100)
+        return results
     finally:
         if owns_temp_dir and not keep_workspace:
             shutil.rmtree(job_dir, ignore_errors=True)

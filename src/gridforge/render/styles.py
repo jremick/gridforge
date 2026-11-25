@@ -36,15 +36,25 @@ STYLE_ROLES: tuple[str, ...] = (
     "landcover",
     "hillshade",
     "fema_flood",
+    "au_protected_areas",
     "water_polygons",
+    "au_hydro_polys",
     "contours",
     "enc_depth_contours",
     "nhd_flowlines",
+    "au_hydro_lines",
     "waterways",
     "buildings",
     "transport",
+    "au_power_lines",
+    "au_pipelines",
+    "au_runways",
     "building_icons",
     "points",
+    "au_substations",
+    "au_hydro_points",
+    "au_homesteads",
+    "au_airfields",
     "enc_navaids",
     "us_towers",
     "mgrs_grid_1km",
@@ -61,13 +71,22 @@ DEFAULT_FONT_FAMILY = "Liberation Sans"
 _LABELED_ROLES: frozenset[str] = frozenset(
     {
         "fema_flood",
+        "au_protected_areas",
         "water_polygons",
+        "au_hydro_polys",
         "contours",
         "enc_depth_contours",
         "nhd_flowlines",
+        "au_hydro_lines",
         "waterways",
         "transport",
+        "au_power_lines",
+        "au_pipelines",
         "points",
+        "au_substations",
+        "au_hydro_points",
+        "au_homesteads",
+        "au_airfields",
         "enc_navaids",
         "us_towers",
         "mgrs_square_labels",
@@ -2457,6 +2476,615 @@ def _build_overlay_style(layer: Any, role: str, color_mode: ColorMode) -> None:
         layer.setLabelsEnabled(False)
 
 
+def _park_boundary_symbol(
+    stroke_hex: str,
+    width_mm: float,
+    dash_vector: list[float],
+    *,
+    band_hex: str | None = None,
+    band_alpha: int = 44,
+    band_width_mm: float = 0.95,
+    band_offset_mm: float = 0.55,
+    tint_alpha: int = 0,
+) -> Any:
+    """Create a crisp topo protected-area boundary (dashed perimeter + subtle inner ribbon)."""
+    from qgis.core import (
+        QgsFillSymbol,
+        QgsSimpleFillSymbolLayer,
+        QgsSimpleLineSymbolLayer,
+        QgsUnitTypes,
+    )
+    from qgis.PyQt.QtCore import Qt
+    from qgis.PyQt.QtGui import QColor
+
+    sym = QgsFillSymbol()
+    sym.deleteSymbolLayer(0)
+
+    if tint_alpha > 0 and band_hex is not None:
+        fill_color = QColor(band_hex)
+        fill_color.setAlpha(tint_alpha)
+        bg = QgsSimpleFillSymbolLayer(fill_color)
+        bg.setStrokeStyle(Qt.NoPen)
+        sym.appendSymbolLayer(bg)
+
+    if band_hex is not None and band_width_mm > 0:
+        band_c = QColor(band_hex)
+        band_c.setAlpha(band_alpha)
+        ribbon = QgsSimpleLineSymbolLayer(band_c, band_width_mm)
+        ribbon.setWidthUnit(QgsUnitTypes.RenderMillimeters)
+        ribbon.setOffset(band_offset_mm)
+        ribbon.setOffsetUnit(QgsUnitTypes.RenderMillimeters)
+        ribbon.setPenJoinStyle(Qt.RoundJoin)
+        sym.appendSymbolLayer(ribbon)
+
+    edge = QgsSimpleLineSymbolLayer(QColor(stroke_hex), width_mm)
+    edge.setWidthUnit(QgsUnitTypes.RenderMillimeters)
+    edge.setPenCapStyle(Qt.FlatCap)
+    edge.setPenJoinStyle(Qt.RoundJoin)
+    edge.setUseCustomDashPattern(True)
+    edge.setCustomDashVector(dash_vector)
+    edge.setCustomDashPatternUnit(QgsUnitTypes.RenderMillimeters)
+    sym.appendSymbolLayer(edge)
+    return sym
+
+
+def _build_au_protected_areas_style(
+    layer: Any,
+    color_mode: ColorMode,
+    *,
+    scale: int = 25000,
+    carto: CartoOptions = _DEFAULT_CARTO,
+) -> None:
+    """Style DCCEEW CAPAD Australian National Parks, Nature Reserves, and IPAs."""
+    from qgis.core import QgsPalLayerSettings, QgsRuleBasedLabeling, QgsRuleBasedRenderer
+
+    wf = scale_width_factor(scale)
+    fd = scale_font_delta(scale)
+    is_color = color_mode == ColorMode.COLOR
+    ipa_expr = "upper(coalesce(\"type_abbr\", '')) = 'IPA' OR lower(coalesce(\"park_type\", '')) LIKE '%indigenous%'"
+
+    root = QgsRuleBasedRenderer.Rule(None)
+    if is_color:
+        _add_rule(
+            root,
+            "Indigenous Protected Areas (IPA)",
+            ipa_expr,
+            _park_boundary_symbol(
+                "#2E7D6B",
+                0.48 * wf,
+                [3.0, 1.1, 0.7, 1.1],
+                band_hex="#2E7D6B",
+                band_alpha=42,
+                band_width_mm=0.95 * wf,
+                band_offset_mm=0.52 * wf,
+                tint_alpha=12,
+            ),
+        )
+        _add_rule(
+            root,
+            "National Parks & Reserves (CAPAD)",
+            f"NOT ({ipa_expr})",
+            _park_boundary_symbol(
+                "#2B7A3E",
+                0.48 * wf,
+                [3.4, 1.3],
+                band_hex="#2B7A3E",
+                band_alpha=46,
+                band_width_mm=1.0 * wf,
+                band_offset_mm=0.55 * wf,
+                tint_alpha=14,
+            ),
+        )
+    else:
+        _add_rule(
+            root,
+            "Indigenous Protected Areas (IPA)",
+            ipa_expr,
+            _park_boundary_symbol(
+                "#1A1A1A",
+                0.46 * wf,
+                [2.4, 1.0, 0.6, 1.0, 0.6, 1.0],
+                band_hex="#666666",
+                band_alpha=180,
+                band_width_mm=0.14,
+                band_offset_mm=0.55,
+            ),
+        )
+        _add_rule(
+            root,
+            "National Parks & Reserves (CAPAD)",
+            f"NOT ({ipa_expr})",
+            _park_boundary_symbol(
+                "#1A1A1A",
+                0.48 * wf,
+                [3.2, 1.1, 0.7, 1.1],
+                band_hex="#555555",
+                band_alpha=180,
+                band_width_mm=0.14,
+                band_offset_mm=0.55,
+            ),
+        )
+
+    layer.setRenderer(QgsRuleBasedRenderer(root))
+
+    if carto.label_density == DensityLevel.LOW:
+        layer.setLabelsEnabled(False)
+        return
+
+    label_root = QgsRuleBasedLabeling.Rule(None)
+    pal = QgsPalLayerSettings()
+    pal.fieldName = (
+        "CASE "
+        "WHEN \"name\" IS NOT NULL AND length(trim(\"name\")) > 0 "
+        "AND \"type_abbr\" IS NOT NULL AND length(trim(\"type_abbr\")) > 0 "
+        "THEN upper(trim(\"name\")) || ' (' || upper(trim(\"type_abbr\")) || ')' "
+        "WHEN \"name\" IS NOT NULL AND length(trim(\"name\")) > 0 THEN upper(trim(\"name\")) "
+        "ELSE '' END"
+    )
+    pal.isExpression = True
+    pal.priority = 4
+    pal.setFormat(
+        _make_text_format(
+            6.6 + fd,
+            "#1E5C2E" if is_color else "#1A1A1A",
+            bold=True,
+            halo_hex="#FAF9F5" if is_color else "#FFFFFF",
+            halo_mm=0.75,
+        )
+    )
+    rule = QgsRuleBasedLabeling.Rule(pal)
+    rule.setDescription("CAPAD Protected Area Labels")
+    rule.setFilterExpression("\"name\" IS NOT NULL AND length(trim(\"name\")) > 0")
+    label_root.appendChild(rule)
+    layer.setLabeling(QgsRuleBasedLabeling(label_root))
+    layer.setLabelsEnabled(True)
+
+
+def _build_au_hydro_polys_style(
+    layer: Any,
+    color_mode: ColorMode,
+    *,
+    scale: int = 25000,
+    carto: CartoOptions = _DEFAULT_CARTO,
+) -> None:
+    """Style Geoscience Australia Surface Hydrology polygons (lakes, waterholes, dry claypans)."""
+    from qgis.core import QgsPalLayerSettings, QgsRuleBasedLabeling, QgsRuleBasedRenderer
+
+    wf = scale_width_factor(scale)
+    fd = scale_font_delta(scale)
+    is_color = color_mode == ColorMode.COLOR
+    perennial_expr = "lower(coalesce(\"perenniality\", 'perennial')) = 'perennial'"
+
+    root = QgsRuleBasedRenderer.Rule(None)
+    if is_color:
+        _add_rule(
+            root,
+            "GA Perennial Waterbody",
+            perennial_expr,
+            _simple_fill_symbol("#A6D1EC", stroke_hex="#3A82B5", stroke_mm=0.20 * wf, stroke_style="solid", fill_opacity=0.65),
+        )
+        _add_rule(
+            root,
+            "GA Non-Perennial / Dry Lake",
+            f"NOT ({perennial_expr})",
+            _hatch_fill_symbol(
+                "#4B8EC2",
+                angle_deg=0.0,
+                spacing_mm=1.8,
+                line_mm=0.12,
+                bg_hex="#CBE3F2",
+                bg_alpha=110,
+                outline_hex="#3A82B5",
+                outline_mm=0.18 * wf,
+                outline_dash=[1.8, 1.0],
+                dash_vector=[1.6, 1.2],
+            ),
+        )
+    else:
+        _add_rule(
+            root,
+            "GA Perennial Waterbody",
+            perennial_expr,
+            _hatch_fill_symbol(
+                "#6B6B6B",
+                angle_deg=0.0,
+                spacing_mm=1.3,
+                line_mm=0.12,
+                bg_hex="#FFFFFF",
+                outline_hex="#1A1A1A",
+                outline_mm=0.22 * wf,
+            ),
+        )
+        _add_rule(
+            root,
+            "GA Non-Perennial / Dry Lake",
+            f"NOT ({perennial_expr})",
+            _hatch_fill_symbol(
+                "#777777",
+                angle_deg=0.0,
+                spacing_mm=1.9,
+                line_mm=0.12,
+                outline_hex="#333333",
+                outline_mm=0.18 * wf,
+                outline_dash=[1.8, 1.0],
+                dash_vector=[1.4, 1.4],
+            ),
+        )
+    layer.setRenderer(QgsRuleBasedRenderer(root))
+
+    label_root = QgsRuleBasedLabeling.Rule(None)
+    pal = QgsPalLayerSettings()
+    pal.fieldName = "name"
+    pal.isExpression = False
+    pal.priority = 5
+    pal.setFormat(
+        _make_text_format(
+            6.2 + fd,
+            "#1E5B88" if is_color else "#111111",
+            italic=True,
+            halo_hex="#FFFFFF",
+            halo_mm=0.6,
+        )
+    )
+    rule = QgsRuleBasedLabeling.Rule(pal)
+    rule.setDescription("GA Waterbody Names")
+    rule.setFilterExpression("\"name\" IS NOT NULL AND length(trim(\"name\")) > 0")
+    label_root.appendChild(rule)
+    layer.setLabeling(QgsRuleBasedLabeling(label_root))
+    layer.setLabelsEnabled(carto.label_density != DensityLevel.LOW)
+
+
+def _build_au_hydro_lines_style(
+    layer: Any,
+    color_mode: ColorMode,
+    *,
+    scale: int = 25000,
+    carto: CartoOptions = _DEFAULT_CARTO,
+    icons_root: Path | None = None,
+) -> None:
+    """Style Geoscience Australia Surface Hydrology watercourses (perennial & non-perennial)."""
+    from qgis.core import QgsPalLayerSettings, QgsRuleBasedLabeling, QgsRuleBasedRenderer
+
+    wf = scale_width_factor(scale)
+    fd = scale_font_delta(scale)
+    rep_mult, min_mult = _density_params(carto.label_density)
+    is_color = color_mode == ColorMode.COLOR
+    arrow_iv = 34.0 / wf
+
+    major_c = "#2474B5" if is_color else "#1A1A1A"
+    minor_c = "#2E80BF" if is_color else "#2B2B2B"
+    nonper_c = "#3D8AC4" if is_color else "#444444"
+    halo_c = "#FAF9F5" if is_color else "#FFFFFF"
+
+    root = QgsRuleBasedRenderer.Rule(None)
+    _add_rule(
+        root,
+        "GA Perennial Major Watercourse",
+        "lower(coalesce(\"perenniality\", '')) = 'perennial' AND lower(coalesce(\"hierarchy\", '')) = 'major'",
+        _waterway_symbol(
+            major_c,
+            0.46 * wf,
+            show_arrows=carto.show_river_arrows,
+            arrow_interval_mm=arrow_iv,
+            arrow_size_mm=1.9 * wf,
+            arrow_color_hex=major_c,
+            icons_root=icons_root,
+        ),
+    )
+    _add_rule(
+        root,
+        "GA Perennial Minor Watercourse",
+        "lower(coalesce(\"perenniality\", '')) = 'perennial' AND lower(coalesce(\"hierarchy\", '')) != 'major'",
+        _waterway_symbol(
+            minor_c,
+            0.25 * wf,
+            show_arrows=carto.show_river_arrows,
+            arrow_interval_mm=arrow_iv * 1.2,
+            arrow_size_mm=1.55 * wf,
+            arrow_color_hex=major_c,
+            icons_root=icons_root,
+        ),
+    )
+    _add_rule(
+        root,
+        "GA Non-Perennial / Ephemeral Creek",
+        "lower(coalesce(\"perenniality\", '')) != 'perennial'",
+        _line_symbol(nonper_c, 0.21 * wf, dash_vector=[2.5, 0.9, 0.5, 0.9]),
+    )
+    layer.setRenderer(QgsRuleBasedRenderer(root))
+
+    if carto.label_density == DensityLevel.LOW:
+        layer.setLabelsEnabled(False)
+        return
+
+    label_root = QgsRuleBasedLabeling.Rule(None)
+    pal = QgsPalLayerSettings()
+    pal.fieldName = "name"
+    pal.isExpression = False
+    pal.priority = 4
+    _configure_curved_line_pal(pal, on_line=False, repeat_mm=72.0 * rep_mult, min_feature_mm=15.0 * min_mult)
+    pal.setFormat(_make_text_format(5.8 + fd, major_c, italic=True, halo_hex=halo_c, halo_mm=0.55))
+    rule = QgsRuleBasedLabeling.Rule(pal)
+    rule.setDescription("GA Watercourse Names")
+    rule.setFilterExpression("\"name\" IS NOT NULL AND length(trim(\"name\")) > 0")
+    label_root.appendChild(rule)
+    layer.setLabeling(QgsRuleBasedLabeling(label_root))
+    layer.setLabelsEnabled(True)
+
+
+def _build_au_hydro_points_style(
+    layer: Any,
+    color_mode: ColorMode,
+    *,
+    scale: int = 25000,
+    carto: CartoOptions = _DEFAULT_CARTO,
+    icons_root: Path | None = None,
+) -> None:
+    """Style Geoscience Australia Outback waterpoints (bores, springs, waterholes, tanks, dams)."""
+    from qgis.core import QgsPalLayerSettings, QgsSingleSymbolRenderer, QgsVectorLayerSimpleLabeling
+
+    wf = scale_width_factor(scale)
+    fd = scale_font_delta(scale)
+    is_color = color_mode == ColorMode.COLOR
+    c_hex = "#1B6CA8" if is_color else "#000000"
+
+    sym = _svg_marker_symbol("water_bore", 2.6 * wf, fill_hex=c_hex, outline_hex=c_hex, icons_root=icons_root)
+    layer.setRenderer(QgsSingleSymbolRenderer(sym))
+
+    if carto.label_density == DensityLevel.LOW:
+        layer.setLabelsEnabled(False)
+        return
+
+    lbl_expr = (
+        "CASE "
+        "WHEN \"name\" IS NOT NULL AND length(trim(\"name\")) > 0 "
+        "AND \"featuretype\" IS NOT NULL AND length(trim(\"featuretype\")) > 0 "
+        "AND strpos(lower(\"name\"), lower(trim(\"featuretype\"))) = 0 "
+        "THEN trim(\"name\") || ' (' || trim(\"featuretype\") || ')' "
+        "WHEN \"name\" IS NOT NULL AND length(trim(\"name\")) > 0 THEN trim(\"name\") "
+        "WHEN \"featuretype\" IS NOT NULL AND length(trim(\"featuretype\")) > 0 THEN trim(\"featuretype\") "
+        "ELSE '' END"
+    )
+    pal = QgsPalLayerSettings()
+    pal.fieldName = lbl_expr
+    pal.isExpression = True
+    pal.priority = 7
+    _configure_point_pal(pal, over_point=False, dist_mm=1.6)
+    pal.setFormat(
+        _make_text_format(
+            5.8 + fd,
+            "#145282" if is_color else "#000000",
+            bold=True,
+            halo_hex="#FFFFFF",
+            halo_mm=0.65,
+        )
+    )
+    layer.setLabeling(QgsVectorLayerSimpleLabeling(pal))
+    layer.setLabelsEnabled(True)
+
+
+def _build_au_power_lines_style(
+    layer: Any,
+    color_mode: ColorMode,
+    *,
+    scale: int = 25000,
+    carto: CartoOptions = _DEFAULT_CARTO,
+) -> None:
+    """Style Geoscience Australia National Electricity Transmission Lines."""
+    from qgis.core import QgsPalLayerSettings, QgsSingleSymbolRenderer, QgsVectorLayerSimpleLabeling
+
+    wf = scale_width_factor(scale)
+    fd = scale_font_delta(scale)
+    rep_mult, min_mult = _density_params(carto.label_density)
+    is_color = color_mode == ColorMode.COLOR
+    c_hex = "#4A4A4A" if is_color else "#1A1A1A"
+
+    layer.setRenderer(QgsSingleSymbolRenderer(_powerline_symbol(c_hex, render_pass=2, wf=wf * 1.15)))
+
+    if carto.label_density == DensityLevel.LOW:
+        layer.setLabelsEnabled(False)
+        return
+
+    lbl_expr = (
+        "CASE "
+        "WHEN \"capacity_kv\" IS NOT NULL AND to_real(\"capacity_kv\") > 0 "
+        "THEN to_int(round(to_real(\"capacity_kv\"))) || ' kV' "
+        "WHEN \"name\" IS NOT NULL AND length(trim(\"name\")) > 0 THEN trim(\"name\") "
+        "ELSE '' END"
+    )
+    pal = QgsPalLayerSettings()
+    pal.fieldName = lbl_expr
+    pal.isExpression = True
+    pal.priority = 4
+    _configure_curved_line_pal(pal, on_line=False, repeat_mm=80.0 * rep_mult, min_feature_mm=16.0 * min_mult)
+    pal.setFormat(_make_text_format(5.5 + fd, c_hex, bold=True, halo_hex="#FFFFFF", halo_mm=0.55))
+    layer.setLabeling(QgsVectorLayerSimpleLabeling(pal))
+    layer.setLabelsEnabled(True)
+
+
+def _build_au_substations_style(
+    layer: Any,
+    color_mode: ColorMode,
+    *,
+    scale: int = 25000,
+    carto: CartoOptions = _DEFAULT_CARTO,
+) -> None:
+    """Style Geoscience Australia electricity substations."""
+    from qgis.core import (
+        QgsMarkerSymbol,
+        QgsPalLayerSettings,
+        QgsSingleSymbolRenderer,
+        QgsVectorLayerSimpleLabeling,
+    )
+
+    wf = scale_width_factor(scale)
+    fd = scale_font_delta(scale)
+    is_color = color_mode == ColorMode.COLOR
+    c_hex = "#3D3D3D" if is_color else "#000000"
+
+    sym = QgsMarkerSymbol.createSimple(
+        {
+            "name": "square",
+            "color": "#FFFFFF",
+            "outline_color": c_hex,
+            "outline_width": f"{0.38 * wf:.3f}",
+            "outline_width_unit": "MM",
+            "size": f"{2.2 * wf:.3f}",
+            "size_unit": "MM",
+        }
+    )
+    layer.setRenderer(QgsSingleSymbolRenderer(sym))
+
+    if carto.label_density == DensityLevel.LOW:
+        layer.setLabelsEnabled(False)
+        return
+
+    lbl_expr = (
+        "CASE "
+        "WHEN \"name\" IS NOT NULL AND length(trim(\"name\")) > 0 "
+        "AND \"voltage_kv\" IS NOT NULL AND to_real(\"voltage_kv\") > 0 "
+        "THEN trim(\"name\") || ' (' || to_int(round(to_real(\"voltage_kv\"))) || ' kV)' "
+        "WHEN \"name\" IS NOT NULL AND length(trim(\"name\")) > 0 THEN trim(\"name\") "
+        "ELSE '' END"
+    )
+    pal = QgsPalLayerSettings()
+    pal.fieldName = lbl_expr
+    pal.isExpression = True
+    pal.priority = 6
+    _configure_point_pal(pal, over_point=False, dist_mm=1.5)
+    pal.setFormat(_make_text_format(5.6 + fd, c_hex, bold=True, halo_hex="#FFFFFF", halo_mm=0.6))
+    layer.setLabeling(QgsVectorLayerSimpleLabeling(pal))
+    layer.setLabelsEnabled(True)
+
+
+def _build_au_pipelines_style(
+    layer: Any,
+    color_mode: ColorMode,
+    *,
+    scale: int = 25000,
+    carto: CartoOptions = _DEFAULT_CARTO,
+) -> None:
+    """Style Geoscience Australia Oil & Gas Pipelines."""
+    from qgis.core import QgsPalLayerSettings, QgsSingleSymbolRenderer, QgsVectorLayerSimpleLabeling
+
+    wf = scale_width_factor(scale)
+    fd = scale_font_delta(scale)
+    rep_mult, min_mult = _density_params(carto.label_density)
+    is_color = color_mode == ColorMode.COLOR
+    c_hex = "#6A4C93" if is_color else "#1A1A1A"
+
+    layer.setRenderer(QgsSingleSymbolRenderer(_pipeline_symbol(c_hex, render_pass=2, wf=wf * 1.05)))
+
+    if carto.label_density == DensityLevel.LOW:
+        layer.setLabelsEnabled(False)
+        return
+
+    lbl_expr = (
+        "CASE "
+        "WHEN \"name\" IS NOT NULL AND length(trim(\"name\")) > 0 THEN trim(\"name\") "
+        "WHEN \"pipeline_type\" IS NOT NULL AND length(trim(\"pipeline_type\")) > 0 "
+        "THEN upper(trim(\"pipeline_type\")) || ' PIPELINE' "
+        "ELSE '' END"
+    )
+    pal = QgsPalLayerSettings()
+    pal.fieldName = lbl_expr
+    pal.isExpression = True
+    pal.priority = 4
+    _configure_curved_line_pal(pal, on_line=False, repeat_mm=85.0 * rep_mult, min_feature_mm=16.0 * min_mult)
+    pal.setFormat(_make_text_format(5.5 + fd, c_hex, bold=True, halo_hex="#FFFFFF", halo_mm=0.55))
+    layer.setLabeling(QgsVectorLayerSimpleLabeling(pal))
+    layer.setLabelsEnabled(True)
+
+
+def _build_au_runways_style(
+    layer: Any,
+    color_mode: ColorMode,
+    *,
+    scale: int = 25000,
+) -> None:
+    """Style Geoscience Australia regional aircraft runways."""
+    from qgis.core import QgsSingleSymbolRenderer
+
+    wf = scale_width_factor(scale)
+    is_color = color_mode == ColorMode.COLOR
+    sym = _cased_road_symbol(
+        "#1A1A1A" if is_color else "#000000",
+        1.55 * wf,
+        "#666666" if is_color else "#444444",
+        1.10 * wf,
+        casing_pass=9,
+        fill_pass=21,
+        centerline_hex="#FFFFFF",
+        centerline_mm=0.18 * wf,
+        centerline_dash=[1.6, 1.1],
+        centerline_pass=27,
+    )
+    layer.setRenderer(QgsSingleSymbolRenderer(sym))
+    layer.setLabelsEnabled(False)
+
+
+def _build_au_airfields_style(
+    layer: Any,
+    color_mode: ColorMode,
+    *,
+    scale: int = 25000,
+    carto: CartoOptions = _DEFAULT_CARTO,
+    icons_root: Path | None = None,
+) -> None:
+    """Style Geoscience Australia regional airfields & ALAs."""
+    from qgis.core import QgsPalLayerSettings, QgsSingleSymbolRenderer, QgsVectorLayerSimpleLabeling
+
+    wf = scale_width_factor(scale)
+    fd = scale_font_delta(scale)
+    is_color = color_mode == ColorMode.COLOR
+    c_hex = "#1B4F72" if is_color else "#000000"
+
+    sym = _svg_marker_symbol("airfield", 3.0 * wf, fill_hex=c_hex, outline_hex=c_hex, icons_root=icons_root)
+    layer.setRenderer(QgsSingleSymbolRenderer(sym))
+
+    pal = QgsPalLayerSettings()
+    pal.fieldName = "name"
+    pal.isExpression = False
+    pal.priority = 8
+    _configure_point_pal(pal, over_point=False, dist_mm=1.8)
+    pal.setFormat(_make_text_format(6.2 + fd, "#10324A" if is_color else "#000000", bold=True, halo_hex="#FFFFFF", halo_mm=0.7))
+    layer.setLabeling(QgsVectorLayerSimpleLabeling(pal))
+    layer.setLabelsEnabled(True)
+
+
+def _build_au_homesteads_style(
+    layer: Any,
+    color_mode: ColorMode,
+    *,
+    scale: int = 25000,
+    carto: CartoOptions = _DEFAULT_CARTO,
+    icons_root: Path | None = None,
+) -> None:
+    """Style Geoscience Australia Outback homesteads & pastoral stations."""
+    from qgis.core import QgsPalLayerSettings, QgsSingleSymbolRenderer, QgsVectorLayerSimpleLabeling
+
+    wf = scale_width_factor(scale)
+    fd = scale_font_delta(scale)
+    is_color = color_mode == ColorMode.COLOR
+    c_hex = "#1A1A1A" if is_color else "#000000"
+
+    sym = _svg_marker_symbol("homestead", 2.7 * wf, fill_hex=c_hex, outline_hex=c_hex, icons_root=icons_root)
+    layer.setRenderer(QgsSingleSymbolRenderer(sym))
+
+    if carto.label_density == DensityLevel.LOW:
+        layer.setLabelsEnabled(False)
+        return
+
+    pal = QgsPalLayerSettings()
+    pal.fieldName = "name"
+    pal.isExpression = False
+    pal.priority = 7
+    _configure_point_pal(pal, over_point=False, dist_mm=1.7)
+    pal.setFormat(_make_text_format(6.1 + fd, c_hex, bold=True, halo_hex="#FAF9F5" if is_color else "#FFFFFF", halo_mm=0.65))
+    layer.setLabeling(QgsVectorLayerSimpleLabeling(pal))
+    layer.setLabelsEnabled(True)
+
+
 def apply_programmatic_style(
     layer: Any,
     role: str,
@@ -2476,14 +3104,20 @@ def apply_programmatic_style(
         _build_hillshade_style(layer, color_mode, carto=opts)
     elif role == "fema_flood":
         _build_fema_flood_style(layer, color_mode, scale=scale, carto=opts)
+    elif role == "au_protected_areas":
+        _build_au_protected_areas_style(layer, color_mode, scale=scale, carto=opts)
     elif role == "water_polygons":
         _build_water_polygons_style(layer, color_mode, scale=scale, carto=opts)
+    elif role == "au_hydro_polys":
+        _build_au_hydro_polys_style(layer, color_mode, scale=scale, carto=opts)
     elif role == "contours":
         _build_contours_style(layer, color_mode, scale=scale, carto=opts)
     elif role == "enc_depth_contours":
         _build_enc_depth_contours_style(layer, color_mode, scale=scale, carto=opts)
     elif role == "nhd_flowlines":
         _build_nhd_flowlines_style(layer, color_mode, scale=scale, carto=opts, icons_root=icons_root)
+    elif role == "au_hydro_lines":
+        _build_au_hydro_lines_style(layer, color_mode, scale=scale, carto=opts, icons_root=icons_root)
     elif role == "waterways":
         _build_waterways_style(layer, color_mode, scale=scale, carto=opts, icons_root=icons_root)
     elif role == "buildings":
@@ -2492,8 +3126,22 @@ def apply_programmatic_style(
         _build_building_icons_style(layer, color_mode, scale=scale, carto=opts, icons_root=icons_root)
     elif role == "transport":
         _build_transport_style(layer, color_mode, scale=scale, carto=opts)
+    elif role == "au_power_lines":
+        _build_au_power_lines_style(layer, color_mode, scale=scale, carto=opts)
+    elif role == "au_pipelines":
+        _build_au_pipelines_style(layer, color_mode, scale=scale, carto=opts)
+    elif role == "au_runways":
+        _build_au_runways_style(layer, color_mode, scale=scale)
     elif role == "points":
         _build_points_style(layer, color_mode, units=units, scale=scale, carto=opts, icons_root=icons_root)
+    elif role == "au_substations":
+        _build_au_substations_style(layer, color_mode, scale=scale, carto=opts)
+    elif role == "au_hydro_points":
+        _build_au_hydro_points_style(layer, color_mode, scale=scale, carto=opts, icons_root=icons_root)
+    elif role == "au_homesteads":
+        _build_au_homesteads_style(layer, color_mode, scale=scale, carto=opts, icons_root=icons_root)
+    elif role == "au_airfields":
+        _build_au_airfields_style(layer, color_mode, scale=scale, carto=opts, icons_root=icons_root)
     elif role == "us_towers":
         _build_us_towers_style(layer, color_mode, units=units, scale=scale, carto=opts, icons_root=icons_root)
     elif role == "enc_navaids":
@@ -2726,10 +3374,27 @@ def populate_project_layers(
     towers_path = Path(regional["towers"]) if "towers" in regional else None
     enc_path = Path(regional["enc"]) if "enc" in regional else None
 
+    au_hydro_path = Path(regional["au-hydro"]) if "au-hydro" in regional else (
+        Path(regional["au_hydro"]) if "au_hydro" in regional else None
+    )
+    au_parks_path = Path(regional["au-parks"]) if "au-parks" in regional else (
+        Path(regional["au_parks"]) if "au_parks" in regional else None
+    )
+    au_infra_path = Path(regional["au-infra"]) if "au-infra" in regional else (
+        Path(regional["au_infra"]) if "au_infra" in regional else None
+    )
+    au_aviation_path = Path(regional["au-aviation"]) if "au-aviation" in regional else (
+        Path(regional["au_aviation"]) if "au_aviation" in regional else None
+    )
+
     fema_layers = set(_list_gpkg_layers(fema_path)) if fema_path else set()
     nhd_layers = set(_list_gpkg_layers(nhd_path)) if nhd_path else set()
     towers_layers = set(_list_gpkg_layers(towers_path)) if towers_path else set()
     enc_layers = set(_list_gpkg_layers(enc_path)) if enc_path else set()
+    au_hydro_layers = set(_list_gpkg_layers(au_hydro_path)) if au_hydro_path else set()
+    au_parks_layers = set(_list_gpkg_layers(au_parks_path)) if au_parks_path else set()
+    au_infra_layers = set(_list_gpkg_layers(au_infra_path)) if au_infra_path else set()
+    au_aviation_layers = set(_list_gpkg_layers(au_aviation_path)) if au_aviation_path else set()
 
     ordered_top_to_bottom: list[Any] = []
 
@@ -2767,11 +3432,19 @@ def populate_project_layers(
                 )
             )
 
-    # 3. Regional Point Overlays (FAA/FCC Obstacles & NOAA ENC Navaids)
+    # 3. Regional Point Overlays (US Obstacles/Navaids + AU Airfields/Homesteads/Waterpoints/Substations)
     if towers_path and "us_towers" in towers_layers:
         _push(_load_vector_layer(project, towers_path, "us_towers", "US Obstacle Towers", role="us_towers", workspace=workspace))
     if enc_path and "enc_navaids" in enc_layers:
         _push(_load_vector_layer(project, enc_path, "enc_navaids", "NOAA ENC Navaids", role="enc_navaids", workspace=workspace))
+    if au_aviation_path and "au_airfields" in au_aviation_layers:
+        _push(_load_vector_layer(project, au_aviation_path, "au_airfields", "AU Airfields", role="au_airfields", workspace=workspace))
+    if au_aviation_path and "au_homesteads" in au_aviation_layers:
+        _push(_load_vector_layer(project, au_aviation_path, "au_homesteads", "AU Homesteads", role="au_homesteads", workspace=workspace))
+    if au_hydro_path and "au_hydro_points" in au_hydro_layers:
+        _push(_load_vector_layer(project, au_hydro_path, "au_hydro_points", "AU Waterpoints & Bores", role="au_hydro_points", workspace=workspace))
+    if au_infra_path and "au_substations" in au_infra_layers and carto.show_power:
+        _push(_load_vector_layer(project, au_infra_path, "au_substations", "AU Substations", role="au_substations", workspace=workspace))
 
     # 4. OSM Points & Building-Polygon Usage Icons
     if "points" in osm_layers:
@@ -2783,17 +3456,25 @@ def populate_project_layers(
             )
         )
 
-    # 5. OSM Transport & Infrastructure (Roads, Exits, Runways, Rail, Power, Pipelines)
+    # 5. OSM Transport & Infrastructure + AU Runways / HV Power / Pipelines
+    if au_aviation_path and "au_runways" in au_aviation_layers:
+        _push(_load_vector_layer(project, au_aviation_path, "au_runways", "AU Runways", role="au_runways", workspace=workspace))
     if "lines" in osm_layers:
         _push(_load_vector_layer(project, workspace.osm_gpkg, "lines", "Roads & Transport", role="transport", workspace=workspace))
+    if au_infra_path and "au_power_lines" in au_infra_layers and carto.show_power:
+        _push(_load_vector_layer(project, au_infra_path, "au_power_lines", "AU Transmission Lines", role="au_power_lines", workspace=workspace))
+    if au_infra_path and "au_pipelines" in au_infra_layers and carto.show_pipelines:
+        _push(_load_vector_layer(project, au_infra_path, "au_pipelines", "AU Pipelines", role="au_pipelines", workspace=workspace))
 
     # 6. OSM Buildings & Power Substations
     if "multipolygons" in osm_layers and (carto.show_buildings or carto.show_power):
         _push(_load_vector_layer(project, workspace.osm_gpkg, "multipolygons", "Buildings", role="buildings", workspace=workspace))
 
-    # 7. Waterways (OSM + optional USGS NHD + optional NOAA ENC Depth Contours)
+    # 7. Waterways (OSM + optional USGS NHD + optional GA Hydrology + optional NOAA ENC Depth Contours)
     if "lines" in osm_layers:
         _push(_load_vector_layer(project, workspace.osm_gpkg, "lines", "Waterways", role="waterways", workspace=workspace))
+    if au_hydro_path and "au_hydro_lines" in au_hydro_layers:
+        _push(_load_vector_layer(project, au_hydro_path, "au_hydro_lines", "AU Watercourses", role="au_hydro_lines", workspace=workspace))
     if nhd_path and "nhd_flowlines" in nhd_layers:
         _push(_load_vector_layer(project, nhd_path, "nhd_flowlines", "USGS NHD Flowlines", role="nhd_flowlines", workspace=workspace))
     if enc_path and "enc_depth_contours" in enc_layers:
@@ -2807,17 +3488,21 @@ def populate_project_layers(
     if "contours" in terrain_layers:
         _push(_load_vector_layer(project, workspace.terrain_gpkg, "contours", "Contours", role="contours", workspace=workspace))
 
-    # 9. OSM Water Polygons (above hillshade so waterbodies stay crisp & clean)
+    # 9. Water Polygons (OSM + optional GA Surface Hydrology polygons; above hillshade)
     if "multipolygons" in osm_layers:
         _push(
             _load_vector_layer(
                 project, workspace.osm_gpkg, "multipolygons", "Waterbodies", role="water_polygons", workspace=workspace
             )
         )
+    if au_hydro_path and "au_hydro_polys" in au_hydro_layers:
+        _push(_load_vector_layer(project, au_hydro_path, "au_hydro_polys", "AU Waterbodies", role="au_hydro_polys", workspace=workspace))
 
-    # 10. FEMA NFHL Flood Zones (above landcover/hillshade, strictly below contours & roads!)
+    # 10. Regional Area Overlays (FEMA Flood Zones + CAPAD AU Parks/IPAs; strictly below contours & roads!)
     if fema_path and "fema_flood" in fema_layers:
         _push(_load_vector_layer(project, fema_path, "fema_flood", "FEMA Flood Zones", role="fema_flood", workspace=workspace))
+    if au_parks_path and "au_protected_areas" in au_parks_layers:
+        _push(_load_vector_layer(project, au_parks_path, "au_protected_areas", "AU Protected Areas", role="au_protected_areas", workspace=workspace))
 
     # 11. Multi-directional Hillshade (Multiply blend over landcover + background; omitted if OFF)
     if carto.hillshade_strength != HillshadeStrength.OFF and workspace.hillshade_tif.is_file():
@@ -2869,11 +3554,20 @@ def export_qml_styles(styles_root: Path | None = None) -> list[Path]:
             "MultiPolygon?crs=EPSG:32613&field=fld_zone:string&field=zone_subty:string&field=sfha_tf:string",
             "fema_flood",
         ),
+        "au_protected_areas": (
+            "MultiPolygon?crs=EPSG:32752"
+            "&field=name:string&field=park_type:string&field=type_abbr:string&field=iucn:string&field=state:string",
+            "au_protected_areas",
+        ),
         "water_polygons": (
             "MultiPolygon?crs=EPSG:32756"
             "&field=name:string&field=natural:string&field=landuse:string"
             "&field=water:string&field=waterway:string",
             "water_polygons",
+        ),
+        "au_hydro_polys": (
+            "MultiPolygon?crs=EPSG:32752&field=name:string&field=featuretype:string&field=perenniality:string",
+            "au_hydro_polys",
         ),
         "contours": (
             "LineString?crs=EPSG:32756&field=elev:double&field=elev_label:string&field=is_index:integer",
@@ -2886,6 +3580,11 @@ def export_qml_styles(styles_root: Path | None = None) -> list[Path]:
         "nhd_flowlines": (
             "LineString?crs=EPSG:32613&field=gnis_name:string&field=fcode:integer&field=flow_type:string",
             "nhd_flowlines",
+        ),
+        "au_hydro_lines": (
+            "LineString?crs=EPSG:32752"
+            "&field=name:string&field=featuretype:string&field=perenniality:string&field=hierarchy:string",
+            "au_hydro_lines",
         ),
         "waterways": (
             "LineString?crs=EPSG:32756&field=name:string&field=waterway:string&field=intermittent:string",
@@ -2910,6 +3609,18 @@ def export_qml_styles(styles_root: Path | None = None) -> list[Path]:
             "&field=tunnel:string&field=layer:string&field=oneway:string",
             "transport",
         ),
+        "au_power_lines": (
+            "LineString?crs=EPSG:32756&field=name:string&field=capacity_kv:double&field=status:string&field=state:string",
+            "au_power_lines",
+        ),
+        "au_pipelines": (
+            "LineString?crs=EPSG:32756&field=name:string&field=pipeline_type:string&field=status:string&field=operator:string",
+            "au_pipelines",
+        ),
+        "au_runways": (
+            "LineString?crs=EPSG:32752&field=featuretype:string&field=type:string",
+            "au_runways",
+        ),
         "points": (
             "Point?crs=EPSG:32756"
             "&field=name:string&field=highway:string&field=ref:string&field=exit_to:string"
@@ -2920,6 +3631,22 @@ def export_qml_styles(styles_root: Path | None = None) -> list[Path]:
             "&field=man_made:string&field=tower:type:string&field=communication:string"
             "&field=tourism:string",
             "points",
+        ),
+        "au_substations": (
+            "Point?crs=EPSG:32756&field=name:string&field=voltage_kv:double&field=status:string&field=state:string",
+            "au_substations",
+        ),
+        "au_hydro_points": (
+            "Point?crs=EPSG:32752&field=name:string&field=featuretype:string&field=type:string&field=perenniality:string",
+            "au_hydro_points",
+        ),
+        "au_homesteads": (
+            "Point?crs=EPSG:32752&field=name:string&field=featuretype:string",
+            "au_homesteads",
+        ),
+        "au_airfields": (
+            "Point?crs=EPSG:32752&field=name:string&field=featuretype:string&field=type:string",
+            "au_airfields",
         ),
         "us_towers": (
             "Point?crs=EPSG:32613"

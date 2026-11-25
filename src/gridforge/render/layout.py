@@ -617,8 +617,13 @@ def _render_compact_map_key(
 
     has_fema = "fema" in regional
     has_towers = "towers" in regional
+    has_au_parks = ("au-parks" in regional) or ("au_parks" in regional)
+    has_au_hydro = ("au-hydro" in regional) or ("au_hydro" in regional)
+    has_au_aviation = ("au-aviation" in regional) or ("au_aviation" in regional)
     has_infra = bool(carto is None or carto.show_power or carto.show_pipelines)
-    extra_rows = int(has_infra) + int(has_fema or has_towers)
+    has_us_row = has_fema or has_towers
+    has_au_row = (has_au_parks or has_au_hydro or has_au_aviation) and not has_us_row
+    extra_rows = int(has_infra) + int(has_us_row or has_au_row)
     total_rows = 8 + extra_rows
     row_y0 = y_mm + 4.8
     avail_h = h_mm - 10.6
@@ -708,7 +713,7 @@ def _render_compact_map_key(
         _add_label(print_layout, "Power / Pipe", lbl_x, ry - 1.15, lbl_w, 2.3, size_pt=lbl_pt, valign="center")
 
     # Row: Active US Regional Overlay (FEMA Flood / FAA Towers)
-    if has_fema or has_towers:
+    if has_us_row:
         ry = _ry(idx); idx += 1
         if has_fema:
             _add_rect(
@@ -736,6 +741,42 @@ def _render_compact_map_key(
             _add_line(print_layout, tx, ry - 0.75, tx + 0.6, ry + 0.65, color_hex="#1B4F72" if is_color else "#000000", width_mm=0.22)
         tag = "Flood / Tower" if (has_fema and has_towers) else ("FEMA Flood" if has_fema else "FAA Obstacle")
         _add_label(print_layout, tag, lbl_x, ry - 1.15, lbl_w, 2.3, size_pt=lbl_pt, valign="center")
+
+    # Row: Active AU Regional Overlays (CAPAD Parks/IPA, Outback Bore/Water, Airfield/Homestead)
+    if has_au_row:
+        ry = _ry(idx); idx += 1
+        if has_au_parks:
+            _add_line(
+                print_layout,
+                sx1,
+                ry,
+                sx1 + (3.2 if (has_au_hydro or has_au_aviation) else 6.0),
+                ry,
+                color_hex="#2B7A3E" if is_color else "#1A1A1A",
+                width_mm=0.40,
+                dash_vector=[1.4, 0.7],
+            )
+        if has_au_hydro or has_au_aviation:
+            bx = sx1 + (4.2 if has_au_parks else 1.8)
+            _add_rect(
+                print_layout,
+                bx,
+                ry - 0.6,
+                1.2,
+                1.2,
+                fill_hex="#1B6CA8" if (is_color and has_au_hydro) else ("#1B4F72" if is_color else "#1A1A1A"),
+                stroke_hex="#1A1A1A",
+                stroke_mm=0.14,
+            )
+        if has_au_parks and (has_au_hydro or has_au_aviation):
+            au_tag = "Park / Bore-ALA" if has_au_aviation else "Park / Waterpt"
+        elif has_au_parks:
+            au_tag = "Nat. Park / IPA"
+        elif has_au_aviation:
+            au_tag = "Airfield / Stn"
+        else:
+            au_tag = "Bore / Waterpt"
+        _add_label(print_layout, au_tag, lbl_x, ry - 1.15, lbl_w, 2.3, size_pt=lbl_pt, valign="center")
 
     # Sheet Metadata footer inside Key Box
     meta_y = y_mm + h_mm - 4.9
