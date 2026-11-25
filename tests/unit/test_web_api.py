@@ -62,7 +62,52 @@ def client_and_dirs(tmp_path: Path) -> tuple[TestClient, Path, Path, Path]:
         web_dist_dir=web_dist,
         memory_budget_mb=3072,
     )
-    return (TestClient(app), data_dir, packs_dir, data_dir / "gridforge_jobs.sqlite3")
+    client = TestClient(app, base_url="http://localhost:8080")
+    return (client, data_dir, packs_dir, data_dir / "gridforge_jobs.sqlite3")
+
+
+class TestStudioAccess:
+    def test_same_origin_job_lifecycle(self, client_and_dirs) -> None:
+        client, *_ = client_and_dirs
+        headers = {"Origin": "http://localhost:8080", "Sec-Fetch-Site": "same-origin"}
+        created = client.post(
+            "/api/jobs",
+            files={"payload": (None, json.dumps({"center": "10,10"}))},
+            headers=headers,
+        )
+        assert created.status_code == 202
+        job_url = "/api/jobs/" + created.json()["job_id"]
+        assert client.post(job_url + "/cancel", headers=headers).json()["status"] == "cancelled"
+        assert client.delete(job_url, headers=headers).status_code == 200
+
+    @pytest.mark.parametrize("headers", [
+        {"Origin": "http://localhost:5173"},
+        {"Origin": "null"},
+        {"Sec-Fetch-Site": "cross-site"},
+        {"Sec-Fetch-Site": "same-site"},
+    ])
+    def test_api_write_requires_matching_browser_origin(self, client_and_dirs, headers) -> None:
+        client, *_ = client_and_dirs
+        response = client.post("/api/jobs", json={"center": "10,10"}, headers=headers)
+        assert response.status_code == 403
+        assert client.get("/api/jobs").json()["jobs"] == []
+
+    def test_host_and_cors_defaults(self, client_and_dirs) -> None:
+        client, *_ = client_and_dirs
+        assert client.get("/api/health", headers={"Host": "[::1]:8080"}).status_code == 200
+        assert client.get("/api/health", headers={"Host": "LOCALHOST:8080"}).status_code == 200
+        assert client.get("/api/health", headers={"Host": "unlisted.example"}).status_code == 400
+        resp = client.get("/api/health", headers={"Origin": "https://other.example"})
+        assert "access-control-allow-origin" not in resp.headers
+
+    def test_configured_hostname_works_behind_https_proxy(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setenv("GRIDFORGE_ALLOWED_HOSTS", "studio.example")
+        app = create_app(data_dir=tmp_path / "jobs")
+        with TestClient(app, base_url="https://studio.example:443") as client:
+            created = client.post(
+                "/api/jobs", json={"center": "10,10"}, headers={"Origin": "https://studio.example"}
+            )
+            assert created.status_code == 202
 
 
 class TestWebMemoryHygieneAndHealth:

@@ -928,7 +928,7 @@ def pack_inspect_cmd(
 @app.command("serve")
 def serve_cmd(
     host: str = typer.Option(
-        "0.0.0.0",
+        "127.0.0.1",
         "--host",
         help="Bind interface for the GridForge self-hosted web server.",
     ),

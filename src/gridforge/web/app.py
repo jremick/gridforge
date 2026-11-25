@@ -15,7 +15,7 @@ from typing import Any
 import httpx
 import mgrs
 from fastapi import FastAPI, HTTPException, Query, Request, status
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
@@ -26,6 +26,7 @@ from gridforge.geo.crs import MAX_UTM_LAT, MIN_UTM_LAT, compute_sheet_layout, pa
 from gridforge.geo.declination import compute_declination
 from gridforge.packs.builder import discover_packs
 from gridforge.web import db
+from gridforge.web.access import SameOriginWritesMiddleware
 from gridforge.web.schemas import (
     CreateJobRequest,
     FootprintRequest,
@@ -439,11 +440,14 @@ def create_app(
         version="0.4.0",
         description="Self-hosted military-style MGRS topographic map generator & offline pack studio.",
     )
+    application.add_middleware(SameOriginWritesMiddleware)
+    allowed_hosts = ["localhost", "127.0.0.1", "[::1]"]
+    extra_hosts = os.environ.get("GRIDFORGE_ALLOWED_HOSTS", "").split(",")
+    allowed_hosts.extend(host.strip() for host in extra_hosts if host.strip())
     application.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_methods=["*"],
-        allow_headers=["*"],
+        TrustedHostMiddleware,
+        allowed_hosts=allowed_hosts,
+        www_redirect=False,
     )
     application.state.data_dir = resolved_data_dir
     application.state.packs_dir = resolved_packs_dir

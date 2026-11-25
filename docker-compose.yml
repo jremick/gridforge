@@ -6,11 +6,13 @@ services:
     image: gridforge:dev
     command: ["uvicorn", "gridforge.web.app:app", "--host", "0.0.0.0", "--port", "8080"]
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     environment:
       - GRIDFORGE_DATA_DIR=/data/jobs
       - GRIDFORGE_PACKS_DIR=/data/packs
       - GRIDFORGE_WEB_DIST=/app/web/dist
+      - GRIDFORGE_ALLOWED_HOSTS=${GRIDFORGE_ALLOWED_HOSTS:-}
+      - FORWARDED_ALLOW_IPS=${FORWARDED_ALLOW_IPS:-127.0.0.1}
       - GDAL_CACHEMAX=192
       - OMP_THREAD_LIMIT=1
     volumes:

@@ -3,12 +3,12 @@ import { defineConfig } from "vite";
 export default defineConfig({
   base: "/",
   server: {
-    host: "0.0.0.0",
+    host: "127.0.0.1",
+    cors: false,
     port: 5173,
     proxy: {
       "/api": {
-        target: "http://localhost:8080",
-        changeOrigin: true,
+        target: "http://127.0.0.1:8080",
       },
     },
   },

@@ -66,7 +66,9 @@ cd gridforge
 docker compose up --build -d
 ```
 
-Open **<http://localhost:8080>** in your browser:
+Open **<http://localhost:8080>** in your browser. Compose publishes the Studio on IPv4 loopback. The API and worker share one job queue, and everyone with access to the Studio can read, cancel, and delete its jobs.
+
+For personal access from another machine, forward port 8080 over SSH and open the same localhost URL. To share the Studio with a trusted group, put an authenticated reverse proxy in front of the loopback port. Set `GRIDFORGE_ALLOWED_HOSTS` to the public hostname (or a comma-separated list of hostnames). Have the proxy preserve the original `Host` including any port and set `X-Forwarded-Proto` to the public scheme. Set `FORWARDED_ALLOW_IPS` to the proxy’s source IP as seen by Uvicorn. Browser requests that change jobs must come from the Studio’s own origin.
 
 - **Place Search & Direct Coordinates:** Press `/` to search any place name (via built-in Nominatim proxy), paste `lat,lon`, enter an MGRS coordinate (e.g. `56H KH 5100 6400`), jump to curated **NSW & Victoria outdoor presets** (*Blue Mountains, Mt Kosciuszko, Budawangs, Warrumbungles, Grampians, Wilsons Promontory, Mt Bogong, Cathedral Range*), or drag the crosshair reticle anywhere on the map.
 - **Live Tilted UTM Footprint & MGRS Preview:** Visually inspects the exact true-scale UTM paper frame and 1 km MGRS grid lines (including convergence tilt) in real time; press `F` to fit the sheet to view.
