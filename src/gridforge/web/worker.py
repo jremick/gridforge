@@ -7,7 +7,6 @@ memory stays safely below the 3 GB worker container limit on 16 GB hosts.
 from __future__ import annotations
 
 import argparse
-import inspect
 import logging
 import os
 import re
@@ -32,8 +31,6 @@ from gridforge.geo.crs import compute_sheet_layout, parse_center
 from gridforge.packs.builder import discover_packs, load_pack_manifest
 from gridforge.pipeline import runner
 from gridforge.render.pyqgis_worker import PyQGISRenderer
-from gridforge.sources.dem_local import LocalDEMSource
-from gridforge.sources.osm_pbf import LocalPBFSource
 from gridforge.sources.overlay_user import UserOverlaySource
 from gridforge.web import db
 from gridforge.web.schemas import CreateJobRequest, JobArtifact, JobRecord, JobStatus
@@ -72,24 +69,6 @@ def _resolve_pack_dir(packs_dir: Path, pack_id: str) -> Path:
             except Exception:
                 continue
     raise FileNotFoundError(f"Offline pack '{pack_id}' not found in '{packs_dir}'.")
-
-
-class _PackLocalDEMSource(LocalDEMSource):
-    """LocalDEMSource carrying exact vertical_datum and attribution from a PackManifest."""
-
-    def __init__(
-        self,
-        path: Path | str,
-        *,
-        vertical_datum: str = "AHD",
-        attribution: str | None = None,
-    ) -> None:
-        super().__init__(path)
-        self.vertical_datum = vertical_datum
-        self.resolved_vertical_datum = vertical_datum
-        if attribution:
-            self.attribution = attribution
-            self.resolved_attribution = attribution
 
 
 def _build_spec_from_request(req: CreateJobRequest) -> SheetSpec:
@@ -183,34 +162,15 @@ def _build_prep_kwargs(
         else None
     )
 
-    prep_sig = inspect.signature(runner.prepare_job_workspace)
     prep_kwargs: dict[str, Any] = {
         "overlay_sources": overlay_sources,
     }
 
-    if progress_cb is not None and "progress_callback" in prep_sig.parameters:
+    if progress_cb is not None:
         prep_kwargs["progress_callback"] = progress_cb
 
     if req.pack_id is not None:
-        pack_dir = _resolve_pack_dir(packs_dir, req.pack_id)
-        if "pack_dir" in prep_sig.parameters:
-            prep_kwargs["pack_dir"] = pack_dir
-        else:
-            manifest = load_pack_manifest(pack_dir)
-            if manifest.dem_path:
-                prep_kwargs["elevation_source"] = _PackLocalDEMSource(
-                    pack_dir / manifest.dem_path,
-                    vertical_datum=manifest.vertical_datum,
-                    attribution=manifest.dem_attribution,
-                )
-            if manifest.osm_pbf_path:
-                prep_kwargs["vector_source"] = LocalPBFSource(
-                    pack_dir / manifest.osm_pbf_path
-                )
-            if manifest.overlays:
-                prep_kwargs["regional_overlay_overrides"] = {
-                    k: (pack_dir / rel) for k, rel in manifest.overlays.items()
-                }
+        prep_kwargs["pack_dir"] = _resolve_pack_dir(packs_dir, req.pack_id)
     return prep_kwargs
 
 

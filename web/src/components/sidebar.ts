@@ -102,6 +102,7 @@ export class SidebarPanel {
     this.root.className = "gf-sidebar";
     this.render();
     this.bindEvents();
+    this.setPacks([]);
     this.syncControlsFromState();
   }
 
@@ -1176,13 +1177,11 @@ export class SidebarPanel {
         return `<option value="${escapeHtml(p.pack_id)}">${escapeHtml(p.name)} (${escapeHtml(meta)})</option>`;
       }),
     ];
-    this.packSelect.innerHTML = options.join("");
-    if (prev && packs.some((p) => p.pack_id === prev)) {
-      this.packSelect.value = prev;
-    } else {
-      this.state.pack_id = "";
-      this.packSelect.value = "";
+    if (prev && !packs.some((p) => p.pack_id === prev)) {
+      options.push(`<option value="${escapeHtml(prev)}">${escapeHtml(prev)} (unavailable)</option>`);
     }
+    this.packSelect.innerHTML = options.join("");
+    this.packSelect.value = prev;
     this.updateSectionPills();
   }
 

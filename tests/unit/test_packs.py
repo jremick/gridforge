@@ -256,3 +256,40 @@ class TestOfflinePackBuilder:
         assert out1 == out2 == dest
         assert dest.read_bytes() == b"chunk1-chunk2"
         assert calls["count"] == 1  # Second call hit disk cache cleanly!
+
+
+@pytest.mark.parametrize(
+    ("missing", "option"), [("dem_path", "--offline-dem"), ("osm_pbf_path", "--offline-pbf")]
+)
+def test_partial_pack_requires_missing_input_before_fetch(tmp_path, monkeypatch, missing, option):
+    from gridforge.config import PackManifest, SheetSpec
+    from gridforge.pipeline import runner
+
+    manifest = PackManifest(
+        pack_id="partial", name="Partial pack", region="test", utm_zones=["56H"],
+        bbox_wgs84=BBox(min_x=150, min_y=-34, max_x=151, max_y=-33),
+        created_at="2026-01-01", dem_path="dem.tif", osm_pbf_path="osm.pbf",
+    ).model_copy(update={missing: None})
+    (tmp_path / "pack.json").write_text(manifest.model_dump_json())
+    (tmp_path / "dem.tif").touch()
+    (tmp_path / "osm.pbf").touch()
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("Pack validation must finish before selecting or fetching online data")
+
+    monkeypatch.setattr(runner, "_resolve_elevation_source", unexpected)
+    monkeypatch.setattr(runner, "OverpassOSMSource", unexpected)
+    monkeypatch.setattr(runner.LocalDEMSource, "fetch_dem", unexpected)
+    spec = SheetSpec(center_lat=-33.5, center_lon=150.5)
+    with pytest.raises(ValueError, match=option):
+        runner.prepare_job_workspace(spec, tmp_path / "job", pack_dir=tmp_path)
+
+    # The corresponding explicit local CLI input completes a partial pack.
+    dem = runner.LocalDEMSource(tmp_path / "dem.tif") if missing == "dem_path" else None
+    osm = runner.LocalPBFSource(tmp_path / "osm.pbf") if missing == "osm_pbf_path" else None
+    _, elev_src, _, vec_src, *_ = runner._resolve_pack_sources(
+        tmp_path, spec, runner.compute_sheet_layout(spec), elevation_source=dem,
+        vector_source=osm, regional_overlay_overrides=None,
+    )
+    assert isinstance(elev_src, runner.LocalDEMSource)
+    assert isinstance(vec_src, runner.LocalPBFSource)

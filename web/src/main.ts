@@ -104,6 +104,11 @@ function hydrateStateFromUrl(state: AppFormState): {
     state.dem_source = demParam as DemSourceKind;
   }
 
+  const pack = params.get("pack");
+  if (pack && /^[a-zA-Z0-9_-]{1,64}$/.test(pack)) {
+    state.pack_id = pack;
+  }
+
   const gridParam = params.get("grid")?.toLowerCase();
   if (gridParam) {
     const match = /^([1-3])x([1-3])$/.exec(gridParam);
@@ -415,6 +420,9 @@ class GridForgeApp {
     if (this.state.dem_source !== "auto") {
       params.set("dem", this.state.dem_source);
     }
+    if (this.state.pack_id) {
+      params.set("pack", this.state.pack_id);
+    }
     if (this.state.grid_cols !== 1 || this.state.grid_rows !== 1) {
       params.set("grid", `${this.state.grid_cols}x${this.state.grid_rows}`);
     }
@@ -580,12 +588,12 @@ class GridForgeApp {
         this.showToast(
           res.packs.length > 0
             ? `Loaded ${res.packs.length} offline pack${res.packs.length === 1 ? "" : "s"}`
-            : "No offline packs installed — using Cloud-Native On-Demand",
+            : "No offline packs installed",
           "info"
         );
       }
     } catch {
-      this.sidebar.setPacks([]);
+      if (notify) this.showToast("Could not refresh offline packs. Your selection is unchanged.", "error");
     }
   }
 

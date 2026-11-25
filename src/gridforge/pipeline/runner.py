@@ -95,9 +95,9 @@ def _resolve_pack_sources(
     regional_overlay_overrides: Mapping[OverlayOverrideKey, Path | str] | None,
 ) -> tuple[
     PackManifest,
-    ElevationSource | None,
+    ElevationSource,
     bool,
-    VectorSource | None,
+    VectorSource,
     dict[str, Path],
     list[USOverlayKind],
     list[AUOverlayKind],
@@ -118,7 +118,12 @@ def _resolve_pack_sources(
 
     pack_used_dem = False
     resolved_elev = elevation_source
-    if resolved_elev is None and manifest.dem_path:
+    if resolved_elev is None:
+        if not manifest.dem_path:
+            raise ValueError(
+                f"Offline pack '{manifest.pack_id}' has no DEM. "
+                "Choose a pack with elevation data or supply --offline-dem."
+            )
         dem_file = (resolved_pack_dir / manifest.dem_path).resolve()
         if not dem_file.exists():
             raise FileNotFoundError(
@@ -128,7 +133,12 @@ def _resolve_pack_sources(
         pack_used_dem = True
 
     resolved_vec = vector_source
-    if resolved_vec is None and manifest.osm_pbf_path:
+    if resolved_vec is None:
+        if not manifest.osm_pbf_path:
+            raise ValueError(
+                f"Offline pack '{manifest.pack_id}' has no OSM data. "
+                "Choose a pack with OSM data or supply --offline-pbf."
+            )
         pbf_file = (resolved_pack_dir / manifest.osm_pbf_path).resolve()
         if not pbf_file.is_file():
             raise FileNotFoundError(
@@ -342,9 +352,9 @@ def prepare_job_workspace(
     if pack_dir is not None:
         (
             pack_manifest,
-            elevation_source,
+            elev_src,
             pack_used_dem,
-            vector_source,
+            vec_src,
             effective_overrides,
             us_kinds_override,
             au_kinds_override,
@@ -356,9 +366,9 @@ def prepare_job_workspace(
             vector_source=vector_source,
             regional_overlay_overrides=regional_overlay_overrides,
         )
-
-    elev_src = _resolve_elevation_source(spec, elevation_source)
-    vec_src: VectorSource = vector_source or OverpassOSMSource()
+    else:
+        elev_src = _resolve_elevation_source(spec, elevation_source)
+        vec_src = vector_source or OverpassOSMSource()
 
     logger.info(
         "Preparing GridForge workspace: EPSG:%s (%s) scale=1:%s paper=%s %s mode=%s dem=%s%s",

@@ -152,6 +152,8 @@ docker run --rm -v "$(pwd)/packs:/data/packs:ro" -v "$(pwd)/out:/out" gridforge:
     --pack /data/packs/blue-mountains --output /out/offline_sheet.pdf
 ```
 
+Render and export require both elevation and OSM data. If you built a partial pack, supply the missing input with `--offline-dem` or `--offline-pbf`. Studio requires both inputs in the selected pack.
+
 ### Standalone Offline Device Exports (`gridforge export`)
 
 ```bash
