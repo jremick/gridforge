@@ -1,0 +1,108 @@
+{
+  "type": "FeatureCollection",
+  "name": "katoomba_bushwalk_loop",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Katoomba — Echo Point — Federal Pass Loop",
+        "category": "track",
+        "distance_km": 6.4,
+        "notes": "Sample Blue Mountains NSW bushwalk overlay for GridForge (--overlay or Web Studio drag-and-drop)"
+      },
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [150.3113, -33.7133],
+          [150.3114, -33.7185],
+          [150.3118, -33.7242],
+          [150.3122, -33.7289],
+          [150.3117, -33.7322],
+          [150.3125, -33.7336],
+          [150.3136, -33.7351],
+          [150.3168, -33.7356],
+          [150.3185, -33.7347],
+          [150.3138, -33.7364],
+          [150.3082, -33.7366],
+          [150.3036, -33.7345],
+          [150.3016, -33.7294],
+          [150.3051, -33.7224],
+          [150.3089, -33.7172],
+          [150.3113, -33.7133]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "CP1: Katoomba Station",
+        "role": "start_finish",
+        "elev_m": 1017
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [150.3113, -33.7133]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "CP2: Echo Point Lookout",
+        "role": "checkpoint",
+        "elev_m": 925
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [150.3117, -33.7322]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "CP3: Three Sisters",
+        "role": "landmark",
+        "elev_m": 910
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [150.3125, -33.7336]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "CP4: Giant Stairway Base",
+        "role": "checkpoint",
+        "elev_m": 670
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [150.3136, -33.7351]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "CP5: Leura Forest",
+        "role": "water_shelter",
+        "elev_m": 640
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [150.3185, -33.7347]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "CP6: Federal Pass / Katoomba Falls",
+        "role": "checkpoint",
+        "elev_m": 695
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [150.3036, -33.7345]
+      }
+    }
+  ]
+}
