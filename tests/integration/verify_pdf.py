@@ -854,6 +854,8 @@ def verify_pdf(
     min_vector_segments: int = 50,
     frame_mm: tuple[float, float, float, float] | None = None,
     expected_margins_mm: tuple[float, float, float, float] = DEFAULT_MARGINS_MM,
+    page_index: int = 0,
+    allow_multipage: bool = False,
 ) -> PDFVerificationReport:
     """Run full physical MediaBox, MGRS 1 km vector grid spacing, orthogonality, and collar checks."""
     path = Path(pdf_path)
@@ -877,11 +879,20 @@ def verify_pdf(
 
     reader = PdfReader(str(path))
     page_count = len(reader.pages)
-    checks["single_page"] = page_count == 1
-    if page_count != 1:
-        errors.append(f"Expected single-page PDF, found {page_count} pages.")
+    if allow_multipage:
+        checks["page_count_valid"] = page_count >= 1
+        if page_count < 1:
+            errors.append("PDF has 0 pages.")
+    else:
+        checks["single_page"] = page_count == 1
+        if page_count != 1:
+            errors.append(f"Expected single-page PDF, found {page_count} pages.")
 
-    page = reader.pages[0]
+    resolved_page_idx = page_index if page_index >= 0 else page_count + page_index
+    if not (0 <= resolved_page_idx < page_count):
+        raise IndexError(f"page_index={page_index} out of range for {page_count}-page PDF: {path}")
+
+    page = reader.pages[resolved_page_idx]
     pypdf_w = float(page.mediabox.width) * PT_TO_MM
     pypdf_h = float(page.mediabox.height) * PT_TO_MM
 
@@ -902,8 +913,8 @@ def verify_pdf(
             f"(err: dw={w_err:.3f} mm, dh={h_err:.3f} mm)."
         )
 
-    # Cross-check with pdfinfo if present
-    pdfinfo_dims = _query_pdfinfo_dimensions_mm(path)
+    # Cross-check with pdfinfo if present (pdfinfo reports page 1 dimensions)
+    pdfinfo_dims = _query_pdfinfo_dimensions_mm(path) if resolved_page_idx == 0 else None
     pdfinfo_w: float | None = None
     pdfinfo_h: float | None = None
     if pdfinfo_dims is not None:
@@ -918,12 +929,12 @@ def verify_pdf(
                 f"pdfinfo dimensions check failed: pdfinfo={pdfinfo_w:.3f} x {pdfinfo_h:.3f} mm, "
                 f"pypdf={pypdf_w:.3f} x {pypdf_h:.3f} mm, expected={exp_w:.2f} x {exp_h:.2f} mm."
             )
-    else:
+    elif resolved_page_idx == 0:
         warnings.append("pdfinfo binary not found on PATH; skipped pdfinfo cross-check.")
 
     # 2. Vector geometry extraction & MGRS 1 km grid spacing / orthogonality check
     with _dense_vector_pypdf_context():
-        vectors = _extract_pdf_vectors(reader, 0)
+        vectors = _extract_pdf_vectors(reader, resolved_page_idx)
         raw_text = page.extract_text() or ""
     has_vectors = vectors.total_vector_segments >= min_vector_segments
     checks["embedded_vectors"] = has_vectors
@@ -1164,6 +1175,399 @@ def assert_pdf_valid(pdf_path: Path | str, **kwargs: Any) -> PDFVerificationRepo
     return report
 
 
+@dataclass
+class CalibrationPageReport:
+    """Structured result for 100.00 mm Printer Scale Calibration & MGRS Romer page checks."""
+
+    pdf_path: Path
+    page_index: int
+    page_count: int
+    pypdf_width_mm: float
+    pypdf_height_mm: float
+    expected_width_mm: float
+    expected_height_mm: float
+    target_ruler_mm: float
+    horizontal_ruler_mm: float | None
+    horizontal_ruler_err_mm: float | None
+    horizontal_ruler_skew_mm: float | None
+    vertical_ruler_mm: float | None
+    vertical_ruler_err_mm: float | None
+    vertical_ruler_skew_mm: float | None
+    extracted_text: str
+    checks: dict[str, bool] = field(default_factory=dict)
+    errors: list[str] = field(default_factory=list)
+
+    @property
+    def passed(self) -> bool:
+        return len(self.errors) == 0
+
+    def summary(self) -> str:
+        status = "PASS" if self.passed else "FAIL"
+        lines = [
+            f"[{status}] Calibration Page Verification: {self.pdf_path} (page {self.page_index + 1}/{self.page_count})",
+            f"  MediaBox (pypdf): {self.pypdf_width_mm:.3f} x {self.pypdf_height_mm:.3f} mm "
+            f"(expected {self.expected_width_mm:.2f} x {self.expected_height_mm:.2f} mm)",
+            f"  Horizontal 100 mm ruler: length={self.horizontal_ruler_mm} mm, "
+            f"err={self.horizontal_ruler_err_mm} mm, skew={self.horizontal_ruler_skew_mm} mm",
+            f"  Vertical   100 mm ruler: length={self.vertical_ruler_mm} mm, "
+            f"err={self.vertical_ruler_err_mm} mm, skew={self.vertical_ruler_skew_mm} mm",
+        ]
+        if self.errors:
+            lines.append("  ERRORS:")
+            for err in self.errors:
+                lines.append(f"    - {err}")
+        return "\n".join(lines)
+
+
+def _find_best_ruler_candidate(
+    segments: list[Segment],
+    axis: str,
+    target_mm: float = 100.0,
+    skew_tol_mm: float = 0.05,
+    cluster_tol_mm: float = 0.15,
+) -> tuple[float | None, float | None]:
+    """Find best axis-aligned vector line (direct or contiguous collinear span) near ``target_mm``.
+
+    Returns ``(best_length_mm, skew_mm)`` minimizing ``abs(length - target_mm)`` among lines
+    within ``skew_tol_mm``.
+    """
+    candidates: list[tuple[float, float]] = []
+
+    # 1. Direct single vector line segments
+    for x0, y0, x1, y1 in segments:
+        if axis == "h":
+            length = abs(x1 - x0)
+            skew = abs(y1 - y0)
+        else:
+            length = abs(y1 - y0)
+            skew = abs(x1 - x0)
+        if length >= 15.0 and skew < skew_tol_mm:
+            candidates.append((length, skew))
+
+    # 2. Contiguous collinear runs (handles exporters that split ruler baselines at ticks)
+    if segments:
+        if axis == "h":
+            keyed = sorted(segments, key=lambda s: 0.5 * (s[1] + s[3]))
+        else:
+            keyed = sorted(segments, key=lambda s: 0.5 * (s[0] + s[2]))
+
+        groups: list[list[Segment]] = []
+        centers: list[float] = []
+        for seg in keyed:
+            pos = 0.5 * (seg[1] + seg[3]) if axis == "h" else 0.5 * (seg[0] + seg[2])
+            if groups and abs(pos - centers[-1]) <= cluster_tol_mm:
+                groups[-1].append(seg)
+                n = len(groups[-1])
+                centers[-1] = centers[-1] + (pos - centers[-1]) / n
+            else:
+                groups.append([seg])
+                centers.append(pos)
+
+        for grp in groups:
+            # Split into contiguous 1D runs along the line axis (bridging <= 0.35 mm gaps)
+            if axis == "h":
+                ivs = sorted((min(s[0], s[2]), max(s[0], s[2]), abs(s[3] - s[1]), s[1], s[3]) for s in grp)
+            else:
+                ivs = sorted((min(s[1], s[3]), max(s[1], s[3]), abs(s[2] - s[0]), s[0], s[2]) for s in grp)
+
+            run_s, run_e, run_skew = ivs[0][0], ivs[0][1], ivs[0][2]
+            run_coords = [ivs[0][3], ivs[0][4]]
+            for a, b, sk, c0, c1 in ivs[1:]:
+                if a <= run_e + 0.35:
+                    run_e = max(run_e, b)
+                    run_skew = max(run_skew, sk)
+                    run_coords.extend((c0, c1))
+                else:
+                    span = run_e - run_s
+                    spread = max(run_coords) - min(run_coords)
+                    eff_skew = max(run_skew, spread)
+                    if span >= 15.0 and eff_skew < skew_tol_mm:
+                        candidates.append((span, eff_skew))
+                    run_s, run_e, run_skew = a, b, sk
+                    run_coords = [c0, c1]
+            span = run_e - run_s
+            spread = max(run_coords) - min(run_coords)
+            eff_skew = max(run_skew, spread)
+            if span >= 15.0 and eff_skew < skew_tol_mm:
+                candidates.append((span, eff_skew))
+
+    if not candidates:
+        return (None, None)
+
+    best_len, best_skew = min(candidates, key=lambda item: (abs(item[0] - target_mm), item[1]))
+    return (best_len, best_skew)
+
+
+def _extract_page_text_with_fallback(reader: PdfReader, pdf_path: Path, page_index: int) -> str:
+    """Extract normalized page text via pypdf, falling back to pdftotext for that page if empty."""
+    page = reader.pages[page_index]
+    with _dense_vector_pypdf_context():
+        raw = page.extract_text() or ""
+    norm = re.sub(r"\s+", " ", raw).strip()
+    if norm:
+        return norm
+    pdftotext = shutil.which("pdftotext")
+    if pdftotext:
+        pnum = str(page_index + 1)
+        proc = subprocess.run(
+            [pdftotext, "-f", pnum, "-l", pnum, str(pdf_path), "-"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            return re.sub(r"\s+", " ", proc.stdout).strip()
+    return norm
+
+
+def verify_calibration_page(
+    pdf_path: Path | str,
+    page_index: int = -1,
+    expected_width_mm: float = 210.0,
+    expected_height_mm: float = 297.0,
+    tolerance_mm: float = 0.15,
+    skew_tol_mm: float = 0.05,
+    target_ruler_mm: float = 100.0,
+) -> CalibrationPageReport:
+    """Verify 100.00 mm horizontal & vertical vector calibration rulers and MGRS Romer page text."""
+    path = Path(pdf_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"PDF does not exist: {path}")
+
+    reader = PdfReader(str(path))
+    page_count = len(reader.pages)
+    resolved_idx = page_index if page_index >= 0 else page_count + page_index
+    if not (0 <= resolved_idx < page_count):
+        raise IndexError(f"page_index={page_index} out of range for {page_count}-page PDF: {path}")
+
+    page = reader.pages[resolved_idx]
+    pypdf_w = float(page.mediabox.width) * PT_TO_MM
+    pypdf_h = float(page.mediabox.height) * PT_TO_MM
+    rotate = int(page.get("/Rotate", 0) or 0) % 360
+    if rotate in (90, 270):
+        pypdf_w, pypdf_h = pypdf_h, pypdf_w
+
+    errors: list[str] = []
+    checks: dict[str, bool] = {}
+
+    w_err = abs(pypdf_w - expected_width_mm)
+    h_err = abs(pypdf_h - expected_height_mm)
+    dim_ok = w_err <= tolerance_mm and h_err <= tolerance_mm
+    checks["mediabox_dimensions"] = dim_ok
+    if not dim_ok:
+        errors.append(
+            f"Calibration page MediaBox mismatch: got {pypdf_w:.3f} x {pypdf_h:.3f} mm, "
+            f"expected {expected_width_mm:.2f} x {expected_height_mm:.2f} mm ± {tolerance_mm:.2f} mm."
+        )
+
+    with _dense_vector_pypdf_context():
+        vectors = _extract_pdf_vectors(reader, resolved_idx)
+
+    h_len, h_skew = _find_best_ruler_candidate(
+        vectors.horizontal_segments,
+        axis="h",
+        target_mm=target_ruler_mm,
+        skew_tol_mm=skew_tol_mm,
+    )
+    v_len, v_skew = _find_best_ruler_candidate(
+        vectors.vertical_segments,
+        axis="v",
+        target_mm=target_ruler_mm,
+        skew_tol_mm=skew_tol_mm,
+    )
+
+    h_err_mm = abs(h_len - target_ruler_mm) if h_len is not None else None
+    v_err_mm = abs(v_len - target_ruler_mm) if v_len is not None else None
+
+    h_ok = h_err_mm is not None and h_err_mm <= tolerance_mm and h_skew is not None and h_skew < skew_tol_mm
+    v_ok = v_err_mm is not None and v_err_mm <= tolerance_mm and v_skew is not None and v_skew < skew_tol_mm
+    checks["horizontal_100mm_ruler"] = h_ok
+    checks["vertical_100mm_ruler"] = v_ok
+
+    if not h_ok:
+        errors.append(
+            f"Missing exact {target_ruler_mm:.2f} mm ± {tolerance_mm:.2f} mm horizontal ruler "
+            f"(skew < {skew_tol_mm:.2f} mm) on calibration page {resolved_idx + 1}; "
+            f"closest horizontal vector={h_len} mm (err={h_err_mm} mm, skew={h_skew} mm)."
+        )
+    if not v_ok:
+        errors.append(
+            f"Missing exact {target_ruler_mm:.2f} mm ± {tolerance_mm:.2f} mm vertical ruler "
+            f"(skew < {skew_tol_mm:.2f} mm) on calibration page {resolved_idx + 1}; "
+            f"closest vertical vector={v_len} mm (err={v_err_mm} mm, skew={v_skew} mm)."
+        )
+
+    norm_text = _extract_page_text_with_fallback(reader, path, resolved_idx)
+    text_lower = norm_text.lower()
+
+    has_100 = "100" in norm_text
+    has_25k = "1:25,000" in norm_text or "1:25000" in norm_text
+    has_actual = "actual size" in text_lower or "100%" in text_lower
+    checks["text_100mm"] = has_100
+    checks["text_romer_25k"] = has_25k
+    checks["text_actual_size_or_100pct"] = has_actual
+
+    if not has_100:
+        errors.append(f"Calibration page missing '100' ruler text. Extracted: {norm_text[:300]!r}")
+    if not has_25k:
+        errors.append(f"Calibration page missing '1:25,000' MGRS Romer text. Extracted: {norm_text[:300]!r}")
+    if not has_actual:
+        errors.append(
+            f"Calibration page missing 'Actual Size' / '100%' print-scaling guidance. Extracted: {norm_text[:300]!r}"
+        )
+
+    return CalibrationPageReport(
+        pdf_path=path,
+        page_index=resolved_idx,
+        page_count=page_count,
+        pypdf_width_mm=pypdf_w,
+        pypdf_height_mm=pypdf_h,
+        expected_width_mm=expected_width_mm,
+        expected_height_mm=expected_height_mm,
+        target_ruler_mm=target_ruler_mm,
+        horizontal_ruler_mm=round(h_len, 4) if h_len is not None else None,
+        horizontal_ruler_err_mm=round(h_err_mm, 4) if h_err_mm is not None else None,
+        horizontal_ruler_skew_mm=round(h_skew, 5) if h_skew is not None else None,
+        vertical_ruler_mm=round(v_len, 4) if v_len is not None else None,
+        vertical_ruler_err_mm=round(v_err_mm, 4) if v_err_mm is not None else None,
+        vertical_ruler_skew_mm=round(v_skew, 5) if v_skew is not None else None,
+        extracted_text=norm_text,
+        checks=checks,
+        errors=errors,
+    )
+
+
+def assert_calibration_page_valid(
+    pdf_path: Path | str,
+    **kwargs: Any,
+) -> CalibrationPageReport:
+    """Run verify_calibration_page and raise AssertionError with diagnostics on failure."""
+    report = verify_calibration_page(pdf_path, **kwargs)
+    if not report.passed:
+        raise AssertionError(report.summary())
+    return report
+
+
+@dataclass
+class MultiPageVerificationReport:
+    """Structured result for multi-page PDF structure, MediaBox consistency, and per-page text."""
+
+    pdf_path: Path
+    file_size_bytes: int
+    page_count: int
+    expected_pages: int
+    page_dimensions_mm: list[tuple[float, float]]
+    page_texts: list[str]
+    checks: dict[str, bool] = field(default_factory=dict)
+    errors: list[str] = field(default_factory=list)
+
+    @property
+    def passed(self) -> bool:
+        return len(self.errors) == 0
+
+    def summary(self) -> str:
+        status = "PASS" if self.passed else "FAIL"
+        lines = [
+            f"[{status}] Multi-Page PDF Verification: {self.pdf_path}",
+            f"  File size  : {self.file_size_bytes:,} bytes",
+            f"  Page count : {self.page_count} (expected {self.expected_pages})",
+            f"  Page sizes : {[(round(w, 2), round(h, 2)) for w, h in self.page_dimensions_mm]}",
+            f"  Text chars : {[len(t) for t in self.page_texts]}",
+        ]
+        if self.errors:
+            lines.append("  ERRORS:")
+            for err in self.errors:
+                lines.append(f"    - {err}")
+        return "\n".join(lines)
+
+
+def verify_multipage_pdf(
+    pdf_path: Path | str,
+    expected_pages: int,
+    *,
+    expected_width_mm: float | None = None,
+    expected_height_mm: float | None = None,
+    dimension_tol_mm: float = 0.15,
+    min_size_bytes: int = 50_000,
+) -> MultiPageVerificationReport:
+    """Verify multi-page PDF page count, consistent MediaBox dimensions, and non-empty text per page."""
+    path = Path(pdf_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"PDF does not exist: {path}")
+
+    file_size = path.stat().st_size
+    errors: list[str] = []
+    checks: dict[str, bool] = {}
+
+    size_ok = file_size >= min_size_bytes
+    checks["file_size"] = size_ok
+    if not size_ok:
+        errors.append(f"PDF file size {file_size:,} bytes < {min_size_bytes:,} bytes.")
+
+    reader = PdfReader(str(path))
+    page_count = len(reader.pages)
+    count_ok = page_count == expected_pages
+    checks["page_count"] = count_ok
+    if not count_ok:
+        errors.append(f"Expected {expected_pages} pages, found {page_count} pages.")
+
+    dims: list[tuple[float, float]] = []
+    texts: list[str] = []
+    ref_w: float | None = expected_width_mm
+    ref_h: float | None = expected_height_mm
+    dims_ok = True
+    texts_ok = True
+
+    for idx, page in enumerate(reader.pages):
+        pw = float(page.mediabox.width) * PT_TO_MM
+        ph = float(page.mediabox.height) * PT_TO_MM
+        rotate = int(page.get("/Rotate", 0) or 0) % 360
+        if rotate in (90, 270):
+            pw, ph = ph, pw
+        dims.append((pw, ph))
+
+        if ref_w is None or ref_h is None:
+            ref_w, ref_h = pw, ph
+        elif abs(pw - ref_w) > dimension_tol_mm or abs(ph - ref_h) > dimension_tol_mm:
+            dims_ok = False
+            errors.append(
+                f"Page {idx + 1} MediaBox {pw:.3f} x {ph:.3f} mm differs from expected "
+                f"{ref_w:.2f} x {ref_h:.2f} mm ± {dimension_tol_mm:.2f} mm."
+            )
+
+        page_txt = _extract_page_text_with_fallback(reader, path, idx)
+        texts.append(page_txt)
+        if not page_txt:
+            texts_ok = False
+            errors.append(f"Page {idx + 1} has empty extracted text.")
+
+    checks["consistent_mediabox"] = dims_ok
+    checks["non_empty_text_all_pages"] = texts_ok
+
+    return MultiPageVerificationReport(
+        pdf_path=path,
+        file_size_bytes=file_size,
+        page_count=page_count,
+        expected_pages=expected_pages,
+        page_dimensions_mm=dims,
+        page_texts=texts,
+        checks=checks,
+        errors=errors,
+    )
+
+
+def assert_multipage_pdf_valid(
+    pdf_path: Path | str,
+    expected_pages: int,
+    **kwargs: Any,
+) -> MultiPageVerificationReport:
+    """Run verify_multipage_pdf and raise AssertionError with diagnostics on failure."""
+    report = verify_multipage_pdf(pdf_path, expected_pages, **kwargs)
+    if not report.passed:
+        raise AssertionError(report.summary())
+    return report
+
+
 def rasterize_pdf_for_inspection(
     pdf_path: Path | str,
     out_dir: Path | str,
@@ -1172,6 +1576,7 @@ def rasterize_pdf_for_inspection(
     full_dpi: int = 150,
     crop_dpi: int = 300,
     margins_mm: tuple[float, float, float, float] = DEFAULT_MARGINS_MM,
+    page_index: int = 0,
 ) -> dict[str, Path]:
     """Rasterize full sheet (150 DPI) and 300 DPI zoomed detail crops via `pdftoppm`.
 
@@ -1192,7 +1597,13 @@ def rasterize_pdf_for_inspection(
     stem = prefix or src.stem
 
     reader = PdfReader(str(src))
-    page = reader.pages[0]
+    page_count = len(reader.pages)
+    resolved_idx = page_index if page_index >= 0 else page_count + page_index
+    if not (0 <= resolved_idx < page_count):
+        raise IndexError(f"page_index={page_index} out of range for {page_count}-page PDF: {src}")
+    page_num_str = str(resolved_idx + 1)
+
+    page = reader.pages[resolved_idx]
     w_mm = float(page.mediabox.width) * PT_TO_MM
     h_mm = float(page.mediabox.height) * PT_TO_MM
     rotate = int(page.get("/Rotate", 0) or 0) % 360
@@ -1208,7 +1619,19 @@ def rasterize_pdf_for_inspection(
     # 1. Full sheet rasterization
     full_prefix = dst_dir / f"{stem}_full"
     subprocess.run(
-        [pdftoppm, "-png", "-r", str(full_dpi), "-singlefile", str(src), str(full_prefix)],
+        [
+            pdftoppm,
+            "-png",
+            "-r",
+            str(full_dpi),
+            "-f",
+            page_num_str,
+            "-l",
+            page_num_str,
+            "-singlefile",
+            str(src),
+            str(full_prefix),
+        ],
         check=True,
         capture_output=True,
         text=True,
@@ -1233,6 +1656,10 @@ def rasterize_pdf_for_inspection(
                 "-png",
                 "-r",
                 str(crop_dpi),
+                "-f",
+                page_num_str,
+                "-l",
+                page_num_str,
                 "-x",
                 str(cx),
                 "-y",
@@ -1269,6 +1696,50 @@ def rasterize_pdf_for_inspection(
     run_crop("collar_right", max(0, px_w - half_w), collar_y, half_w, collar_h)
 
     return outputs
+
+
+def rasterize_all_pages(
+    pdf_path: Path | str,
+    out_dir: Path | str,
+    *,
+    prefix: str | None = None,
+    dpi: int = 150,
+) -> list[Path]:
+    """Rasterize every page of a multi-page PDF to ``{stem}_p{n}.png`` via `pdftoppm`."""
+    pdftoppm = shutil.which("pdftoppm")
+    if not pdftoppm:
+        raise RuntimeError("`pdftoppm` (poppler-utils) is required for visual rasterization.")
+
+    src = Path(pdf_path)
+    dst_dir = Path(out_dir)
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    stem = prefix or src.stem
+
+    reader = PdfReader(str(src))
+    out_paths: list[Path] = []
+    for idx in range(len(reader.pages)):
+        pnum = idx + 1
+        page_prefix = dst_dir / f"{stem}_p{pnum}"
+        subprocess.run(
+            [
+                pdftoppm,
+                "-png",
+                "-r",
+                str(dpi),
+                "-f",
+                str(pnum),
+                "-l",
+                str(pnum),
+                "-singlefile",
+                str(src),
+                str(page_prefix),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        out_paths.append(page_prefix.with_suffix(".png"))
+    return out_paths
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
