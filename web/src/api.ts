@@ -5,7 +5,13 @@ import type {
   GeocodeResponse,
   HealthResponse,
   JobRecord,
+  Orientation,
   PacksResponse,
+  PaperSize,
+  RouteMetricsResponse,
+  StripPlanResponse,
+  Units,
+  WaypointInput,
 } from "./types";
 
 export class ApiError extends Error {
@@ -90,6 +96,51 @@ export function fetchFootprint(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(req),
+    signal,
+  });
+}
+
+export function fetchStripPlan(
+  routeFile: File,
+  params: {
+    scale: number;
+    paper: PaperSize;
+    orientation: Orientation;
+    units: Units;
+    overlap_pct?: number;
+  },
+  signal?: AbortSignal
+): Promise<StripPlanResponse> {
+  const form = new FormData();
+  form.append("route_file", routeFile, routeFile.name);
+  form.append("scale", String(params.scale));
+  form.append("paper", params.paper);
+  form.append("orientation", params.orientation);
+  form.append("units", params.units);
+  if (typeof params.overlap_pct === "number") {
+    form.append("overlap_pct", String(params.overlap_pct));
+  }
+  return requestJson<StripPlanResponse>("/api/strip-plan", {
+    method: "POST",
+    body: form,
+    signal,
+  });
+}
+
+export function fetchRouteMetrics(
+  waypoints: WaypointInput[],
+  units: Units,
+  dateIso?: string | null,
+  signal?: AbortSignal
+): Promise<RouteMetricsResponse> {
+  return requestJson<RouteMetricsResponse>("/api/route-metrics", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      waypoints,
+      units,
+      date_iso: dateIso ?? null,
+    }),
     signal,
   });
 }

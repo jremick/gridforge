@@ -1,21 +1,33 @@
 import maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
-import type { Feature, FeatureCollection, Point, Position } from "geojson";
+import type {
+  Feature,
+  FeatureCollection,
+  LineString,
+  Point,
+  Position,
+} from "geojson";
 import {
   DEFAULT_CENTER_LAT,
   DEFAULT_CENTER_LON,
   DEFAULT_MAP_ZOOM,
+  WAYPOINT_CATEGORY_OPTIONS,
 } from "./presets";
-import type { BasemapId } from "./types";
+import type { BasemapId, WaypointCategory, WaypointInput } from "./types";
 
 const EMPTY_FC: FeatureCollection = {
   type: "FeatureCollection",
   features: [],
 };
 
+const CATEGORY_COLOR_MAP: Record<WaypointCategory, string> = Object.fromEntries(
+  WAYPOINT_CATEGORY_OPTIONS.map((o) => [o.value, o.color])
+) as Record<WaypointCategory, string>;
+
 export interface GridForgeMapCallbacks {
   onCenterDrag: (lat: number, lon: number) => void;
   onCenterCommit: (lat: number, lon: number) => void;
+  onMapMarkupClick?: (lat: number, lon: number) => void;
   onCursorMove?: (lat: number, lon: number) => void;
 }
 
@@ -65,7 +77,19 @@ function buildInitialStyle(): maplibregl.StyleSpecification {
         type: "geojson",
         data: EMPTY_FC,
       },
+      "strip-route": {
+        type: "geojson",
+        data: EMPTY_FC,
+      },
       "sheet-labels": {
+        type: "geojson",
+        data: EMPTY_FC,
+      },
+      "waypoints-legs": {
+        type: "geojson",
+        data: EMPTY_FC,
+      },
+      "waypoints-points": {
         type: "geojson",
         data: EMPTY_FC,
       },
@@ -171,6 +195,59 @@ function buildInitialStyle(): maplibregl.StyleSpecification {
         },
       },
       {
+        id: "strip-route-casing",
+        type: "line",
+        source: "strip-route",
+        layout: {
+          "line-cap": "round",
+          "line-join": "round",
+        },
+        paint: {
+          "line-color": "#0F1419",
+          "line-width": 5.2,
+          "line-opacity": 0.8,
+        },
+      },
+      {
+        id: "strip-route-line",
+        type: "line",
+        source: "strip-route",
+        layout: {
+          "line-cap": "round",
+          "line-join": "round",
+        },
+        paint: {
+          "line-color": "#EC4899",
+          "line-width": 3.0,
+          "line-opacity": 0.96,
+        },
+      },
+      {
+        id: "waypoints-legs-casing",
+        type: "line",
+        source: "waypoints-legs",
+        layout: {
+          "line-cap": "round",
+          "line-join": "round",
+        },
+        paint: {
+          "line-color": "#0F1419",
+          "line-width": 4.4,
+          "line-opacity": 0.75,
+        },
+      },
+      {
+        id: "waypoints-legs-line",
+        type: "line",
+        source: "waypoints-legs",
+        paint: {
+          "line-color": "#E879F9",
+          "line-width": 2.4,
+          "line-dasharray": [4, 3],
+          "line-opacity": 0.96,
+        },
+      },
+      {
         id: "sheet-labels-layer",
         type: "symbol",
         source: "sheet-labels",
@@ -178,6 +255,17 @@ function buildInitialStyle(): maplibregl.StyleSpecification {
           "icon-image": ["get", "icon_id"],
           "icon-allow-overlap": true,
           "icon-ignore-placement": true,
+        },
+      },
+      {
+        id: "waypoints-points-layer",
+        type: "symbol",
+        source: "waypoints-points",
+        layout: {
+          "icon-image": ["get", "icon_id"],
+          "icon-allow-overlap": true,
+          "icon-ignore-placement": true,
+          "icon-anchor": "bottom",
         },
       },
     ],
@@ -212,7 +300,8 @@ function renderSheetBadgeImage(label: string): {
   data: Uint8Array;
 } | null {
   const scale = 2;
-  const w = 36 * scale;
+  const logicalW = Math.max(36, 14 + label.length * 8);
+  const w = logicalW * scale;
   const h = 22 * scale;
   const canvas = document.createElement("canvas");
   canvas.width = w;
@@ -231,10 +320,63 @@ function renderSheetBadgeImage(label: string): {
   ctx.stroke();
 
   ctx.fillStyle = "#FBBF24";
-  ctx.font = `700 ${12 * scale}px "JetBrains Mono", "SF Mono", ui-monospace, monospace`;
+  ctx.font = `700 ${11.5 * scale}px "JetBrains Mono", "SF Mono", ui-monospace, monospace`;
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
   ctx.fillText(label, w / 2, h / 2 + 0.5 * scale);
+
+  const img = ctx.getImageData(0, 0, w, h);
+  return { width: w, height: h, data: new Uint8Array(img.data.buffer) };
+}
+
+function renderWaypointPinImage(
+  code: string,
+  accentColor: string
+): {
+  width: number;
+  height: number;
+  data: Uint8Array;
+} | null {
+  const scale = 2;
+  const logicalW = Math.max(40, 16 + code.length * 7.5);
+  const badgeH = 21;
+  const tipH = 7;
+  const w = Math.ceil(logicalW * scale);
+  const h = (badgeH + tipH) * scale;
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return null;
+
+  const inset = 1.5 * scale;
+  const bh = badgeH * scale;
+  const r = 5 * scale;
+
+  // Pointer triangle
+  ctx.beginPath();
+  ctx.moveTo(w / 2 - 5 * scale, bh - 2 * scale);
+  ctx.lineTo(w / 2, h - 1 * scale);
+  ctx.lineTo(w / 2 + 5 * scale, bh - 2 * scale);
+  ctx.closePath();
+  ctx.fillStyle = accentColor;
+  ctx.fill();
+
+  // Pill badge
+  ctx.beginPath();
+  ctx.roundRect(inset, inset, w - inset * 2, bh - inset * 1.5, r);
+  ctx.fillStyle = "rgba(15, 20, 25, 0.94)";
+  ctx.fill();
+  ctx.lineWidth = 1.8 * scale;
+  ctx.strokeStyle = accentColor;
+  ctx.stroke();
+
+  // Crisp code text
+  ctx.fillStyle = "#F8FAFC";
+  ctx.font = `700 ${10.5 * scale}px "JetBrains Mono", "SF Mono", ui-monospace, monospace`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(code, w / 2, bh / 2 + 0.5 * scale);
 
   const img = ctx.getImageData(0, 0, w, h);
   return { width: w, height: h, data: new Uint8Array(img.data.buffer) };
@@ -286,7 +428,7 @@ function buildSheetLabelsGeoJson(
         : typeof props.sheet_id === "string"
           ? props.sheet_id
           : `S${idx + 1}`;
-    const label = rawLabel.trim().toUpperCase().slice(0, 4);
+    const label = rawLabel.trim().toUpperCase().slice(0, 5);
     const iconId = `sheet-label-${label}`;
     labels.push(label);
 
@@ -331,21 +473,26 @@ function collectPositions(fc: FeatureCollection): Position[] {
 }
 
 export class GridForgeMap {
+  private readonly container: HTMLElement;
   private readonly map: maplibregl.Map;
   private readonly marker: maplibregl.Marker;
   private isLoaded = false;
   private pendingFootprint: FeatureCollection | null = null;
   private pendingGrid: FeatureCollection | null = null;
+  private pendingStripRoute: FeatureCollection | null = null;
+  private pendingWaypoints: WaypointInput[] | null = null;
   private currentFootprint: FeatureCollection | null = null;
   private currentBasemap: BasemapId = "opentopo";
   private suppressClickUntil = 0;
   private draggingMarker = false;
+  private markupMode = false;
 
   constructor(
     container: HTMLElement,
     callbacks: GridForgeMapCallbacks,
     options?: GridForgeMapOptions
   ) {
+    this.container = container;
     const initLat = options?.initialLat ?? DEFAULT_CENTER_LAT;
     const initLon = options?.initialLon ?? DEFAULT_CENTER_LON;
     const initZoom = options?.initialZoom ?? DEFAULT_MAP_ZOOM;
@@ -395,6 +542,10 @@ export class GridForgeMap {
     this.map.on("click", (e) => {
       if (performance.now() < this.suppressClickUntil) return;
       const { lat, lng } = e.lngLat;
+      if (this.markupMode) {
+        callbacks.onMapMarkupClick?.(lat, lng);
+        return;
+      }
       this.marker.setLngLat([lng, lat]);
       callbacks.onCenterCommit(lat, lng);
     });
@@ -414,7 +565,20 @@ export class GridForgeMap {
         this.pendingFootprint = null;
         this.pendingGrid = null;
       }
+      if (this.pendingStripRoute) {
+        this.applyStripRoute(this.pendingStripRoute);
+        this.pendingStripRoute = null;
+      }
+      if (this.pendingWaypoints) {
+        this.applyWaypoints(this.pendingWaypoints);
+        this.pendingWaypoints = null;
+      }
     });
+  }
+
+  setMarkupMode(active: boolean): void {
+    this.markupMode = active;
+    this.container.classList.toggle("markup-active", active);
   }
 
   setBasemap(basemap: BasemapId): void {
@@ -458,6 +622,21 @@ export class GridForgeMap {
     }
   }
 
+  private ensureWaypointPinImage(
+    code: string,
+    category: WaypointCategory
+  ): string {
+    const iconId = `wp-pin-${code}-${category}`;
+    if (!this.map.hasImage(iconId)) {
+      const color = CATEGORY_COLOR_MAP[category] ?? "#EC4899";
+      const rendered = renderWaypointPinImage(code, color);
+      if (rendered) {
+        this.map.addImage(iconId, rendered, { pixelRatio: 2 });
+      }
+    }
+    return iconId;
+  }
+
   isDragging(): boolean {
     return this.draggingMarker;
   }
@@ -493,6 +672,23 @@ export class GridForgeMap {
     this.applyGeoJson(footprint, gridData);
   }
 
+  updateStripRoute(routeGeoJson: FeatureCollection | null): void {
+    const fc = routeGeoJson ?? EMPTY_FC;
+    if (!this.isLoaded) {
+      this.pendingStripRoute = fc;
+      return;
+    }
+    this.applyStripRoute(fc);
+  }
+
+  updateWaypoints(waypoints: WaypointInput[]): void {
+    if (!this.isLoaded) {
+      this.pendingWaypoints = [...waypoints];
+      return;
+    }
+    this.applyWaypoints(waypoints);
+  }
+
   private applyGeoJson(
     footprint: FeatureCollection,
     grid: FeatureCollection
@@ -513,6 +709,66 @@ export class GridForgeMap {
     fpSource?.setData(footprint);
     gridSource?.setData(grid);
     labelSource?.setData(labelsFc);
+  }
+
+  private applyStripRoute(routeGeoJson: FeatureCollection): void {
+    const src = this.map.getSource("strip-route") as
+      | maplibregl.GeoJSONSource
+      | undefined;
+    src?.setData(routeGeoJson);
+  }
+
+  private applyWaypoints(waypoints: WaypointInput[]): void {
+    const pointFeatures: Feature<Point>[] = [];
+    const legCoords: Position[] = [];
+
+    for (let idx = 0; idx < waypoints.length; idx += 1) {
+      const wp = waypoints[idx];
+      if (!wp) continue;
+      const code = `WP${idx + 1}`;
+      const iconId = this.ensureWaypointPinImage(code, wp.category);
+      pointFeatures.push({
+        type: "Feature",
+        properties: { code, label: wp.label, category: wp.category, icon_id: iconId },
+        geometry: {
+          type: "Point",
+          coordinates: [wp.lon, wp.lat],
+        },
+      });
+      legCoords.push([wp.lon, wp.lat]);
+    }
+
+    const legsFc: FeatureCollection<LineString> = {
+      type: "FeatureCollection",
+      features:
+        legCoords.length >= 2
+          ? [
+              {
+                type: "Feature",
+                properties: {},
+                geometry: {
+                  type: "LineString",
+                  coordinates: legCoords,
+                },
+              },
+            ]
+          : [],
+    };
+
+    const pointsFc: FeatureCollection<Point> = {
+      type: "FeatureCollection",
+      features: pointFeatures,
+    };
+
+    const legsSrc = this.map.getSource("waypoints-legs") as
+      | maplibregl.GeoJSONSource
+      | undefined;
+    const ptsSrc = this.map.getSource("waypoints-points") as
+      | maplibregl.GeoJSONSource
+      | undefined;
+
+    legsSrc?.setData(legsFc);
+    ptsSrc?.setData(pointsFc);
   }
 
   fitFootprint(sidebarWidthPx = 368): void {

@@ -4,7 +4,11 @@ import {
   formatSignedDeg,
   formatSignedMilsNumber,
 } from "../presets";
-import type { FootprintResponse, HealthResponse } from "../types";
+import type {
+  FootprintResponse,
+  HealthResponse,
+  StripPlanResponse,
+} from "../types";
 
 export interface TelemetryCallbacks {
   onToggleDrawer: () => void;
@@ -145,6 +149,18 @@ export class TelemetryBar {
 
     this.declEl.textContent = formatDeclinationCompass(d.magnetic_declination_deg);
     this.declEl.title = `${d.model_name} (${d.decimal_year.toFixed(2)}) · Annual change: ${formatSignedDeg(d.annual_change_deg)}/yr`;
+  }
+
+  updateStripPlan(plan: StripPlanResponse): void {
+    const first = plan.sheets[0];
+    if (first?.center_mgrs_10m) {
+      this.latestMgrs = first.center_mgrs_10m;
+      this.mgrsEl.textContent = first.center_mgrs_10m;
+    }
+    this.utmEl.textContent = `${plan.utm_zone}${plan.utm_hemisphere} (EPSG:${plan.utm_epsg})`;
+    const count = plan.sheet_count ?? plan.sheets.length;
+    this.sheetEl.textContent = `Strip · ${count}sh (${plan.route_distance_km.toFixed(1)} km)`;
+    this.sheetEl.title = `Auto-Fit Strip Atlas: ${count} true-scale UTM sheets covering ${plan.route_distance_km.toFixed(2)} km`;
   }
 
   updateHealth(health: HealthResponse | null, errorMsg?: string): void {

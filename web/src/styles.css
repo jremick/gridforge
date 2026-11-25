@@ -331,6 +331,10 @@ button {
   height: 100%;
 }
 
+.gf-map-container.markup-active .maplibregl-canvas-container {
+  cursor: crosshair !important;
+}
+
 /* MapLibre dark theme & dynamic sidebar/drawer offsets */
 .gf-map-container .maplibregl-ctrl-bottom-left {
   left: calc(var(--sidebar-w) + 12px);
@@ -471,6 +475,17 @@ button {
   color: var(--accent-amber-bright);
 }
 
+.gf-markup-btn.active {
+  background: var(--accent-amber);
+  color: #0f1419;
+  font-weight: 700;
+}
+
+.gf-markup-btn.active:hover {
+  background: var(--accent-amber-bright);
+  color: #0f1419;
+}
+
 /* Positioned cleanly above the MapLibre scale bar so it never collides with attribution */
 .gf-map-hint {
   position: absolute;
@@ -489,7 +504,12 @@ button {
   color: var(--text-secondary);
   pointer-events: none;
   white-space: nowrap;
-  transition: left 0.22s ease;
+  transition: left 0.22s ease, border-color 0.14s ease, color 0.14s ease;
+}
+
+.gf-map-hint.markup-active {
+  border-color: var(--accent-amber);
+  color: var(--accent-amber-bright);
 }
 
 .gf-shell.sidebar-collapsed .gf-map-hint {
@@ -908,6 +928,11 @@ details[open] > .gf-section-summary .gf-chevron {
   gap: 2px;
 }
 
+.gf-atlas-grid.disabled {
+  opacity: 0.45;
+  pointer-events: none;
+}
+
 .gf-atlas-btn {
   border: none;
   background: transparent;
@@ -1071,6 +1096,303 @@ details[open] > .gf-section-summary .gf-chevron {
   accent-color: var(--accent-cyan);
   margin: 0;
   cursor: pointer;
+}
+
+/* Slope-Angle Avalanche Shading Row */
+
+.gf-slope-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 4px;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  background: rgba(15, 20, 25, 0.72);
+  border: 1px solid var(--border-subtle);
+  cursor: pointer;
+  font-size: 11.5px;
+  user-select: none;
+  transition: border-color 0.14s ease, background 0.14s ease;
+}
+
+.gf-slope-toggle:hover {
+  border-color: var(--accent-amber);
+  background: var(--bg-elevated);
+}
+
+.gf-slope-left {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
+.gf-slope-left input[type="checkbox"] {
+  accent-color: var(--accent-amber);
+  margin: 0;
+  cursor: pointer;
+}
+
+.gf-slope-legend {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+.gf-slope-legend i {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+}
+
+/* Strip Atlas Planner Bar */
+
+.gf-strip-bar {
+  margin-top: 6px;
+}
+
+.gf-strip-bar.hidden {
+  display: none;
+}
+
+.gf-strip-btn {
+  width: 100%;
+  height: 30px;
+  border-radius: var(--radius-sm);
+  background: var(--accent-amber-soft);
+  border: 1px solid rgba(245, 158, 11, 0.55);
+  color: var(--accent-amber-bright);
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  transition: background 0.14s ease, border-color 0.14s ease;
+}
+
+.gf-strip-btn:hover:not(:disabled) {
+  background: rgba(245, 158, 11, 0.24);
+  border-color: var(--accent-amber);
+}
+
+.gf-strip-btn:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
+
+.gf-strip-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 5px 7px;
+  border-radius: var(--radius-sm);
+  background: rgba(236, 72, 153, 0.12);
+  border: 1px solid rgba(236, 72, 153, 0.45);
+}
+
+.gf-strip-badge {
+  font-size: 11px;
+  font-weight: 600;
+  color: #f9a8d4;
+}
+
+/* Section 05 Waypoints & Route Card */
+
+.gf-wp-controls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.gf-wp-markup-btn {
+  flex: 1;
+  height: 29px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  color: var(--text-primary);
+  font-size: 11.5px;
+  font-weight: 600;
+  transition: all 0.14s ease;
+}
+
+.gf-wp-markup-btn:hover {
+  border-color: var(--accent-amber);
+  color: var(--accent-amber-bright);
+}
+
+.gf-wp-markup-btn.active {
+  background: var(--accent-amber);
+  border-color: var(--accent-amber);
+  color: #0f1419;
+  font-weight: 700;
+}
+
+.gf-wp-card-toggle {
+  padding: 2px 2px 0;
+}
+
+.gf-wp-list {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.gf-wp-empty {
+  padding: 8px 9px;
+  border-radius: var(--radius-sm);
+  border: 1px dashed var(--border-subtle);
+  background: rgba(15, 20, 25, 0.5);
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.gf-wp-empty kbd {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  color: var(--text-primary);
+}
+
+.gf-wp-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 7px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-base);
+  border: 1px solid var(--border-subtle);
+}
+
+.gf-wp-top {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.gf-wp-code {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 5px;
+  border-radius: 3px;
+  border: 1px solid #ec4899;
+  color: #ec4899;
+  flex-shrink: 0;
+}
+
+.gf-wp-name-input {
+  flex: 1;
+  min-width: 0;
+  height: 24px;
+  padding: 0 6px;
+  border-radius: 3px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-primary);
+  font-size: 11.5px;
+  outline: none;
+}
+
+.gf-wp-name-input:focus {
+  border-color: var(--accent-cyan);
+}
+
+.gf-wp-cat-select {
+  height: 24px;
+  padding: 0 4px;
+  border-radius: 3px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  font-size: 10.5px;
+  flex-shrink: 0;
+}
+
+.gf-wp-del {
+  width: 22px;
+  height: 24px;
+  border: none;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 14px;
+  line-height: 1;
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+}
+
+.gf-wp-del:hover {
+  background: var(--accent-red-soft);
+  color: var(--accent-red);
+}
+
+.gf-wp-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  font-size: 10.5px;
+  color: var(--text-secondary);
+  padding-left: 2px;
+}
+
+.gf-wp-mgrs {
+  color: var(--accent-cyan);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gf-wp-az {
+  color: var(--accent-amber-bright);
+}
+
+.gf-wp-total {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-secondary);
+  padding: 5px 8px;
+  border-radius: var(--radius-sm);
+  background: rgba(56, 189, 248, 0.09);
+  border: 1px solid rgba(56, 189, 248, 0.25);
+}
+
+.gf-wp-total.hidden {
+  display: none;
+}
+
+/* Compact Supplemental PDF Pages in Footer */
+
+.gf-supp-pages {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 5px 7px;
+  border-radius: var(--radius-sm);
+  background: rgba(15, 20, 25, 0.65);
+  border: 1px solid var(--border-subtle);
+}
+
+.gf-supp-chips {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding-left: 19px;
 }
 
 /* Custom Overlay File Dropzone */

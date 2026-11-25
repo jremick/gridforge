@@ -10,8 +10,10 @@ import {
   PAPER_OPTIONS,
   SCALE_OPTIONS,
   US_OVERLAY_OPTIONS,
+  WAYPOINT_CATEGORY_OPTIONS,
   escapeHtml,
   formatBytes,
+  isStripEligibleFile,
   looksLikeCoordOrMgrs,
 } from "../presets";
 import type {
@@ -28,8 +30,10 @@ import type {
   Orientation,
   PackSummary,
   PaperSize,
+  RouteMetricsResponse,
   USOverlayKind,
   Units,
+  WaypointCategory,
 } from "../types";
 
 export interface SidebarCallbacks {
@@ -39,6 +43,16 @@ export interface SidebarCallbacks {
   onPresetSelect: (preset: LocationPreset) => void;
   onFootprintParamsChange: (options?: { fitAfterLoad?: boolean }) => void;
   onStateChange: () => void;
+  onOverlayFileChange: (file: File | null) => void;
+  onAutoStripPlan: () => void;
+  onClearStripPlan: () => void;
+  onToggleMarkupMode: () => void;
+  onWaypointEdit: (
+    index: number,
+    patch: { label?: string; category?: WaypointCategory }
+  ) => void;
+  onWaypointDelete: (index: number) => void;
+  onWaypointsClear: () => void;
   onRefreshPacks: () => void;
   onSubmitJob: () => void;
   onCopyCli: () => void;
@@ -46,6 +60,10 @@ export interface SidebarCallbacks {
 
 const GEOCODE_DEBOUNCE_MS = 300;
 const CHEVRON_SVG = `<svg class="gf-chevron" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+
+const CATEGORY_COLOR_MAP: Record<WaypointCategory, string> = Object.fromEntries(
+  WAYPOINT_CATEGORY_OPTIONS.map((o) => [o.value, o.color])
+) as Record<WaypointCategory, string>;
 
 export class SidebarPanel {
   private readonly root: HTMLElement;
@@ -58,17 +76,27 @@ export class SidebarPanel {
   private titleInput!: HTMLInputElement;
   private scaleSelect!: HTMLSelectElement;
   private paperSelect!: HTMLSelectElement;
+  private atlasGridEl!: HTMLElement;
   private atlasSublabelEl!: HTMLElement;
   private demSelect!: HTMLSelectElement;
   private packSelect!: HTMLSelectElement;
   private contourSelect!: HTMLSelectElement;
   private hillshadeSelect!: HTMLSelectElement;
   private labelDensitySelect!: HTMLSelectElement;
+  private slopeCheck!: HTMLInputElement;
   private fileInput!: HTMLInputElement;
   private fileTitleEl!: HTMLElement;
   private fileSubEl!: HTMLElement;
   private fileClearBtn!: HTMLButtonElement;
   private dropzoneEl!: HTMLElement;
+  private stripBarEl!: HTMLElement;
+  private waypointsSectionEl!: HTMLDetailsElement;
+  private waypointsPillEl!: HTMLElement;
+  private wpMarkupBtn!: HTMLButtonElement;
+  private wpClearBtn!: HTMLButtonElement;
+  private wpRouteCardCheck!: HTMLInputElement;
+  private wpListEl!: HTMLElement;
+  private wpTotalEl!: HTMLElement;
   private outPdfCheck!: HTMLInputElement;
   private outGeoPdfCheck!: HTMLInputElement;
   private outMbtilesCheck!: HTMLInputElement;
@@ -77,12 +105,20 @@ export class SidebarPanel {
   private outGarminProfile!: HTMLSelectElement;
   private outDigitalGridCheck!: HTMLInputElement;
   private digitalGridRow!: HTMLElement;
+  private suppPagesBoxEl!: HTMLElement;
+  private outCalibrationCheck!: HTMLInputElement;
+  private outRouteCardCheck!: HTMLInputElement;
+  private outElevProfileCheck!: HTMLInputElement;
   private generateBtn!: HTMLButtonElement;
   private formErrorEl!: HTMLElement;
   private sheetPillEl!: HTMLElement;
   private overlayPillEl!: HTMLElement;
   private cartoPillEl!: HTMLElement;
+
   private activePresetId: string | null = "blue-mountains";
+  private markupMode = false;
+  private planningStrip = false;
+  private routeMetrics: RouteMetricsResponse | null = null;
 
   private geocodeTimer: number | null = null;
   private geocodeAbort: AbortController | null = null;
@@ -327,7 +363,7 @@ export class SidebarPanel {
             </div>
 
             <div class="gf-overlay-group">
-              <span class="gf-overlay-heading">Australia National Overlays (CC BY 4.0)</span>
+              <span class="gf-overlay-heading">Australia State &amp; National Overlays (CC BY 4.0)</span>
               ${auOverlaysHtml}
             </div>
 
@@ -339,7 +375,7 @@ export class SidebarPanel {
         </details>
 
         <!-- 4. Cartography & User Overlay -->
-        <details class="gf-section">
+        <details class="gf-section" data-role="carto-section">
           <summary class="gf-section-summary">
             <span class="gf-section-title-group">
               <span class="gf-section-index">04</span>
@@ -377,11 +413,23 @@ export class SidebarPanel {
               <div class="gf-toggle-grid">
                 ${cartoTogglesHtml}
               </div>
+              <label class="gf-slope-toggle">
+                <span class="gf-slope-left">
+                  <input type="checkbox" data-role="slope-shading" />
+                  <span>Slope-Angle Shading (&gt;30° Avalanche)</span>
+                </span>
+                <span class="gf-slope-legend" title="Slope bands: 27–30° yellow, 30–35° orange, 35–45° red, 45°+ purple">
+                  <i style="background:#F6E05E"></i>
+                  <i style="background:#ED8936"></i>
+                  <i style="background:#E53E3E"></i>
+                  <i style="background:#805AD5"></i>
+                </span>
+              </label>
             </div>
 
             <div class="gf-field">
               <span class="gf-label">
-                <span>Custom User Overlay</span>
+                <span>Custom User Overlay &amp; Strip Route</span>
                 <span class="gf-sublabel">.geojson · .gpx · .csv</span>
               </span>
               <div class="gf-dropzone" data-role="dropzone">
@@ -397,12 +445,45 @@ export class SidebarPanel {
                 />
                 <button type="button" class="gf-file-clear" data-role="file-clear" title="Clear overlay file" hidden>×</button>
               </div>
+              <div class="gf-strip-bar hidden" data-role="strip-bar"></div>
             </div>
+          </div>
+        </details>
+
+        <!-- 5. Waypoints & Route Card -->
+        <details class="gf-section" data-role="waypoints-section">
+          <summary class="gf-section-summary">
+            <span class="gf-section-title-group">
+              <span class="gf-section-index">05</span>
+              <span class="gf-section-title">Waypoints &amp; Route Card</span>
+            </span>
+            <span class="gf-section-meta">
+              <span class="gf-section-pill" data-role="waypoints-pill">0 WPs</span>
+              ${CHEVRON_SVG}
+            </span>
+          </summary>
+          <div class="gf-section-body">
+            <div class="gf-wp-controls">
+              <button type="button" class="gf-wp-markup-btn" data-role="wp-markup-toggle">
+                <span>⌖ Drop on Map</span>
+              </button>
+              <button type="button" class="gf-mini-btn danger" data-role="wp-clear-all" disabled>
+                Clear All
+              </button>
+            </div>
+
+            <label class="gf-inline-check gf-wp-card-toggle">
+              <input type="checkbox" data-role="wp-route-card" />
+              <span>Include Tactical Route Card Page (MGRS &amp; Mag Azimuths)</span>
+            </label>
+
+            <div class="gf-wp-list" data-role="wp-list"></div>
+            <div class="gf-wp-total hidden" data-role="wp-total"></div>
           </div>
         </details>
       </div>
 
-      <!-- 5. Outputs & Generate Sticky Footer -->
+      <!-- Sticky Outputs & Generate Footer -->
       <div class="gf-sidebar-footer">
         <div class="gf-outputs-box">
           <div class="gf-output-line">
@@ -414,6 +495,23 @@ export class SidebarPanel {
               <input type="checkbox" data-role="out-geopdf" />
               <span>GeoPDF</span>
             </label>
+          </div>
+
+          <div class="gf-supp-pages" data-role="supp-pages">
+            <label class="gf-inline-check" title="Append true-scale 100 mm ruler & MGRS Romer verification page">
+              <input type="checkbox" data-role="out-calibration" />
+              <span>100 mm Scale Calibration &amp; Romer Page</span>
+            </label>
+            <div class="gf-supp-chips">
+              <label class="gf-inline-check" title="Append Tactical Waypoints & Magnetic Bearings table page">
+                <input type="checkbox" data-role="out-route-card" />
+                <span>Route Card</span>
+              </label>
+              <label class="gf-inline-check" title="Prepend DEM Elevation Profile & Strip Index cover page">
+                <input type="checkbox" data-role="out-elev-profile" />
+                <span>Elev Profile</span>
+              </label>
+            </div>
           </div>
 
           <div class="gf-output-line">
@@ -442,7 +540,7 @@ export class SidebarPanel {
             </div>
           </div>
 
-          <label class="gf-inline-check" data-role="digital-grid-row" style="padding: 2px 4px;">
+          <label class="gf-inline-check" data-role="digital-grid-row" style="padding: 1px 4px;">
             <input type="checkbox" data-role="out-digital-grid" />
             <span>Include MGRS Grid on Digital Exports</span>
           </label>
@@ -475,17 +573,33 @@ export class SidebarPanel {
     this.titleInput = this.q<HTMLInputElement>("#gf-title-input");
     this.scaleSelect = this.q<HTMLSelectElement>("#gf-scale-select");
     this.paperSelect = this.q<HTMLSelectElement>("#gf-paper-select");
+    this.atlasGridEl = this.q("[data-role='atlas-grid']");
     this.atlasSublabelEl = this.q("[data-role='atlas-sublabel']");
     this.demSelect = this.q<HTMLSelectElement>("#gf-dem-select");
     this.packSelect = this.q<HTMLSelectElement>("#gf-pack-select");
     this.contourSelect = this.q<HTMLSelectElement>("#gf-contour-select");
     this.hillshadeSelect = this.q<HTMLSelectElement>("#gf-hillshade-select");
     this.labelDensitySelect = this.q<HTMLSelectElement>("#gf-label-select");
+    this.slopeCheck = this.q<HTMLInputElement>("[data-role='slope-shading']");
     this.fileInput = this.q<HTMLInputElement>("#gf-overlay-file");
     this.fileTitleEl = this.q("[data-role='file-title']");
     this.fileSubEl = this.q("[data-role='file-sub']");
     this.fileClearBtn = this.q<HTMLButtonElement>("[data-role='file-clear']");
     this.dropzoneEl = this.q("[data-role='dropzone']");
+    this.stripBarEl = this.q("[data-role='strip-bar']");
+    this.waypointsSectionEl = this.q<HTMLDetailsElement>(
+      "[data-role='waypoints-section']"
+    );
+    this.waypointsPillEl = this.q("[data-role='waypoints-pill']");
+    this.wpMarkupBtn = this.q<HTMLButtonElement>(
+      "[data-role='wp-markup-toggle']"
+    );
+    this.wpClearBtn = this.q<HTMLButtonElement>("[data-role='wp-clear-all']");
+    this.wpRouteCardCheck = this.q<HTMLInputElement>(
+      "[data-role='wp-route-card']"
+    );
+    this.wpListEl = this.q("[data-role='wp-list']");
+    this.wpTotalEl = this.q("[data-role='wp-total']");
     this.outPdfCheck = this.q<HTMLInputElement>("[data-role='out-pdf']");
     this.outGeoPdfCheck = this.q<HTMLInputElement>("[data-role='out-geopdf']");
     this.outMbtilesCheck = this.q<HTMLInputElement>("[data-role='out-mbtiles']");
@@ -500,6 +614,16 @@ export class SidebarPanel {
       "[data-role='out-digital-grid']"
     );
     this.digitalGridRow = this.q("[data-role='digital-grid-row']");
+    this.suppPagesBoxEl = this.q("[data-role='supp-pages']");
+    this.outCalibrationCheck = this.q<HTMLInputElement>(
+      "[data-role='out-calibration']"
+    );
+    this.outRouteCardCheck = this.q<HTMLInputElement>(
+      "[data-role='out-route-card']"
+    );
+    this.outElevProfileCheck = this.q<HTMLInputElement>(
+      "[data-role='out-elev-profile']"
+    );
     this.generateBtn = this.q<HTMLButtonElement>("[data-role='generate-btn']");
     this.formErrorEl = this.q("[data-role='form-error']");
     this.sheetPillEl = this.q("[data-role='sheet-pill']");
@@ -541,7 +665,6 @@ export class SidebarPanel {
         return;
       }
 
-      // Immediate place lookup on Enter/Go
       this.cancelPendingGeocode();
       const controller = new AbortController();
       this.geocodeAbort = controller;
@@ -606,7 +729,6 @@ export class SidebarPanel {
     });
 
     this.geocodeMenuEl.addEventListener("mousedown", (e) => {
-      // Prevent input blur before click registers
       e.preventDefault();
     });
 
@@ -663,6 +785,7 @@ export class SidebarPanel {
       .querySelectorAll<HTMLButtonElement>("[data-atlas-cols]")
       .forEach((btn) => {
         btn.addEventListener("click", () => {
+          if (this.state.stripPlan) return;
           const cols = Number(btn.dataset.atlasCols);
           const rows = Number(btn.dataset.atlasRows);
           if (
@@ -790,6 +913,12 @@ export class SidebarPanel {
         });
       });
 
+    this.slopeCheck.addEventListener("change", () => {
+      this.state.carto.show_slope_shading = this.slopeCheck.checked;
+      this.updateSectionPills();
+      this.callbacks.onStateChange();
+    });
+
     const handleFile = (file: File | null) => {
       if (file && file.size > 25 * 1024 * 1024) {
         this.setFormError("Overlay file exceeds 25 MB limit.");
@@ -799,7 +928,7 @@ export class SidebarPanel {
       this.state.overlayFile = file;
       this.syncFileDisplay();
       this.updateSectionPills();
-      this.callbacks.onStateChange();
+      this.callbacks.onOverlayFileChange(file);
     };
 
     this.fileInput.addEventListener("change", () => {
@@ -827,10 +956,71 @@ export class SidebarPanel {
       if (file) handleFile(file);
     });
 
+    this.stripBarEl.addEventListener("click", (e) => {
+      const target = e.target as HTMLElement | null;
+      const btn = target?.closest<HTMLButtonElement>("button[data-strip-action]");
+      if (!btn) return;
+      const action = btn.dataset.stripAction;
+      if (action === "plan") {
+        this.callbacks.onAutoStripPlan();
+      } else if (action === "clear") {
+        this.callbacks.onClearStripPlan();
+      }
+    });
+
+    // Waypoints Section 05 events
+    this.wpMarkupBtn.addEventListener("click", () => {
+      this.callbacks.onToggleMarkupMode();
+    });
+
+    this.wpClearBtn.addEventListener("click", () => {
+      this.callbacks.onWaypointsClear();
+    });
+
+    const syncRouteCardChecks = (checked: boolean) => {
+      this.state.include_route_card = checked;
+      this.wpRouteCardCheck.checked = checked;
+      this.outRouteCardCheck.checked = checked;
+      this.callbacks.onStateChange();
+    };
+
+    this.wpRouteCardCheck.addEventListener("change", () => {
+      syncRouteCardChecks(this.wpRouteCardCheck.checked);
+    });
+
+    this.wpListEl.addEventListener("change", (e) => {
+      const target = e.target as HTMLElement | null;
+      if (!target) return;
+      if (target instanceof HTMLInputElement && target.dataset.wpName) {
+        const idx = Number(target.dataset.wpName);
+        this.callbacks.onWaypointEdit(idx, {
+          label: target.value.trim() || `WP${idx + 1}`,
+        });
+      } else if (target instanceof HTMLSelectElement && target.dataset.wpCat) {
+        const idx = Number(target.dataset.wpCat);
+        this.callbacks.onWaypointEdit(idx, {
+          category: target.value as WaypointCategory,
+        });
+      }
+    });
+
+    this.wpListEl.addEventListener("click", (e) => {
+      const target = e.target as HTMLElement | null;
+      const btn = target?.closest<HTMLButtonElement>("button[data-wp-del]");
+      if (!btn) return;
+      const idx = Number(btn.dataset.wpDel);
+      this.callbacks.onWaypointDelete(idx);
+    });
+
     // Outputs
     const syncOutputControls = () => {
-      this.outGeoPdfCheck.disabled = !this.state.outputs.pdf;
-      if (!this.state.outputs.pdf) {
+      const pdfOn = this.state.outputs.pdf;
+      this.outGeoPdfCheck.disabled = !pdfOn;
+      this.outCalibrationCheck.disabled = !pdfOn;
+      this.outRouteCardCheck.disabled = !pdfOn;
+      this.outElevProfileCheck.disabled = !pdfOn;
+      this.suppPagesBoxEl.style.opacity = pdfOn ? "1" : "0.45";
+      if (!pdfOn) {
         this.state.outputs.geopdf = false;
         this.outGeoPdfCheck.checked = false;
       }
@@ -859,6 +1049,20 @@ export class SidebarPanel {
 
     this.outGeoPdfCheck.addEventListener("change", () => {
       this.state.outputs.geopdf = this.outGeoPdfCheck.checked;
+      this.callbacks.onStateChange();
+    });
+
+    this.outCalibrationCheck.addEventListener("change", () => {
+      this.state.include_calibration_page = this.outCalibrationCheck.checked;
+      this.callbacks.onStateChange();
+    });
+
+    this.outRouteCardCheck.addEventListener("change", () => {
+      syncRouteCardChecks(this.outRouteCardCheck.checked);
+    });
+
+    this.outElevProfileCheck.addEventListener("change", () => {
+      this.state.include_elevation_profile = this.outElevProfileCheck.checked;
       this.callbacks.onStateChange();
     });
 
@@ -1017,19 +1221,29 @@ export class SidebarPanel {
   }
 
   private updateAtlasButtons(): void {
+    const stripActive = this.state.stripPlan !== null;
+    this.atlasGridEl.classList.toggle("disabled", stripActive);
     this.root
       .querySelectorAll<HTMLButtonElement>("[data-atlas-cols]")
       .forEach((btn) => {
+        btn.disabled = stripActive;
         const active =
+          !stripActive &&
           Number(btn.dataset.atlasCols) === this.state.grid_cols &&
           Number(btn.dataset.atlasRows) === this.state.grid_rows;
         btn.classList.toggle("active", active);
       });
-    const count = this.state.grid_cols * this.state.grid_rows;
-    this.atlasSublabelEl.textContent =
-      count === 1
-        ? "Single sheet"
-        : `${count} edge-matched sheets (multi-page PDF)`;
+    if (stripActive && this.state.stripPlan) {
+      const count =
+        this.state.stripPlan.sheet_count ?? this.state.stripPlan.sheets.length;
+      this.atlasSublabelEl.textContent = `Strip Atlas active (${count} sheets)`;
+    } else {
+      const count = this.state.grid_cols * this.state.grid_rows;
+      this.atlasSublabelEl.textContent =
+        count === 1
+          ? "Single sheet"
+          : `${count} edge-matched sheets (multi-page PDF)`;
+    }
   }
 
   private updatePresetButtons(): void {
@@ -1051,17 +1265,149 @@ export class SidebarPanel {
       this.fileSubEl.textContent = "Waypoints, tracks, or polygons (max 25 MB)";
       this.fileClearBtn.hidden = true;
     }
+    this.renderStripBar();
+  }
+
+  private renderStripBar(): void {
+    const eligible = isStripEligibleFile(this.state.overlayFile);
+    const plan = this.state.stripPlan;
+
+    if (!eligible && !plan) {
+      this.stripBarEl.classList.add("hidden");
+      this.stripBarEl.innerHTML = "";
+      return;
+    }
+
+    this.stripBarEl.classList.remove("hidden");
+
+    if (plan) {
+      const count = plan.sheet_count ?? plan.sheets.length;
+      this.stripBarEl.innerHTML = `
+        <div class="gf-strip-summary">
+          <span class="gf-strip-badge mono">Strip Atlas: ${count} sheet${count === 1 ? "" : "s"} · ${plan.route_distance_km.toFixed(1)} km</span>
+          <button type="button" class="gf-mini-btn danger" data-strip-action="clear">Clear Strip</button>
+        </div>
+      `;
+    } else {
+      this.stripBarEl.innerHTML = `
+        <button
+          type="button"
+          class="gf-strip-btn"
+          data-strip-action="plan"
+          ${this.planningStrip ? "disabled" : ""}
+        >
+          <span>${this.planningStrip ? "Planning Strip Atlas…" : "Auto-Fit Strip Atlas"}</span>
+        </button>
+      `;
+    }
+  }
+
+  private renderWaypointsList(): void {
+    const wps = this.state.waypoints;
+    this.wpClearBtn.disabled = wps.length === 0;
+    this.wpMarkupBtn.classList.toggle("active", this.markupMode);
+    this.wpMarkupBtn.innerHTML = this.markupMode
+      ? `<span>⌖ Markup ON (Click Map)</span>`
+      : `<span>⌖ Drop on Map</span>`;
+
+    if (wps.length === 0) {
+      this.waypointsPillEl.textContent = "0 WPs";
+      this.wpListEl.innerHTML = `
+        <div class="gf-wp-empty">
+          Toggle <strong>⌖ Markup</strong> (or press <kbd>M</kbd>) and click the map to drop numbered waypoints, MGRS grids &amp; magnetic bearings.
+        </div>
+      `;
+      this.wpTotalEl.classList.add("hidden");
+      this.wpTotalEl.textContent = "";
+      return;
+    }
+
+    const totalKm = this.routeMetrics?.total_distance_km ?? 0;
+    const totalMi = this.routeMetrics?.total_distance_mi ?? 0;
+    const useImperial = this.state.units === "imperial";
+
+    this.waypointsPillEl.textContent =
+      wps.length >= 2 && this.routeMetrics
+        ? `${wps.length} WPs · ${useImperial ? `${totalMi.toFixed(1)} mi` : `${totalKm.toFixed(1)} km`}`
+        : `${wps.length} WP${wps.length === 1 ? "" : "s"}`;
+
+    this.wpListEl.innerHTML = wps
+      .map((wp, idx) => {
+        const code = `WP${idx + 1}`;
+        const mWp = this.routeMetrics?.waypoints[idx];
+        const leg = idx > 0 ? this.routeMetrics?.legs[idx - 1] : undefined;
+        const mgrsStr =
+          mWp?.mgrs_10m ?? `${wp.lat.toFixed(4)}, ${wp.lon.toFixed(4)}`;
+        const legStr =
+          idx === 0
+            ? "Start"
+            : leg
+              ? useImperial
+                ? `${leg.leg_dist_mi.toFixed(2)} mi`
+                : `${leg.leg_dist_km.toFixed(2)} km`
+              : "…";
+        const azStr =
+          idx === 0
+            ? "—"
+            : leg
+              ? `${Math.round(leg.mag_az_deg).toString().padStart(3, "0")}°M`
+              : "…";
+        const color = CATEGORY_COLOR_MAP[wp.category] ?? "#EC4899";
+
+        const catOptions = WAYPOINT_CATEGORY_OPTIONS.map(
+          (o) =>
+            `<option value="${o.value}" ${o.value === wp.category ? "selected" : ""}>${escapeHtml(o.label)}</option>`
+        ).join("");
+
+        return `
+          <div class="gf-wp-row">
+            <div class="gf-wp-top">
+              <span class="gf-wp-code mono" style="border-color:${color};color:${color}">${code}</span>
+              <input
+                type="text"
+                class="gf-wp-name-input"
+                data-wp-name="${idx}"
+                value="${escapeHtml(wp.label)}"
+                maxlength="60"
+                aria-label="Waypoint ${idx + 1} name"
+              />
+              <select class="gf-wp-cat-select" data-wp-cat="${idx}" aria-label="Waypoint ${idx + 1} category">
+                ${catOptions}
+              </select>
+              <button type="button" class="gf-wp-del" data-wp-del="${idx}" title="Remove ${code}">×</button>
+            </div>
+            <div class="gf-wp-meta mono">
+              <span class="gf-wp-mgrs" title="10m MGRS">${escapeHtml(mgrsStr)}</span>
+              <span>${escapeHtml(legStr)}</span>
+              <span class="gf-wp-az">${escapeHtml(azStr)}</span>
+            </div>
+          </div>
+        `;
+      })
+      .join("");
+
+    if (wps.length >= 2 && this.routeMetrics) {
+      const distText = useImperial
+        ? `${totalMi.toFixed(2)} mi (${totalKm.toFixed(2)} km)`
+        : `${totalKm.toFixed(2)} km`;
+      this.wpTotalEl.textContent = `Total: ${distText} · ${wps.length - 1} leg${wps.length === 2 ? "" : "s"} · WMM2025 Mag Az`;
+      this.wpTotalEl.classList.remove("hidden");
+    } else {
+      this.wpTotalEl.classList.add("hidden");
+      this.wpTotalEl.textContent = "";
+    }
   }
 
   private updateSectionPills(): void {
     const scaleK = `1:${Math.round(this.state.scale / 1000)}k`;
     const paperLbl = this.state.paper.toUpperCase();
     const orientShort = this.state.orientation === "landscape" ? "L" : "P";
-    const atlasSuffix =
-      this.state.grid_cols * this.state.grid_rows > 1
+    const stripSuffix = this.state.stripPlan
+      ? ` · Strip ${this.state.stripPlan.sheet_count ?? this.state.stripPlan.sheets.length}sh`
+      : this.state.grid_cols * this.state.grid_rows > 1
         ? ` · ${this.state.grid_cols}×${this.state.grid_rows}`
         : "";
-    this.sheetPillEl.textContent = `${scaleK} · ${paperLbl} ${orientShort}${atlasSuffix}`;
+    this.sheetPillEl.textContent = `${scaleK} · ${paperLbl} ${orientShort}${stripSuffix}`;
 
     const overlayCount =
       this.state.au_overlays.length + this.state.us_overlays.length;
@@ -1081,6 +1427,7 @@ export class SidebarPanel {
       this.state.carto.contour_density !== "normal" ||
       this.state.carto.hillshade_strength !== "normal" ||
       this.state.carto.label_density !== "normal" ||
+      this.state.carto.show_slope_shading ||
       !this.state.carto.show_buildings ||
       !this.state.carto.show_trees ||
       !this.state.carto.show_power ||
@@ -1088,7 +1435,13 @@ export class SidebarPanel {
       !this.state.carto.show_grid ||
       !this.state.carto.show_river_arrows ||
       this.state.overlayFile !== null;
-    this.cartoPillEl.textContent = customCarto ? "Custom" : "Default";
+    this.cartoPillEl.textContent = this.state.stripPlan
+      ? "Strip"
+      : this.state.carto.show_slope_shading
+        ? "Slope"
+        : customCarto
+          ? "Custom"
+          : "Default";
   }
 
   syncControlsFromState(clearPreset = false): void {
@@ -1124,6 +1477,7 @@ export class SidebarPanel {
     this.contourSelect.value = this.state.carto.contour_density;
     this.hillshadeSelect.value = this.state.carto.hillshade_strength;
     this.labelDensitySelect.value = this.state.carto.label_density;
+    this.slopeCheck.checked = this.state.carto.show_slope_shading;
 
     this.root
       .querySelectorAll<HTMLInputElement>("[data-carto-toggle]")
@@ -1134,9 +1488,19 @@ export class SidebarPanel {
         }
       });
 
-    this.outPdfCheck.checked = this.state.outputs.pdf;
+    const pdfOn = this.state.outputs.pdf;
+    this.outPdfCheck.checked = pdfOn;
     this.outGeoPdfCheck.checked = this.state.outputs.geopdf;
-    this.outGeoPdfCheck.disabled = !this.state.outputs.pdf;
+    this.outGeoPdfCheck.disabled = !pdfOn;
+    this.outCalibrationCheck.checked = this.state.include_calibration_page;
+    this.outCalibrationCheck.disabled = !pdfOn;
+    this.outRouteCardCheck.checked = this.state.include_route_card;
+    this.outRouteCardCheck.disabled = !pdfOn;
+    this.wpRouteCardCheck.checked = this.state.include_route_card;
+    this.outElevProfileCheck.checked = this.state.include_elevation_profile;
+    this.outElevProfileCheck.disabled = !pdfOn;
+    this.suppPagesBoxEl.style.opacity = pdfOn ? "1" : "0.45";
+
     this.outMbtilesCheck.checked = this.state.outputs.mbtiles;
     this.outMbtilesFmt.value = this.state.outputs.mbtiles_format;
     this.outMbtilesFmt.disabled = !this.state.outputs.mbtiles;
@@ -1150,9 +1514,29 @@ export class SidebarPanel {
     this.digitalGridRow.style.opacity = anyDigital ? "1" : "0.45";
 
     this.syncFileDisplay();
+    this.renderWaypointsList();
     this.updateAtlasButtons();
     this.updatePresetButtons();
     this.updateSectionPills();
+  }
+
+  setPlanningStrip(planning: boolean): void {
+    this.planningStrip = planning;
+    this.renderStripBar();
+  }
+
+  setMarkupMode(active: boolean): void {
+    this.markupMode = active;
+    this.renderWaypointsList();
+  }
+
+  setRouteMetrics(metrics: RouteMetricsResponse | null): void {
+    this.routeMetrics = metrics;
+    this.renderWaypointsList();
+  }
+
+  openWaypointsSection(): void {
+    this.waypointsSectionEl.open = true;
   }
 
   setCenterInput(value: string, clearPreset = false): void {

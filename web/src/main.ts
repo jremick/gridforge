@@ -6,6 +6,8 @@ import {
   fetchHealth,
   fetchJobs,
   fetchPacks,
+  fetchRouteMetrics,
+  fetchStripPlan,
   submitJob,
 } from "./api";
 import { JobsDrawer } from "./components/jobsDrawer";
@@ -40,9 +42,11 @@ import type {
   PaperSize,
   USOverlayKind,
   Units,
+  WaypointCategory,
 } from "./types";
 
 const FOOTPRINT_DEBOUNCE_MS = 180;
+const ROUTE_METRICS_DEBOUNCE_MS = 150;
 const ACTIVE_JOBS_POLL_MS = 2000;
 const IDLE_JOBS_POLL_MS = 10000;
 const HEALTH_POLL_MS = 5000;
@@ -134,6 +138,14 @@ function hydrateStateFromUrl(state: AppFormState): {
       .filter((s): s is USOverlayKind => VALID_US_OV.has(s));
   }
 
+  if (params.get("slope") === "1" || params.get("slope") === "true") {
+    state.carto.show_slope_shading = true;
+  }
+
+  if (params.get("cal") === "1") {
+    state.include_calibration_page = true;
+  }
+
   return { hasCustomCenter, needsFlyToResolvedCenter };
 }
 
@@ -145,12 +157,16 @@ class GridForgeApp {
   private readonly drawer: JobsDrawer;
   private readonly map: GridForgeMap;
   private readonly footprintBannerEl: HTMLElement;
+  private readonly mapHintEl: HTMLElement;
+  private readonly mapHintTextEl: HTMLElement;
   private readonly cursorCoordsEl: HTMLElement;
   private readonly toastContainerEl: HTMLElement;
   private readonly collapseBtnEl: HTMLButtonElement;
+  private readonly markupToolbarBtn: HTMLButtonElement;
 
   private sidebarCollapsed = false;
   private drawerOpen = false;
+  private markupMode = false;
   private activeBasemap: BasemapId = "opentopo";
   private latestFootprint: FootprintResponse | null = null;
   private jobs: JobRecord[] = [];
@@ -158,6 +174,9 @@ class GridForgeApp {
 
   private footprintTimer: number | null = null;
   private footprintAbort: AbortController | null = null;
+  private stripAbort: AbortController | null = null;
+  private metricsTimer: number | null = null;
+  private metricsAbort: AbortController | null = null;
   private jobsPollTimer: number | null = null;
 
   constructor(root: HTMLElement) {
@@ -188,6 +207,13 @@ class GridForgeApp {
               ).join("")}
             </div>
             <div class="gf-map-actions">
+              <button
+                type="button"
+                class="gf-map-icon-btn gf-markup-btn"
+                data-map-action="markup"
+                aria-pressed="false"
+                title="Toggle waypoint markup drop mode (M)"
+              >⌖ Markup</button>
               <button type="button" class="gf-map-icon-btn" data-map-action="fit" title="Fit sheet footprint (F)">⌖ Fit</button>
               <button type="button" class="gf-map-icon-btn" data-map-action="zoom-in" title="Zoom in">+</button>
               <button type="button" class="gf-map-icon-btn" data-map-action="zoom-out" title="Zoom out">−</button>
@@ -197,8 +223,8 @@ class GridForgeApp {
 
           <div class="gf-footprint-banner hidden" data-role="footprint-banner"></div>
 
-          <div class="gf-map-hint">
-            <span>Click map or drag reticle · F to fit</span>
+          <div class="gf-map-hint" data-role="map-hint">
+            <span data-role="map-hint-text">Click map or drag reticle · F to fit</span>
             <span class="mono" data-role="cursor-coords">—</span>
           </div>
 
@@ -210,11 +236,17 @@ class GridForgeApp {
 
     this.shellEl = this.q(root, "[data-role='shell']");
     this.footprintBannerEl = this.q(root, "[data-role='footprint-banner']");
+    this.mapHintEl = this.q(root, "[data-role='map-hint']");
+    this.mapHintTextEl = this.q(root, "[data-role='map-hint-text']");
     this.cursorCoordsEl = this.q(root, "[data-role='cursor-coords']");
     this.toastContainerEl = this.q(root, "[data-role='toasts']");
     this.collapseBtnEl = this.q<HTMLButtonElement>(
       root,
       "[data-role='sidebar-toggle']"
+    );
+    this.markupToolbarBtn = this.q<HTMLButtonElement>(
+      root,
+      "[data-map-action='markup']"
     );
 
     this.telemetry = new TelemetryBar(this.q(root, "[data-role='topbar']"), {
@@ -227,6 +259,7 @@ class GridForgeApp {
       this.state,
       {
         onCenterSubmit: (centerText) => {
+          this.clearStripPlanInternal(false);
           this.state.center = centerText;
           this.syncUrlFromState();
           this.requestFootprintImmediate({
@@ -240,7 +273,9 @@ class GridForgeApp {
         onPresetSelect: (preset) => this.applyPreset(preset),
         onFootprintParamsChange: (opts) => {
           this.syncUrlFromState();
-          if (opts?.fitAfterLoad) {
+          if (this.state.stripPlan && this.state.overlayFile) {
+            void this.runStripPlan({ fitAfterLoad: true, silentToast: true });
+          } else if (opts?.fitAfterLoad) {
             this.requestFootprintImmediate({
               flyToResult: false,
               syncMarker: false,
@@ -249,10 +284,19 @@ class GridForgeApp {
           } else {
             this.scheduleFootprint();
           }
+          if (this.state.waypoints.length > 0) {
+            this.scheduleRouteMetrics();
+          }
         },
         onStateChange: () => {
           this.syncUrlFromState();
-          if (this.latestFootprint) {
+          if (this.state.stripPlan) {
+            this.map.updateFootprint(
+              this.state.stripPlan.footprint_geojson,
+              this.state.stripPlan.grid_geojson,
+              this.state.carto.show_grid
+            );
+          } else if (this.latestFootprint) {
             this.map.updateFootprint(
               this.latestFootprint.footprint_geojson,
               this.latestFootprint.grid_geojson,
@@ -260,6 +304,20 @@ class GridForgeApp {
             );
           }
         },
+        onOverlayFileChange: (file) => {
+          if (!file && this.state.stripPlan) {
+            this.clearStripPlanInternal(true);
+          } else if (this.state.stripPlan && file) {
+            this.clearStripPlanInternal(true);
+          }
+        },
+        onAutoStripPlan: () =>
+          void this.runStripPlan({ fitAfterLoad: true, silentToast: false }),
+        onClearStripPlan: () => this.clearStripPlanInternal(true),
+        onToggleMarkupMode: () => this.setMarkupMode(!this.markupMode),
+        onWaypointEdit: (idx, patch) => this.handleWaypointEdit(idx, patch),
+        onWaypointDelete: (idx) => this.handleWaypointDelete(idx),
+        onWaypointsClear: () => this.handleWaypointsClear(),
         onRefreshPacks: () => void this.loadPacks(true),
         onSubmitJob: () => void this.handleSubmitJob(),
         onCopyCli: () => {
@@ -281,6 +339,9 @@ class GridForgeApp {
       this.q(root, "[data-role='map']"),
       {
         onCenterDrag: (lat, lon) => {
+          if (this.state.stripPlan) {
+            this.clearStripPlanInternal(false);
+          }
           this.state.lat = lat;
           this.state.lon = lon;
           this.state.center = formatCoords(lat, lon);
@@ -288,6 +349,9 @@ class GridForgeApp {
           this.scheduleFootprint();
         },
         onCenterCommit: (lat, lon) => {
+          if (this.state.stripPlan) {
+            this.clearStripPlanInternal(false);
+          }
           this.state.lat = lat;
           this.state.lon = lon;
           this.state.center = formatCoords(lat, lon);
@@ -295,6 +359,7 @@ class GridForgeApp {
           this.syncUrlFromState();
           this.scheduleFootprint();
         },
+        onMapMarkupClick: (lat, lon) => this.handleAddWaypoint(lat, lon),
         onCursorMove: (lat, lon) => {
           this.cursorCoordsEl.textContent = `${lat.toFixed(4)}, ${lon.toFixed(4)}`;
         },
@@ -344,7 +409,9 @@ class GridForgeApp {
       .forEach((btn) => {
         btn.addEventListener("click", () => {
           const action = btn.dataset.mapAction;
-          if (action === "fit") {
+          if (action === "markup") {
+            this.setMarkupMode(!this.markupMode);
+          } else if (action === "fit") {
             this.fitSheetOnMap();
           } else if (action === "zoom-in") {
             this.map.zoomIn();
@@ -380,10 +447,38 @@ class GridForgeApp {
       ) {
         e.preventDefault();
         this.fitSheetOnMap();
-      } else if (e.key === "Escape" && this.drawerOpen) {
-        this.setDrawerOpen(false);
+      } else if (
+        (e.key === "m" || e.key === "M") &&
+        !inInput &&
+        !e.ctrlKey &&
+        !e.metaKey &&
+        !e.altKey
+      ) {
+        e.preventDefault();
+        this.setMarkupMode(!this.markupMode);
+      } else if (e.key === "Escape") {
+        if (this.markupMode) {
+          this.setMarkupMode(false);
+        } else if (this.drawerOpen) {
+          this.setDrawerOpen(false);
+        }
       }
     });
+  }
+
+  private setMarkupMode(active: boolean): void {
+    this.markupMode = active;
+    this.map.setMarkupMode(active);
+    this.sidebar.setMarkupMode(active);
+    this.markupToolbarBtn.classList.toggle("active", active);
+    this.markupToolbarBtn.setAttribute("aria-pressed", String(active));
+    this.mapHintEl.classList.toggle("markup-active", active);
+    this.mapHintTextEl.textContent = active
+      ? "Markup ON: click map to drop WP · M to exit"
+      : "Click map or drag reticle · F to fit";
+    if (active) {
+      this.sidebar.openWaypointsSection();
+    }
   }
 
   private fitSheetOnMap(): void {
@@ -427,11 +522,18 @@ class GridForgeApp {
     if (this.state.us_overlays.length > 0) {
       params.set("us", this.state.us_overlays.join(","));
     }
+    if (this.state.carto.show_slope_shading) {
+      params.set("slope", "1");
+    }
+    if (this.state.include_calibration_page) {
+      params.set("cal", "1");
+    }
     const nextUrl = `${window.location.pathname}?${params.toString()}`;
     window.history.replaceState(null, "", nextUrl);
   }
 
   private applyPlaceResult(place: GeocodeResult): void {
+    this.clearStripPlanInternal(false);
     this.state.lat = place.lat;
     this.state.lon = place.lon;
     this.state.center = formatCoords(place.lat, place.lon);
@@ -447,6 +549,7 @@ class GridForgeApp {
   }
 
   private applyPreset(preset: LocationPreset): void {
+    this.clearStripPlanInternal(false);
     this.state.lat = preset.lat;
     this.state.lon = preset.lon;
     this.state.center = formatCoords(preset.lat, preset.lon);
@@ -469,6 +572,193 @@ class GridForgeApp {
       syncMarker: false,
     });
   }
+
+  // ---------- Strip Atlas Planner ----------
+
+  private async runStripPlan(options: {
+    fitAfterLoad: boolean;
+    silentToast: boolean;
+  }): Promise<void> {
+    const file = this.state.overlayFile;
+    if (!file) return;
+
+    this.stripAbort?.abort();
+    const controller = new AbortController();
+    this.stripAbort = controller;
+    this.sidebar.setPlanningStrip(true);
+
+    try {
+      const plan = await fetchStripPlan(
+        file,
+        {
+          scale: this.state.scale,
+          paper: this.state.paper,
+          orientation: this.state.orientation,
+          units: this.state.units,
+        },
+        controller.signal
+      );
+
+      if (controller.signal.aborted) return;
+
+      this.state.stripPlan = plan;
+      this.state.include_elevation_profile = true;
+
+      const anchor = plan.sheets[0];
+      if (anchor) {
+        this.state.lat = anchor.center_lat;
+        this.state.lon = anchor.center_lon;
+        this.state.center = formatCoords(anchor.center_lat, anchor.center_lon);
+        this.map.setCenter(anchor.center_lat, anchor.center_lon, { fly: false });
+      }
+
+      this.map.updateFootprint(
+        plan.footprint_geojson,
+        plan.grid_geojson,
+        this.state.carto.show_grid
+      );
+      this.map.updateStripRoute(plan.route_geojson);
+      this.telemetry.updateStripPlan(plan);
+      this.sidebar.syncControlsFromState(true);
+      this.setFootprintError(null);
+
+      if (options.fitAfterLoad) {
+        this.fitSheetOnMap();
+      }
+
+      if (!options.silentToast) {
+        const count = plan.sheet_count ?? plan.sheets.length;
+        this.showToast(
+          `Strip Atlas: ${count} sheet${count === 1 ? "" : "s"} · ${plan.route_distance_km.toFixed(1)} km`,
+          "success"
+        );
+      }
+    } catch (err) {
+      if (controller.signal.aborted) return;
+      const msg =
+        err instanceof Error ? err.message : "Failed to plan strip atlas";
+      this.setFootprintError(msg);
+      this.showToast(msg, "error");
+    } finally {
+      if (!controller.signal.aborted) {
+        this.sidebar.setPlanningStrip(false);
+      }
+    }
+  }
+
+  private clearStripPlanInternal(restoreFootprint: boolean): void {
+    this.stripAbort?.abort();
+    this.stripAbort = null;
+    if (!this.state.stripPlan) return;
+    this.state.stripPlan = null;
+    this.map.updateStripRoute(null);
+    this.sidebar.syncControlsFromState();
+    if (restoreFootprint) {
+      this.requestFootprintImmediate({
+        flyToResult: false,
+        syncMarker: false,
+      });
+    }
+  }
+
+  // ---------- Waypoints & Tactical Route Metrics ----------
+
+  private handleAddWaypoint(lat: number, lon: number): void {
+    const num = this.state.waypoints.length + 1;
+    const isFirst = num === 1;
+    this.state.waypoints = [
+      ...this.state.waypoints,
+      {
+        label: `WP${num}`,
+        lat: Number(lat.toFixed(6)),
+        lon: Number(lon.toFixed(6)),
+        category: "waypoint",
+      },
+    ];
+    if (isFirst) {
+      this.state.include_route_card = true;
+      this.sidebar.openWaypointsSection();
+    }
+    this.map.updateWaypoints(this.state.waypoints);
+    this.sidebar.syncControlsFromState();
+    this.scheduleRouteMetrics();
+  }
+
+  private handleWaypointEdit(
+    index: number,
+    patch: { label?: string; category?: WaypointCategory }
+  ): void {
+    const existing = this.state.waypoints[index];
+    if (!existing) return;
+    const updated = [...this.state.waypoints];
+    updated[index] = {
+      ...existing,
+      label: patch.label !== undefined ? patch.label : existing.label,
+      category:
+        patch.category !== undefined ? patch.category : existing.category,
+    };
+    this.state.waypoints = updated;
+    this.map.updateWaypoints(this.state.waypoints);
+    this.scheduleRouteMetrics();
+  }
+
+  private handleWaypointDelete(index: number): void {
+    this.state.waypoints = this.state.waypoints.filter((_, i) => i !== index);
+    if (this.state.waypoints.length === 0) {
+      this.state.include_route_card = false;
+      this.sidebar.setRouteMetrics(null);
+    }
+    this.map.updateWaypoints(this.state.waypoints);
+    this.sidebar.syncControlsFromState();
+    if (this.state.waypoints.length > 0) {
+      this.scheduleRouteMetrics();
+    }
+  }
+
+  private handleWaypointsClear(): void {
+    this.metricsAbort?.abort();
+    this.state.waypoints = [];
+    this.state.include_route_card = false;
+    this.map.updateWaypoints([]);
+    this.sidebar.setRouteMetrics(null);
+    this.sidebar.syncControlsFromState();
+  }
+
+  private scheduleRouteMetrics(): void {
+    if (this.metricsTimer !== null) {
+      window.clearTimeout(this.metricsTimer);
+    }
+    this.metricsTimer = window.setTimeout(() => {
+      this.metricsTimer = null;
+      void this.loadRouteMetrics();
+    }, ROUTE_METRICS_DEBOUNCE_MS);
+  }
+
+  private async loadRouteMetrics(): Promise<void> {
+    if (this.state.waypoints.length === 0) {
+      this.sidebar.setRouteMetrics(null);
+      return;
+    }
+
+    this.metricsAbort?.abort();
+    const controller = new AbortController();
+    this.metricsAbort = controller;
+
+    try {
+      const metrics = await fetchRouteMetrics(
+        this.state.waypoints,
+        this.state.units,
+        null,
+        controller.signal
+      );
+      if (controller.signal.aborted) return;
+      this.sidebar.setRouteMetrics(metrics);
+    } catch {
+      // Keep local waypoint display cleanly if backend is restarting
+    }
+  }
+
+  // ---------- Footprint, Health, Packs & Jobs ----------
 
   private setDrawerOpen(open: boolean): void {
     this.drawerOpen = open;
@@ -627,7 +917,7 @@ class GridForgeApp {
   }
 
   private buildJobPayload(): CreateJobPayload {
-    return {
+    const payload: CreateJobPayload = {
       center:
         this.state.center.trim() || formatCoords(this.state.lat, this.state.lon),
       scale: this.state.scale,
@@ -642,9 +932,22 @@ class GridForgeApp {
       us_overlays: [...this.state.us_overlays],
       carto: { ...this.state.carto },
       outputs: { ...this.state.outputs },
-      grid_cols: this.state.grid_cols,
-      grid_rows: this.state.grid_rows,
+      grid_cols: this.state.stripPlan ? 1 : this.state.grid_cols,
+      grid_rows: this.state.stripPlan ? 1 : this.state.grid_rows,
+      waypoints: this.state.waypoints.map((wp) => ({ ...wp })),
+      include_calibration_page:
+        this.state.outputs.pdf && this.state.include_calibration_page,
+      include_route_card:
+        this.state.outputs.pdf && this.state.include_route_card,
+      include_elevation_profile:
+        this.state.outputs.pdf && this.state.include_elevation_profile,
     };
+
+    if (this.state.stripPlan && this.state.stripPlan.sheets.length > 0) {
+      payload.strip_sheets = this.state.stripPlan.sheets.map((s) => ({ ...s }));
+    }
+
+    return payload;
   }
 
   private async handleSubmitJob(): Promise<void> {

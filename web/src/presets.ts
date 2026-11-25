@@ -9,6 +9,7 @@ import type {
   LocationPreset,
   PaperSize,
   USOverlayKind,
+  WaypointCategory,
 } from "./types";
 
 export const DEFAULT_CENTER_LAT = -33.732;
@@ -174,6 +175,16 @@ export const AU_OVERLAY_OPTIONS: readonly {
   hint: string;
 }[] = [
   {
+    value: "au-nsw-trails",
+    label: "NSW Fire Trails, Huts & Trigs",
+    hint: "Spatial Services fire trails, 4WD, tracks & trigs",
+  },
+  {
+    value: "au-vic-trails",
+    label: "VIC Vicmap Trails & Huts",
+    hint: "DEECA 4WD fire tracks, alpine huts & camps",
+  },
+  {
     value: "au-hydro",
     label: "GA Hydrology (Bores/Streams)",
     hint: "Watercourses, bores & waterholes",
@@ -220,6 +231,18 @@ export const US_OVERLAY_OPTIONS: readonly {
     label: "NOAA ENC Charts",
     hint: "Coastal depth soundings & buoys",
   },
+];
+
+export const WAYPOINT_CATEGORY_OPTIONS: readonly {
+  value: WaypointCategory;
+  label: string;
+  color: string;
+}[] = [
+  { value: "waypoint", label: "WP", color: "#EC4899" },
+  { value: "camp", label: "Camp", color: "#10B981" },
+  { value: "water", label: "Water", color: "#38BDF8" },
+  { value: "hazard", label: "Hazard", color: "#EF4444" },
+  { value: "lz", label: "LZ", color: "#F59E0B" },
 ];
 
 export const DENSITY_OPTIONS: readonly { value: DensityLevel; label: string }[] =
@@ -290,6 +313,7 @@ export function createInitialFormState(): AppFormState {
       show_pipelines: true,
       show_grid: true,
       show_river_arrows: true,
+      show_slope_shading: false,
     },
     outputs: {
       pdf: true,
@@ -301,7 +325,22 @@ export function createInitialFormState(): AppFormState {
       include_grid_on_digital: true,
     },
     overlayFile: null,
+    waypoints: [],
+    stripPlan: null,
+    include_calibration_page: false,
+    include_route_card: false,
+    include_elevation_profile: false,
   };
+}
+
+export function isStripEligibleFile(file: File | null): boolean {
+  if (!file) return false;
+  const lower = file.name.toLowerCase();
+  return (
+    lower.endsWith(".gpx") ||
+    lower.endsWith(".geojson") ||
+    lower.endsWith(".json")
+  );
 }
 
 const LAT_LON_RE =
@@ -391,6 +430,7 @@ const STAGE_LABELS: Record<string, string> = {
   building_terrain: "Generating contours & hillshade",
   rendering: "Rendering PyQGIS map sheet",
   rendering_pdf: "Rendering 300 DPI print PDF",
+  rendering_supplements: "Generating Route Card / Calibration",
   merging_atlas: "Merging multi-sheet Atlas PDF",
   exporting_mbtiles: "Exporting ATAK .mbtiles",
   exporting_kmz: "Exporting Garmin .kmz",
@@ -446,17 +486,23 @@ export function buildCliCommand(state: AppFormState): string {
   const slug = slugifyFilename(state);
   const pdfEnabled = state.outputs.pdf;
   const subcmd = pdfEnabled ? "render" : "export";
+  const stripMode = Boolean(state.stripPlan && state.overlayFile && pdfEnabled);
 
-  const args: string[] = [
-    "docker compose run --rm cli gridforge",
-    subcmd,
-    `--center ${shellQuote(centerArg)}`,
+  const args: string[] = ["docker compose run --rm cli gridforge", subcmd];
+
+  if (stripMode && state.overlayFile) {
+    args.push(`--strip-route ${shellQuote(`/output/${state.overlayFile.name}`)}`);
+  } else {
+    args.push(`--center ${shellQuote(centerArg)}`);
+  }
+
+  args.push(
     `--scale ${state.scale}`,
     `--paper ${state.paper}`,
     `--orientation ${state.orientation}`,
     `--mode ${state.color_mode}`,
-    `--units ${state.units}`,
-  ];
+    `--units ${state.units}`
+  );
 
   if (state.title.trim()) {
     args.push(`--title ${shellQuote(state.title.trim())}`);
@@ -483,6 +529,7 @@ export function buildCliCommand(state: AppFormState): string {
   if (state.carto.label_density !== "normal") {
     args.push(`--label-density ${state.carto.label_density}`);
   }
+  if (state.carto.show_slope_shading) args.push("--slope-shading");
   if (!state.carto.show_buildings) args.push("--no-buildings");
   if (!state.carto.show_trees) args.push("--no-trees");
   if (!state.carto.show_power) args.push("--no-power");
@@ -493,12 +540,21 @@ export function buildCliCommand(state: AppFormState): string {
     args.push("--no-grid");
   }
 
-  if (state.overlayFile) {
+  if (state.overlayFile && !stripMode) {
     args.push(`--overlay ${shellQuote(`/output/${state.overlayFile.name}`)}`);
+  }
+
+  for (const wp of state.waypoints) {
+    const cleanLabel = wp.label.replace(/,/g, " ").trim() || "WP";
+    const wpSpec = `${cleanLabel},${wp.lat.toFixed(5)},${wp.lon.toFixed(5)},${wp.category}`;
+    args.push(`--waypoint ${shellQuote(wpSpec)}`);
   }
 
   if (pdfEnabled) {
     if (state.outputs.geopdf) args.push("--geopdf");
+    if (state.include_calibration_page) args.push("--calibration-page");
+    if (state.include_route_card) args.push("--route-card");
+    if (state.include_elevation_profile) args.push("--elevation-profile");
     if (state.outputs.mbtiles) {
       args.push(`--mbtiles /output/${slug}.mbtiles`);
       if (state.outputs.mbtiles_format !== "png") {

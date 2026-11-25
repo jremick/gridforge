@@ -7,8 +7,15 @@ export type Units = "metric" | "imperial";
 export type DensityLevel = "low" | "normal" | "high";
 export type HillshadeStrength = "off" | "light" | "normal" | "strong";
 export type DemSourceKind = "auto" | "au-elvis" | "glo30" | "usgs3dep";
-export type AUOverlayKind = "au-hydro" | "au-parks" | "au-infra" | "au-aviation";
+export type AUOverlayKind =
+  | "au-nsw-trails"
+  | "au-vic-trails"
+  | "au-hydro"
+  | "au-parks"
+  | "au-infra"
+  | "au-aviation";
 export type USOverlayKind = "fema" | "nhd" | "towers" | "enc";
+export type WaypointCategory = "waypoint" | "camp" | "water" | "hazard" | "lz";
 export type MBTilesFormat = "png" | "jpg";
 export type GarminProfile = "standard" | "modern";
 export type BasemapId = "opentopo" | "osm" | "satellite";
@@ -30,6 +37,7 @@ export interface CartoOptions {
   show_pipelines: boolean;
   show_grid: boolean;
   show_river_arrows: boolean;
+  show_slope_shading: boolean;
 }
 
 export interface OutputOptions {
@@ -40,6 +48,45 @@ export interface OutputOptions {
   kmz: boolean;
   garmin_profile: GarminProfile;
   include_grid_on_digital: boolean;
+}
+
+export interface WaypointInput {
+  label: string;
+  lat: number;
+  lon: number;
+  category: WaypointCategory;
+  notes?: string | null;
+}
+
+export interface RouteMetricsWaypoint {
+  seq: number;
+  code: string;
+  label: string;
+  category: WaypointCategory;
+  lat: number;
+  lon: number;
+  mgrs_10m: string;
+  utm_epsg: number;
+  elev_m?: number | null;
+}
+
+export interface RouteMetricsLeg {
+  from_code: string;
+  to_code: string;
+  leg_dist_km: number;
+  leg_dist_mi: number;
+  cum_dist_km: number;
+  true_az_deg: number;
+  grid_az_deg: number;
+  mag_az_deg: number;
+  mag_az_mils: number;
+}
+
+export interface RouteMetricsResponse {
+  waypoints: RouteMetricsWaypoint[];
+  legs: RouteMetricsLeg[];
+  total_distance_km: number;
+  total_distance_mi: number;
 }
 
 export interface HealthResponse {
@@ -56,6 +103,28 @@ export interface BBox {
   min_y: number;
   max_x: number;
   max_y: number;
+}
+
+export interface StripSheetPlan {
+  sheet_id: string;
+  index: number;
+  center_lat: number;
+  center_lon: number;
+  center_mgrs_10m: string;
+  utm_bbox: BBox;
+}
+
+export interface StripPlanResponse {
+  utm_epsg: number;
+  utm_zone: number;
+  utm_hemisphere: "N" | "S";
+  gzd: string;
+  route_distance_km: number;
+  sheet_count?: number;
+  sheets: StripSheetPlan[];
+  route_geojson: FeatureCollection;
+  footprint_geojson: FeatureCollection;
+  grid_geojson: FeatureCollection;
 }
 
 export interface PackSummary {
@@ -148,6 +217,11 @@ export interface CreateJobPayload {
   outputs: OutputOptions;
   grid_cols: number;
   grid_rows: number;
+  waypoints: WaypointInput[];
+  strip_sheets?: StripSheetPlan[];
+  include_calibration_page: boolean;
+  include_route_card: boolean;
+  include_elevation_profile: boolean;
 }
 
 export interface JobArtifact {
@@ -199,6 +273,11 @@ export interface AppFormState {
   carto: CartoOptions;
   outputs: OutputOptions;
   overlayFile: File | null;
+  waypoints: WaypointInput[];
+  stripPlan: StripPlanResponse | null;
+  include_calibration_page: boolean;
+  include_route_card: boolean;
+  include_elevation_profile: boolean;
 }
 
 export interface LocationPreset {
