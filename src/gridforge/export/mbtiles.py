@@ -6,6 +6,7 @@ import sqlite3
 import subprocess
 import tempfile
 import time
+from contextlib import closing
 from pathlib import Path
 
 from osgeo import gdal
@@ -18,6 +19,7 @@ from gridforge.config import (
     JobWorkspace,
     MBTilesFormat,
 )
+from gridforge.export._atomic import staged_archive
 from gridforge.export.raster import render_collarless_geotiff
 
 
@@ -103,21 +105,13 @@ def export_mbtiles(
     resolved_out = caller_out.resolve()
     resolved_out.parent.mkdir(parents=True, exist_ok=True)
 
-    # Remove stale MBTiles archive and sidecars before creating fresh output.
-    for sidecar in (
-        resolved_out,
-        Path(f"{resolved_out}-journal"),
-        Path(f"{resolved_out}-wal"),
-        Path(f"{resolved_out}-shm"),
-        Path(f"{resolved_out}.aux.xml"),
-    ):
-        if sidecar.exists():
-            sidecar.unlink()
-
     layout = workspace.layout
     spec = layout.spec
 
-    with tempfile.TemporaryDirectory(prefix="gridforge_mbtiles_") as tmp_dir_str:
+    with (
+        staged_archive(resolved_out, sidecar_suffixes=("-journal", "-wal", "-shm", ".aux.xml")) as staged,
+        tempfile.TemporaryDirectory(prefix="gridforge_mbtiles_") as tmp_dir_str,
+    ):
         tmp_dir = Path(tmp_dir_str)
 
         if collarless_tif is not None and Path(collarless_tif).is_file():
@@ -212,18 +206,18 @@ def export_mbtiles(
         if tile_format == MBTilesFormat.JPG:
             translate_cmd.extend(["-co", f"QUALITY={jpeg_quality}"])
 
-        translate_cmd.extend([str(warped_tif), str(resolved_out)])
+        translate_cmd.extend([str(warped_tif), str(staged)])
         _run_cmd(translate_cmd, step="gdal_translate MBTILES")
 
         # Inspect initial max zoom to compute clean multi-zoom overview pyramid.
-        with sqlite3.connect(str(resolved_out)) as conn:
+        with closing(sqlite3.connect(staged)) as conn:
             row = conn.execute("SELECT MAX(zoom_level) FROM tiles").fetchone()
             base_max_zoom = int(row[0]) if row and row[0] is not None else 0
 
         overview_factors = _compute_overview_factors(w_3857, h_3857, base_max_zoom)
         if overview_factors:
             _run_cmd(
-                ["gdaladdo", "-r", "average", str(resolved_out), *overview_factors],
+                ["gdaladdo", "-r", "average", str(staged), *overview_factors],
                 step="gdaladdo MBTiles overviews",
             )
 
@@ -239,7 +233,7 @@ def export_mbtiles(
             f"{bounds_wgs84[2]:.6f},{bounds_wgs84[3]:.6f}"
         )
 
-        with sqlite3.connect(str(resolved_out)) as conn:
+        with closing(sqlite3.connect(staged)) as conn:
             stats = conn.execute(
                 "SELECT COUNT(*), MIN(zoom_level), MAX(zoom_level), MAX(LENGTH(tile_data)) "
                 "FROM tiles"
@@ -270,15 +264,15 @@ def export_mbtiles(
             )
             conn.commit()
 
-    elapsed = round(time.perf_counter() - t0, 3)
-    return ExportResult(
-        format=ExportFormat.MBTILES,
-        output_path=caller_out,
-        file_size_bytes=resolved_out.stat().st_size,
-        tile_count=tile_count,
-        min_zoom=min_zoom,
-        max_zoom=max_zoom,
-        max_tile_px=(256, 256),
-        max_tile_bytes=max_tile_bytes,
-        elapsed_seconds=elapsed,
-    )
+        elapsed = round(time.perf_counter() - t0, 3)
+        return ExportResult(
+            format=ExportFormat.MBTILES,
+            output_path=caller_out,
+            file_size_bytes=staged.stat().st_size,
+            tile_count=tile_count,
+            min_zoom=min_zoom,
+            max_zoom=max_zoom,
+            max_tile_px=(256, 256),
+            max_tile_bytes=max_tile_bytes,
+            elapsed_seconds=elapsed,
+        )
