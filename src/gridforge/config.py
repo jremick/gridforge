@@ -83,12 +83,14 @@ class USOverlayKind(str, Enum):
 
 
 class AUOverlayKind(str, Enum):
-    """Optional Australia-wide CC BY 4.0 national thematic overlay layers."""
+    """Optional Australia-wide & state CC BY 4.0 thematic overlay layers."""
 
     AU_HYDRO = "au-hydro"
     AU_PARKS = "au-parks"
     AU_INFRA = "au-infra"
     AU_AVIATION = "au-aviation"
+    AU_NSW_TRAILS = "au-nsw-trails"
+    AU_VIC_TRAILS = "au-vic-trails"
 
 
 class ExportFormat(str, Enum):
@@ -119,8 +121,28 @@ class MBTilesFormat(str, Enum):
     JPG = "jpg"
 
 
+class WaypointCategory(str, Enum):
+    """Tactical waypoint classification for custom markup and route cards."""
+
+    WAYPOINT = "waypoint"
+    CAMP = "camp"
+    WATER = "water"
+    HAZARD = "hazard"
+    LZ = "lz"
+
+
+class WaypointInput(BaseModel):
+    """User-supplied tactical waypoint coordinate and metadata."""
+
+    label: str = Field(..., min_length=1, max_length=60)
+    lat: float = Field(..., ge=-80.0, le=84.0)
+    lon: float = Field(..., ge=-180.0, le=180.0)
+    category: WaypointCategory = WaypointCategory.WAYPOINT
+    notes: str | None = None
+
+
 class CartoOptions(BaseModel):
-    """Phase 2 cartographic density and layer visibility controls."""
+    """Phase 2+ cartographic density and layer visibility controls."""
 
     contour_density: DensityLevel = DensityLevel.NORMAL
     hillshade_strength: HillshadeStrength = HillshadeStrength.NORMAL
@@ -131,6 +153,7 @@ class CartoOptions(BaseModel):
     show_pipelines: bool = True
     show_grid: bool = True
     show_river_arrows: bool = True
+    show_slope_shading: bool = False
 
 
 VALID_SCALES: tuple[int, ...] = (15000, 24000, 25000, 48000, 50000)
@@ -162,6 +185,10 @@ class SheetSpec(BaseModel):
     dem_source: DemSourceKind = DemSourceKind.AUTO
     us_overlays: list[USOverlayKind] = Field(default_factory=list)
     au_overlays: list[AUOverlayKind] = Field(default_factory=list)
+    waypoints: list[WaypointInput] = Field(default_factory=list)
+    include_calibration_page: bool = False
+    include_route_card: bool = False
+    include_elevation_profile: bool = False
 
     @field_validator("center_lat")
     @classmethod
@@ -302,6 +329,8 @@ class JobWorkspace(BaseModel):
     vertical_datum: str = "EGM2008"
     dem_source_name: str = "copernicus-glo30"
     regional_overlays: dict[str, Path] = Field(default_factory=dict)
+    slope_tif: Path | None = None
+    waypoints_gpkg: Path | None = None
 
 
 class RenderResult(BaseModel):
