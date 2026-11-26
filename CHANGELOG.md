@@ -5,6 +5,36 @@ All notable changes to **GridForge** are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-11-26
+
+Major tactical communications, multi-theme cartography, North America backcountry coverage, offline basemap, and field-device export release shipping four cartographic themes (`172` native QGIS 3.40 `.qml` styles), curved-Earth RF Fresnel Link Cards, tactical range rings & sectors, GeoPackage / OsmAnd / Field Bundle `.zip` exports, Saved Trip Projects, turnkey pure-GDAL offline basemaps across 29 global regions, and full US & Canada backcountry open-data sources.
+
+### Added
+
+- **Phase 0 — Live Multi-Arch GHCR Release Pipeline & Studio Polish:**
+  - Added `workflow_dispatch` tag trigger (`tag` input + semver resolution) to `.github/workflows/release.yml` and published live multi-arch (`linux/amd64` + `linux/arm64`) images to `ghcr.io/jremick/gridforge`.
+  - Auto-clears Copy CLI / form error banners in Studio on control edits and organizes Quick-Jump Presets into 4 regional tabs (`NSW/VIC`, `AU`, `NZ`, `NA` — 32 curated backcountry destinations).
+- **Track 1 — Point-to-Point Curved-Earth RF / 1st Fresnel Link Profile & Link Card PDF (`--rf-link`, `--rf-link-card`, `POST /api/rf-link-profile`):**
+  - Curved-Earth (`k=4/3`) terrain & 1st Fresnel zone clearance engine (`src/gridforge/pipeline/terrain.py`) computing `CLEAR` / `MARGINAL` / `OBSTRUCTED` status, 60% F1 clearance, exact FSPL (dB), True/Grid/WMM2025 Magnetic bearings, NATO mils, and 10 m MGRS endpoints across 200 bilinear DEM samples.
+  - Pure-vector **RF / LOS Fresnel Link Card** companion PDF page (`render_rf_link_card_pdf` in `src/gridforge/geo/supplements.py`) and interactive MapLibre Studio `⚡ A ↔ B` picker with band presets (`LoRa 915`, `UHF CB 477`, `GMRS 462`, `VHF 146`, `LoRa 868`, `2.4 GHz`, `5.8 GHz`) and live inline SVG Fresnel profile chart.
+- **Track 2 — Turnkey Pure-GDAL Offline Basemap Builder & 29-Region Global Pack Manager (`gridforge basemap-pack`, `include_basemap`):**
+  - Pure GDAL/NumPy/PIL hypsometric color-relief + multi-directional hillshade Web Mercator `.mbtiles` builder (`src/gridforge/packs/basemap_builder.py`, zoom `7–12`, atomic via `staged_archive`, `< 300 MB` RAM, zero QGIS/Qt imports).
+  - Expanded offline pack catalog (`src/gridforge/packs/regions.py`) to **29 grouped regions** (`au_tactical`: 7, `au_state`: 8, `nz`: 6, `na`: 8 — 5 US + 3 Canada) with `include_basemap=True` bundling `<pack_dir>/basemap.mbtiles` and per-pack discovery (`GET /api/basemap/info?pack_id=` & `GET /api/basemap/{z}/{x}/{y}.{ext}?pack_id=`).
+- **Track 3 — `night-red` & `alpine` Themes (`172` Native QGIS `.qml`s) + Tactical Ruler, Range Rings & Sectors (`--mode night-red|alpine`, `--range-ring`, `--tactical-line`, `POST /api/ruler-metrics`):**
+  - **`night-red`:** Red-headlamp-safe cartographic theme with strictly low-Red (`R <= 61`) ink on all critical terrain, road, trail, water, grid, viewshed, and tactical layers so nothing disappears under red night-vision illumination.
+  - **`alpine`:** Winter/ski-mountaineering theme with snow canvas, glacier/snowfield polygons, Swiss glacier-blue contours, and boosted `0.68` avalanche slope shading.
+  - Regenerated all **43 layer roles × 4 themes = 172 native QGIS 3.40 `.qml` files**.
+  - Added interactive Studio `📏 Ruler` (live geodesic distance, True/Grid/Mag bearing + NATO mils + DEM `%` grade + `Pin to PDF`), `◎ Ring` concentric geodesic range rings, and `⬠ Sector` polygon AOI markup (`src/gridforge/geo/tactical.py`) rendered crisply onto print sheets.
+- **Track 4 — OGC GeoPackage Tiles, OsmAnd `.sqlitedb`, Field Bundle `.zip` & Saved Trip Projects (`--gpkg`, `--osmand`, `--field-bundle`, `/api/projects`):**
+  - Atomic OGC GeoPackage raster tiles (`.gpkg`, `GoogleMapsCompatible` EPSG:3857 + overviews), OsmAnd `.sqlitedb` (`BigPlanet` `z=17-zoom`), and `<slug>_field_bundle.zip` bundling all enabled artifacts alongside valid GPX 1.1 (`waypoints`, `viewsheds`, `rf_links`, `tactical_graphics`) and `README_FIELD_BUNDLE.txt`.
+  - Added SQLite WAL **Saved Trip Projects** CRUD (`GET/POST /api/projects`, `GET/PATCH/DELETE /api/projects/{id}` under `SameOriginWritesMiddleware`), `GET /api/jobs/{id}/thumbnail.png`, and Studio **Projects** slide-over drawer (Save/Load/Clone/Delete with map sheet thumbnails).
+- **Track 5 — Strong North America Coverage (US Trails/Public Lands & Canada NRCan HRDEM/Parks Canada):**
+  - **United States (`--us-overlay us-trails`, `--us-overlay us-public-lands`):** Live Public Domain **USFS** (`EDW_TrailNFSPublish_01`, `EDW_RecreationOpportunities_01`, `EDW_Wilderness_01`), **NPS** (`NPS_Public_Trails`, `NPS_Public_POIs_Geographic`), and **USGS PAD-US** federal land managers & wilderness boundaries.
+  - **Canada (`--dem-source ca-hrdem`, `--ca-overlay ca-canvec-trails`):** Live OGL-Canada **NRCan CanElevation STAC** (`hrdem-mosaic-1m` -> `hrdem-mosaic-2m` -> nationwide `mrdem-30` in `CGVD2013` -> Copernicus GLO-30) plus **Parks Canada** trails/POIs, **DataBC** active forestry recreation trails (BC), and **ECCC CPCAD** protected areas.
+  - Upgraded `AutoDEMSource` to accurate **5-way** routing (`US -> CA -> AU -> NZ -> Global`) with piecewise US–Canada international border classification.
+- **Automated Verification (`293` offline pytest + `6` Copy CLI + `3/3` live US/Canada/AU E2E):**
+  - Added `tests/unit/test_v14_rf_and_na.py`, `tests/unit/test_v14_exports_and_packs.py`, `tests/unit/test_v14_web_and_rf.py`, and `tests/integration/test_v14_features.py` verifying Yosemite CA (`alpine`), Banff AB (`night-red`, `CGVD2013`), and Mt Kosciuszko (RF Fresnel Link Card, Tactical Rings/Sector, `.gpkg`/`.sqlitedb`/`.zip`).
+
 ## [1.3.0] - 2026-11-26
 
 Major operational, geospatial, self-hosting, and hardening release adding RF/LOS Viewshed mapping, New Zealand 1 m LiDAR & DOC trails, Queensland Tier-0 2 m State LiDAR, Atlas Overview Index Covers & Fold/Join Marks, Studio Offline Pack Manager & Air-Gapped Basemap Mode, multi-arch GHCR CI/CD + homelab reverse-proxy guides, and five production security/reliability hardening improvements (Codex PRs `#1`–`#5`).

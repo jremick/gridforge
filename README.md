@@ -7,11 +7,11 @@
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](pyproject.toml)
 [![PyQGIS 3.40 LTR](https://img.shields.io/badge/PyQGIS-3.40%20LTR-589632?logo=qgis&logoColor=white)](Dockerfile)
-[![Multi-Arch](https://img.shields.io/badge/Docker-arm64%20%7C%20amd64-2496ED?logo=docker&logoColor=white)](Dockerfile)
-[![Tests](https://img.shields.io/badge/Tests-264%2B%20passing-2ea44f)](tests/)
-[![Idle Memory](https://img.shields.io/badge/Idle%20RAM-~124%20MiB-f59e0b)](docker-compose.yml)
+[![Multi-Arch GHCR](https://img.shields.io/badge/GHCR-amd64%20%7C%20arm64-2496ED?logo=docker&logoColor=white)](https://github.com/jremick/gridforge/pkgs/container/gridforge)
+[![Tests](https://img.shields.io/badge/Tests-293%20pytest%20%2B%206%20CLI-2ea44f)](tests/)
+[![Idle Memory](https://img.shields.io/badge/Idle%20RAM-~150%20MiB-f59e0b)](docker-compose.ghcr.yml)
 
-True-scale **local UTM** 300 DPI print PDFs · **RF Viewsheds** · **New Zealand 1 m LiDAR & All-8-State AU Trails** · **Atlas Index Covers & Fold Marks** · **Air-Gapped Studio** · **ATAK `.mbtiles`** · **Garmin `.kmz`**
+True-scale **local UTM** 300 DPI print PDFs · **4 Themes (`Color`/`B&W`/`Night-Red`/`Alpine`)** · **RF Fresnel Link Cards & Viewsheds** · **US/Canada/AU/NZ Open Data** · **ATAK / Garmin / OsmAnd / GeoPackage / Field Bundle `.zip`**
 
 </div>
 
@@ -53,6 +53,57 @@ Every sheet below was generated directly by GridForge at 300 DPI and verified au
 ### Offline Field Device Exports — ATAK `.mbtiles` & Garmin Custom Maps `.kmz`
 
 ![ATAK MBTiles and Garmin KMZ Offline Exports](docs/images/exports-atak-garmin.jpg)
+
+---
+
+## `v1.4.0` Alpine & Night-Red Themes, RF Fresnel Link Cards, North America Coverage & Field Bundles
+
+GridForge `v1.4.0` expands into a complete multi-continent tactical & backcountry mapping platform across **North America (US & Canada)**, **Australia**, and **New Zealand**, adding four full cartographic themes (`172` native QGIS 3.40 `.qml` styles), curved-Earth RF Fresnel analysis, turnkey offline basemaps, Saved Trip Projects, and universal field-device bundles:
+
+![GridForge v1.4.0 Showcase — Yosemite Alpine Winter, Banff Night-Red NRCan HRDEM, Mt Kosciuszko RF Viewshed & Tactical Markup, and 915 MHz Fresnel Link Card](docs/images/v14-showcase.jpg)
+
+![GridForge Studio v1.4.0 — Live 915 MHz Fresnel Chart, Tactical Ruler/Rings/Sectors, 4 Map Themes, and Saved Projects](docs/images/studio-v14-rf-tactical.jpg)
+
+- **Point-to-Point RF / 1st Fresnel Link Profile & Link Card PDF (`--rf-link`, `--rf-link-card`, `⚡ A ↔ B` in Studio):** Models curved-Earth (`k=4/3`) terrain & 60% 1st Fresnel zone clearance across 200 DEM samples with band presets (`LoRa 915`, `UHF CB 477`, `GMRS 462`, `VHF 146`, `2.4/5.8 GHz`), FSPL (dB), WMM2025 Magnetic/Grid bearings + NATO mils, live inline SVG chart in Studio, and a pure-vector companion **RF Link Card** PDF page.
+- **4 Dedicated Cartographic Themes (`--mode color|bw|night-red|alpine`, `172` Native `.qml`s):**
+  - **`night-red`:** Red-headlamp-safe palette with zero red/orange ink (`R <= 61`) on critical terrain, roads, trails, water, grid, viewshed, and tactical markup so night operations stay razor-legible under red light.
+  - **`alpine`:** Winter/ski-mountaineering palette featuring snow canvas, glacier polygons, Swiss glacier-blue contours, and boosted avalanche slope shading.
+- **Strong North America Coverage (US & Canada):**
+  - **United States (`--us-overlay us-trails`, `--us-overlay us-public-lands`):** Live Public Domain **USFS** & **NPS** trails/POIs plus **USGS PAD-US** & USFS federal land manager / wilderness boundaries layered over USGS 3DEP 1 m/10 m LiDAR (`NAVD88`).
+  - **Canada (`--dem-source ca-hrdem`, `--ca-overlay ca-canvec-trails`):** Live OGL-Canada **NRCan CanElevation STAC** (`1 m / 2 m HRDEM` -> nationwide `mrdem-30` in `CGVD2013`) plus **Parks Canada** trails/POIs, **DataBC** trails, and **ECCC CPCAD** protected areas (integrated into 5-way `AutoDEMSource`).
+- **Tactical Ruler, Concentric Range Rings & Sector AOIs (`--range-ring`, `--tactical-line`, `📏 Ruler` / `◎ Ring` / `⬠ Sector`):** Measure live geodesic distance, True/Grid/Magnetic azimuths, NATO mils, and DEM slope `%` grade in Studio, pin bearing lines, drop concentric range rings, and draw polygon sectors rendered crisply onto print sheets.
+- **Turnkey Offline Basemaps (`gridforge basemap-pack`) & 29-Region Pack Manager:** Pure-GDAL hypsometric color-relief + hillshade `.mbtiles` (`< 300 MB` RAM) bundled automatically into packs across **29 global presets** (AU Tactical, AU States, New Zealand, North America) with per-pack Studio `/api/basemap/*?pack_id=` discovery.
+- **GeoPackage Tiles, OsmAnd `.sqlitedb`, Field Bundle `.zip` & Saved Trip Projects (`--gpkg`, `--osmand`, `--field-bundle`):** Export atomic OGC GeoPackage raster tiles, OsmAnd `.sqlitedb` (`BigPlanet`), or an all-in-one `<slug>_field_bundle.zip` (PDF + device archives + GPX 1.1 + `README_FIELD_BUNDLE.txt`), and save/load/clone map setups with sheet thumbnails in the Studio **Projects** drawer.
+
+```bash
+# Yosemite Valley CA — Alpine Winter Theme + USGS 3DEP (NAVD88) + USFS/NPS Trails + PAD-US Public Lands
+docker run --rm -v "$(pwd)/out:/out" ghcr.io/jremick/gridforge:latest \
+  gridforge render --center "37.745,-119.593" --scale 24000 --paper letter --units imperial \
+    --mode alpine --dem-source usgs3dep --us-overlay us-trails --us-overlay us-public-lands \
+    --slope-shading --title "YOSEMITE VALLEY — ALPINE" \
+    --output /out/yosemite_24k_letter_alpine.pdf
+
+# Banff AB, Canada — Red-Headlamp Night-Red Theme + NRCan HRDEM/MRDEM (CGVD2013) + Parks Canada Trails
+docker run --rm -v "$(pwd)/out:/out" ghcr.io/jremick/gridforge:latest \
+  gridforge render --center "51.178,-115.571" --scale 25000 --paper a4 --mode night-red \
+    --dem-source ca-hrdem --ca-overlay ca-canvec-trails \
+    --title "BANFF — SULPHUR MTN (NIGHT-RED)" \
+    --output /out/banff_25k_a4_night_red.pdf
+
+# Mt Kosciuszko NSW — RF Viewshed + 915 MHz Fresnel Link Card + Tactical Rings + GeoPackage + OsmAnd + Field Bundle .zip
+docker run --rm -v "$(pwd)/out:/out" ghcr.io/jremick/gridforge:latest \
+  gridforge render --center "-36.456,148.263" --scale 25000 --paper a4 \
+    --dem-source au-elvis --au-overlay au-nsw-trails \
+    --viewshed "-36.4559,148.2636,10,1.5,8,Kosciuszko Relay" \
+    --rf-link "-36.4559,148.2636,-36.4535,148.2877,10,2,915,Kosciuszko Relay,Seamans Hut" --rf-link-card \
+    --range-ring "-36.4559,148.2636,1:2,Relay Rings" \
+    --output /out/kosciuszko_rf_tactical.pdf --gpkg /out/kosciuszko.gpkg \
+    --osmand /out/kosciuszko.sqlitedb --field-bundle /out/kosciuszko_field_bundle.zip
+
+# Build a standalone pure-GDAL offline terrain basemap .mbtiles for air-gapped Studio use
+docker run --rm -v "$(pwd)/packs:/data/packs" ghcr.io/jremick/gridforge:latest \
+  gridforge basemap-pack --region blue-mountains --output /data/packs/basemap.mbtiles
+```
 
 ---
 
@@ -312,7 +363,7 @@ Measured on an Apple Silicon **M5 (16 GB RAM)** host running native `linux/arm64
 | **Warm-cache A4 300 DPI render time** | **`2.25 s`** (Katoomba B&W) / **`5.92 s`** (Boulder 1 m LiDAR) | Fast interactive turnaround |
 | **1 km MGRS physical grid accuracy** | **`0.0046 mm`** (Letter 1:24k) / **`0.0185 mm`** (A4 1:25k) | `≤ 0.15 mm` protractor tolerance |
 | **MGRS grid orthogonality skew** | **`0.0000 mm`** across all tested UTM zones | `< 0.05 mm` |
-| **Automated test suite (`pytest` + Node)** | **`264` offline pytest + `5` Copy CLI unit tests passing** | Runs offline inside `gridforge:dev` & `npm --prefix web test` |
+| **Automated test suite (`pytest` + Node)** | **`293` offline pytest + `6` Copy CLI unit tests passing** | Runs offline inside `gridforge:dev` & `npm --prefix web test` |
 | **100 mm Calibration ruler accuracy** | **`0.0000 mm` error / `0.0000 mm` skew** (H & V) | `≤ 0.15 mm` |
 
 ---
@@ -323,22 +374,22 @@ See **[CONTRIBUTING.md](CONTRIBUTING.md)** for development workflow and strict o
 
 ```text
 src/gridforge/
-├── config.py              # Pydantic v2 SheetSpec, ViewshedObserver, CartoOptions, PackManifest contracts
-├── cli.py                 # Typer CLI (`render`, `export`, `inspect`, `pack`, `serve`)
-├── geo/                   # UTM/MGRS CRS, atlas/antimeridian checks, WMM2025 SVGs, Atlas Index & supplements
-├── sources/               # QLD 2m/GA 5m/SRTM (AU), LINZ 1m/8m (NZ), USGS 3DEP (US), GLO-30, OSM, AU/NZ/US overlays
-├── packs/                 # Memory-safe streaming Australia offline pack catalog, manifest-ID lookup & builder
-├── pipeline/              # OSM -> GeoPackage normalization, GDAL hillshade/contours/slope/viewshed, runner
-├── render/                # Isolated PyQGIS subprocess worker, Color/B&W styling, QgsPrintLayout collar & fold marks
-├── export/                # Atomic staged publication, collarless UTM GeoTIFF, ATAK MBTiles 1.3, Garmin KMZ
-└── web/                   # FastAPI server (zero qgis imports), SameOrigin/TrustedHost, MBTiles basemap, Pack Manager
+├── config.py              # Pydantic v2 SheetSpec, RFLinkSpec, TacticalGraphic, ViewshedObserver contracts
+├── cli.py                 # Typer CLI (`render`, `export`, `inspect`, `pack`, `basemap-pack`, `serve`)
+├── geo/                   # UTM/MGRS CRS, atlas/antimeridian checks, tactical markup/ruler, RF Link Card & supplements
+├── sources/               # US 3DEP/USFS/NPS/PAD-US, CA NRCan/Parks CA/DataBC, AU 2m/5m/8-states, NZ LINZ/DOC, GLO-30, OSM
+├── packs/                 # 29-region global pack catalog, pure-GDAL offline basemap builder & manifest-ID lookup
+├── pipeline/              # OSM -> GeoPackage normalization, GDAL hillshade/contours/slope/viewshed/Fresnel RF, runner
+├── render/                # Isolated PyQGIS subprocess worker, 4-theme styling, QgsPrintLayout collar & fold marks
+├── export/                # Atomic staged publication: ATAK MBTiles, Garmin KMZ, OGC GeoPackage, OsmAnd, Field Bundle .zip
+└── web/                   # FastAPI server (zero qgis imports), SameOrigin/TrustedHost, Projects CRUD, Basemap & Pack Manager
 web/                       # TypeScript + Vite + MapLibre GL JS Print Studio SPA + Copy CLI tests
 config/osmconf.ini         # Shared GDAL OSM driver schema for online & air-gapped parity
 assets/
 ├── icons/                 # 22 crisp self-contained military/topo/Outback/alpine/RF-observer SVG symbols
-└── styles/{color,bw}/     # 78 native QGIS 3.40 Color & dedicated laser-print B&W .qml styles
+└── styles/{color,bw,night-red,alpine}/  # 172 native QGIS 3.40 .qml styles across 4 themes
 deploy/                    # Caddyfile.example, Traefik v3 override, and Tailscale Serve homelab guide
-.github/workflows/         # Automated offline CI + multi-arch (amd64/arm64) GHCR release pipeline
+.github/workflows/         # Automated offline CI + live multi-arch (amd64/arm64) GHCR release pipeline
 examples/                  # Sample Blue Mountains GeoJSON route overlay & runnable CLI cookbook
 ```
 
@@ -358,10 +409,11 @@ docker run --rm -e GRIDFORGE_RUN_LIVE=1 -v "$(pwd):/app" gridforge:dev pytest te
 
 ## Roadmap & Backlog
 
+- **Shipped in `v1.4.0`:** Live multi-arch GHCR (`ghcr.io/jremick/gridforge:latest`), curved-Earth RF/Fresnel Link Profiles & Link Card PDFs, `night-red` & `alpine` themes (`172` native QGIS `.qml`s), Tactical Ruler/Rings/Sectors, turnkey pure-GDAL offline `.mbtiles` basemaps + 29 AU/NZ/NA pack regions, OGC GeoPackage `.gpkg` + OsmAnd `.sqlitedb` + Field Bundle `.zip`, Saved Trip Projects drawer, and full US (`us-trails`, `us-public-lands`) + Canada (`ca-hrdem`, `ca-canvec-trails`) coverage.
 - **Shipped in `v1.3.0`:** GDAL RF/LOS Viewshed mapping (`--viewshed` & Studio `📡 LOS`), New Zealand LINZ 1 m LiDAR / 8 m DEM (`NZVD2016`) + DOC trails/huts/peaks, Queensland Tier-0 2 m State LiDAR, pure-vector Atlas Overview Index Covers & Fold/Join marks, Studio Offline Pack Manager & Air-Gapped MBTiles Web Basemap Mode, multi-arch GHCR CI/CD + homelab deploy guides, and local-first security/atomic-export/projection hardening (PRs `#1`–`#5`).
 - **Shipped in `v1.2.0`:** Pan-Australia state fire-trail, hut, campground & trig coverage across all 8 states/territories (`NSW`, `VIC`, `TAS`, `QLD`, `WA`, `SA`, `NT`, `ACT`), automatic cross-border `au-state-trails` router with dynamic attribution, air-gapped pack bundling, and Studio Auto + 8-chip state selector.
 - **Shipped in `v1.1.0`:** NSW & Victoria state fire-trail/hut/trig layers, GDAL slope-angle avalanche shading, GPX/GeoJSON auto-strip-map builder + elevation profile cover, interactive waypoint markup + tactical route cards, and 100 mm printer scale calibration & MGRS Romer pages.
-- **Backlog (`v1.4+`):** European & UK open regional LiDAR providers (EU-DEM / Swisstopo / IGN / Environment Agency), custom organization collar/legend branding profiles, and downloadable regional offline basemap `.mbtiles` builder presets.
+- **Backlog (`v1.5+`):** European & UK open regional LiDAR providers (Swisstopo / IGN France / UK Environment Agency / Kartverket Norway), custom organization collar/legend branding profiles, and automated multi-sheet print-shop imposition (`A3`/`A2` booklet spreads).
 
 ---
 
@@ -386,4 +438,7 @@ docker run --rm -e GRIDFORGE_RUN_LIVE=1 -v "$(pwd):/app" gridforge:dev pytest te
 | **NT NTLIS / DEPWS** | Northern Territory 4WD/Larapinta Tracks, Place Names/Lookouts & Survey Marks (`au-nt-trails`) | **CC BY 4.0** — © Northern Territory of Australia (NTLIS / DEPWS) & Geoscience Australia |
 | **Copernicus WorldDEM-30** | Global 30 m elevation (`EGM2008`) | **Copernicus DEM License** — © DLR e.V. 2010–2014 & © Airbus Defence and Space GmbH 2014–2018, EU & ESA |
 | **USGS 3DEP / NHD / FEMA / FAA / NOAA** | US 1 m & 10 m DEM (`NAVD88`), NHD streams, NFHL flood zones, DOF obstacle towers, ENC charts | **US Public Domain** |
+| **USFS / NPS / USGS PAD-US** | US National Forest & National Park Trails/POIs (`us-trails`) and Federal Public Lands & Wilderness (`us-public-lands`) | **US Public Domain** — U.S. Forest Service, National Park Service & USGS PAD-US |
+| **NRCan CanElevation (HRDEM / MRDEM)** | Canada 1 m / 2 m LiDAR & 30 m MRDEM (`CGVD2013`, via `ca-hrdem`) | **Open Government Licence – Canada** — Natural Resources Canada (NRCan) |
+| **Parks Canada / DataBC / ECCC CPCAD** | Canada National Park Trails/POIs, BC Recreation Trails & Protected Areas (`ca-canvec-trails`) | **Open Government Licence – Canada / BC** — Parks Canada, ECCC CPCAD & DataBC |
 | **NOAA / NCEI WMM2025** | Global magnetic declination & secular variation (`2025.0–2030.0`) | **US Public Domain** |
