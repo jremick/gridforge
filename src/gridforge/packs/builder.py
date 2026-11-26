@@ -11,7 +11,7 @@ import tempfile
 from collections.abc import Iterator, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import httpx
 from osgeo import gdal, ogr, osr
@@ -19,19 +19,29 @@ from osgeo import gdal, ogr, osr
 from gridforge.config import (
     AUOverlayKind,
     BBox,
+    CAOverlayKind,
     FrameMarginsMM,
+    NZOverlayKind,
     PackManifest,
     SheetLayout,
     SheetSpec,
+    USOverlayKind,
 )
 from gridforge.geo.crs import resolve_utm_zone
-from gridforge.packs.catalog import RegionPreset, resolve_region
+from gridforge.packs.basemap_builder import (
+    DEFAULT_BASEMAP_MAX_ZOOM,
+    DEFAULT_BASEMAP_MIN_ZOOM,
+    build_offline_basemap_mbtiles,
+)
+from gridforge.packs.regions import (
+    DEFAULT_AU_PBF_URL,
+    PackDemTier,
+    RegionPreset,
+    resolve_region,
+)
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_AU_PBF_URL: str = (
-    "https://download.geofabrik.de/australia-oceania/australia-latest.osm.pbf"
-)
 DEA_SRTM_1S_URL: str = (
     "https://dea-public-data.s3.ap-southeast-2.amazonaws.com/"
     "projects/elevation/ga_srtm_dem1sv1_0/dems1sv1_0.tif"
@@ -46,6 +56,15 @@ COPERNICUS_ATTRIBUTION: str = (
     "Produced using Copernicus WorldDEM-30 © DLR e.V. 2010-2014 and © Airbus Defence and "
     "Space GmbH 2014-2018 provided under COPERNICUS by the European Union and ESA; "
     "all rights reserved."
+)
+LINZ_DEM_ATTRIBUTION: str = (
+    "Elevation data: Toitū Te Whenua Land Information New Zealand (CC BY 4.0)"
+)
+USGS_DEM_ATTRIBUTION: str = (
+    "Elevation data: U.S. Geological Survey 3DEP (Public Domain)"
+)
+NRCAN_DEM_ATTRIBUTION: str = (
+    "Elevation data: Natural Resources Canada HRDEM/CDEM (Open Government Licence – Canada)"
 )
 
 _GDAL_CURL_ENV: dict[str, str] = {
@@ -66,6 +85,17 @@ _ALL_AU_OVERLAYS: tuple[AUOverlayKind, ...] = (
     AUOverlayKind.AU_AVIATION,
     AUOverlayKind.AU_STATE_TRAILS,
 )
+_ALL_NZ_OVERLAYS: tuple[NZOverlayKind, ...] = (NZOverlayKind.NZ_DOC_TRAILS,)
+_ALL_US_OVERLAYS: tuple[USOverlayKind, ...] = (
+    USOverlayKind.US_TRAILS,
+    USOverlayKind.US_PUBLIC_LANDS,
+    USOverlayKind.NHD,
+    USOverlayKind.FEMA,
+    USOverlayKind.TOWERS,
+)
+_ALL_CA_OVERLAYS: tuple[CAOverlayKind, ...] = (CAOverlayKind.CA_CANVEC_TRAILS,)
+
+OverlayOverrideKey = str | AUOverlayKind | NZOverlayKind | USOverlayKind | CAOverlayKind
 
 
 def _run_cmd(
@@ -130,15 +160,20 @@ def _extract_osm_pbf(
     *,
     source_pbf: Path | None,
     cache_dir: Path,
+    pbf_url: str = DEFAULT_AU_PBF_URL,
+    country: str = "AU",
 ) -> Path:
-    """Stream-download Geofabrik Australia PBF if needed and clip bbox with osmium."""
+    """Stream-download Geofabrik regional PBF if needed and clip bbox with osmium."""
     if source_pbf is not None:
         src = Path(source_pbf).resolve()
         if not src.is_file():
             raise FileNotFoundError(f"Source OSM PBF/XML not found: '{src}'")
     else:
-        url = os.environ.get("GRIDFORGE_AU_PBF_URL", DEFAULT_AU_PBF_URL).strip()
-        filename = Path(url.split("?")[0]).name or "australia-latest.osm.pbf"
+        if country == "AU":
+            url = os.environ.get("GRIDFORGE_AU_PBF_URL", pbf_url).strip()
+        else:
+            url = os.environ.get("GRIDFORGE_PBF_URL", pbf_url).strip()
+        filename = Path(url.split("?")[0]).name or "region-latest.osm.pbf"
         src = _stream_download_file(url, cache_dir / "geofabrik" / filename)
 
     out_pbf.parent.mkdir(parents=True, exist_ok=True)
@@ -246,12 +281,24 @@ def _make_tile_layout(tile_bbox: BBox) -> SheetLayout:
     )
 
 
+def _local_dem_metadata(dem_tier: PackDemTier) -> tuple[str, str]:
+    if dem_tier == "glo30":
+        return ("EGM2008", COPERNICUS_ATTRIBUTION)
+    if dem_tier == "nz-linz":
+        return ("NZVD2016", LINZ_DEM_ATTRIBUTION)
+    if dem_tier == "usgs3dep":
+        return ("NAVD88", USGS_DEM_ATTRIBUTION)
+    if dem_tier == "ca-hrdem":
+        return ("CGVD2013", NRCAN_DEM_ATTRIBUTION)
+    return ("AHD", GA_DEM_ATTRIBUTION)
+
+
 def _extract_dem(
     bbox: BBox,
     out_dem: Path,
     *,
     source_dem: Path | None,
-    dem_tier: Literal["srtm-1s", "glo30", "au-elvis"],
+    dem_tier: PackDemTier,
     cache_dir: Path,
 ) -> tuple[Path, str, str]:
     """Stream-clip DEM disk-to-disk into compressed tiled Float32 GeoTIFF.
@@ -308,8 +355,7 @@ def _extract_dem(
             step="gdal_translate local source DEM for pack",
             extra_env=_GDAL_CURL_ENV,
         )
-        datum = "EGM2008" if dem_tier == "glo30" else "AHD"
-        attr = COPERNICUS_ATTRIBUTION if dem_tier == "glo30" else GA_DEM_ATTRIBUTION
+        datum, attr = _local_dem_metadata(dem_tier)
         return (out_dem, datum, attr)
 
     if dem_tier == "srtm-1s":
@@ -365,7 +411,9 @@ def _extract_dem(
                         step="gdal_translate AU Elvis DEM compression for pack",
                         extra_env=_GDAL_CURL_ENV,
                     )
-                    return (out_dem, src_au.vertical_datum, src_au.attribution)
+                    datum = str(getattr(src_au, "resolved_vertical_datum", None) or src_au.vertical_datum)
+                    attr = str(getattr(src_au, "resolved_attribution", None) or src_au.attribution)
+                    return (out_dem, datum, attr)
             except Exception as exc:
                 logger.warning("au-elvis pack DEM failed (%s); falling back to DEA SRTM 1s", exc)
 
@@ -377,7 +425,70 @@ def _extract_dem(
             cache_dir=cache_dir,
         )
 
-    raise ValueError(f"Unsupported dem_tier '{dem_tier}'. Use 'srtm-1s', 'glo30', or 'au-elvis'.")
+    if dem_tier == "nz-linz":
+        try:
+            from gridforge.sources.dem_nz_linz import NZLinzDEMSource
+
+            with tempfile.TemporaryDirectory(prefix="gf_pack_nzlinz_") as tmp_s:
+                tmp_dir = Path(tmp_s)
+                src_nz = NZLinzDEMSource(cache_dir=cache_dir / "nz_linz")
+                raw_tif = src_nz.fetch_dem(_make_tile_layout(bbox), tmp_dir)
+                _run_cmd(
+                    ["gdal_translate", "-ot", "Float32", *gdal_opts, str(raw_tif), str(out_dem)],
+                    step="gdal_translate NZ LINZ DEM compression for pack",
+                    extra_env=_GDAL_CURL_ENV,
+                )
+                datum = str(getattr(src_nz, "resolved_vertical_datum", None) or src_nz.vertical_datum)
+                attr = str(getattr(src_nz, "resolved_attribution", None) or src_nz.attribution)
+                return (out_dem, datum, attr)
+        except Exception as exc:
+            logger.warning("nz-linz pack DEM failed (%s); falling back to Copernicus GLO-30", exc)
+            return _extract_dem(bbox, out_dem, source_dem=None, dem_tier="glo30", cache_dir=cache_dir)
+
+    if dem_tier == "usgs3dep":
+        try:
+            from gridforge.sources.dem_usgs3dep import USGS3DEPSource
+
+            with tempfile.TemporaryDirectory(prefix="gf_pack_3dep_") as tmp_s:
+                tmp_dir = Path(tmp_s)
+                src_us = USGS3DEPSource(cache_dir=cache_dir / "usgs3dep")
+                raw_tif = src_us.fetch_dem(_make_tile_layout(bbox), tmp_dir)
+                _run_cmd(
+                    ["gdal_translate", "-ot", "Float32", *gdal_opts, str(raw_tif), str(out_dem)],
+                    step="gdal_translate USGS 3DEP DEM compression for pack",
+                    extra_env=_GDAL_CURL_ENV,
+                )
+                datum = str(getattr(src_us, "resolved_vertical_datum", None) or src_us.vertical_datum)
+                attr = str(getattr(src_us, "resolved_attribution", None) or src_us.attribution)
+                return (out_dem, datum, attr)
+        except Exception as exc:
+            logger.warning("usgs3dep pack DEM failed (%s); falling back to Copernicus GLO-30", exc)
+            return _extract_dem(bbox, out_dem, source_dem=None, dem_tier="glo30", cache_dir=cache_dir)
+
+    if dem_tier == "ca-hrdem":
+        try:
+            from gridforge.sources.dem_ca_hrdem import CanadaHRDEMSource
+
+            with tempfile.TemporaryDirectory(prefix="gf_pack_cahrdem_") as tmp_s:
+                tmp_dir = Path(tmp_s)
+                src_ca = CanadaHRDEMSource(cache_dir=cache_dir / "ca_hrdem")
+                raw_tif = src_ca.fetch_dem(_make_tile_layout(bbox), tmp_dir)
+                _run_cmd(
+                    ["gdal_translate", "-ot", "Float32", *gdal_opts, str(raw_tif), str(out_dem)],
+                    step="gdal_translate NRCan HRDEM/CDEM compression for pack",
+                    extra_env=_GDAL_CURL_ENV,
+                )
+                datum = str(getattr(src_ca, "resolved_vertical_datum", None) or src_ca.vertical_datum)
+                attr = str(getattr(src_ca, "resolved_attribution", None) or src_ca.attribution)
+                return (out_dem, datum, attr)
+        except Exception as exc:
+            logger.warning("ca-hrdem pack DEM failed (%s); falling back to Copernicus GLO-30", exc)
+            return _extract_dem(bbox, out_dem, source_dem=None, dem_tier="glo30", cache_dir=cache_dir)
+
+    raise ValueError(
+        f"Unsupported dem_tier '{dem_tier}'. "
+        "Use 'auto', 'srtm-1s', 'glo30', 'au-elvis', 'nz-linz', 'usgs3dep', or 'ca-hrdem'."
+    )
 
 
 def _list_gpkg_layer_counts(gpkg_path: Path) -> list[tuple[str, int]]:
@@ -417,7 +528,7 @@ def _append_gpkg_layers_wgs84(
     *,
     spat_bbox: BBox | None = None,
 ) -> int:
-    """Append all non-empty layers from src_gpkg into dst_gpkg in EPSG:4326. Returns features added."""
+    """Append all non-empty layers from src_gpkg into dst_gpkg in EPSG:4326. Returns layers added."""
     layers = _list_gpkg_layer_counts(src_gpkg)
     added_layers = 0
     existing_layers = {name for name, _ in _list_gpkg_layer_counts(dst_gpkg)} if dst_gpkg.is_file() else set()
@@ -455,19 +566,63 @@ def _append_gpkg_layers_wgs84(
     return added_layers
 
 
-def _extract_au_overlays(
+def _build_cloud_overlay_sources_for_country(country: str) -> tuple[list[str], dict[str, Any]]:
+    """Return ordered overlay keys and live cloud sources matching the pack region's country."""
+    if country == "NZ":
+        keys = [k.value for k in _ALL_NZ_OVERLAYS]
+        try:
+            from gridforge.sources.overlays_nz import build_nz_overlay_sources
+
+            return (keys, build_nz_overlay_sources(_ALL_NZ_OVERLAYS))
+        except Exception as exc:
+            logger.warning("Unable to import NZ cloud overlay sources (%s); skipping", exc)
+            return (keys, {})
+
+    if country == "US":
+        keys = [k.value for k in _ALL_US_OVERLAYS]
+        try:
+            from gridforge.sources.overlays_us import build_us_overlay_sources
+
+            return (keys, build_us_overlay_sources(_ALL_US_OVERLAYS))
+        except Exception as exc:
+            logger.warning("Unable to import US cloud overlay sources (%s); skipping", exc)
+            return (keys, {})
+
+    if country == "CA":
+        keys = [k.value for k in _ALL_CA_OVERLAYS]
+        try:
+            from gridforge.sources.overlays_ca import build_ca_overlay_sources
+
+            return (keys, build_ca_overlay_sources(_ALL_CA_OVERLAYS))
+        except Exception as exc:
+            logger.warning("Unable to import CA cloud overlay sources (%s); skipping", exc)
+            return (keys, {})
+
+    # Default / AU
+    keys = [k.value for k in _ALL_AU_OVERLAYS]
+    try:
+        from gridforge.sources.overlays_au import build_au_overlay_sources
+
+        return (keys, build_au_overlay_sources(_ALL_AU_OVERLAYS))
+    except Exception as exc:
+        logger.warning("Unable to import AU cloud overlay sources (%s); skipping", exc)
+        return (keys, {})
+
+
+def _extract_regional_overlays(
     bbox: BBox,
     overlays_dir: Path,
     *,
-    local_overlay_overrides: Mapping[str | AUOverlayKind, Path | str] | None,
+    country: str = "AU",
+    local_overlay_overrides: Mapping[OverlayOverrideKey, Path | str] | None,
     overlay_tile_deg: float,
 ) -> tuple[dict[str, str], list[str]]:
-    """Fetch or clip Australian regional overlays in bounded low-RAM spatial chunks."""
+    """Fetch or clip regional overlays (AU / NZ / US / CA) in bounded low-RAM spatial chunks."""
     overlays_dir.mkdir(parents=True, exist_ok=True)
     normalized_overrides: dict[str, Path] = {}
     if local_overlay_overrides:
         for k, v in local_overlay_overrides.items():
-            key_str = k.value if isinstance(k, AUOverlayKind) else str(k)
+            key_str = k.value if hasattr(k, "value") else str(k)
             normalized_overrides[key_str] = Path(v).resolve()
 
     overlay_rel_paths: dict[str, str] = {}
@@ -479,26 +634,28 @@ def _extract_au_overlays(
         "au-infra": "Energy infrastructure: © Commonwealth of Australia (Geoscience Australia) (CC BY 4.0)",
         "au-aviation": "Aviation & cultural features: © Commonwealth of Australia (Geoscience Australia) (CC BY 4.0)",
         "au-state-trails": "Australian State Trails, Huts & Trig Stations (CC BY 4.0)",
+        "nz-doc-trails": "New Zealand DOC Tracks/Huts & LINZ Peaks (CC BY 4.0)",
+        "us-trails": "US Trails & Recreation POIs: USFS / NPS / USGS National Map (Public Domain)",
+        "us-public-lands": "US Public Lands & Wilderness: USGS PAD-US / USFS / BLM / NPS (Public Domain)",
+        "ca-canvec-trails": "Canada Trails, Shelters & Parks: NRCan CanVec / Parks Canada (OGL-Canada)",
+        "fema": "Flood hazard zones: FEMA NFHL (Public Domain)",
+        "nhd": "Hydrography: USGS NHD (Public Domain)",
+        "towers": "Communications towers: FCC ASR / FAA DOF (Public Domain)",
     }
 
     # When local_overlay_overrides is explicitly supplied (e.g. air-gapped pack build/CI),
     # honor only the specified local overlays and avoid unexpected live cloud fetches.
     cloud_sources: dict[str, Any] = {}
     if local_overlay_overrides is None:
-        try:
-            from gridforge.sources.overlays_au import build_au_overlay_sources
+        ordered_keys, cloud_sources = _build_cloud_overlay_sources_for_country(country)
+    else:
+        ordered_keys = [k.value for k in _ALL_AU_OVERLAYS]
 
-            cloud_sources = build_au_overlay_sources(_ALL_AU_OVERLAYS)
-        except Exception as exc:
-            logger.warning("Unable to import AU cloud overlay sources (%s); skipping cloud overlays", exc)
-
-    spatial_tiles = _iter_spatial_tiles(bbox, overlay_tile_deg)
-
-    # Preserve canonical overlay ordering, plus any extra state-specific keys in local_overlay_overrides
-    ordered_keys: list[str] = [k.value for k in _ALL_AU_OVERLAYS]
     for extra_key in normalized_overrides:
         if extra_key not in ordered_keys:
             ordered_keys.append(extra_key)
+
+    spatial_tiles = _iter_spatial_tiles(bbox, overlay_tile_deg)
 
     for key in ordered_keys:
         slug = key.replace("-", "_")
@@ -568,6 +725,10 @@ def _extract_au_overlays(
     return (overlay_rel_paths, attributions)
 
 
+# Backward-compatible alias for any internal callers
+_extract_au_overlays = _extract_regional_overlays
+
+
 def _compute_dir_size_bytes(directory: Path) -> int:
     total = 0
     for path in directory.rglob("*"):
@@ -589,10 +750,13 @@ def build_offline_pack(
     include_osm: bool = True,
     include_dem: bool = True,
     include_overlays: bool = True,
+    include_basemap: bool = True,
+    basemap_min_zoom: int = DEFAULT_BASEMAP_MIN_ZOOM,
+    basemap_max_zoom: int = DEFAULT_BASEMAP_MAX_ZOOM,
     source_pbf: Path | str | None = None,
     source_dem: Path | str | None = None,
-    local_overlay_overrides: Mapping[str | AUOverlayKind, Path | str] | None = None,
-    dem_tier: Literal["srtm-1s", "glo30", "au-elvis"] = "srtm-1s",
+    local_overlay_overrides: Mapping[OverlayOverrideKey, Path | str] | None = None,
+    dem_tier: PackDemTier = "srtm-1s",
     cache_dir: Path | None = None,
     overlay_tile_deg: float = 1.0,
 ) -> PackManifest:
@@ -601,6 +765,10 @@ def build_offline_pack(
     out_dir = Path(output_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     resolved_cache = _default_cache_dir(cache_dir)
+
+    effective_dem_tier: PackDemTier = dem_tier
+    if dem_tier == "auto" or (source_dem is None and preset.country != "AU" and dem_tier == "srtm-1s"):
+        effective_dem_tier = preset.default_dem_tier
 
     pack_id = _slugify_pack_id(out_dir.name if preset.category == "custom" else preset.region_id)
     pack_name = name or preset.name
@@ -613,19 +781,21 @@ def build_offline_pack(
             out_dir / "osm.osm.pbf",
             source_pbf=Path(source_pbf) if source_pbf is not None else None,
             cache_dir=resolved_cache,
+            pbf_url=preset.pbf_url,
+            country=preset.country,
         )
         osm_rel = "osm.osm.pbf"
         attributions.append(OSM_ATTRIBUTION)
 
     dem_rel: str | None = None
-    vertical_datum = "AHD"
+    vertical_datum = _local_dem_metadata(effective_dem_tier)[0]
     dem_attr: str | None = None
     if include_dem:
         _, vertical_datum, dem_attr = _extract_dem(
             preset.bbox_wgs84,
             out_dir / "dem.tif",
             source_dem=Path(source_dem) if source_dem is not None else None,
-            dem_tier=dem_tier,
+            dem_tier=effective_dem_tier,
             cache_dir=resolved_cache,
         )
         dem_rel = "dem.tif"
@@ -634,15 +804,42 @@ def build_offline_pack(
 
     overlays_rel: dict[str, str] = {}
     if include_overlays:
-        overlays_rel, ov_attrs = _extract_au_overlays(
+        overlays_rel, ov_attrs = _extract_regional_overlays(
             preset.bbox_wgs84,
             out_dir / "overlays",
+            country=preset.country,
             local_overlay_overrides=local_overlay_overrides,
             overlay_tile_deg=overlay_tile_deg,
         )
         for attr in ov_attrs:
             if attr not in attributions:
                 attributions.append(attr)
+
+    basemap_rel: str | None = None
+    if include_basemap:
+        basemap_source_dem: Path | None = None
+        if dem_rel is not None and (out_dir / dem_rel).is_file():
+            basemap_source_dem = out_dir / dem_rel
+        elif source_dem is not None and Path(source_dem).is_file():
+            basemap_source_dem = Path(source_dem)
+
+        if basemap_source_dem is not None:
+            build_offline_basemap_mbtiles(
+                preset.bbox_wgs84,
+                out_dir / "basemap.mbtiles",
+                source_dem=basemap_source_dem,
+                min_zoom=basemap_min_zoom,
+                max_zoom=basemap_max_zoom,
+                name=f"{pack_name} Offline Basemap",
+                attribution=dem_attr,
+                cache_dir=resolved_cache,
+            )
+            basemap_rel = "basemap.mbtiles"
+        else:
+            logger.info(
+                "Skipping offline basemap for '%s' because no DEM was included in this pack.",
+                pack_id,
+            )
 
     created_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     manifest_path = out_dir / "pack.json"
@@ -658,6 +855,7 @@ def build_offline_pack(
         vertical_datum=vertical_datum,
         dem_attribution=dem_attr,
         osm_pbf_path=osm_rel,
+        basemap_path=basemap_rel,
         overlays=overlays_rel,
         attributions=attributions,
         created_at=created_at,

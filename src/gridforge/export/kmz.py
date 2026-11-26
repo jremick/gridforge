@@ -38,7 +38,13 @@ def _run_cmd(cmd: list[str], *, step: str) -> None:
 
 
 def _paper_bg_rgb(color_mode: ColorMode) -> tuple[int, int, int]:
-    return (250, 249, 245) if color_mode == ColorMode.COLOR else (255, 255, 255)
+    if color_mode == ColorMode.COLOR:
+        return (250, 249, 245)
+    if color_mode == ColorMode.NIGHT_RED:
+        return (28, 12, 12)
+    if color_mode == ColorMode.ALPINE:
+        return (247, 250, 252)
+    return (255, 255, 255)
 
 
 def compute_optimal_tile_grid(

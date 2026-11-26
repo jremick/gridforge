@@ -82,7 +82,13 @@ def _compute_overview_factors(width_px: int, height_px: int, max_zoom: int) -> l
 
 
 def _paper_bg_rgb(color_mode: ColorMode) -> tuple[int, int, int]:
-    return (250, 249, 245) if color_mode == ColorMode.COLOR else (255, 255, 255)
+    if color_mode == ColorMode.COLOR:
+        return (250, 249, 245)
+    if color_mode == ColorMode.NIGHT_RED:
+        return (28, 12, 12)
+    if color_mode == ColorMode.ALPINE:
+        return (247, 250, 252)
+    return (255, 255, 255)
 
 
 def export_mbtiles(
