@@ -89,8 +89,28 @@ class AUOverlayKind(str, Enum):
     AU_PARKS = "au-parks"
     AU_INFRA = "au-infra"
     AU_AVIATION = "au-aviation"
+    AU_STATE_TRAILS = "au-state-trails"
     AU_NSW_TRAILS = "au-nsw-trails"
     AU_VIC_TRAILS = "au-vic-trails"
+    AU_TAS_TRAILS = "au-tas-trails"
+    AU_QLD_TRAILS = "au-qld-trails"
+    AU_WA_TRAILS = "au-wa-trails"
+    AU_SA_TRAILS = "au-sa-trails"
+    AU_NT_TRAILS = "au-nt-trails"
+    AU_ACT_TRAILS = "au-act-trails"
+
+
+AU_STATE_TRAIL_OVERLAY_KINDS: tuple[AUOverlayKind, ...] = (
+    AUOverlayKind.AU_STATE_TRAILS,
+    AUOverlayKind.AU_NSW_TRAILS,
+    AUOverlayKind.AU_VIC_TRAILS,
+    AUOverlayKind.AU_TAS_TRAILS,
+    AUOverlayKind.AU_QLD_TRAILS,
+    AUOverlayKind.AU_WA_TRAILS,
+    AUOverlayKind.AU_SA_TRAILS,
+    AUOverlayKind.AU_NT_TRAILS,
+    AUOverlayKind.AU_ACT_TRAILS,
+)
 
 
 class ExportFormat(str, Enum):
