@@ -1,9 +1,10 @@
-"""Cloud-native Australia-wide elevation source (GA National 5 m LiDAR WCS + DEA SRTM 1s COG)."""
+"""Cloud-native Australia-wide elevation source (QLD 2 m LiDAR -> GA 5 m LiDAR WCS -> DEA SRTM 1s COG)."""
 
 from __future__ import annotations
 
 from array import array
 import hashlib
+import json
 import logging
 import math
 import os
@@ -19,6 +20,22 @@ from gridforge.sources.dem_copernicus import GDAL_VSICURL_ENV
 
 logger = logging.getLogger(__name__)
 
+# Tier 0: Queensland Spatial Imagery 2 m LiDAR DEM (CC BY 4.0, AHD), gated by completed LiDAR extents
+QLD_LIDAR_EXTENTS_URL: Final[str] = (
+    "https://spatial-gis.information.qld.gov.au/arcgis/rest/services/"
+    "Elevation/ElevationProjectExtents/MapServer/200/query"
+)
+QLD_DEM_IMAGESERVER_URL: Final[str] = (
+    "https://spatial-img.information.qld.gov.au/arcgis/rest/services/"
+    "Elevation/QldDem/ImageServer/exportImage"
+)
+QLD_LIDAR_COVERAGE_BBOX: Final[tuple[float, float, float, float]] = (138.0, -29.3, 154.0, -10.5)
+QLD_LIDAR_ATTRIBUTION: Final[str] = (
+    "Elevation data: © State of Queensland (Department of Resources) QldDem LiDAR (CC BY 4.0)"
+)
+QLD_MAX_EXPORT_PX: Final[int] = 2048
+
+# Tier 1 & 2: Geoscience Australia National 5 m LiDAR WCS -> DEA SRTM 1s COG (CC BY 4.0, AHD)
 GA_5M_LIDAR_WCS_URL: Final[str] = (
     "https://services.ga.gov.au/gis/services/DEM_LiDAR_5m_2025/MapServer/WCSServer"
 )
@@ -50,6 +67,32 @@ def _bboxes_intersect(
 def is_in_australia_coverage(bbox: BBox) -> bool:
     """Return ``True`` if a WGS84 bounding box overlaps Australian GA DEM coverage bounds."""
     return _bboxes_intersect(bbox.as_tuple(), AU_COVERAGE_BBOX)
+
+
+def is_in_qld_lidar_coverage(bbox: BBox) -> bool:
+    """Return ``True`` if a WGS84 bounding box overlaps Queensland state LiDAR bounds."""
+    return _bboxes_intersect(bbox.as_tuple(), QLD_LIDAR_COVERAGE_BBOX)
+
+
+def qld_export_size_for_bbox(
+    bbox: BBox,
+    *,
+    target_res_m: float = 2.0,
+    max_px: int = QLD_MAX_EXPORT_PX,
+) -> tuple[int, int]:
+    """Compute ``(width_px, height_px)`` for QLD ``QldDem`` export capped under 20 MB Float32."""
+    mid_lat = 0.5 * (bbox.min_y + bbox.max_y)
+    cos_lat = max(0.2, math.cos(math.radians(mid_lat)))
+    width_m = max(1.0, bbox.width * 111320.0 * cos_lat)
+    height_m = max(1.0, bbox.height * 111320.0)
+    px_w = max(64, int(round(width_m / target_res_m)))
+    px_h = max(64, int(round(height_m / target_res_m)))
+    peak = max(px_w, px_h)
+    if peak > max_px:
+        scale = max_px / float(peak)
+        px_w = max(64, int(round(px_w * scale)))
+        px_h = max(64, int(round(px_h * scale)))
+    return (px_w, px_h)
 
 
 def _round_enclosing_bbox(bbox: BBox, step_deg: float = 0.001) -> BBox:
@@ -171,10 +214,12 @@ def _run_subprocess(cmd: list[str], env: dict[str, str], context: str) -> None:
 
 
 class AUElvisDEMSource:
-    """On-demand Australia-wide elevation source (GA 5 m LiDAR WCS -> DEA SRTM 1s COG).
+    """On-demand Australia-wide elevation source (QLD 2 m LiDAR -> GA 5 m LiDAR WCS -> DEA SRTM 1s COG).
 
-    Never mixes Tier 1 (5 m LiDAR) and Tier 2 (SRTM 1s) pixels on the same sheet.
-    Vertical datum is Australian Height Datum (``AHD``).
+    Never mixes resolution tiers on the same sheet; every tier uses Australian Height Datum (``AHD``).
+    Tier 0 (Queensland ``QldDem/ImageServer`` 2 m LiDAR, gated by completed LiDAR extents) activates
+    for tactical scales (``<= 1:25,000``) inside Queensland and falls through cleanly to GA National
+    5 m LiDAR WCS and DEA SRTM 1s COG whenever state LiDAR coverage is absent or incomplete.
     """
 
     name: str = "au-elvis"
@@ -185,6 +230,7 @@ class AUElvisDEMSource:
         self,
         cache_dir: Path | str | None = None,
         *,
+        prefer_state_lidar: bool = True,
         prefer_5m: bool = True,
         srtm_product: Literal["smoothed", "hydro"] = "smoothed",
         max_exact_zero_ratio: float = 0.05,
@@ -199,6 +245,7 @@ class AUElvisDEMSource:
             else os.environ.get("GRIDFORGE_CACHE_DIR", "/tmp/gridforge-cache")
         )
         self.cache_dir: Path = base_cache / "au_elvis"
+        self.prefer_state_lidar = prefer_state_lidar
         self.prefer_5m = prefer_5m
         self.srtm_product = srtm_product
         self.max_exact_zero_ratio = max_exact_zero_ratio
@@ -241,6 +288,145 @@ class AUElvisDEMSource:
             if owns_client:
                 client.close()
 
+    def _has_qld_completed_lidar(self, clip_bbox: BBox) -> bool:
+        """Return ``True`` if Queensland Spatial completed LiDAR project extents overlap ``clip_bbox``."""
+        key = _bbox_hash(clip_bbox)
+        extents_cache = self.cache_dir / "qld_extents" / f"{key}.json"
+        if self.use_clip_cache and extents_cache.is_file() and extents_cache.stat().st_size > 0:
+            try:
+                cached = json.loads(extents_cache.read_text(encoding="utf-8"))
+                return bool(cached.get("has_lidar"))
+            except (json.JSONDecodeError, OSError):
+                logger.warning("Ignoring corrupt cached QLD LiDAR extents file: %s", extents_cache)
+
+        params = {
+            "geometry": f"{clip_bbox.min_x:.6f},{clip_bbox.min_y:.6f},{clip_bbox.max_x:.6f},{clip_bbox.max_y:.6f}",
+            "geometryType": "esriGeometryEnvelope",
+            "inSR": "4326",
+            "spatialRel": "esriSpatialRelIntersects",
+            "where": "completed='Yes'",
+            "outFields": "project_name,completed,year",
+            "returnGeometry": "false",
+            "f": "json",
+        }
+        try:
+            status, _content_type, body = self._http_get_bytes(QLD_LIDAR_EXTENTS_URL, params)
+        except Exception as exc:
+            logger.warning("QLD LiDAR extent query failed (%s); falling back to GA 5m LiDAR", exc)
+            return False
+
+        if status != 200 or not body:
+            return False
+
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return False
+
+        if not isinstance(payload, dict) or payload.get("error"):
+            return False
+
+        features = payload.get("features") or []
+        has_lidar = len(features) > 0
+        if self.use_clip_cache:
+            extents_cache.parent.mkdir(parents=True, exist_ok=True)
+            tmp = extents_cache.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps({"has_lidar": has_lidar, "count": len(features)}), encoding="utf-8")
+            tmp.replace(extents_cache)
+        return has_lidar
+
+    def _fetch_qld_lidar_dem(
+        self,
+        layout: SheetLayout,
+        clip_bbox: BBox,
+        work_dir: Path,
+        out_tif: Path,
+    ) -> bool:
+        """Attempt Tier-0 Queensland 2 m LiDAR DEM via ``QldDem/ImageServer`` (AHD, CC BY 4.0)."""
+        if layout.spec.scale > 25000 or not is_in_qld_lidar_coverage(clip_bbox):
+            return False
+
+        px_w, px_h = qld_export_size_for_bbox(clip_bbox)
+        key = _bbox_hash(clip_bbox)
+        cache_path = self.cache_dir / "clips" / f"au_qld2m_{px_w}x{px_h}_{key}.tif"
+        if self.use_clip_cache and cache_path.is_file() and cache_path.stat().st_size > 0:
+            logger.info("Using cached QLD 2m LiDAR clip: %s", cache_path)
+            shutil.copy2(cache_path, out_tif)
+            self.resolved_tier = "qld-2m-lidar"
+            self.resolved_attribution = QLD_LIDAR_ATTRIBUTION
+            self.resolved_vertical_datum = self.vertical_datum
+            return True
+
+        if not self._has_qld_completed_lidar(clip_bbox):
+            logger.info("No completed QLD LiDAR project overlaps %s; trying GA 5m LiDAR", clip_bbox.as_tuple())
+            return False
+
+        params = {
+            "bbox": f"{clip_bbox.min_x:.6f},{clip_bbox.min_y:.6f},{clip_bbox.max_x:.6f},{clip_bbox.max_y:.6f}",
+            "bboxSR": "4326",
+            "imageSR": "4326",
+            "size": f"{px_w},{px_h}",
+            "format": "tiff",
+            "pixelType": "F32",
+            "noData": "-9999",
+            "interpolation": "RSP_BilinearInterpolation",
+            "f": "image",
+        }
+        try:
+            status, content_type, body = self._http_get_bytes(QLD_DEM_IMAGESERVER_URL, params)
+        except Exception as exc:
+            logger.warning("QLD 2m QldDem ImageServer failed (%s); falling back to GA 5m LiDAR", exc)
+            return False
+
+        ct_low = content_type.lower()
+        if status != 200 or "xml" in ct_low or "html" in ct_low or "json" in ct_low or len(body) < 2048:
+            logger.info(
+                "QLD QldDem returned non-DEM payload (status=%s, ct=%s, bytes=%d); falling back to GA 5m LiDAR",
+                status,
+                content_type,
+                len(body),
+            )
+            return False
+
+        tmp_qld = work_dir / "dem_au_qld2m_tmp.tif"
+        tmp_qld.write_bytes(body)
+
+        try:
+            valid_frac, zero_frac, cliff_ratio, min_v, max_v = _inspect_raster_coverage(tmp_qld)
+        except Exception as exc:
+            logger.warning("QLD 2m LiDAR GeoTIFF unreadable (%s); falling back to GA 5m LiDAR", exc)
+            tmp_qld.unlink(missing_ok=True)
+            return False
+
+        coastal_water_ok = zero_frac <= 0.45 and cliff_ratio <= 0.15
+        if (
+            valid_frac < self.min_valid_ratio
+            or max_v <= min_v + 0.1
+            or (zero_frac > self.max_exact_zero_ratio and not coastal_water_ok)
+        ):
+            logger.info(
+                "QLD 2m LiDAR incomplete/absent (valid=%.1f%%, exact_zero=%.1f%%, cliff_ratio=%.1f%%, "
+                "range=[%.1f, %.1f]); falling back to GA 5m LiDAR",
+                valid_frac * 100.0,
+                zero_frac * 100.0,
+                cliff_ratio * 100.0,
+                min_v,
+                max_v,
+            )
+            tmp_qld.unlink(missing_ok=True)
+            return False
+
+        tmp_qld.replace(out_tif)
+        self.resolved_tier = "qld-2m-lidar"
+        self.resolved_attribution = QLD_LIDAR_ATTRIBUTION
+        self.resolved_vertical_datum = self.vertical_datum
+        if self.use_clip_cache and out_tif.is_file() and out_tif.stat().st_size > 0:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_cache = cache_path.with_suffix(".tif.tmp")
+            shutil.copy2(out_tif, tmp_cache)
+            tmp_cache.replace(cache_path)
+        return True
+
     def _fetch_5m_lidar_wcs(
         self,
         layout: SheetLayout,
@@ -255,6 +441,8 @@ class AUElvisDEMSource:
             logger.info("Using cached GA 5m LiDAR clip: %s", cache_path)
             shutil.copy2(cache_path, out_tif)
             self.resolved_tier = "5m-lidar"
+            self.resolved_attribution = self.attribution
+            self.resolved_vertical_datum = self.vertical_datum
             return True
 
         params = {
@@ -316,6 +504,8 @@ class AUElvisDEMSource:
 
         tmp_5m.replace(out_tif)
         self.resolved_tier = "5m-lidar"
+        self.resolved_attribution = self.attribution
+        self.resolved_vertical_datum = self.vertical_datum
         if self.use_clip_cache and out_tif.is_file() and out_tif.stat().st_size > 0:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             tmp_cache = cache_path.with_suffix(".tif.tmp")
@@ -354,6 +544,8 @@ class AUElvisDEMSource:
             logger.info("Using cached GA SRTM 1s clip: %s", cache_path)
             shutil.copy2(cache_path, out_tif)
             self.resolved_tier = "srtm-1s"
+            self.resolved_attribution = self.attribution
+            self.resolved_vertical_datum = self.vertical_datum
             return out_tif
 
         vsicurl_cog = f"/vsicurl/{self._srtm_cog_url()}"
@@ -396,6 +588,8 @@ class AUElvisDEMSource:
             )
 
         self.resolved_tier = "srtm-1s"
+        self.resolved_attribution = self.attribution
+        self.resolved_vertical_datum = self.vertical_datum
         if self.use_clip_cache and out_tif.is_file() and out_tif.stat().st_size > 0:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             tmp_cache = cache_path.with_suffix(".tif.tmp")
@@ -404,7 +598,7 @@ class AUElvisDEMSource:
         return out_tif
 
     def fetch_dem(self, layout: SheetLayout, work_dir: Path) -> Path:
-        """Fetch GA 5 m LiDAR (where complete) or DEA GA SRTM 1s DEM for ``layout``."""
+        """Fetch QLD 2 m LiDAR (where completed), GA 5 m LiDAR WCS, or DEA GA SRTM 1s DEM."""
         work_dir.mkdir(parents=True, exist_ok=True)
         clip_bbox = _round_enclosing_bbox(layout.wgs84_fetch_bbox, step_deg=0.001)
         out_tif = work_dir / "dem_raw.tif"
@@ -413,6 +607,9 @@ class AUElvisDEMSource:
             raise RuntimeError(
                 f"Outside Australian DEM coverage for requested footprint {clip_bbox.as_tuple()}"
             )
+
+        if self.prefer_state_lidar and self._fetch_qld_lidar_dem(layout, clip_bbox, work_dir, out_tif):
+            return out_tif
 
         if self.prefer_5m and self._fetch_5m_lidar_wcs(layout, clip_bbox, work_dir, out_tif):
             return out_tif

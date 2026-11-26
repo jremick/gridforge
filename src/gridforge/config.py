@@ -71,6 +71,7 @@ class DemSourceKind(str, Enum):
     GLO30 = "glo30"
     USGS3DEP = "usgs3dep"
     AU_ELVIS = "au-elvis"
+    NZ_LINZ = "nz-linz"
 
 
 class USOverlayKind(str, Enum):
@@ -111,6 +112,12 @@ AU_STATE_TRAIL_OVERLAY_KINDS: tuple[AUOverlayKind, ...] = (
     AUOverlayKind.AU_NT_TRAILS,
     AUOverlayKind.AU_ACT_TRAILS,
 )
+
+
+class NZOverlayKind(str, Enum):
+    """Optional New Zealand CC BY 4.0 thematic overlay layers."""
+
+    NZ_DOC_TRAILS = "nz-doc-trails"
 
 
 class ExportFormat(str, Enum):
@@ -161,6 +168,17 @@ class WaypointInput(BaseModel):
     notes: str | None = None
 
 
+class ViewshedObserver(BaseModel):
+    """Observer point and RF/line-of-sight viewshed parameters."""
+
+    label: str = Field(default="Observer", min_length=1, max_length=60)
+    lat: float = Field(..., ge=-80.0, le=84.0)
+    lon: float = Field(..., ge=-180.0, le=180.0)
+    observer_height_m: float = Field(default=2.0, ge=0.0, le=500.0)
+    target_height_m: float = Field(default=1.5, ge=0.0, le=500.0)
+    max_distance_m: float = Field(default=10000.0, ge=250.0, le=25000.0)
+
+
 class CartoOptions(BaseModel):
     """Phase 2+ cartographic density and layer visibility controls."""
 
@@ -205,10 +223,14 @@ class SheetSpec(BaseModel):
     dem_source: DemSourceKind = DemSourceKind.AUTO
     us_overlays: list[USOverlayKind] = Field(default_factory=list)
     au_overlays: list[AUOverlayKind] = Field(default_factory=list)
+    nz_overlays: list[NZOverlayKind] = Field(default_factory=list)
     waypoints: list[WaypointInput] = Field(default_factory=list)
+    viewsheds: list[ViewshedObserver] = Field(default_factory=list)
     include_calibration_page: bool = False
     include_route_card: bool = False
     include_elevation_profile: bool = False
+    include_atlas_index: bool = False
+    show_fold_marks: bool = False
 
     @field_validator("center_lat")
     @classmethod
@@ -351,6 +373,8 @@ class JobWorkspace(BaseModel):
     regional_overlays: dict[str, Path] = Field(default_factory=dict)
     slope_tif: Path | None = None
     waypoints_gpkg: Path | None = None
+    viewshed_tif: Path | None = None
+    viewshed_observers_gpkg: Path | None = None
 
 
 class RenderResult(BaseModel):

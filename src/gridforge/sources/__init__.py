@@ -6,6 +6,7 @@ from gridforge.sources.base import ElevationSource, OverlaySource, VectorSource
 from gridforge.sources.dem_au_elvis import AUElvisDEMSource, is_in_australia_coverage
 from gridforge.sources.dem_copernicus import CopernicusGLO30Source
 from gridforge.sources.dem_local import LocalDEMSource
+from gridforge.sources.dem_nz_linz import NZLinzDEMSource, is_in_nz_coverage
 from gridforge.sources.dem_usgs3dep import AutoDEMSource, USGS3DEPSource, is_in_us_3dep_coverage
 from gridforge.sources.osm_overpass import OverpassOSMSource
 from gridforge.sources.osm_pbf import LocalPBFSource
@@ -39,6 +40,11 @@ from gridforge.sources.overlays_au_states_west import (
     SATrailsSource,
     WATrailsSource,
 )
+from gridforge.sources.overlays_nz import (
+    NZDocTrailsSource,
+    build_nz_overlay_sources,
+    is_in_nz_overlay_coverage,
+)
 from gridforge.sources.overlays_us import (
     FAATowersSource,
     FEMAFloodSource,
@@ -66,6 +72,8 @@ __all__ = [
     "NOAAENCSource",
     "NSWTrailsSource",
     "NTTrailsSource",
+    "NZDocTrailsSource",
+    "NZLinzDEMSource",
     "OverpassOSMSource",
     "OverlaySource",
     "QLDTrailsSource",
@@ -77,11 +85,14 @@ __all__ = [
     "VectorSource",
     "WATrailsSource",
     "build_au_overlay_sources",
+    "build_nz_overlay_sources",
     "build_us_overlay_sources",
     "is_in_act_coverage",
     "is_in_australia_coverage",
     "is_in_nsw_coverage",
     "is_in_nt_coverage",
+    "is_in_nz_coverage",
+    "is_in_nz_overlay_coverage",
     "is_in_qld_coverage",
     "is_in_sa_coverage",
     "is_in_tas_coverage",

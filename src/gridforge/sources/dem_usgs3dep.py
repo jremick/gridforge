@@ -21,6 +21,7 @@ from gridforge.sources.dem_copernicus import (
     CopernicusGLO30Source,
     GDAL_VSICURL_ENV,
 )
+from gridforge.sources.dem_nz_linz import NZLinzDEMSource, is_in_nz_coverage
 
 logger = logging.getLogger(__name__)
 
@@ -404,7 +405,7 @@ class USGS3DEPSource:
 
 
 class AutoDEMSource:
-    """Automatic DEM router: USGS 3DEP (NAVD88) in US, GA/ELVIS (AHD) in Australia, Copernicus GLO-30 globally."""
+    """Automatic 4-way DEM router: USGS 3DEP (US), GA/ELVIS (AU), LINZ (NZ), Copernicus GLO-30 globally."""
 
     name: str = "auto-dem"
     attribution: str = CopernicusGLO30Source.attribution
@@ -415,10 +416,12 @@ class AutoDEMSource:
         *,
         usgs_source: USGS3DEPSource | None = None,
         au_source: AUElvisDEMSource | None = None,
+        nz_source: NZLinzDEMSource | None = None,
         copernicus_source: CopernicusGLO30Source | None = None,
     ) -> None:
         self.usgs_source = usgs_source or USGS3DEPSource(cache_dir=cache_dir)
         self.au_source = au_source or AUElvisDEMSource(cache_dir=cache_dir)
+        self.nz_source = nz_source or NZLinzDEMSource(cache_dir=cache_dir)
         self.copernicus_source = copernicus_source or CopernicusGLO30Source(cache_dir=cache_dir)
         self.resolved_source_name: str = self.copernicus_source.name
         self.resolved_vertical_datum: str = "EGM2008"
@@ -426,7 +429,7 @@ class AutoDEMSource:
         self.attribution = self.resolved_attribution
 
     def fetch_dem(self, layout: SheetLayout, work_dir: Path) -> Path:
-        """Select regional high-res DEM (USGS 3DEP in US, GA 5m/SRTM in AU) or Copernicus GLO-30 globally."""
+        """Select regional high-res DEM (USGS 3DEP in US, GA/QLD in AU, LINZ in NZ) or Copernicus GLO-30 globally."""
         if is_in_us_3dep_coverage(layout.wgs84_fetch_bbox):
             try:
                 path = self.usgs_source.fetch_dem(layout, work_dir)
@@ -437,9 +440,13 @@ class AutoDEMSource:
                     exc,
                 )
             else:
-                self.resolved_source_name = self.usgs_source.name
-                self.resolved_vertical_datum = self.usgs_source.vertical_datum
-                self.resolved_attribution = self.usgs_source.attribution
+                self.resolved_source_name = getattr(self.usgs_source, "resolved_source_name", self.usgs_source.name)
+                self.resolved_vertical_datum = getattr(
+                    self.usgs_source, "resolved_vertical_datum", self.usgs_source.vertical_datum
+                )
+                self.resolved_attribution = getattr(
+                    self.usgs_source, "resolved_attribution", self.usgs_source.attribution
+                )
                 self.attribution = self.resolved_attribution
                 return path
         elif is_in_australia_coverage(layout.wgs84_fetch_bbox):
@@ -452,9 +459,32 @@ class AutoDEMSource:
                     exc,
                 )
             else:
-                self.resolved_source_name = self.au_source.name
-                self.resolved_vertical_datum = self.au_source.vertical_datum
-                self.resolved_attribution = self.au_source.attribution
+                self.resolved_source_name = getattr(self.au_source, "resolved_source_name", self.au_source.name)
+                self.resolved_vertical_datum = getattr(
+                    self.au_source, "resolved_vertical_datum", self.au_source.vertical_datum
+                )
+                self.resolved_attribution = getattr(
+                    self.au_source, "resolved_attribution", self.au_source.attribution
+                )
+                self.attribution = self.resolved_attribution
+                return path
+        elif is_in_nz_coverage(layout.wgs84_fetch_bbox):
+            try:
+                path = self.nz_source.fetch_dem(layout, work_dir)
+            except Exception as exc:
+                logger.warning(
+                    "New Zealand LINZ DEM fetch unavailable for %s (%s); falling back to Copernicus GLO-30",
+                    layout.wgs84_fetch_bbox.as_tuple(),
+                    exc,
+                )
+            else:
+                self.resolved_source_name = getattr(self.nz_source, "resolved_source_name", self.nz_source.name)
+                self.resolved_vertical_datum = getattr(
+                    self.nz_source, "resolved_vertical_datum", self.nz_source.vertical_datum
+                )
+                self.resolved_attribution = getattr(
+                    self.nz_source, "resolved_attribution", self.nz_source.attribution
+                )
                 self.attribution = self.resolved_attribution
                 return path
 
