@@ -107,7 +107,9 @@ Open **<http://localhost:8080>** in your browser:
 - **Live Tilted UTM Footprint & MGRS Preview:** Visually inspects the exact true-scale UTM paper frame and 1 km MGRS grid lines (including convergence tilt) in real time; press `F` to fit the sheet to view.
 - **Multi-Sheet Edge-Matched Atlas PDFs:** Select `1×1`, `2×1`, `1×2`, `2×2`, `3×2`, or `3×3` in **Sheet & Print** to preview labeled adjacent sheets (`A1`–`C3`) sharing one locked UTM projection and export a merged multi-page true-scale Atlas PDF.
 - **Custom Overlays & Offline Packs:** Drag and drop `.geojson`, `.gpx`, or `.csv` files (try [`examples/katoomba_route.geojson`](examples/katoomba_route.geojson)), toggle Australian/US federal overlays, or pick any air-gapped pack placed in `./packs/`.
-- **Shareable Permalinks & Copy CLI:** Bookmark or share any map setup directly via URL parameters, click **Copy CLI** for the exact reproducible Docker command, and **Preview** or **Download** finished PDF / `.mbtiles` / `.kmz` artifacts from the Queue drawer.
+- **Shareable Permalinks & Downloads:** Bookmark or share map settings via URL parameters. **Preview** or **Download** finished PDF / `.mbtiles` / `.kmz` artifacts from the Queue drawer.
+
+**Copy CLI** copies a Docker Compose command for single-sheet PDFs, route-strip PDFs, and center-sheet device exports. Run it from the directory containing `docker-compose.yml`. Generated files remain in `./out/` after the container exits. For an uploaded overlay or strip route, put a copy with the same filename in `./out/inputs/` first. Selected packs are looked up by manifest ID under `./packs/`. Use **Generate Map Sheet** for rectangular atlas PDFs or a strip PDF combined with device exports.
 
 Stop the stack cleanly anytime with `docker compose down`.
 
@@ -115,7 +117,7 @@ Stop the stack cleanly anytime with `docker compose down`.
 
 ## CLI Cookbook & Air-Gapped Australia Pack Builder
 
-Every studio capability is also available headlessly via the `gridforge` CLI (see [`examples/render-examples.sh`](examples/render-examples.sh) for a runnable end-to-end cookbook).
+The [CLI cookbook](examples/render-examples.sh) includes runnable examples for print and device exports.
 
 ### Render a Print Sheet + Custom Route Overlay
 
@@ -240,6 +242,10 @@ examples/                  # Sample Blue Mountains GeoJSON route overlay & runna
 ```
 
 ```bash
+# Studio command generation and host-side Compose output check (Node 22.6+ and a local gridforge:dev image)
+npm --prefix web test
+npm --prefix web run test:compose
+
 # Offline unit + integration CI gate (no network required)
 docker run --rm -v "$(pwd):/app" gridforge:dev pytest tests/unit tests/integration
 

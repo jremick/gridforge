@@ -556,7 +556,8 @@ export class SidebarPanel {
             type="button"
             class="gf-cli-btn"
             data-role="copy-cli"
-            title="Copy reproducible docker compose CLI command"
+            aria-label="Copy CLI command"
+            title="Copy Docker Compose command"
           >
             <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
               <path d="M2.5 4.5L6 8L2.5 11.5M7.5 11.5H13.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>

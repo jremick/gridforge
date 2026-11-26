@@ -41,7 +41,7 @@ from gridforge.geo.supplements import (
     render_route_card_pdf,
 )
 from gridforge.geo.waypoints import compute_route_metrics
-from gridforge.packs.builder import discover_packs, load_pack_manifest
+from gridforge.packs.builder import discover_packs, load_pack_manifest, resolve_pack_directory
 from gridforge.pipeline import runner
 from gridforge.render.pyqgis_worker import PyQGISRenderer
 from gridforge.sources.dem_local import LocalDEMSource
@@ -68,22 +68,6 @@ def _artifact_stem(req: CreateJobRequest, center_mgrs: str | None) -> str:
     base = re.sub(r"[^a-zA-Z0-9]+", "_", raw_base.lower()).strip("_")[:48] or "gridforge_map"
     scale_k = f"{req.scale // 1000}k"
     return f"{base}_{scale_k}_{req.paper.value}_{req.color_mode.value}"
-
-
-def _resolve_pack_dir(packs_dir: Path, pack_id: str) -> Path:
-    """Locate the directory containing ``pack.json`` for ``pack_id`` safely under ``packs_dir``."""
-    direct = (packs_dir / pack_id).resolve()
-    if direct.is_relative_to(packs_dir.resolve()) and (direct / "pack.json").is_file():
-        return direct
-    for child in sorted(packs_dir.iterdir()) if packs_dir.is_dir() else []:
-        if child.is_dir() and (child / "pack.json").is_file():
-            try:
-                manifest = load_pack_manifest(child)
-                if manifest.pack_id == pack_id:
-                    return child.resolve()
-            except Exception:
-                continue
-    raise FileNotFoundError(f"Offline pack '{pack_id}' not found in '{packs_dir}'.")
 
 
 class _PackLocalDEMSource(LocalDEMSource):
@@ -278,7 +262,7 @@ def _build_prep_kwargs(
         prep_kwargs["progress_callback"] = progress_cb
 
     if req.pack_id is not None:
-        pack_dir = _resolve_pack_dir(packs_dir, req.pack_id)
+        pack_dir = resolve_pack_directory(packs_dir, req.pack_id)
         if "pack_dir" in prep_sig.parameters:
             prep_kwargs["pack_dir"] = pack_dir
         else:

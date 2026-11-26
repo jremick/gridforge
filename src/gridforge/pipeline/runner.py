@@ -576,13 +576,14 @@ def _infer_route_file_from_overlays(
         candidate = Path(overlay_path).expanduser().resolve()
         if candidate.is_file():
             return candidate
-    if overlay_sources:
-        for src in overlay_sources:
-            src_path = getattr(src, "path", None)
-            if src_path is not None:
-                cand = Path(src_path).expanduser().resolve()
-                if cand.is_file() and cand.suffix.lower() in (".gpx", ".geojson", ".json"):
-                    return cand
+    for source in overlay_sources or ():
+        paths = source.paths if isinstance(source, UserOverlaySource) else [getattr(source, "path", None)]
+        for path in paths:
+            if path is None:
+                continue
+            candidate = Path(path).expanduser().resolve()
+            if candidate.is_file() and candidate.suffix.lower() in (".gpx", ".geojson", ".json"):
+                return candidate
     return None
 
 

@@ -321,8 +321,18 @@ class GridForgeApp {
         onRefreshPacks: () => void this.loadPacks(true),
         onSubmitJob: () => void this.handleSubmitJob(),
         onCopyCli: () => {
-          const cmd = buildCliCommand(this.state);
-          this.copyText(cmd, "Copied CLI command!");
+          const result = buildCliCommand(this.state);
+          if ("error" in result) {
+            this.sidebar.setFormError(result.error);
+            return;
+          }
+          this.sidebar.setFormError(null);
+          this.copyText(
+            result.command,
+            this.state.overlayFile
+              ? "Command copied. Place the selected file in ./out/inputs/ before running."
+              : "Command copied. Run from the project directory. Results appear in ./out/."
+          );
         },
       },
       urlHydration.hasCustomCenter ? null : "blue-mountains"

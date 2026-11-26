@@ -468,7 +468,7 @@ export function formatArtifactLabel(kind: string, filename: string): string {
 
 function shellQuote(arg: string): string {
   if (/^[a-zA-Z0-9._/:=-]+$/.test(arg)) return arg;
-  return `"${arg.replace(/["\\$`]/g, "\\$&")}"`;
+  return "'" + arg.replace(/'/g, "'\\''") + "'";
 }
 
 function slugifyFilename(state: AppFormState): string {
@@ -481,17 +481,29 @@ function slugifyFilename(state: AppFormState): string {
   return `${slug || "gridforge_sheet"}_${state.paper}_${state.color_mode}`;
 }
 
-export function buildCliCommand(state: AppFormState): string {
+type CliCopyResult = { command: string } | { error: string };
+
+export function buildCliCommand(state: AppFormState): CliCopyResult {
   const centerArg = state.center.trim() || formatCoords(state.lat, state.lon);
   const slug = slugifyFilename(state);
   const pdfEnabled = state.outputs.pdf;
   const subcmd = pdfEnabled ? "render" : "export";
-  const stripMode = Boolean(state.stripPlan && state.overlayFile && pdfEnabled);
+  const digital = state.outputs.mbtiles || state.outputs.kmz;
+  const stripMode = Boolean(state.stripPlan && pdfEnabled);
+  if (!pdfEnabled && !digital) {
+    return { error: "Select at least one output to copy a command." };
+  }
+  if (pdfEnabled && !stripMode && (state.grid_cols > 1 || state.grid_rows > 1)) {
+    return { error: "Use Generate Map Sheet for rectangular atlas PDFs, or select 1×1 to copy a CLI command." };
+  }
+  if (stripMode && (!state.overlayFile || digital)) {
+    return { error: "To copy a strip PDF command, select its route file and PDF as the only output. Studio can generate the combined job." };
+  }
 
   const args: string[] = ["docker compose run --rm cli gridforge", subcmd];
 
   if (stripMode && state.overlayFile) {
-    args.push(`--strip-route ${shellQuote(`/output/${state.overlayFile.name}`)}`);
+    args.push(`--strip-route ${shellQuote(`/out/inputs/${state.overlayFile.name}`)}`);
   } else {
     args.push(`--center ${shellQuote(centerArg)}`);
   }
@@ -511,7 +523,7 @@ export function buildCliCommand(state: AppFormState): string {
     args.push(`--dem-source ${state.dem_source}`);
   }
   if (state.pack_id) {
-    args.push(`--pack ${shellQuote(`/data/packs/${state.pack_id}`)}`);
+    args.push(`--pack-id ${shellQuote(state.pack_id)}`);
   }
   for (const ov of state.au_overlays) {
     args.push(`--au-overlay ${ov}`);
@@ -536,17 +548,24 @@ export function buildCliCommand(state: AppFormState): string {
   if (!state.carto.show_pipelines) args.push("--no-pipelines");
   if (!state.carto.show_river_arrows) args.push("--no-river-arrows");
   if (pdfEnabled && !state.carto.show_grid) args.push("--no-grid");
-  if (!pdfEnabled && !state.outputs.include_grid_on_digital) {
+  if (pdfEnabled && digital && !state.outputs.include_grid_on_digital) {
+    args.push("--no-export-grid");
+  }
+  if (!pdfEnabled && !(state.carto.show_grid && state.outputs.include_grid_on_digital)) {
     args.push("--no-grid");
   }
 
   if (state.overlayFile && !stripMode) {
-    args.push(`--overlay ${shellQuote(`/output/${state.overlayFile.name}`)}`);
+    args.push(`--overlay ${shellQuote(`/out/inputs/${state.overlayFile.name}`)}`);
   }
 
   for (const wp of state.waypoints) {
-    const cleanLabel = wp.label.replace(/,/g, " ").trim() || "WP";
-    const wpSpec = `${cleanLabel},${wp.lat.toFixed(5)},${wp.lon.toFixed(5)},${wp.category}`;
+    if (!wp.label.trim() || wp.label.includes(",")) {
+      return { error: "Use a nonempty waypoint label without commas to copy a CLI command, or generate the map in Studio." };
+    }
+    const fields = [wp.label, wp.lat, wp.lon, wp.category];
+    if (wp.notes) fields.push(wp.notes);
+    const wpSpec = fields.join(",");
     args.push(`--waypoint ${shellQuote(wpSpec)}`);
   }
 
@@ -556,18 +575,18 @@ export function buildCliCommand(state: AppFormState): string {
     if (state.include_route_card) args.push("--route-card");
     if (state.include_elevation_profile) args.push("--elevation-profile");
     if (state.outputs.mbtiles) {
-      args.push(`--mbtiles /output/${slug}.mbtiles`);
+      args.push(`--mbtiles /out/${slug}.mbtiles`);
       if (state.outputs.mbtiles_format !== "png") {
         args.push(`--mbtiles-format ${state.outputs.mbtiles_format}`);
       }
     }
     if (state.outputs.kmz) {
-      args.push(`--kmz /output/${slug}.kmz`);
+      args.push(`--kmz /out/${slug}.kmz`);
       if (state.outputs.garmin_profile !== "standard") {
         args.push(`--garmin-profile ${state.outputs.garmin_profile}`);
       }
     }
-    args.push(`--output /output/${slug}.pdf`);
+    args.push(`--output /out/${slug}.pdf`);
   } else {
     const fmt =
       state.outputs.mbtiles && state.outputs.kmz
@@ -583,10 +602,10 @@ export function buildCliCommand(state: AppFormState): string {
       args.push(`--garmin-profile ${state.outputs.garmin_profile}`);
     }
     const ext = fmt === "both" ? "" : `.${fmt}`;
-    args.push(`--output /output/${slug}${ext}`);
+    args.push(`--output /out/${slug}${ext}`);
   }
 
-  return args.join(" ");
+  return { command: args.join(" ") };
 }
 
 export function escapeHtml(input: string): string {

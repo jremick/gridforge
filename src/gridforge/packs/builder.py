@@ -8,7 +8,7 @@ import os
 import re
 import subprocess
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -664,13 +664,12 @@ def load_pack_manifest(pack_dir: Path | str) -> PackManifest:
     return PackManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
 
 
-def discover_packs(packs_root: Path | str) -> list[PackManifest]:
-    """Discover all valid offline packs under ``packs_root``, sorted by ``pack_id``."""
+def _installed_packs(packs_root: Path | str) -> Iterator[tuple[Path, PackManifest]]:
+    """Yield each discoverable manifest with the directory that actually contains it."""
     root = Path(packs_root)
     if not root.is_dir():
-        return []
+        return
 
-    found: list[PackManifest] = []
     seen_ids: set[str] = set()
 
     candidates: list[Path] = []
@@ -688,6 +687,17 @@ def discover_packs(packs_root: Path | str) -> list[PackManifest]:
             continue
         if manifest.pack_id not in seen_ids:
             seen_ids.add(manifest.pack_id)
-            found.append(manifest)
+            yield pack_dir, manifest
 
-    return sorted(found, key=lambda m: m.pack_id)
+
+def discover_packs(packs_root: Path | str) -> list[PackManifest]:
+    """Discover all valid offline packs under ``packs_root``, sorted by ``pack_id``."""
+    return sorted((m for _, m in _installed_packs(packs_root)), key=lambda m: m.pack_id)
+
+
+def resolve_pack_directory(packs_root: Path | str, pack_id: str) -> Path:
+    """Find a selected pack by the ID displayed in Studio."""
+    for directory, manifest in _installed_packs(packs_root):
+        if manifest.pack_id == pack_id:
+            return directory.resolve()
+    raise FileNotFoundError(f"Offline pack '{pack_id}' is not installed in '{packs_root}'.")

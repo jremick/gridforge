@@ -5,6 +5,7 @@ from __future__ import annotations
 from enum import Enum
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Literal, Optional, cast
 
@@ -31,6 +32,7 @@ from gridforge.config import (
 )
 from gridforge.geo.crs import compute_sheet_layout, parse_center
 from gridforge.geo.declination import compute_declination
+from gridforge.packs.builder import resolve_pack_directory
 from gridforge.pipeline.runner import run_export_job, run_render_job, run_strip_atlas_job
 from gridforge.sources.base import ElevationSource, OverlaySource, VectorSource
 from gridforge.sources.dem_local import LocalDEMSource
@@ -75,11 +77,22 @@ def _configure_logging(verbose: bool) -> None:
     )
 
 
+def _cli_pack(path: Path | None, pack_id: str | None) -> Path | None:
+    if pack_id is None:
+        return path
+    if path is not None:
+        raise typer.BadParameter("Choose either --pack or --pack-id.")
+    try:
+        return resolve_pack_directory(os.environ.get("GRIDFORGE_PACKS_DIR", "/data/packs"), pack_id)
+    except FileNotFoundError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--pack-id") from exc
+
+
 def _parse_waypoints(raw_waypoints: list[str] | None) -> list[WaypointInput]:
     """Parse repeatable ``--waypoint 'Label,lat,lon[,category[,notes]]'`` CLI strings."""
     parsed: list[WaypointInput] = []
     for raw in raw_waypoints or []:
-        parts = [p.strip() for p in raw.split(",")]
+        parts = [p.strip() for p in raw.split(",", maxsplit=4)]
         if len(parts) < 3:
             raise typer.BadParameter(
                 f"Invalid --waypoint '{raw}'. Expected 'Label,lat,lon[,category[,notes]]'."
@@ -105,7 +118,7 @@ def _parse_waypoints(raw_waypoints: list[str] | None) -> list[WaypointInput]:
                     f"Invalid waypoint category '{parts[3]}' in '{raw}'. Choose: {allowed}."
                 ) from exc
 
-        notes = ",".join(parts[4:]).strip() or None if len(parts) >= 5 else None
+        notes = parts[4] if len(parts) == 5 and parts[4] else None
         try:
             parsed.append(WaypointInput(label=label, lat=lat, lon=lon, category=cat, notes=notes))
         except Exception as exc:
@@ -268,6 +281,9 @@ def render_cmd(
         "--pack",
         help="Path to an air-gapped offline regional pack directory containing pack.json.",
     ),
+    pack_id: Optional[str] = typer.Option(
+        None, "--pack-id", help="ID of an installed pack in GRIDFORGE_PACKS_DIR (default /data/packs)."
+    ),
     contour_density: DensityLevel = typer.Option(
         DensityLevel.NORMAL,
         "--contour-density",
@@ -291,6 +307,7 @@ def render_cmd(
     power: bool = typer.Option(True, "--power/--no-power", help="Show power lines, towers, and substations."),
     pipelines: bool = typer.Option(True, "--pipelines/--no-pipelines", help="Show pipelines."),
     grid: bool = typer.Option(True, "--grid/--no-grid", help="Show MGRS 1 km grid & neatline ticks."),
+    export_grid: bool = typer.Option(True, "--export-grid/--no-export-grid", help="Include the enabled print grid in accompanying digital exports."),
     river_arrows: bool = typer.Option(
         True,
         "--river-arrows/--no-river-arrows",
@@ -411,6 +428,7 @@ def render_cmd(
     )
     parsed_waypoints = _parse_waypoints(waypoint)
 
+    pack_dir = _cli_pack(pack, pack_id)
     elev_src: ElevationSource | None = LocalDEMSource(offline_dem) if offline_dem is not None else None
     vec_src: VectorSource | None = LocalPBFSource(offline_pbf) if offline_pbf is not None else None
     overlay_srcs: list[OverlaySource] = [UserOverlaySource(p) for p in (overlay or [])]
@@ -443,7 +461,7 @@ def render_cmd(
             elevation_source=elev_src,
             vector_source=vec_src,
             overlay_sources=overlay_srcs or None,
-            pack_dir=pack,
+            pack_dir=pack_dir,
             keep_workspace=keep_workspace,
             work_dir=work_dir,
         )
@@ -475,7 +493,7 @@ def render_cmd(
             elevation_source=elev_src,
             vector_source=vec_src,
             overlay_sources=overlay_srcs or None,
-            pack_dir=pack,
+            pack_dir=pack_dir,
             keep_workspace=keep_workspace,
             work_dir=work_dir,
             mbtiles_out=mbtiles,
@@ -483,7 +501,7 @@ def render_cmd(
             mbtiles_format=mbtiles_format,
             garmin_profile=garmin_profile,
             max_tiles=max_tiles,
-            export_include_grid=grid,
+            export_include_grid=grid and export_grid,
             export_dpi=dpi,
         )
 
@@ -601,6 +619,9 @@ def export_cmd(
         "--pack",
         help="Path to an air-gapped offline regional pack directory containing pack.json.",
     ),
+    pack_id: Optional[str] = typer.Option(
+        None, "--pack-id", help="ID of an installed pack in GRIDFORGE_PACKS_DIR (default /data/packs)."
+    ),
     contour_density: DensityLevel = typer.Option(
         DensityLevel.NORMAL,
         "--contour-density",
@@ -680,6 +701,7 @@ def export_cmd(
         carto=carto,
     )
 
+    pack_dir = _cli_pack(pack, pack_id)
     elev_src: ElevationSource | None = LocalDEMSource(offline_dem) if offline_dem is not None else None
     vec_src: VectorSource | None = LocalPBFSource(offline_pbf) if offline_pbf is not None else None
     overlay_srcs: list[OverlaySource] = [UserOverlaySource(p) for p in (overlay or [])]
@@ -691,7 +713,7 @@ def export_cmd(
         elevation_source=elev_src,
         vector_source=vec_src,
         overlay_sources=overlay_srcs or None,
-        pack_dir=pack,
+        pack_dir=pack_dir,
         mbtiles_format=mbtiles_format,
         garmin_profile=garmin_profile,
         max_tiles=max_tiles,
