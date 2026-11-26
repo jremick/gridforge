@@ -13,6 +13,7 @@ from pathlib import Path
 from gridforge.config import (
     AU_STATE_TRAIL_OVERLAY_KINDS,
     AUOverlayKind,
+    CAOverlayKind,
     CartoOptions,
     ColorMode,
     DeclinationInfo,
@@ -27,8 +28,10 @@ from gridforge.config import (
     PackManifest,
     PaperSize,
     RenderResult,
+    RFLinkSpec,
     SheetLayout,
     SheetSpec,
+    TacticalGraphic,
     Units,
     USOverlayKind,
     ViewshedObserver,
@@ -75,7 +78,7 @@ from gridforge.sources.overlays_us import build_us_overlay_sources
 logger = logging.getLogger(__name__)
 
 ProgressCallback = Callable[[str, int], None]
-OverlayOverrideKey = str | USOverlayKind | AUOverlayKind | NZOverlayKind
+OverlayOverrideKey = str | USOverlayKind | AUOverlayKind | NZOverlayKind | CAOverlayKind
 
 
 def _report_progress(callback: ProgressCallback | None, stage: str, pct: int) -> None:
@@ -100,6 +103,10 @@ def _resolve_elevation_source(
         from gridforge.sources.dem_nz_linz import NZLinzDEMSource
 
         return NZLinzDEMSource()
+    if spec.dem_source == DemSourceKind.CA_HRDEM:
+        from gridforge.sources.dem_ca_hrdem import CanadaHRDEMSource
+
+        return CanadaHRDEMSource()
     if spec.dem_source == DemSourceKind.GLO30:
         return CopernicusGLO30Source()
     return AutoDEMSource()
@@ -198,7 +205,7 @@ def _resolve_pack_sources(
         for raw_key, raw_path in regional_overlay_overrides.items():
             norm_key = (
                 raw_key.value
-                if isinstance(raw_key, (USOverlayKind, AUOverlayKind, NZOverlayKind))
+                if isinstance(raw_key, (USOverlayKind, AUOverlayKind, NZOverlayKind, CAOverlayKind))
                 else str(raw_key).lower().replace("_", "-")
             )
             merged_overrides[norm_key] = Path(raw_path).expanduser().resolve()
@@ -303,22 +310,26 @@ def _fetch_regional_overlays(
     us_kinds_override: Sequence[USOverlayKind] | None = None,
     au_kinds_override: Sequence[AUOverlayKind] | None = None,
     nz_kinds_override: Sequence[NZOverlayKind] | None = None,
+    ca_kinds_override: Sequence[CAOverlayKind] | None = None,
 ) -> tuple[dict[str, Path], list[str]]:
-    """Fetch opt-in US, Australia, and New Zealand regional overlays, retaining non-empty GeoPackages."""
+    """Fetch opt-in US, Australia, New Zealand, and Canada regional overlays, retaining non-empty GeoPackages."""
     us_kinds = list(spec.us_overlays) if us_kinds_override is None else list(us_kinds_override)
     au_kinds = list(spec.au_overlays) if au_kinds_override is None else list(au_kinds_override)
     nz_kinds = list(spec.nz_overlays) if nz_kinds_override is None else list(nz_kinds_override)
+    ca_kinds = list(spec.ca_overlays) if ca_kinds_override is None else list(ca_kinds_override)
 
-    if not us_kinds and not au_kinds and not nz_kinds:
+    if not us_kinds and not au_kinds and not nz_kinds and not ca_kinds:
         return {}, []
 
     us_overrides: dict[str | USOverlayKind, Path | str] = {}
     au_overrides: dict[str | AUOverlayKind, Path | str] = {}
     nz_overrides: dict[str | NZOverlayKind, Path | str] = {}
+    ca_overrides: dict[str | CAOverlayKind, Path | str] = {}
     if local_overrides:
         us_values = {k.value for k in USOverlayKind}
         au_values = {k.value for k in AUOverlayKind}
         nz_values = {k.value for k in NZOverlayKind}
+        ca_values = {k.value for k in CAOverlayKind}
         for raw_key, raw_path in local_overrides.items():
             if isinstance(raw_key, USOverlayKind):
                 us_overrides[raw_key] = raw_path
@@ -326,6 +337,8 @@ def _fetch_regional_overlays(
                 au_overrides[raw_key] = raw_path
             elif isinstance(raw_key, NZOverlayKind):
                 nz_overrides[raw_key] = raw_path
+            elif isinstance(raw_key, CAOverlayKind):
+                ca_overrides[raw_key] = raw_path
             else:
                 norm = str(raw_key).lower().replace("_", "-")
                 if norm in us_values:
@@ -334,6 +347,8 @@ def _fetch_regional_overlays(
                     au_overrides[norm] = raw_path
                 elif norm in nz_values:
                     nz_overrides[norm] = raw_path
+                elif norm in ca_values:
+                    ca_overrides[norm] = raw_path
 
     overlay_dir = job_dir / "regional_overlays"
     overlay_dir.mkdir(parents=True, exist_ok=True)
@@ -347,6 +362,10 @@ def _fetch_regional_overlays(
         from gridforge.sources.overlays_nz import build_nz_overlay_sources
 
         sources.update(build_nz_overlay_sources(nz_kinds, local_overrides=nz_overrides or None))
+    if ca_kinds:
+        from gridforge.sources.overlays_ca import build_ca_overlay_sources
+
+        sources.update(build_ca_overlay_sources(ca_kinds, local_overrides=ca_overrides or None))
 
     resolved_paths: dict[str, Path] = {}
     attributions: list[str] = []
@@ -488,7 +507,7 @@ def prepare_job_workspace(
     declination_svg = render_declination_svg(
         declination,
         resolved_dir / "declination.svg",
-        bw=(spec.color_mode == ColorMode.BW),
+        bw=(spec.color_mode in (ColorMode.BW, ColorMode.NIGHT_RED)),
     )
     grid_ref_svg = render_grid_ref_box_svg(
         mgrs_meta,
@@ -496,7 +515,7 @@ def prepare_job_workspace(
         resolved_dir / "grid_ref_box.svg",
     )
 
-    # 6. Process optional user overlays, tactical waypoints, and US/AU regional thematic overlays
+    # 6. Process optional user overlays, tactical waypoints/graphics, and US/AU/NZ/CA regional overlays
     _report_progress(progress_callback, "overlays", 46)
     overlays_gpkg: Path | None = None
     overlay_attributions: list[str] = []
@@ -517,10 +536,26 @@ def prepare_job_workspace(
             resolved_dir / "waypoints.gpkg",
         )
 
+    tactical_graphics_gpkg: Path | None = None
+    if spec.tactical_graphics or spec.rf_links:
+        from gridforge.geo.tactical import write_tactical_graphics_gpkg
+
+        tactical_graphics_gpkg = write_tactical_graphics_gpkg(
+            list(spec.tactical_graphics),
+            layout.utm_epsg,
+            resolved_dir / "tactical_graphics.gpkg",
+            rf_links=list(spec.rf_links),
+            date_iso=spec.date_iso,
+        )
+
     nz_kinds_override: list[NZOverlayKind] | None = None
+    ca_kinds_override: list[CAOverlayKind] | None = None
     if pack_manifest is not None:
         nz_kinds_override = [
             k for k in spec.nz_overlays if effective_overrides and k.value in effective_overrides
+        ]
+        ca_kinds_override = [
+            k for k in spec.ca_overlays if effective_overrides and k.value in effective_overrides
         ]
 
     regional_overlays, regional_attributions = _fetch_regional_overlays(
@@ -531,6 +566,7 @@ def prepare_job_workspace(
         us_kinds_override=us_kinds_override,
         au_kinds_override=au_kinds_override,
         nz_kinds_override=nz_kinds_override,
+        ca_kinds_override=ca_kinds_override,
     )
 
     # 7. Assemble mandatory attributions (deduplicated, preserving order)
@@ -569,6 +605,7 @@ def prepare_job_workspace(
         waypoints_gpkg=waypoints_gpkg,
         viewshed_tif=viewshed_tif,
         viewshed_observers_gpkg=viewshed_observers_gpkg,
+        tactical_graphics_gpkg=tactical_graphics_gpkg,
     )
 
 
@@ -577,6 +614,10 @@ def _run_workspace_exports(
     *,
     mbtiles_out: Path | None = None,
     kmz_out: Path | None = None,
+    gpkg_out: Path | None = None,
+    osmand_out: Path | None = None,
+    field_bundle_out: Path | None = None,
+    extra_bundle_artifacts: Sequence[Path | tuple[str, Path]] = (),
     mbtiles_format: MBTilesFormat = MBTilesFormat.PNG,
     garmin_profile: GarminProfile = GarminProfile.STANDARD,
     max_tiles: int | None = None,
@@ -584,16 +625,17 @@ def _run_workspace_exports(
     dpi: int | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> list[ExportResult]:
-    """Run requested MBTiles and/or Garmin KMZ exports sharing one collarless GeoTIFF render."""
-    if mbtiles_out is None and kmz_out is None:
+    """Run requested MBTiles, Garmin KMZ, GeoPackage tiles, OsmAnd, and Field Bundle exports."""
+    raster_targets = [p for p in (mbtiles_out, kmz_out, gpkg_out, osmand_out) if p is not None]
+    if not raster_targets and field_bundle_out is None:
         return []
 
     eff_dpi = dpi if dpi is not None else workspace.layout.spec.dpi
     eff_grid = workspace.layout.spec.carto.show_grid if include_grid is None else include_grid
 
     shared_tif: Path | None = None
-    if mbtiles_out is not None and kmz_out is not None:
-        _report_progress(progress_callback, "rendering_raster", 84)
+    if len(raster_targets) >= 2:
+        _report_progress(progress_callback, "rendering_raster", 82)
         shared_tif = render_collarless_geotiff(
             workspace,
             workspace.job_dir / "collarless_export.tif",
@@ -603,7 +645,7 @@ def _run_workspace_exports(
 
     results: list[ExportResult] = []
     if mbtiles_out is not None:
-        _report_progress(progress_callback, "exporting_mbtiles", 88)
+        _report_progress(progress_callback, "exporting_mbtiles", 85)
         results.append(
             export_mbtiles(
                 workspace,
@@ -615,7 +657,7 @@ def _run_workspace_exports(
             )
         )
     if kmz_out is not None:
-        _report_progress(progress_callback, "exporting_kmz", 94)
+        _report_progress(progress_callback, "exporting_kmz", 88)
         results.append(
             export_garmin_kmz(
                 workspace,
@@ -627,6 +669,47 @@ def _run_workspace_exports(
                 collarless_tif=shared_tif,
             )
         )
+    if gpkg_out is not None:
+        from gridforge.export.gpkg_tiles import export_gpkg_tiles
+
+        _report_progress(progress_callback, "exporting_gpkg", 91)
+        gpkg_res = export_gpkg_tiles(
+            workspace,
+            Path(gpkg_out),
+            tile_format=mbtiles_format,
+            dpi=eff_dpi,
+            include_grid=eff_grid,
+            collarless_tif=shared_tif,
+        )
+        workspace.gpkg_tiles_path = gpkg_res.output_path
+        results.append(gpkg_res)
+    if osmand_out is not None:
+        from gridforge.export.osmand import export_osmand_sqlitedb
+
+        _report_progress(progress_callback, "exporting_osmand", 94)
+        osm_res = export_osmand_sqlitedb(
+            workspace,
+            Path(osmand_out),
+            tile_format=mbtiles_format,
+            dpi=eff_dpi,
+            include_grid=eff_grid,
+            collarless_tif=shared_tif,
+        )
+        workspace.osmand_sqlitedb_path = osm_res.output_path
+        results.append(osm_res)
+    if field_bundle_out is not None:
+        from gridforge.export.bundle import export_field_bundle_zip
+
+        _report_progress(progress_callback, "exporting_bundle", 97)
+        bundle_items: list[Path | tuple[str, Path]] = list(extra_bundle_artifacts)
+        bundle_items.extend(res.output_path for res in results)
+        bundle_res = export_field_bundle_zip(
+            workspace,
+            Path(field_bundle_out),
+            artifacts=bundle_items,
+        )
+        workspace.field_bundle_zip_path = bundle_res.output_path
+        results.append(bundle_res)
     return results
 
 
@@ -670,8 +753,8 @@ def _assemble_pdf_with_supplements(
     output_pdf: Path,
     overlap_pct: float = 0.0,
 ) -> Path:
-    """Assemble ``[Atlas Index?] + [Elevation Profile?] + Map Sheet(s) + [Route Card?] + [100 mm Calibration?]``."""
-    bw = spec.color_mode == ColorMode.BW
+    """Assemble ``[Atlas Index?] + [Elevation Profile?] + Map Sheet(s) + [Route Card?] + [RF Link Card?] + [100 mm Calibration?]``."""
+    bw = spec.color_mode in (ColorMode.BW, ColorMode.NIGHT_RED)
     supp_dir = job_dir / "supplements"
     supp_dir.mkdir(parents=True, exist_ok=True)
     front_pages: list[Path] = []
@@ -761,6 +844,27 @@ def _assemble_pdf_with_supplements(
         )
         back_pages.append(card_pdf)
 
+    if spec.include_rf_link_card and spec.rf_links and dem_paths:
+        from gridforge.geo.supplements import render_rf_link_card_pdf
+        from gridforge.pipeline.terrain import compute_rf_link_profile
+
+        rf_profiles = [
+            compute_rf_link_profile(
+                dem_paths[0],
+                lnk,
+                anchor_layout.utm_epsg,
+                date_iso=spec.date_iso,
+            )
+            for lnk in spec.rf_links
+        ]
+        rf_pdf = render_rf_link_card_pdf(
+            rf_profiles,
+            anchor_layout,
+            supp_dir / "rf_link_card.pdf",
+            bw=bw,
+        )
+        back_pages.append(rf_pdf)
+
     if spec.include_calibration_page:
         cal_pdf = render_calibration_pdf(
             anchor_layout.page_width_mm,
@@ -793,6 +897,9 @@ def run_render_job(
     renderer: MapRenderer | None = None,
     mbtiles_out: Path | str | None = None,
     kmz_out: Path | str | None = None,
+    gpkg_out: Path | str | None = None,
+    osmand_out: Path | str | None = None,
+    field_bundle_out: Path | str | None = None,
     mbtiles_format: MBTilesFormat = MBTilesFormat.PNG,
     garmin_profile: GarminProfile = GarminProfile.STANDARD,
     max_tiles: int | None = None,
@@ -815,6 +922,7 @@ def run_render_job(
     wants_supplements = bool(
         spec.include_calibration_page
         or (spec.include_route_card and len(spec.waypoints) > 0)
+        or (spec.include_rf_link_card and len(spec.rf_links) > 0)
         or spec.include_elevation_profile
     )
 
@@ -859,12 +967,16 @@ def run_render_job(
         else:
             result = map_renderer.render_pdf(workspace, output_pdf_path)
 
-        # Optionally produce matching offline device archives from the exact same workspace
-        if mbtiles_out is not None or kmz_out is not None:
+        # Optionally produce matching offline device archives / Field Bundle from the exact same workspace
+        if any(x is not None for x in (mbtiles_out, kmz_out, gpkg_out, osmand_out, field_bundle_out)):
             _run_workspace_exports(
                 workspace,
                 mbtiles_out=Path(mbtiles_out) if mbtiles_out is not None else None,
                 kmz_out=Path(kmz_out) if kmz_out is not None else None,
+                gpkg_out=Path(gpkg_out) if gpkg_out is not None else None,
+                osmand_out=Path(osmand_out) if osmand_out is not None else None,
+                field_bundle_out=Path(field_bundle_out) if field_bundle_out is not None else None,
+                extra_bundle_artifacts=[output_pdf_path],
                 mbtiles_format=mbtiles_format,
                 garmin_profile=garmin_profile,
                 max_tiles=max_tiles,
@@ -904,13 +1016,17 @@ def run_strip_atlas_job(
     us_overlays: Sequence[USOverlayKind] | None = None,
     au_overlays: Sequence[AUOverlayKind] | None = None,
     nz_overlays: Sequence[NZOverlayKind] | None = None,
+    ca_overlays: Sequence[CAOverlayKind] | None = None,
     carto: CartoOptions | None = None,
     waypoints: Sequence[WaypointInput] | None = None,
     viewsheds: Sequence[ViewshedObserver] | None = None,
+    rf_links: Sequence[RFLinkSpec] | None = None,
+    tactical_graphics: Sequence[TacticalGraphic] | None = None,
     include_calibration_page: bool = False,
     include_route_card: bool = False,
     include_elevation_profile: bool = True,
     include_atlas_index: bool = False,
+    include_rf_link_card: bool = False,
     show_fold_marks: bool = False,
     overlap_pct: float = 10.0,
     max_sheets: int = 12,
@@ -952,9 +1068,12 @@ def run_strip_atlas_job(
     eff_carto = carto if carto is not None else CartoOptions()
     eff_waypoints = list(waypoints or [])
     eff_viewsheds = list(viewsheds or [])
+    eff_rf_links = list(rf_links or [])
+    eff_tactical = list(tactical_graphics or [])
     eff_us = list(dict.fromkeys(us_overlays or []))
     eff_au = list(dict.fromkeys(au_overlays or []))
     eff_nz = list(dict.fromkeys(nz_overlays or []))
+    eff_ca = list(dict.fromkeys(ca_overlays or []))
 
     owns_temp_dir = work_dir is None
     if work_dir is not None:
@@ -1002,12 +1121,16 @@ def run_strip_atlas_job(
                 us_overlays=eff_us,
                 au_overlays=eff_au,
                 nz_overlays=eff_nz,
+                ca_overlays=eff_ca,
                 waypoints=eff_waypoints,
                 viewsheds=eff_viewsheds,
+                rf_links=eff_rf_links,
+                tactical_graphics=eff_tactical,
                 include_calibration_page=include_calibration_page,
                 include_route_card=include_route_card,
                 include_elevation_profile=include_elevation_profile,
                 include_atlas_index=include_atlas_index,
+                include_rf_link_card=include_rf_link_card,
                 show_fold_marks=show_fold_marks,
             )
             if anchor_spec is None:
@@ -1092,15 +1215,24 @@ def run_export_job(
     keep_workspace: bool = False,
     work_dir: Path | str | None = None,
 ) -> list[ExportResult]:
-    """Export standalone ATAK ``.mbtiles`` and/or Garmin ``.kmz`` archive(s) without generating a PDF."""
+    """Export standalone ATAK ``.mbtiles``, Garmin ``.kmz``, GeoPackage ``.gpkg``, OsmAnd ``.sqlitedb``, or Field Bundle ``.zip``."""
     out = Path(output_path)
     mbt_out: Path | None = None
     kmz_out: Path | None = None
+    gpkg_out: Path | None = None
+    osmand_out: Path | None = None
+    bundle_out: Path | None = None
 
     if export_format == ExportFormat.MBTILES:
         mbt_out = out
     elif export_format == ExportFormat.KMZ:
         kmz_out = out
+    elif export_format == ExportFormat.GPKG:
+        gpkg_out = out
+    elif export_format == ExportFormat.OSMAND:
+        osmand_out = out
+    elif export_format == ExportFormat.BUNDLE:
+        bundle_out = out
     elif export_format == ExportFormat.BOTH:
         if out.is_dir() or str(output_path).endswith(("/", "\\")):
             out.mkdir(parents=True, exist_ok=True)
@@ -1135,6 +1267,9 @@ def run_export_job(
             workspace,
             mbtiles_out=mbt_out,
             kmz_out=kmz_out,
+            gpkg_out=gpkg_out,
+            osmand_out=osmand_out,
+            field_bundle_out=bundle_out,
             mbtiles_format=mbtiles_format,
             garmin_profile=garmin_profile,
             max_tiles=max_tiles,

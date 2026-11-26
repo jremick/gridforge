@@ -14,6 +14,7 @@ import typer
 from gridforge.config import (
     VALID_SCALES,
     AUOverlayKind,
+    CAOverlayKind,
     CartoOptions,
     ColorMode,
     DemSourceKind,
@@ -25,7 +26,9 @@ from gridforge.config import (
     NZOverlayKind,
     Orientation,
     PaperSize,
+    RFLinkSpec,
     SheetSpec,
+    TacticalGraphic,
     Units,
     USOverlayKind,
     ViewshedObserver,
@@ -57,9 +60,13 @@ app.add_typer(pack_app, name="pack")
 class PackDemTier(str, Enum):
     """Supported DEM tiers when building an offline regional pack."""
 
+    AUTO = "auto"
     SRTM_1S = "srtm-1s"
     GLO30 = "glo30"
     AU_ELVIS = "au-elvis"
+    NZ_LINZ = "nz-linz"
+    USGS3DEP = "usgs3dep"
+    CA_HRDEM = "ca-hrdem"
 
 
 def _format_bytes(num_bytes: int) -> str:
@@ -170,6 +177,138 @@ def _parse_viewsheds(raw_viewsheds: list[str] | None) -> list[ViewshedObserver]:
     return parsed
 
 
+def _parse_rf_links(raw_links: list[str] | None) -> list[RFLinkSpec]:
+    """Parse repeatable ``--rf-link 'from_lat,from_lon,to_lat,to_lon[,freq_mhz[,from_h_m[,to_h_m[,from_label[,to_label]]]]]'``."""
+    parsed: list[RFLinkSpec] = []
+    for idx, raw in enumerate(raw_links or [], start=1):
+        parts = [p.strip() for p in raw.split(",", maxsplit=8)]
+        if len(parts) < 4:
+            raise typer.BadParameter(
+                f"Invalid --rf-link '{raw}'. Expected "
+                "'from_lat,from_lon,to_lat,to_lon[,freq_mhz[,from_h_m[,to_h_m[,from_label[,to_label]]]]]'"
+            )
+        try:
+            from_lat = float(parts[0])
+            from_lon = float(parts[1])
+            to_lat = float(parts[2])
+            to_lon = float(parts[3])
+            freq_mhz = float(parts[4]) if len(parts) >= 5 and parts[4] else 915.0
+            from_h = float(parts[5]) if len(parts) >= 6 and parts[5] else 2.0
+            to_h = float(parts[6]) if len(parts) >= 7 and parts[6] else 2.0
+        except ValueError as exc:
+            raise typer.BadParameter(
+                f"Invalid numeric field in --rf-link '{raw}'."
+            ) from exc
+
+        from_label = parts[7] if len(parts) >= 8 and parts[7] else f"TX{idx}"
+        to_label = parts[8] if len(parts) >= 9 and parts[8] else f"RX{idx}"
+        try:
+            parsed.append(
+                RFLinkSpec(
+                    from_lat=from_lat,
+                    from_lon=from_lon,
+                    to_lat=to_lat,
+                    to_lon=to_lon,
+                    freq_mhz=freq_mhz,
+                    from_height_m=from_h,
+                    to_height_m=to_h,
+                    from_label=from_label,
+                    to_label=to_label,
+                )
+            )
+        except Exception as exc:
+            raise typer.BadParameter(f"Invalid --rf-link '{raw}': {exc}") from exc
+    return parsed
+
+
+def _parse_range_rings(raw_rings: list[str] | None) -> list[TacticalGraphic]:
+    """Parse repeatable ``--range-ring 'lat,lon[,r1/r2/r3[,label]]'`` CLI strings."""
+    parsed: list[TacticalGraphic] = []
+    for raw in raw_rings or []:
+        parts = [p.strip() for p in raw.split(",", maxsplit=3)]
+        if len(parts) < 2:
+            raise typer.BadParameter(
+                f"Invalid --range-ring '{raw}'. Expected 'lat,lon[,r1/r2/r3[,label]]'."
+            )
+        try:
+            lat = float(parts[0])
+            lon = float(parts[1])
+        except ValueError as exc:
+            raise typer.BadParameter(f"Invalid coordinates in --range-ring '{raw}'.") from exc
+
+        radii_km: list[float] = [1.0, 3.0, 5.0]
+        if len(parts) >= 3 and parts[2]:
+            tokens = [
+                t.strip()
+                for t in parts[2].replace(":", "/").replace(";", "/").replace("|", "/").split("/")
+                if t.strip()
+            ]
+            try:
+                radii_km = [float(t) for t in tokens]
+            except ValueError as exc:
+                raise typer.BadParameter(
+                    f"Invalid radii '{parts[2]}' in --range-ring '{raw}'. Use e.g. '1:3:5' or '1/3/5'."
+                ) from exc
+            if not radii_km:
+                raise typer.BadParameter(f"At least one positive radius is required in --range-ring '{raw}'.")
+
+        label = parts[3] if len(parts) >= 4 else ""
+        try:
+            parsed.append(
+                TacticalGraphic(
+                    kind="range_ring",
+                    label=label,
+                    points=[(lat, lon)],
+                    radii_km=radii_km,
+                )
+            )
+        except Exception as exc:
+            raise typer.BadParameter(f"Invalid --range-ring '{raw}': {exc}") from exc
+    return parsed
+
+
+def _parse_tactical_lines(raw_lines: list[str] | None) -> list[TacticalGraphic]:
+    """Parse repeatable ``--tactical-line 'lat1,lon1,lat2,lon2[,label]'`` or ``'lat1,lon1;lat2,lon2[;...][,label]'``."""
+    parsed: list[TacticalGraphic] = []
+    for raw in raw_lines or []:
+        pts: list[tuple[float, float]] = []
+        label = ""
+        if ";" in raw:
+            segs = [s.strip() for s in raw.split(";") if s.strip()]
+            for idx_s, seg in enumerate(segs):
+                sp = [p.strip() for p in seg.split(",", maxsplit=2)]
+                if len(sp) < 2:
+                    raise typer.BadParameter(
+                        f"Invalid --tactical-line '{raw}'. Expected 'lat1,lon1,lat2,lon2[,label]' or 'lat1,lon1;lat2,lon2[,label]'."
+                    )
+                try:
+                    pts.append((float(sp[0]), float(sp[1])))
+                except ValueError as exc:
+                    raise typer.BadParameter(f"Invalid coordinate in --tactical-line '{raw}'.") from exc
+                if idx_s == len(segs) - 1 and len(sp) >= 3:
+                    label = sp[2]
+        else:
+            parts = [p.strip() for p in raw.split(",", maxsplit=4)]
+            if len(parts) < 4:
+                raise typer.BadParameter(
+                    f"Invalid --tactical-line '{raw}'. Expected 'lat1,lon1,lat2,lon2[,label]'."
+                )
+            try:
+                pts = [(float(parts[0]), float(parts[1])), (float(parts[2]), float(parts[3]))]
+            except ValueError as exc:
+                raise typer.BadParameter(f"Invalid coordinates in --tactical-line '{raw}'.") from exc
+            if len(parts) >= 5:
+                label = parts[4]
+
+        if len(pts) < 2:
+            raise typer.BadParameter(f"--tactical-line '{raw}' requires at least 2 coordinate pairs.")
+        try:
+            parsed.append(TacticalGraphic(kind="bearing_line", label=label, points=pts))
+        except Exception as exc:
+            raise typer.BadParameter(f"Invalid --tactical-line '{raw}': {exc}") from exc
+    return parsed
+
+
 def _build_spec(
     *,
     center: str,
@@ -186,12 +325,16 @@ def _build_spec(
     us_overlays: list[USOverlayKind] | None = None,
     au_overlays: list[AUOverlayKind] | None = None,
     nz_overlays: list[NZOverlayKind] | None = None,
+    ca_overlays: list[CAOverlayKind] | None = None,
     waypoints: list[WaypointInput] | None = None,
     viewsheds: list[ViewshedObserver] | None = None,
+    rf_links: list[RFLinkSpec] | None = None,
+    tactical_graphics: list[TacticalGraphic] | None = None,
     include_calibration_page: bool = False,
     include_route_card: bool = False,
     include_elevation_profile: bool = False,
     include_atlas_index: bool = False,
+    include_rf_link_card: bool = False,
     show_fold_marks: bool = False,
     carto: CartoOptions | None = None,
 ) -> SheetSpec:
@@ -221,12 +364,16 @@ def _build_spec(
         us_overlays=list(dict.fromkeys(us_overlays or [])),
         au_overlays=list(dict.fromkeys(au_overlays or [])),
         nz_overlays=list(dict.fromkeys(nz_overlays or [])),
+        ca_overlays=list(dict.fromkeys(ca_overlays or [])),
         waypoints=list(waypoints or []),
         viewsheds=list(viewsheds or []),
+        rf_links=list(rf_links or []),
+        tactical_graphics=list(tactical_graphics or []),
         include_calibration_page=include_calibration_page,
         include_route_card=include_route_card,
         include_elevation_profile=include_elevation_profile,
         include_atlas_index=include_atlas_index,
+        include_rf_link_card=include_rf_link_card,
         show_fold_marks=show_fold_marks,
         carto=carto if carto is not None else CartoOptions(),
     )
@@ -275,9 +422,10 @@ def render_cmd(
     mode: ColorMode = typer.Option(
         ColorMode.COLOR,
         "--mode",
+        "--color-mode",
         "-m",
         case_sensitive=False,
-        help="Cartographic theme (color, bw).",
+        help="Cartographic theme (color, bw, night-red, alpine).",
     ),
     units: Units = typer.Option(
         Units.METRIC,
@@ -314,13 +462,13 @@ def render_cmd(
         DemSourceKind.AUTO,
         "--dem-source",
         case_sensitive=False,
-        help="Elevation source selection (auto, glo30, usgs3dep, au-elvis, nz-linz).",
+        help="Elevation source selection (auto, glo30, usgs3dep, au-elvis, nz-linz, ca-hrdem).",
     ),
     us_overlay: Optional[list[USOverlayKind]] = typer.Option(
         None,
         "--us-overlay",
         case_sensitive=False,
-        help="Optional US public-domain overlay (fema, nhd, towers, enc); repeatable.",
+        help="Optional US public-domain overlay (fema, nhd, towers, enc, us-trails, us-public-lands); repeatable.",
     ),
     au_overlay: Optional[list[AUOverlayKind]] = typer.Option(
         None,
@@ -337,6 +485,12 @@ def render_cmd(
         "--nz-overlay",
         case_sensitive=False,
         help="Optional New Zealand CC BY 4.0 overlay (nz-doc-trails); repeatable.",
+    ),
+    ca_overlay: Optional[list[CAOverlayKind]] = typer.Option(
+        None,
+        "--ca-overlay",
+        case_sensitive=False,
+        help="Optional Canada OGL-Canada overlay (ca-canvec-trails); repeatable.",
     ),
     pack: Optional[Path] = typer.Option(
         None,
@@ -396,6 +550,21 @@ def render_cmd(
         "--viewshed",
         help='Add an RF/LOS viewshed observer as "lat,lon[,obs_m[,tgt_m[,max_km[,label]]]]"; repeatable.',
     ),
+    rf_link: Optional[list[str]] = typer.Option(
+        None,
+        "--rf-link",
+        help='Add a point-to-point RF Fresnel link as "from_lat,from_lon,to_lat,to_lon[,freq_mhz[,from_h[,to_h[,from_lbl[,to_lbl]]]]]"; repeatable.',
+    ),
+    range_ring: Optional[list[str]] = typer.Option(
+        None,
+        "--range-ring",
+        help='Add concentric tactical range rings as "lat,lon[,r1/r2/r3[,label]]" (km); repeatable.',
+    ),
+    tactical_line: Optional[list[str]] = typer.Option(
+        None,
+        "--tactical-line",
+        help='Add a tactical bearing line as "lat1,lon1,lat2,lon2[,label]"; repeatable.',
+    ),
     calibration_page: bool = typer.Option(
         False,
         "--calibration-page/--no-calibration-page",
@@ -416,6 +585,11 @@ def render_cmd(
         "--atlas-index/--no-atlas-index",
         help="Prepend a vector Atlas Overview & Sheet Index cover page for multi-sheet / strip atlases.",
     ),
+    rf_link_card: bool = typer.Option(
+        False,
+        "--rf-link-card/--no-rf-link-card",
+        help="Append a curved-Earth RF / Fresnel Link Budget & Profile Card page for --rf-link links.",
+    ),
     fold_marks: bool = typer.Option(
         False,
         "--fold-marks/--no-fold-marks",
@@ -430,6 +604,21 @@ def render_cmd(
         None,
         "--kmz",
         help="Also export a Garmin Custom Maps KMZ archive of the exact same map area.",
+    ),
+    gpkg: Optional[Path] = typer.Option(
+        None,
+        "--gpkg",
+        help="Also export an OGC GeoPackage (.gpkg) raster tile pyramid of the exact same map area.",
+    ),
+    osmand: Optional[Path] = typer.Option(
+        None,
+        "--osmand",
+        help="Also export an OsmAnd (.sqlitedb) offline raster map archive of the exact same map area.",
+    ),
+    field_bundle: Optional[Path] = typer.Option(
+        None,
+        "--field-bundle",
+        help="Also package a Field Bundle (.zip) with PDF, requested device archives, GPX 1.1, and README.",
     ),
     garmin_profile: GarminProfile = typer.Option(
         GarminProfile.STANDARD,
@@ -511,6 +700,11 @@ def render_cmd(
     )
     parsed_waypoints = _parse_waypoints(waypoint)
     parsed_viewsheds = _parse_viewsheds(viewshed)
+    parsed_rf_links = _parse_rf_links(rf_link)
+    parsed_tactical = [
+        *_parse_range_rings(range_ring),
+        *_parse_tactical_lines(tactical_line),
+    ]
 
     elev_src: ElevationSource | None = LocalDEMSource(offline_dem) if offline_dem is not None else None
     vec_src: VectorSource | None = LocalPBFSource(offline_pbf) if offline_pbf is not None else None
@@ -537,13 +731,17 @@ def render_cmd(
             us_overlays=us_overlay,
             au_overlays=au_overlay,
             nz_overlays=nz_overlay,
+            ca_overlays=ca_overlay,
             carto=carto,
             waypoints=parsed_waypoints,
             viewsheds=parsed_viewsheds,
+            rf_links=parsed_rf_links,
+            tactical_graphics=parsed_tactical,
             include_calibration_page=calibration_page,
             include_route_card=route_card,
             include_elevation_profile=elevation_profile,
             include_atlas_index=atlas_index,
+            include_rf_link_card=rf_link_card,
             show_fold_marks=fold_marks,
             overlap_pct=overlap_pct,
             elevation_source=elev_src,
@@ -570,12 +768,16 @@ def render_cmd(
             us_overlays=us_overlay,
             au_overlays=au_overlay,
             nz_overlays=nz_overlay,
+            ca_overlays=ca_overlay,
             waypoints=parsed_waypoints,
             viewsheds=parsed_viewsheds,
+            rf_links=parsed_rf_links,
+            tactical_graphics=parsed_tactical,
             include_calibration_page=calibration_page,
             include_route_card=route_card,
             include_elevation_profile=elevation_profile,
             include_atlas_index=atlas_index,
+            include_rf_link_card=rf_link_card,
             show_fold_marks=fold_marks,
             carto=carto,
         )
@@ -590,6 +792,9 @@ def render_cmd(
             work_dir=work_dir,
             mbtiles_out=mbtiles,
             kmz_out=kmz,
+            gpkg_out=gpkg,
+            osmand_out=osmand,
+            field_bundle_out=field_bundle,
             mbtiles_format=mbtiles_format,
             garmin_profile=garmin_profile,
             max_tiles=max_tiles,
@@ -609,6 +814,12 @@ def render_cmd(
             typer.echo(f"Exported ATAK MBTiles: {mbtiles}")
         if kmz is not None:
             typer.echo(f"Exported Garmin KMZ: {kmz}")
+        if gpkg is not None:
+            typer.echo(f"Exported GeoPackage Raster Tiles: {gpkg}")
+        if osmand is not None:
+            typer.echo(f"Exported OsmAnd SQLiteDB: {osmand}")
+        if field_bundle is not None:
+            typer.echo(f"Exported Field Bundle ZIP: {field_bundle}")
         if result.workspace_dir is not None:
             typer.echo(f"Workspace retained at: {result.workspace_dir}")
 
@@ -644,9 +855,10 @@ def export_cmd(
     mode: ColorMode = typer.Option(
         ColorMode.COLOR,
         "--mode",
+        "--color-mode",
         "-m",
         case_sensitive=False,
-        help="Cartographic theme (color, bw).",
+        help="Cartographic theme (color, bw, night-red, alpine).",
     ),
     units: Units = typer.Option(
         Units.METRIC,
@@ -660,7 +872,7 @@ def export_cmd(
         "--format",
         "-f",
         case_sensitive=False,
-        help="Offline device archive format (mbtiles, kmz, both).",
+        help="Offline device archive format (mbtiles, kmz, both, gpkg, osmand, bundle).",
     ),
     output: Path = typer.Option(
         ...,
@@ -692,13 +904,13 @@ def export_cmd(
         DemSourceKind.AUTO,
         "--dem-source",
         case_sensitive=False,
-        help="Elevation source selection (auto, glo30, usgs3dep, au-elvis, nz-linz).",
+        help="Elevation source selection (auto, glo30, usgs3dep, au-elvis, nz-linz, ca-hrdem).",
     ),
     us_overlay: Optional[list[USOverlayKind]] = typer.Option(
         None,
         "--us-overlay",
         case_sensitive=False,
-        help="Optional US public-domain overlay (fema, nhd, towers, enc); repeatable.",
+        help="Optional US public-domain overlay (fema, nhd, towers, enc, us-trails, us-public-lands); repeatable.",
     ),
     au_overlay: Optional[list[AUOverlayKind]] = typer.Option(
         None,
@@ -715,6 +927,12 @@ def export_cmd(
         "--nz-overlay",
         case_sensitive=False,
         help="Optional New Zealand CC BY 4.0 overlay (nz-doc-trails); repeatable.",
+    ),
+    ca_overlay: Optional[list[CAOverlayKind]] = typer.Option(
+        None,
+        "--ca-overlay",
+        case_sensitive=False,
+        help="Optional Canada OGL-Canada overlay (ca-canvec-trails); repeatable.",
     ),
     pack: Optional[Path] = typer.Option(
         None,
@@ -769,6 +987,21 @@ def export_cmd(
         "--viewshed",
         help='Add an RF/LOS viewshed observer as "lat,lon[,obs_m[,tgt_m[,max_km[,label]]]]"; repeatable.',
     ),
+    rf_link: Optional[list[str]] = typer.Option(
+        None,
+        "--rf-link",
+        help='Add a point-to-point RF Fresnel link as "from_lat,from_lon,to_lat,to_lon[,freq_mhz[,from_h[,to_h[,from_lbl[,to_lbl]]]]]"; repeatable.',
+    ),
+    range_ring: Optional[list[str]] = typer.Option(
+        None,
+        "--range-ring",
+        help='Add concentric tactical range rings as "lat,lon[,r1/r2/r3[,label]]" (km); repeatable.',
+    ),
+    tactical_line: Optional[list[str]] = typer.Option(
+        None,
+        "--tactical-line",
+        help='Add a tactical bearing line as "lat1,lon1,lat2,lon2[,label]"; repeatable.',
+    ),
     offline_dem: Optional[Path] = typer.Option(None, "--offline-dem", help="Local GeoTIFF/VRT or directory of DEMs."),
     offline_pbf: Optional[Path] = typer.Option(None, "--offline-pbf", help="Local .osm.pbf or .osm XML file."),
     overlay: Optional[list[Path]] = typer.Option(None, "--overlay", help="Optional user overlay (.geojson, .gpx, .csv)."),
@@ -778,7 +1011,7 @@ def export_cmd(
     json_output: bool = typer.Option(False, "--json/--no-json", help="Print ExportResult list as JSON."),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging."),
 ) -> None:
-    """Export an offline ATAK ``.mbtiles`` and/or Garmin Custom Maps ``.kmz`` archive."""
+    """Export an offline ATAK ``.mbtiles``, Garmin ``.kmz``, GeoPackage ``.gpkg``, OsmAnd ``.sqlitedb``, or Field Bundle ``.zip``."""
     _configure_logging(verbose)
 
     carto = CartoOptions(
@@ -807,8 +1040,11 @@ def export_cmd(
         us_overlays=us_overlay,
         au_overlays=au_overlay,
         nz_overlays=nz_overlay,
+        ca_overlays=ca_overlay,
         waypoints=_parse_waypoints(waypoint),
         viewsheds=_parse_viewsheds(viewshed),
+        rf_links=_parse_rf_links(rf_link),
+        tactical_graphics=[*_parse_range_rings(range_ring), *_parse_tactical_lines(tactical_line)],
         carto=carto,
     )
 
@@ -1003,7 +1239,12 @@ def pack_list_regions_cmd(
     category: Optional[str] = typer.Option(
         None,
         "--category",
-        help="Optional filter: 'state' (8 AU states/territories) or 'tactical' (7 tactical regions).",
+        help="Optional filter: 'state' or 'tactical'.",
+    ),
+    group: Optional[str] = typer.Option(
+        None,
+        "--group",
+        help="Optional region group filter: 'au_tactical', 'au_state', 'nz', or 'na'.",
     ),
     json_output: bool = typer.Option(
         False,
@@ -1011,10 +1252,16 @@ def pack_list_regions_cmd(
         help="Output machine-readable JSON instead of a formatted table.",
     ),
 ) -> None:
-    """List curated Australian states/territories and tactical region presets for offline packs."""
-    from gridforge.packs.catalog import list_regions
+    """List curated global region presets (AU, NZ, North America) for offline packs."""
+    from gridforge.packs.regions import REGION_GROUPS, list_regions
 
-    regions = list_regions()
+    if group is not None:
+        grp_norm = group.strip().lower()
+        if grp_norm not in REGION_GROUPS:
+            raise typer.BadParameter(f"Invalid --group. Choose one of: {', '.join(REGION_GROUPS)}.")
+        regions = list_regions(group=grp_norm)
+    else:
+        regions = list_regions()
     if category is not None:
         cat_norm = category.strip().lower()
         if cat_norm not in ("state", "tactical"):
@@ -1025,11 +1272,11 @@ def pack_list_regions_cmd(
         typer.echo(json.dumps([json.loads(r.model_dump_json()) for r in regions], indent=2))
         return
 
-    header = ("REGION ID", "CATEGORY", "NAME", "UTM ZONES", "EST. SIZE")
+    header = ("REGION ID", "GROUP", "NAME", "UTM ZONES", "EST. SIZE")
     table_rows = [
         (
             r.region_id,
-            r.category,
+            r.group,
             r.name,
             ",".join(r.utm_zones),
             r.estimated_size_hint or "-",
@@ -1053,7 +1300,7 @@ def pack_build_cmd(
         ...,
         "--region",
         "-r",
-        help='Catalog region ID (e.g. "tas", "blue-mountains", "red-centre") or custom "w,s,e,n" WGS84 bbox.',
+        help='Catalog region ID (e.g. "tas", "blue-mountains", "nz-tongariro", "us-rockies", "ca-banff") or custom "w,s,e,n" WGS84 bbox.',
     ),
     output: Path = typer.Option(
         ...,
@@ -1070,7 +1317,7 @@ def pack_build_cmd(
     source_pbf: Optional[Path] = typer.Option(
         None,
         "--source-pbf",
-        help="Optional local .osm.pbf/.osm file to extract from instead of downloading Geofabrik Australia.",
+        help="Optional local .osm.pbf/.osm file to extract from instead of downloading Geofabrik.",
     ),
     source_dem: Optional[Path] = typer.Option(
         None,
@@ -1078,17 +1325,22 @@ def pack_build_cmd(
         help="Optional local GeoTIFF/VRT DEM to clip from instead of streaming cloud elevation.",
     ),
     dem_tier: PackDemTier = typer.Option(
-        PackDemTier.SRTM_1S,
+        PackDemTier.AUTO,
         "--dem-tier",
         case_sensitive=False,
-        help="Elevation source tier (srtm-1s, glo30, au-elvis).",
+        help="Elevation source tier (auto, srtm-1s, glo30, au-elvis, nz-linz, usgs3dep, ca-hrdem).",
     ),
     include_osm: bool = typer.Option(True, "--osm/--no-osm", help="Include clipped OSM PBF in pack."),
     include_dem: bool = typer.Option(True, "--dem/--no-dem", help="Include compressed DEM GeoTIFF in pack."),
     include_overlays: bool = typer.Option(
         True,
         "--overlays/--no-overlays",
-        help="Include Australian CC BY 4.0 national overlays (hydro, parks, infra, aviation).",
+        help="Include regional open-data overlays (AU/NZ/US/CA).",
+    ),
+    include_basemap: bool = typer.Option(
+        True,
+        "--basemap/--no-basemap",
+        help="Generate an air-gapped terrain basemap.mbtiles (zoom 7–12) inside the pack.",
     ),
     overlay_tile_deg: float = typer.Option(
         1.0,
@@ -1122,9 +1374,13 @@ def pack_build_cmd(
             include_osm=include_osm,
             include_dem=include_dem,
             include_overlays=include_overlays,
+            include_basemap=include_basemap,
             source_pbf=source_pbf,
             source_dem=source_dem,
-            dem_tier=cast(Literal["srtm-1s", "glo30", "au-elvis"], dem_tier.value),
+            dem_tier=cast(
+                Literal["auto", "srtm-1s", "glo30", "au-elvis", "nz-linz", "usgs3dep", "ca-hrdem"],
+                dem_tier.value,
+            ),
             cache_dir=cache_dir,
             overlay_tile_deg=overlay_tile_deg,
         )
@@ -1138,7 +1394,88 @@ def pack_build_cmd(
     typer.echo(
         f"Built offline pack '{manifest.pack_id}' ({manifest.name}) at {output.resolve()} "
         f"[{_format_bytes(manifest.size_bytes)}, UTM {', '.join(manifest.utm_zones)}, "
-        f"datum={manifest.vertical_datum}, overlays={len(manifest.overlays)}]"
+        f"datum={manifest.vertical_datum}, overlays={len(manifest.overlays)}, "
+        f"basemap={'yes' if manifest.basemap_path else 'no'}]"
+    )
+
+
+@app.command("basemap-pack")
+def basemap_pack_cmd(
+    region: str = typer.Option(
+        ...,
+        "--region",
+        "-r",
+        help='Catalog region ID (e.g. "blue-mountains", "nz-tongariro", "us-rockies", "ca-banff") or custom "w,s,e,n" WGS84 bbox.',
+    ),
+    output: Path = typer.Option(
+        ...,
+        "--output",
+        "-O",
+        help="Destination air-gapped terrain basemap .mbtiles file path.",
+    ),
+    source_dem: Optional[Path] = typer.Option(
+        None,
+        "--source-dem",
+        help="Optional local GeoTIFF/VRT DEM to render from without network access.",
+    ),
+    min_zoom: int = typer.Option(7, "--min-zoom", min=4, max=14, help="Minimum basemap Web Mercator zoom (default 7)."),
+    max_zoom: int = typer.Option(12, "--max-zoom", min=4, max=15, help="Maximum basemap Web Mercator zoom (default 12)."),
+    name: Optional[str] = typer.Option(None, "--name", "-n", help="Optional MBTiles metadata name."),
+    tile_format: MBTilesFormat = typer.Option(
+        MBTilesFormat.JPG,
+        "--tile-format",
+        case_sensitive=False,
+        help="Basemap tile image format (jpg, png).",
+    ),
+    cache_dir: Optional[Path] = typer.Option(
+        None,
+        "--cache-dir",
+        help="Optional download cache directory (defaults to GRIDFORGE_CACHE_DIR).",
+    ),
+    json_output: bool = typer.Option(False, "--json/--no-json", help="Print build metadata as JSON."),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging."),
+) -> None:
+    """Build a standalone air-gapped hypsometric + hillshade terrain ``basemap.mbtiles`` for Studio."""
+    from gridforge.packs.basemap_builder import build_basemap_for_region
+
+    _configure_logging(verbose)
+    if min_zoom > max_zoom:
+        raise typer.BadParameter("--min-zoom must be less than or equal to --max-zoom.")
+
+    try:
+        out_path = build_basemap_for_region(
+            region,
+            output,
+            source_dem=source_dem,
+            min_zoom=min_zoom,
+            max_zoom=max_zoom,
+            name=name,
+            tile_format=cast(Literal["png", "jpg"], tile_format.value),
+            cache_dir=cache_dir,
+        )
+    except (ValueError, FileNotFoundError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    size_bytes = out_path.stat().st_size if out_path.is_file() else 0
+    if json_output:
+        typer.echo(
+            json.dumps(
+                {
+                    "output_mbtiles": str(out_path),
+                    "region": region,
+                    "min_zoom": min_zoom,
+                    "max_zoom": max_zoom,
+                    "tile_format": tile_format.value,
+                    "size_bytes": size_bytes,
+                },
+                indent=2,
+            )
+        )
+        return
+
+    typer.echo(
+        f"Built offline terrain basemap {out_path} "
+        f"[{_format_bytes(size_bytes)}, z{min_zoom}..z{max_zoom}, {tile_format.value.upper()}]"
     )
 
 
@@ -1190,6 +1527,7 @@ def pack_inspect_cmd(
             else "none",
         ),
         ("OSM PBF", manifest.osm_pbf_path or "none"),
+        ("Offline Basemap", manifest.basemap_path or "none"),
         ("Overlays", overlays_str),
         ("Attributions", " | ".join(manifest.attributions) if manifest.attributions else "none"),
     ]

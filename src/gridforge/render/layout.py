@@ -12,13 +12,15 @@ from typing import Any
 
 from gridforge.config import (
     AU_STATE_TRAIL_OVERLAY_KINDS,
+    CAOverlayKind,
     ColorMode,
     GridTick,
     JobWorkspace,
     NZOverlayKind,
     SheetLayout,
+    USOverlayKind,
 )
-from gridforge.render.styles import DEFAULT_FONT_FAMILY, map_background_hex
+from gridforge.render.styles import DEFAULT_FONT_FAMILY, _is_bw, _pal, map_background_hex
 
 _AU_STATE_TRAIL_KEYS: frozenset[str] = frozenset(
     {k.value for k in AU_STATE_TRAIL_OVERLAY_KINDS}
@@ -27,7 +29,21 @@ _AU_STATE_TRAIL_KEYS: frozenset[str] = frozenset(
 _NZ_TRAIL_KEYS: frozenset[str] = frozenset(
     {NZOverlayKind.NZ_DOC_TRAILS.value, NZOverlayKind.NZ_DOC_TRAILS.value.replace("-", "_")}
 )
-_ALL_TRAIL_OVERLAY_KEYS: frozenset[str] = _AU_STATE_TRAIL_KEYS | _NZ_TRAIL_KEYS
+_NA_TRAIL_KEYS: frozenset[str] = frozenset(
+    {
+        USOverlayKind.US_TRAILS.value,
+        USOverlayKind.US_TRAILS.value.replace("-", "_"),
+        CAOverlayKind.CA_CANVEC_TRAILS.value,
+        CAOverlayKind.CA_CANVEC_TRAILS.value.replace("-", "_"),
+    }
+)
+_PUBLIC_LANDS_KEYS: frozenset[str] = frozenset(
+    {
+        USOverlayKind.US_PUBLIC_LANDS.value,
+        USOverlayKind.US_PUBLIC_LANDS.value.replace("-", "_"),
+    }
+)
+_ALL_TRAIL_OVERLAY_KEYS: frozenset[str] = _AU_STATE_TRAIL_KEYS | _NZ_TRAIL_KEYS | _NA_TRAIL_KEYS
 
 # Per-scale metric & imperial scale bar parameters calibrated to fit cleanly in ~40 mm width.
 # Format: (units_per_segment, segments_left, segments_right, unit_label, subdivision_count)
@@ -238,9 +254,8 @@ def _render_mgrs_ticks(
 ) -> None:
     """Draw exact 2.0 mm outward ticks and military principal-digit labels on all 4 edges."""
     tick_len = 2.0
-    is_color = color_mode == ColorMode.COLOR
-    tick_color = "#1B4F72" if is_color else "#000000"
-    text_color = "#10324A" if is_color else "#000000"
+    tick_color = _pal(color_mode, "grid_1km")
+    text_color = _pal(color_mode, "grid_100km")
 
     fx = layout.frame_x_mm
     fy = layout.frame_y_mm
@@ -603,7 +618,7 @@ def _render_compact_map_key(
     workspace: JobWorkspace | None = None,
 ) -> None:
     """Draw a deterministic, non-overlapping vector cartographic key legend in Col 4."""
-    is_color = color_mode == ColorMode.COLOR
+    bw = _is_bw(color_mode)
     regional = (workspace.regional_overlays or {}) if workspace is not None else {}
     carto = workspace.layout.spec.carto if workspace is not None else None
 
@@ -638,7 +653,11 @@ def _render_compact_map_key(
     has_au_aviation = ("au-aviation" in regional) or ("au_aviation" in regional)
     has_au_state_trails = any(k in regional for k in _AU_STATE_TRAIL_KEYS)
     has_nz_trails = any(k in regional for k in _NZ_TRAIL_KEYS)
-    has_state_or_nz_trails = has_au_state_trails or has_nz_trails
+    has_na_trails = any(k in regional for k in _NA_TRAIL_KEYS)
+    has_state_or_regional_trails = has_au_state_trails or has_nz_trails or has_na_trails
+    has_public_lands = any(k in regional for k in _PUBLIC_LANDS_KEYS) or (
+        ("ca-canvec-trails" in regional or "ca_canvec_trails" in regional) and not has_au_parks
+    )
     has_slope = bool(
         workspace is not None
         and workspace.slope_tif is not None
@@ -650,6 +669,11 @@ def _render_compact_map_key(
         workspace is not None
         and workspace.viewshed_tif is not None
         and workspace.viewshed_tif.is_file()
+    )
+    has_tactical = bool(
+        workspace is not None
+        and workspace.tactical_graphics_gpkg is not None
+        and workspace.tactical_graphics_gpkg.is_file()
     )
     has_waypoints = bool(
         workspace is not None
@@ -666,18 +690,24 @@ def _render_compact_map_key(
             8
             + int(has_infra)
             + int(has_us_row or has_au_row)
-            + int(has_state_or_nz_trails)
+            + int(has_public_lands)
+            + int(has_state_or_regional_trails)
             + int(has_slope)
             + int(has_viewshed)
+            + int(has_tactical)
             + int(has_waypoints)
         )
 
     if _count_rows() > 11:
         has_infra = False
-    if _count_rows() > 11 and has_au_row and has_state_or_nz_trails:
+    if _count_rows() > 11 and has_au_row and has_state_or_regional_trails:
         has_au_row = False
     if _count_rows() > 11 and has_au_row:
         has_au_row = False
+    if _count_rows() > 11 and has_us_row:
+        has_us_row = False
+    if _count_rows() > 11 and has_waypoints and has_tactical:
+        has_waypoints = False
 
     total_rows = _count_rows()
     meta_y = y_mm + h_mm - 4.7
@@ -698,13 +728,13 @@ def _render_compact_map_key(
     idx = 0
     # Row: Major Highway / Road
     ry = _ry(idx); idx += 1
-    _add_line(print_layout, sx1, ry, sx2, ry, color_hex="#5E1D12" if is_color else "#000000", width_mm=1.0)
-    _add_line(print_layout, sx1 + 0.15, ry, sx2 - 0.15, ry, color_hex="#D97925" if is_color else "#C8C8C8", width_mm=0.60)
+    _add_line(print_layout, sx1, ry, sx2, ry, color_hex=_pal(color_mode, "motorway_casing"), width_mm=1.0)
+    _add_line(print_layout, sx1 + 0.15, ry, sx2 - 0.15, ry, color_hex=_pal(color_mode, "primary_fill"), width_mm=0.60)
     _add_label(print_layout, "Major Road", lbl_x, ry - 1.15, lbl_w, 2.3, size_pt=lbl_pt, valign="center")
 
     # Row: Secondary / Minor Road
     ry = _ry(idx); idx += 1
-    _add_line(print_layout, sx1, ry, sx2, ry, color_hex="#4A4A4A" if is_color else "#222222", width_mm=0.68)
+    _add_line(print_layout, sx1, ry, sx2, ry, color_hex=_pal(color_mode, "tertiary_casing"), width_mm=0.68)
     _add_line(print_layout, sx1 + 0.15, ry, sx2 - 0.15, ry, color_hex="#FFFFFF", width_mm=0.38)
     _add_label(print_layout, "Minor Road", lbl_x, ry - 1.15, lbl_w, 2.3, size_pt=lbl_pt, valign="center")
 
@@ -716,7 +746,7 @@ def _render_compact_map_key(
         ry,
         sx2,
         ry,
-        color_hex="#5E442B" if is_color else "#1A1A1A",
+        color_hex=_pal(color_mode, "track"),
         width_mm=0.28,
         dash_vector=[1.4, 0.8],
     )
@@ -724,16 +754,26 @@ def _render_compact_map_key(
 
     # Row: Railway (line + tiny ticks)
     ry = _ry(idx); idx += 1
-    _add_line(print_layout, sx1, ry, sx2, ry, color_hex="#1A1A1A", width_mm=0.26)
+    rail_c = _pal(color_mode, "rail")
+    _add_line(print_layout, sx1, ry, sx2, ry, color_hex=rail_c, width_mm=0.26)
     for tx in (sx1 + 1.3, sx1 + 3.0, sx1 + 4.7):
-        _add_line(print_layout, tx, ry - 0.55, tx, ry + 0.55, color_hex="#1A1A1A", width_mm=0.20)
+        _add_line(print_layout, tx, ry - 0.55, tx, ry + 0.55, color_hex=rail_c, width_mm=0.20)
     _add_label(print_layout, "Railway", lbl_x, ry - 1.15, lbl_w, 2.3, size_pt=lbl_pt, valign="center")
 
     # Row: Water / Stream
     ry = _ry(idx); idx += 1
-    if is_color:
-        _add_rect(print_layout, sx1, ry - 0.7, 2.4, 1.4, fill_hex="#A6D1EC", stroke_hex="#3A82B5", stroke_mm=0.15)
-        _add_line(print_layout, sx1 + 3.0, ry, sx2, ry, color_hex="#2B79B3", width_mm=0.35)
+    if not bw:
+        _add_rect(
+            print_layout,
+            sx1,
+            ry - 0.7,
+            2.4,
+            1.4,
+            fill_hex=_pal(color_mode, "water_fill"),
+            stroke_hex=_pal(color_mode, "water_stroke"),
+            stroke_mm=0.15,
+        )
+        _add_line(print_layout, sx1 + 3.0, ry, sx2, ry, color_hex=_pal(color_mode, "river"), width_mm=0.35)
     else:
         _add_rect(print_layout, sx1, ry - 0.7, 2.4, 1.4, fill_hex="#FFFFFF", stroke_hex="#1A1A1A", stroke_mm=0.18)
         _add_line(print_layout, sx1 + 0.2, ry, sx1 + 2.2, ry, color_hex="#666666", width_mm=0.12)
@@ -742,26 +782,26 @@ def _render_compact_map_key(
 
     # Row: Index / Minor Contour
     ry = _ry(idx); idx += 1
-    _add_line(print_layout, sx1, ry - 0.3, sx2, ry - 0.3, color_hex="#8F5B28" if is_color else "#1A1A1A", width_mm=0.30)
-    _add_line(print_layout, sx1, ry + 0.4, sx2, ry + 0.4, color_hex="#A87846" if is_color else "#555555", width_mm=0.14)
+    _add_line(print_layout, sx1, ry - 0.3, sx2, ry - 0.3, color_hex=_pal(color_mode, "contour_idx"), width_mm=0.30)
+    _add_line(print_layout, sx1, ry + 0.4, sx2, ry + 0.4, color_hex=_pal(color_mode, "contour_minor"), width_mm=0.14)
     _add_label(print_layout, "Index / Contour", lbl_x, ry - 1.15, lbl_w, 2.3, size_pt=lbl_pt, valign="center")
 
     # Row: MGRS 1 km Grid
     ry = _ry(idx); idx += 1
-    _add_line(print_layout, sx1, ry, sx2, ry, color_hex="#1B4F72" if is_color else "#000000", width_mm=0.20)
+    _add_line(print_layout, sx1, ry, sx2, ry, color_hex=_pal(color_mode, "grid_1km"), width_mm=0.20)
     _add_label(print_layout, "MGRS 1 km Grid", lbl_x, ry - 1.15, lbl_w, 2.3, size_pt=lbl_pt, valign="center")
 
     # Row: Peak & Building
     ry = _ry(idx); idx += 1
-    _add_triangle(print_layout, sx1 + 0.3, ry - 0.8, 1.6, fill_hex="#111111")
+    _add_triangle(print_layout, sx1 + 0.3, ry - 0.8, 1.6, fill_hex=_pal(color_mode, "ink_dark"))
     _add_rect(
         print_layout,
         sx1 + 3.4,
         ry - 0.65,
         1.6,
         1.3,
-        fill_hex="#6E6E6E" if is_color else "#262626",
-        stroke_hex="#222222",
+        fill_hex=_pal(color_mode, "building_fill"),
+        stroke_hex=_pal(color_mode, "building_stroke"),
         stroke_mm=0.10,
     )
     _add_label(print_layout, "Peak / Building", lbl_x, ry - 1.15, lbl_w, 2.3, size_pt=lbl_pt, valign="center")
@@ -769,9 +809,10 @@ def _render_compact_map_key(
     # Row: Power / Pipeline (when active)
     if has_infra:
         ry = _ry(idx); idx += 1
-        _add_line(print_layout, sx1, ry, sx2, ry, color_hex="#555555" if is_color else "#222222", width_mm=0.18)
+        pwr_c = _pal(color_mode, "power")
+        _add_line(print_layout, sx1, ry, sx2, ry, color_hex=pwr_c, width_mm=0.18)
         for tx in (sx1 + 1.8, sx1 + 4.2):
-            _add_line(print_layout, tx, ry - 0.5, tx, ry + 0.5, color_hex="#555555" if is_color else "#222222", width_mm=0.18)
+            _add_line(print_layout, tx, ry - 0.5, tx, ry + 0.5, color_hex=pwr_c, width_mm=0.18)
         _add_label(print_layout, "Power / Pipe", lbl_x, ry - 1.15, lbl_w, 2.3, size_pt=lbl_pt, valign="center")
 
     # Row: Active US Regional Overlay (FEMA Flood / FAA Towers)
@@ -784,8 +825,8 @@ def _render_compact_map_key(
                 ry - 0.65,
                 2.5,
                 1.3,
-                fill_hex="#DCEEFF" if is_color else "#FFFFFF",
-                stroke_hex="#1565C0" if is_color else "#333333",
+                fill_hex="#DCEEFF" if not bw else "#FFFFFF",
+                stroke_hex=_pal(color_mode, "fema_stroke"),
                 stroke_mm=0.18,
             )
             _add_line(
@@ -794,13 +835,14 @@ def _render_compact_map_key(
                 ry + 0.5,
                 sx1 + 2.2,
                 ry - 0.5,
-                color_hex="#1976D2" if is_color else "#444444",
+                color_hex=_pal(color_mode, "fema_hatch"),
                 width_mm=0.14,
             )
         if has_towers:
             tx = sx1 + (4.4 if has_fema else 3.0)
-            _add_line(print_layout, tx, ry - 0.75, tx - 0.6, ry + 0.65, color_hex="#1B4F72" if is_color else "#000000", width_mm=0.22)
-            _add_line(print_layout, tx, ry - 0.75, tx + 0.6, ry + 0.65, color_hex="#1B4F72" if is_color else "#000000", width_mm=0.22)
+            tw_c = _pal(color_mode, "accent_blue")
+            _add_line(print_layout, tx, ry - 0.75, tx - 0.6, ry + 0.65, color_hex=tw_c, width_mm=0.22)
+            _add_line(print_layout, tx, ry - 0.75, tx + 0.6, ry + 0.65, color_hex=tw_c, width_mm=0.22)
         tag = "Flood / Tower" if (has_fema and has_towers) else ("FEMA Flood" if has_fema else "FAA Obstacle")
         _add_label(print_layout, tag, lbl_x, ry - 1.15, lbl_w, 2.3, size_pt=lbl_pt, valign="center")
 
@@ -814,7 +856,7 @@ def _render_compact_map_key(
                 ry,
                 sx1 + (3.2 if (has_au_hydro or has_au_aviation) else 6.0),
                 ry,
-                color_hex="#2B7A3E" if is_color else "#1A1A1A",
+                color_hex=_pal(color_mode, "park_stroke"),
                 width_mm=0.40,
                 dash_vector=[1.4, 0.7],
             )
@@ -826,7 +868,7 @@ def _render_compact_map_key(
                 ry - 0.6,
                 1.2,
                 1.2,
-                fill_hex="#1B6CA8" if (is_color and has_au_hydro) else ("#1B4F72" if is_color else "#1A1A1A"),
+                fill_hex=_pal(color_mode, "au_bore") if has_au_hydro else _pal(color_mode, "accent_blue"),
                 stroke_hex="#1A1A1A",
                 stroke_mm=0.14,
             )
@@ -840,8 +882,34 @@ def _render_compact_map_key(
             au_tag = "Bore / Waterpt"
         _add_label(print_layout, au_tag, lbl_x, ry - 1.15, lbl_w, 2.3, size_pt=lbl_pt, valign="center")
 
-    # Row: Pan-Australia State Fire Trails or New Zealand DOC Tracks / Huts / Trigs
-    if has_state_or_nz_trails:
+    # Row: US/CA Public Lands & Wilderness Areas
+    if has_public_lands:
+        ry = _ry(idx); idx += 1
+        pl_c = _pal(color_mode, "public_np_stroke")
+        _add_rect(
+            print_layout,
+            sx1,
+            ry - 0.58,
+            6.0,
+            1.16,
+            fill_hex="#E2F0E8" if not bw else "#FFFFFF",
+            stroke_hex=pl_c,
+            stroke_mm=0.14,
+        )
+        _add_line(
+            print_layout,
+            sx1,
+            ry,
+            sx2,
+            ry,
+            color_hex=pl_c,
+            width_mm=0.38,
+            dash_vector=[1.6, 0.7],
+        )
+        _add_label(print_layout, "Public Lands / Park", lbl_x, ry - 1.15, lbl_w, 2.3, size_pt=lbl_pt, valign="center")
+
+    # Row: Pan-Australia State Fire Trails, NZ DOC, or North America USFS/NPS/CanVec Trails
+    if has_state_or_regional_trails:
         ry = _ry(idx); idx += 1
         _add_line(
             print_layout,
@@ -849,22 +917,23 @@ def _render_compact_map_key(
             ry,
             sx1 + 3.8,
             ry,
-            color_hex="#D95F02" if is_color else "#000000",
+            color_hex=_pal(color_mode, "state_fire_trail"),
             width_mm=0.42,
-            dash_vector=[1.4, 0.65] if is_color else [1.5, 0.55, 0.5, 0.55],
+            dash_vector=[1.4, 0.65] if not bw else [1.5, 0.55, 0.5, 0.55],
         )
-        _add_triangle(print_layout, sx1 + 4.5, ry - 0.68, 1.35, fill_hex="#7A3E1D" if is_color else "#111111")
+        _add_triangle(print_layout, sx1 + 4.5, ry - 0.68, 1.35, fill_hex=_pal(color_mode, "poi_hut"))
         tr_lbl = "Fire Trl / Hut / Trig" if has_au_state_trails else "Tracks / Huts / Trigs"
         _add_label(print_layout, tr_lbl, lbl_x, ry - 1.15, lbl_w, 2.3, size_pt=lbl_pt, valign="center")
 
     # Row: Slope-Angle Shading (Avalanche >30 deg)
     if has_slope:
         ry = _ry(idx); idx += 1
-        swatches = (
-            ("#F6E05E", "#ED8936", "#E53E3E", "#805AD5")
-            if is_color
-            else ("#C0C0C0", "#888888", "#484848", "#181818")
-        )
+        if color_mode == ColorMode.NIGHT_RED:
+            swatches = ("#5DADE2", "#2E6DA4", "#283593", "#1A1048")
+        elif bw:
+            swatches = ("#C0C0C0", "#888888", "#484848", "#181818")
+        else:
+            swatches = ("#F6E05E", "#ED8936", "#E53E3E", "#805AD5")
         sw_w = (sx2 - sx1) / len(swatches)
         for s_idx, sw_hex in enumerate(swatches):
             _add_rect(
@@ -882,14 +951,15 @@ def _render_compact_map_key(
     # Row: RF / Line-of-Sight Viewshed Coverage
     if has_viewshed:
         ry = _ry(idx); idx += 1
+        vs_fill = "#78C2C4" if color_mode == ColorMode.NIGHT_RED else ("#B8B8B8" if bw else "#6BE6BF")
         _add_rect(
             print_layout,
             sx1,
             ry - 0.55,
             4.0,
             1.10,
-            fill_hex="#6BE6BF" if is_color else "#B8B8B8",
-            stroke_hex="#00897B" if is_color else "#222222",
+            fill_hex=vs_fill,
+            stroke_hex=_pal(color_mode, "viewshed_ring"),
             stroke_mm=0.16,
         )
         _add_rect(
@@ -898,16 +968,41 @@ def _render_compact_map_key(
             ry - 0.55,
             1.10,
             1.10,
-            fill_hex="#00695C" if is_color else "#000000",
+            fill_hex=_pal(color_mode, "viewshed_obs"),
             stroke_hex="#111111",
             stroke_mm=0.14,
         )
         _add_label(print_layout, "LOS / RF Viewshed", lbl_x, ry - 1.05, lbl_w, 2.1, size_pt=lbl_pt, valign="center")
 
+    # Row: Tactical Graphics (Range Rings, Bearing Lines, Sectors / AOIs)
+    if has_tactical:
+        ry = _ry(idx); idx += 1
+        _add_line(
+            print_layout,
+            sx1,
+            ry,
+            sx1 + 3.6,
+            ry,
+            color_hex=_pal(color_mode, "tactical_line"),
+            width_mm=0.40,
+            dash_vector=[1.6, 0.7],
+        )
+        _add_rect(
+            print_layout,
+            sx1 + 4.3,
+            ry - 0.55,
+            1.6,
+            1.10,
+            fill_hex="transparent",
+            stroke_hex=_pal(color_mode, "tactical_ring"),
+            stroke_mm=0.22,
+        )
+        _add_label(print_layout, "Tactical Markup", lbl_x, ry - 1.05, lbl_w, 2.1, size_pt=lbl_pt, valign="center")
+
     # Row: Custom Tactical Waypoints & Route Legs
     if has_waypoints:
         ry = _ry(idx); idx += 1
-        wp_c = "#C2185B" if is_color else "#111111"
+        wp_c = _pal(color_mode, "wp_route")
         _add_line(
             print_layout,
             sx1,
@@ -932,7 +1027,13 @@ def _render_compact_map_key(
 
     # Sheet Metadata footer inside Key Box
     _add_line(print_layout, x_mm + 1.0, meta_divider_y, x_mm + w_mm - 1.0, meta_divider_y, color_hex="#BBBBBB", width_mm=0.14)
-    mode_tag = "COLOR" if is_color else "B&W PRINT"
+    mode_tags = {
+        ColorMode.COLOR: "COLOR",
+        ColorMode.BW: "B&W PRINT",
+        ColorMode.NIGHT_RED: "NIGHT-RED",
+        ColorMode.ALPINE: "ALPINE",
+    }
+    mode_tag = mode_tags.get(color_mode, color_mode.value.upper())
     _add_label(
         print_layout,
         f"DATE: {date_str} | {mode_tag}",
@@ -1205,12 +1306,18 @@ def build_print_layout(
     fw = layout.frame_width_mm
     title_text = (spec.title.strip() if spec.title else f"MGRS {mgrs_meta.center_mgrs_10m}").upper()
     squares_str = "/".join(mgrs_meta.square_ids_100km) if mgrs_meta.square_ids_100km else ""
+    theme_suffix = ""
+    if spec.color_mode == ColorMode.NIGHT_RED:
+        theme_suffix = " | NIGHT-RED"
+    elif spec.color_mode == ColorMode.ALPINE:
+        theme_suffix = " | ALPINE"
     right_header = (
-        f"MGRS {layout.gzd} {squares_str} | UTM {layout.utm_zone}{layout.utm_hemisphere} (EPSG:{layout.utm_epsg})"
+        f"MGRS {layout.gzd} {squares_str} | UTM {layout.utm_zone}{layout.utm_hemisphere} "
+        f"(EPSG:{layout.utm_epsg}){theme_suffix}"
     )
 
     left_w = fw * 0.40
-    center_w = fw * 0.22
+    center_w = fw * 0.20 if theme_suffix else fw * 0.22
     right_w = fw - left_w - center_w
 
     _add_label(
@@ -1246,9 +1353,9 @@ def build_print_layout(
         1.4,
         right_w,
         6.2,
-        size_pt=7.0,
+        size_pt=6.3 if len(right_header) > 40 else 7.0,
         color_hex="#1A1A1A",
-        bold=False,
+        bold=bool(theme_suffix),
         halign="right",
         valign="center",
     )

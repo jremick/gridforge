@@ -22,6 +22,7 @@ from typing import Any
 
 from gridforge.config import (
     AU_STATE_TRAIL_OVERLAY_KINDS,
+    CAOverlayKind,
     CartoOptions,
     ColorMode,
     DensityLevel,
@@ -29,6 +30,7 @@ from gridforge.config import (
     JobWorkspace,
     NZOverlayKind,
     Units,
+    USOverlayKind,
 )
 
 logger = logging.getLogger(__name__)
@@ -41,6 +43,7 @@ STYLE_ROLES: tuple[str, ...] = (
     "slope_shading",
     "fema_flood",
     "au_protected_areas",
+    "public_lands",
     "water_polygons",
     "au_hydro_polys",
     "contours",
@@ -70,6 +73,9 @@ STYLE_ROLES: tuple[str, ...] = (
     "overlay_polygons",
     "overlay_lines",
     "overlay_points",
+    "tactical_sectors",
+    "tactical_rings",
+    "tactical_lines",
     "waypoint_route",
     "waypoint_points",
     "viewshed_rings",
@@ -82,6 +88,7 @@ _LABELED_ROLES: frozenset[str] = frozenset(
     {
         "fema_flood",
         "au_protected_areas",
+        "public_lands",
         "water_polygons",
         "au_hydro_polys",
         "contours",
@@ -102,12 +109,517 @@ _LABELED_ROLES: frozenset[str] = frozenset(
         "enc_navaids",
         "us_towers",
         "mgrs_square_labels",
+        "tactical_sectors",
+        "tactical_rings",
+        "tactical_lines",
         "waypoint_points",
         "viewshed_observers",
     }
 )
 _NATIVE_QML_MARKER = "gridforge-pyqgis-exported"
 _DEFAULT_CARTO = CartoOptions()
+
+# 4-theme military/topographic palette tables.
+# CRITICAL for `night-red`: every critical feature (contours, roads, trails, grid, POIs,
+# waypoints, tactical graphics) has low Red-channel reflectance (R <= 61) so nothing
+# disappears under a 625-660 nm red headlamp!
+_THEME_PALETTE: dict[ColorMode, dict[str, str]] = {
+    ColorMode.COLOR: {
+        "bg": "#FAF9F5",
+        "halo": "#FAF9F5",
+        "ink": "#1A1A1A",
+        "ink_dark": "#111111",
+        "ink_soft": "#2B2B2B",
+        "danger": "#C62828",
+        "accent_blue": "#1B4F72",
+        "accent_blue_dark": "#10324A",
+        "contour_idx": "#8F5B28",
+        "contour_minor": "#A87846",
+        "contour_label": "#78481B",
+        "water_fill": "#A6D1EC",
+        "water_stroke": "#3A82B5",
+        "river": "#2B79B3",
+        "stream": "#3D8AC4",
+        "water_label": "#1E5B88",
+        "nhd_perennial": "#2474B5",
+        "nhd_intermit": "#358AC9",
+        "nhd_ephem": "#5C9FD4",
+        "enc_depth": "#1565C0",
+        "motorway_casing": "#5E1D12",
+        "motorway_fill": "#C84B31",
+        "motorway_center": "#FAF9F5",
+        "primary_casing": "#6E3A0C",
+        "primary_fill": "#D97925",
+        "secondary_casing": "#6E5614",
+        "secondary_fill": "#E5B742",
+        "tertiary_casing": "#4A4A4A",
+        "tertiary_fill": "#FFFFFF",
+        "service_casing": "#686868",
+        "service_fill": "#F7F7F7",
+        "track": "#5E442B",
+        "trail": "#3D3D3D",
+        "rail": "#1A1A1A",
+        "runway_fill": "#666666",
+        "taxiway_casing": "#333333",
+        "taxiway_fill": "#B0B0B0",
+        "power": "#555555",
+        "au_power": "#4A4A4A",
+        "au_sub": "#3D3D3D",
+        "pipeline": "#6A4C93",
+        "shield_stroke": "#5E1D12",
+        "exit_stroke": "#C84B31",
+        "exit_text": "#8C1D18",
+        "building_fill": "#6E6E6E",
+        "building_stroke": "#404040",
+        "substation_hatch": "#555555",
+        "substation_bg": "#E6E2DC",
+        "substation_outline": "#333333",
+        "pylon": "#444444",
+        "viewpoint": "#333333",
+        "grid_1km": "#1B4F72",
+        "grid_100km": "#10324A",
+        "zone_boundary": "#7B1FA2",
+        "square_label": "#1B4F72",
+        "overlay_accent": "#C2185B",
+        "fema_stroke": "#1565C0",
+        "fema_hatch": "#1976D2",
+        "fema_bg": "#1E88E5",
+        "fema_mod_hatch": "#64B5F6",
+        "fema_mod_outline": "#42A5F5",
+        "fema_label": "#0D47A1",
+        "park_stroke": "#2B7A3E",
+        "park_ipa_stroke": "#2E7D6B",
+        "park_label": "#1E5C2E",
+        "public_np_stroke": "#1F6E43",
+        "public_nf_stroke": "#3A8249",
+        "public_blm_stroke": "#8C732A",
+        "public_label": "#185232",
+        "au_bore": "#1B6CA8",
+        "au_bore_label": "#145282",
+        "au_hydro_major": "#2474B5",
+        "au_hydro_minor": "#2E80BF",
+        "au_hydro_nonper": "#3D8AC4",
+        "au_dry_hatch": "#4B8EC2",
+        "au_dry_bg": "#CBE3F2",
+        "state_fire_trail": "#D95F02",
+        "state_4wd": "#7F4F24",
+        "state_walk": "#A63603",
+        "state_fire_label": "#A83F00",
+        "state_walk_label": "#6B2A0A",
+        "poi_hut": "#7A3E1D",
+        "poi_camp": "#1E6B3A",
+        "poi_lookout": "#1B4F72",
+        "poi_hc_label": "#4A230D",
+        "wp_route": "#C2185B",
+        "wp_camp": "#1E7E34",
+        "wp_camp_border": "#0D4D1D",
+        "wp_water": "#1565C0",
+        "wp_water_border": "#0A3A70",
+        "wp_hazard": "#D84315",
+        "wp_hazard_border": "#7F2307",
+        "wp_lz": "#6A1B9A",
+        "wp_lz_border": "#3B0A59",
+        "wp_std": "#C2185B",
+        "wp_std_border": "#7A0D38",
+        "wp_label": "#880E4F",
+        "viewshed_ring": "#00897B",
+        "viewshed_obs": "#00695C",
+        "viewshed_obs_out": "#004D40",
+        "tactical_sector": "#7B1FA2",
+        "tactical_ring": "#0D47A1",
+        "tactical_line": "#B71C1C",
+        "tactical_rf_line": "#00695C",
+        "tactical_label": "#7F0000",
+        "conifer_icon": "#4F7E46",
+        "conifer_bg": "#BDD8B0",
+        "decid_icon": "#688B48",
+        "decid_bg": "#D6E6B8",
+        "mixed_bg": "#CFE2C2",
+        "scrub_bg": "#E3ECD2",
+        "park_lc_bg": "#D8EAD0",
+        "park_lc_stroke": "#8FB884",
+        "wetland_hatch": "#5A96A8",
+        "wetland_bg": "#D2E5E2",
+        "rock_bg": "#EAE4D7",
+        "urban_bg": "#EFECE5",
+        "glacier_bg": "#EBF5FB",
+        "glacier_stroke": "#85C1E9",
+        "military_hatch": "#C06060",
+        "military_bg": "#F4E8E6",
+        "military_outline": "#B04A4A",
+        "aeroway_bg": "#E2E0DA",
+        "aeroway_stroke": "#666666",
+    },
+    ColorMode.BW: {
+        "bg": "#FFFFFF",
+        "halo": "#FFFFFF",
+        "ink": "#000000",
+        "ink_dark": "#000000",
+        "ink_soft": "#111111",
+        "danger": "#000000",
+        "accent_blue": "#000000",
+        "accent_blue_dark": "#000000",
+        "contour_idx": "#1A1A1A",
+        "contour_minor": "#505050",
+        "contour_label": "#111111",
+        "water_fill": "#FFFFFF",
+        "water_stroke": "#1A1A1A",
+        "river": "#1A1A1A",
+        "stream": "#333333",
+        "water_label": "#111111",
+        "nhd_perennial": "#1A1A1A",
+        "nhd_intermit": "#333333",
+        "nhd_ephem": "#555555",
+        "enc_depth": "#222222",
+        "motorway_casing": "#000000",
+        "motorway_fill": "#FFFFFF",
+        "motorway_center": "#000000",
+        "primary_casing": "#000000",
+        "primary_fill": "#C8C8C8",
+        "secondary_casing": "#000000",
+        "secondary_fill": "#FFFFFF",
+        "tertiary_casing": "#222222",
+        "tertiary_fill": "#FFFFFF",
+        "service_casing": "#444444",
+        "service_fill": "#FFFFFF",
+        "track": "#1A1A1A",
+        "trail": "#1A1A1A",
+        "rail": "#000000",
+        "runway_fill": "#444444",
+        "taxiway_casing": "#000000",
+        "taxiway_fill": "#BDBDBD",
+        "power": "#333333",
+        "au_power": "#1A1A1A",
+        "au_sub": "#000000",
+        "pipeline": "#1A1A1A",
+        "shield_stroke": "#000000",
+        "exit_stroke": "#000000",
+        "exit_text": "#000000",
+        "building_fill": "#262626",
+        "building_stroke": "#000000",
+        "substation_hatch": "#222222",
+        "substation_bg": "#F2F2F2",
+        "substation_outline": "#000000",
+        "pylon": "#1A1A1A",
+        "viewpoint": "#111111",
+        "grid_1km": "#000000",
+        "grid_100km": "#000000",
+        "zone_boundary": "#000000",
+        "square_label": "#1A1A1A",
+        "overlay_accent": "#000000",
+        "fema_stroke": "#222222",
+        "fema_hatch": "#444444",
+        "fema_bg": "#FFFFFF",
+        "fema_mod_hatch": "#777777",
+        "fema_mod_outline": "#555555",
+        "fema_label": "#1A1A1A",
+        "park_stroke": "#1A1A1A",
+        "park_ipa_stroke": "#1A1A1A",
+        "park_label": "#1A1A1A",
+        "public_np_stroke": "#1A1A1A",
+        "public_nf_stroke": "#333333",
+        "public_blm_stroke": "#4D4D4D",
+        "public_label": "#111111",
+        "au_bore": "#000000",
+        "au_bore_label": "#000000",
+        "au_hydro_major": "#1A1A1A",
+        "au_hydro_minor": "#2B2B2B",
+        "au_hydro_nonper": "#444444",
+        "au_dry_hatch": "#777777",
+        "au_dry_bg": "#FFFFFF",
+        "state_fire_trail": "#000000",
+        "state_4wd": "#1A1A1A",
+        "state_walk": "#1A1A1A",
+        "state_fire_label": "#000000",
+        "state_walk_label": "#1A1A1A",
+        "poi_hut": "#000000",
+        "poi_camp": "#000000",
+        "poi_lookout": "#111111",
+        "poi_hc_label": "#000000",
+        "wp_route": "#111111",
+        "wp_camp": "#111111",
+        "wp_camp_border": "#000000",
+        "wp_water": "#111111",
+        "wp_water_border": "#000000",
+        "wp_hazard": "#000000",
+        "wp_hazard_border": "#000000",
+        "wp_lz": "#000000",
+        "wp_lz_border": "#000000",
+        "wp_std": "#111111",
+        "wp_std_border": "#000000",
+        "wp_label": "#000000",
+        "viewshed_ring": "#222222",
+        "viewshed_obs": "#000000",
+        "viewshed_obs_out": "#000000",
+        "tactical_sector": "#111111",
+        "tactical_ring": "#000000",
+        "tactical_line": "#000000",
+        "tactical_rf_line": "#222222",
+        "tactical_label": "#000000",
+    },
+    ColorMode.NIGHT_RED: {
+        "bg": "#FAF9F7",
+        "halo": "#FAF9F7",
+        "ink": "#0D1B2A",
+        "ink_dark": "#0A141E",
+        "ink_soft": "#1E2D3D",
+        "danger": "#2B1B69",
+        "accent_blue": "#0D3B66",
+        "accent_blue_dark": "#092642",
+        "contour_idx": "#1B3A4B",
+        "contour_minor": "#3C5E73",
+        "contour_label": "#0E2636",
+        "water_fill": "#96C7E0",
+        "water_stroke": "#125282",
+        "river": "#104D7A",
+        "stream": "#1D669C",
+        "water_label": "#0C3C61",
+        "nhd_perennial": "#104D7A",
+        "nhd_intermit": "#1B6396",
+        "nhd_ephem": "#2E78AD",
+        "enc_depth": "#0E4B78",
+        "motorway_casing": "#0B1622",
+        "motorway_fill": "#22538C",
+        "motorway_center": "#FFFFFF",
+        "primary_casing": "#102030",
+        "primary_fill": "#2B7094",
+        "secondary_casing": "#1C2C3B",
+        "secondary_fill": "#5D9BB8",
+        "tertiary_casing": "#22303D",
+        "tertiary_fill": "#FFFFFF",
+        "service_casing": "#3A4A59",
+        "service_fill": "#F5F7F9",
+        "track": "#1B3144",
+        "trail": "#142330",
+        "rail": "#0A1219",
+        "runway_fill": "#3B4A59",
+        "taxiway_casing": "#182430",
+        "taxiway_fill": "#95A5B3",
+        "power": "#2B3D4F",
+        "au_power": "#223344",
+        "au_sub": "#152330",
+        "pipeline": "#36246E",
+        "shield_stroke": "#0D2D4F",
+        "exit_stroke": "#0D3B66",
+        "exit_text": "#0B1F3A",
+        "building_fill": "#3D4E5E",
+        "building_stroke": "#14202B",
+        "substation_hatch": "#2B3D4F",
+        "substation_bg": "#E1E7EC",
+        "substation_outline": "#14202B",
+        "pylon": "#223344",
+        "viewpoint": "#182938",
+        "grid_1km": "#0D2B45",
+        "grid_100km": "#081C2E",
+        "zone_boundary": "#261E66",
+        "square_label": "#0D2B45",
+        "overlay_accent": "#1D2975",
+        "fema_stroke": "#0F4C81",
+        "fema_hatch": "#165C99",
+        "fema_bg": "#1A6EB5",
+        "fema_mod_hatch": "#3579B0",
+        "fema_mod_outline": "#236499",
+        "fema_label": "#092E52",
+        "park_stroke": "#145746",
+        "park_ipa_stroke": "#144E63",
+        "park_label": "#0E3D31",
+        "public_np_stroke": "#125245",
+        "public_nf_stroke": "#1F5949",
+        "public_blm_stroke": "#264A66",
+        "public_label": "#0D3B31",
+        "au_bore": "#0F4F82",
+        "au_bore_label": "#0A3659",
+        "au_hydro_major": "#104D7A",
+        "au_hydro_minor": "#1A5F91",
+        "au_hydro_nonper": "#286FA3",
+        "au_dry_hatch": "#266D9E",
+        "au_dry_bg": "#C2DFEE",
+        "state_fire_trail": "#123E78",
+        "state_4wd": "#1B4D5C",
+        "state_walk": "#0D4E68",
+        "state_fire_label": "#0B2C59",
+        "state_walk_label": "#0D3B4F",
+        "poi_hut": "#163759",
+        "poi_camp": "#145243",
+        "poi_lookout": "#0E456B",
+        "poi_hc_label": "#0C233B",
+        "wp_route": "#1F2470",
+        "wp_camp": "#145A46",
+        "wp_camp_border": "#0A3327",
+        "wp_water": "#0F4C81",
+        "wp_water_border": "#082C4D",
+        "wp_hazard": "#2E1A6B",
+        "wp_hazard_border": "#180C3D",
+        "wp_lz": "#10375C",
+        "wp_lz_border": "#081E33",
+        "wp_std": "#1F2470",
+        "wp_std_border": "#0E1242",
+        "wp_label": "#111547",
+        "viewshed_ring": "#0B5959",
+        "viewshed_obs": "#084545",
+        "viewshed_obs_out": "#052E2E",
+        "tactical_sector": "#25216E",
+        "tactical_ring": "#0E4D6B",
+        "tactical_line": "#0E2E5E",
+        "tactical_rf_line": "#084F4F",
+        "tactical_label": "#0A1E3D",
+        "conifer_icon": "#2C5944",
+        "conifer_bg": "#DFE8E2",
+        "decid_icon": "#3A6650",
+        "decid_bg": "#E4ECE6",
+        "mixed_bg": "#E6EEE8",
+        "scrub_bg": "#ECF1ED",
+        "park_lc_bg": "#E2EBE4",
+        "park_lc_stroke": "#2E5D47",
+        "wetland_hatch": "#2B6B7C",
+        "wetland_bg": "#DCE9EC",
+        "rock_bg": "#ECEEF0",
+        "urban_bg": "#EFF1F3",
+        "glacier_bg": "#DFECF4",
+        "glacier_stroke": "#2B6CB0",
+        "military_hatch": "#243A5E",
+        "military_bg": "#E3E8F0",
+        "military_outline": "#182A47",
+        "aeroway_bg": "#E4E8EC",
+        "aeroway_stroke": "#2B3D4F",
+    },
+    ColorMode.ALPINE: {
+        "bg": "#F8FBFE",
+        "halo": "#F8FBFE",
+        "ink": "#14202B",
+        "ink_dark": "#0D1821",
+        "ink_soft": "#263645",
+        "danger": "#B71C1C",
+        "accent_blue": "#134E7A",
+        "accent_blue_dark": "#0C3352",
+        "contour_idx": "#1B5E8A",
+        "contour_minor": "#4E89B5",
+        "contour_label": "#104266",
+        "water_fill": "#99D4F2",
+        "water_stroke": "#1A69A4",
+        "river": "#145C94",
+        "stream": "#2574B3",
+        "water_label": "#0E4775",
+        "nhd_perennial": "#145C94",
+        "nhd_intermit": "#2674B3",
+        "nhd_ephem": "#5295C9",
+        "enc_depth": "#12569E",
+        "motorway_casing": "#4A1C16",
+        "motorway_fill": "#B84433",
+        "motorway_center": "#F8FBFE",
+        "primary_casing": "#5E3310",
+        "primary_fill": "#CC7029",
+        "secondary_casing": "#5C4B18",
+        "secondary_fill": "#D9AE42",
+        "tertiary_casing": "#3F4D5A",
+        "tertiary_fill": "#FFFFFF",
+        "service_casing": "#5D6B78",
+        "service_fill": "#F4F7FA",
+        "track": "#4A5866",
+        "trail": "#23313F",
+        "rail": "#14202B",
+        "runway_fill": "#5A6775",
+        "taxiway_casing": "#2C3A47",
+        "taxiway_fill": "#A6B3BF",
+        "power": "#4A5568",
+        "au_power": "#3E4C59",
+        "au_sub": "#2D3748",
+        "pipeline": "#5E428A",
+        "shield_stroke": "#4A1C16",
+        "exit_stroke": "#B84433",
+        "exit_text": "#7A1F14",
+        "building_fill": "#5A6775",
+        "building_stroke": "#2D3748",
+        "substation_hatch": "#4A5568",
+        "substation_bg": "#E4E9EE",
+        "substation_outline": "#2D3748",
+        "pylon": "#3E4C59",
+        "viewpoint": "#263645",
+        "grid_1km": "#133D61",
+        "grid_100km": "#0B263D",
+        "zone_boundary": "#6A1B9A",
+        "square_label": "#133D61",
+        "overlay_accent": "#AD1457",
+        "fema_stroke": "#1565C0",
+        "fema_hatch": "#1976D2",
+        "fema_bg": "#1E88E5",
+        "fema_mod_hatch": "#64B5F6",
+        "fema_mod_outline": "#42A5F5",
+        "fema_label": "#0D47A1",
+        "park_stroke": "#1D6E52",
+        "park_ipa_stroke": "#1E6B73",
+        "park_label": "#134E3A",
+        "public_np_stroke": "#18664E",
+        "public_nf_stroke": "#2D7A56",
+        "public_blm_stroke": "#526A80",
+        "public_label": "#124C3A",
+        "au_bore": "#14629E",
+        "au_bore_label": "#0D4570",
+        "au_hydro_major": "#145C94",
+        "au_hydro_minor": "#216FA8",
+        "au_hydro_nonper": "#3782BA",
+        "au_dry_hatch": "#3E84B8",
+        "au_dry_bg": "#C7E2F4",
+        "state_fire_trail": "#C44914",
+        "state_4wd": "#4A5D70",
+        "state_walk": "#8C2D12",
+        "state_fire_label": "#94320A",
+        "state_walk_label": "#66210D",
+        "poi_hut": "#7A3516",
+        "poi_camp": "#1A6648",
+        "poi_lookout": "#154E78",
+        "poi_hc_label": "#4A1F0C",
+        "wp_route": "#AD1457",
+        "wp_camp": "#1B7340",
+        "wp_camp_border": "#0C4223",
+        "wp_water": "#135EA8",
+        "wp_water_border": "#093663",
+        "wp_hazard": "#C62828",
+        "wp_hazard_border": "#731313",
+        "wp_lz": "#6A1B9A",
+        "wp_lz_border": "#380B54",
+        "wp_std": "#AD1457",
+        "wp_std_border": "#6B0934",
+        "wp_label": "#7A0B3B",
+        "viewshed_ring": "#00796B",
+        "viewshed_obs": "#005B4F",
+        "viewshed_obs_out": "#003D33",
+        "tactical_sector": "#6A1B9A",
+        "tactical_ring": "#1565C0",
+        "tactical_line": "#AD1457",
+        "tactical_rf_line": "#00695C",
+        "tactical_label": "#7A0B3B",
+        "conifer_icon": "#356B52",
+        "conifer_bg": "#C5DFD0",
+        "decid_icon": "#4B7A58",
+        "decid_bg": "#D6E7D4",
+        "mixed_bg": "#D2E5D8",
+        "scrub_bg": "#E4EFE8",
+        "park_lc_bg": "#D8ECE2",
+        "park_lc_stroke": "#4D8A6E",
+        "wetland_hatch": "#3E879E",
+        "wetland_bg": "#D0E7EC",
+        "rock_bg": "#DCE2E8",
+        "urban_bg": "#EAEFF4",
+        "glacier_bg": "#E2F2FC",
+        "glacier_stroke": "#6BAED6",
+        "military_hatch": "#A64B4B",
+        "military_bg": "#F2E8EA",
+        "military_outline": "#8C3B3B",
+        "aeroway_bg": "#DFE5EB",
+        "aeroway_stroke": "#4A5866",
+    },
+}
+
+
+def _pal(color_mode: ColorMode, key: str) -> str:
+    """Look up a cartographic theme color hex for ``color_mode``."""
+    return _THEME_PALETTE.get(color_mode, _THEME_PALETTE[ColorMode.COLOR])[key]
+
+
+def _is_bw(color_mode: ColorMode) -> bool:
+    """Return True when ``color_mode`` uses monochrome laser-print hatching/stippling."""
+    return color_mode == ColorMode.BW
 
 
 def get_styles_root() -> Path:
@@ -151,7 +663,7 @@ def get_qml_path(role: str, color_mode: ColorMode, styles_root: Path | None = No
 
 def map_background_hex(color_mode: ColorMode) -> str:
     """Return the map frame canvas background color hex for the chosen theme."""
-    return "#FAF9F5" if color_mode == ColorMode.COLOR else "#FFFFFF"
+    return _pal(color_mode, "bg")
 
 
 def scale_width_factor(scale: int) -> float:
@@ -191,6 +703,18 @@ def _hillshade_params(
             HillshadeStrength.LIGHT: (0.18, 12, 2),
             HillshadeStrength.NORMAL: (0.32, 8, 5),
             HillshadeStrength.STRONG: (0.48, 0, 10),
+        }
+    elif color_mode == ColorMode.ALPINE:
+        table = {
+            HillshadeStrength.LIGHT: (0.22, 10, 4),
+            HillshadeStrength.NORMAL: (0.36, 4, 8),
+            HillshadeStrength.STRONG: (0.52, -4, 14),
+        }
+    elif color_mode == ColorMode.NIGHT_RED:
+        table = {
+            HillshadeStrength.LIGHT: (0.14, 24, 0),
+            HillshadeStrength.NORMAL: (0.24, 18, 2),
+            HillshadeStrength.STRONG: (0.36, 10, 6),
         }
     else:
         table = {
@@ -912,7 +1436,7 @@ def _build_landcover_style(
     from qgis.core import QgsRuleBasedRenderer
 
     root = QgsRuleBasedRenderer.Rule(None)
-    is_color = color_mode == ColorMode.COLOR
+    bw = _is_bw(color_mode)
 
     if carto.show_trees:
         evergreen_expr = (
@@ -933,7 +1457,7 @@ def _build_landcover_style(
             "OR \"leaf_cycle\" IN ('evergreen','deciduous'))"
         )
 
-        if is_color:
+        if not bw:
             _add_rule(
                 root,
                 "Evergreen / Coniferous Forest",
@@ -942,8 +1466,8 @@ def _build_landcover_style(
                     "conifer",
                     spacing_mm=6.2,
                     icon_mm=1.6,
-                    icon_hex="#4F7E46",
-                    bg_hex="#BDD8B0",
+                    icon_hex=_pal(color_mode, "conifer_icon"),
+                    bg_hex=_pal(color_mode, "conifer_bg"),
                     icons_root=icons_root,
                 ),
             )
@@ -955,8 +1479,8 @@ def _build_landcover_style(
                     "deciduous",
                     spacing_mm=6.2,
                     icon_mm=1.6,
-                    icon_hex="#688B48",
-                    bg_hex="#D6E6B8",
+                    icon_hex=_pal(color_mode, "decid_icon"),
+                    bg_hex=_pal(color_mode, "decid_bg"),
                     icons_root=icons_root,
                 ),
             )
@@ -964,21 +1488,26 @@ def _build_landcover_style(
                 root,
                 "Mixed / Unspecified Forest",
                 mixed_forest_expr,
-                _simple_fill_symbol("#CFE2C2"),
+                _simple_fill_symbol(_pal(color_mode, "mixed_bg")),
             )
             _add_rule(
                 root,
                 "Scrub / Heath / Grassland",
                 "\"natural\" IN ('scrub','heath','grassland','fell') "
                 "OR \"landuse\" IN ('meadow','grass','orchard','vineyard','farmland')",
-                _simple_fill_symbol("#E3ECD2"),
+                _simple_fill_symbol(_pal(color_mode, "scrub_bg")),
             )
             _add_rule(
                 root,
                 "Parks & Reserves",
                 "\"leisure\" IN ('park','nature_reserve','golf_course','recreation_ground') "
                 "OR \"landuse\" = 'recreation_ground'",
-                _simple_fill_symbol("#D8EAD0", stroke_hex="#8FB884", stroke_mm=0.14, stroke_style="dash"),
+                _simple_fill_symbol(
+                    _pal(color_mode, "park_lc_bg"),
+                    stroke_hex=_pal(color_mode, "park_lc_stroke"),
+                    stroke_mm=0.14,
+                    stroke_style="dash",
+                ),
             )
         else:
             # Dedicated B&W laser-print canopy patterns: distinct evergreen vs deciduous vs mixed
@@ -1031,17 +1560,28 @@ def _build_landcover_style(
                 _simple_fill_symbol("transparent", stroke_hex="#666666", stroke_mm=0.18, stroke_style="dash"),
             )
 
-    if is_color:
+    if not bw:
+        _add_rule(
+            root,
+            "Glaciers & Permanent Snow",
+            "\"natural\" IN ('glacier','snow')",
+            _simple_fill_symbol(
+                _pal(color_mode, "glacier_bg"),
+                stroke_hex=_pal(color_mode, "glacier_stroke"),
+                stroke_mm=0.18 if color_mode == ColorMode.ALPINE else 0.14,
+                stroke_style="dash" if color_mode == ColorMode.NIGHT_RED else "solid",
+            ),
+        )
         _add_rule(
             root,
             "Wetland / Marsh",
             "\"natural\" IN ('wetland','mud')",
             _hatch_fill_symbol(
-                "#5A96A8",
+                _pal(color_mode, "wetland_hatch"),
                 angle_deg=0.0,
                 spacing_mm=2.2,
                 line_mm=0.14,
-                bg_hex="#D2E5E2",
+                bg_hex=_pal(color_mode, "wetland_bg"),
                 dash_vector=[1.8, 1.4],
             ),
         )
@@ -1049,25 +1589,25 @@ def _build_landcover_style(
             root,
             "Bare Rock / Sand / Scree",
             "\"natural\" IN ('bare_rock','scree','shingle','sand','beach')",
-            _simple_fill_symbol("#EAE4D7"),
+            _simple_fill_symbol(_pal(color_mode, "rock_bg")),
         )
         _add_rule(
             root,
             "Built-up Residential / Commercial",
             "\"landuse\" IN ('residential','commercial','industrial','retail')",
-            _simple_fill_symbol("#EFECE5"),
+            _simple_fill_symbol(_pal(color_mode, "urban_bg")),
         )
         _add_rule(
             root,
             "Military Area",
             "\"landuse\" = 'military'",
             _hatch_fill_symbol(
-                "#C06060",
+                _pal(color_mode, "military_hatch"),
                 angle_deg=45.0,
                 spacing_mm=3.0,
                 line_mm=0.14,
-                bg_hex="#F4E8E6",
-                outline_hex="#B04A4A",
+                bg_hex=_pal(color_mode, "military_bg"),
+                outline_hex=_pal(color_mode, "military_outline"),
                 outline_mm=0.22,
             ),
         )
@@ -1075,9 +1615,20 @@ def _build_landcover_style(
             root,
             "Aeroway Area",
             "\"aeroway\" IN ('aerodrome','runway','apron','taxiway')",
-            _simple_fill_symbol("#E2E0DA", stroke_hex="#666666", stroke_mm=0.18, stroke_style="solid"),
+            _simple_fill_symbol(
+                _pal(color_mode, "aeroway_bg"),
+                stroke_hex=_pal(color_mode, "aeroway_stroke"),
+                stroke_mm=0.18,
+                stroke_style="solid",
+            ),
         )
     else:
+        _add_rule(
+            root,
+            "Glaciers & Permanent Snow",
+            "\"natural\" IN ('glacier','snow')",
+            _stipple_fill_symbol("#888888", spacing_mm=3.2, dot_mm=0.22, outline_hex="#444444", outline_mm=0.16),
+        )
         _add_rule(
             root,
             "Wetland / Marsh",
@@ -1157,22 +1708,43 @@ def _build_slope_shading_style(
     )
     from qgis.PyQt.QtGui import QColor, QPainter
 
-    is_color = color_mode == ColorMode.COLOR
+    bw = _is_bw(color_mode)
     band_count = layer.bandCount() if hasattr(layer, "bandCount") else 4
 
     if band_count >= 3:
         renderer = QgsMultiBandColorRenderer(layer.dataProvider(), 1, 2, 3)
         if band_count >= 4:
             renderer.setAlphaBand(4)
-        # terrain.py RGBA already carries progressive band alpha (115..205 Color / 85..180 B&W);
-        # scaling to 0.58 Color / 0.65 B&W yields crisp ~26-46% effective avalanche tint over hillshade.
-        renderer.setOpacity(0.58 if is_color else 0.65)
+        # ALPINE amplifies avalanche slope prominence; NIGHT_RED colorizes warm reds into
+        # red-headlamp-safe deep indigo while preserving the band-4 alpha channel!
+        if color_mode == ColorMode.ALPINE:
+            renderer.setOpacity(0.68)
+        elif color_mode == ColorMode.NIGHT_RED:
+            renderer.setOpacity(0.62)
+        elif bw:
+            renderer.setOpacity(0.65)
+        else:
+            renderer.setOpacity(0.58)
         layer.setRenderer(renderer)
+        if color_mode == ColorMode.NIGHT_RED and layer.hueSaturationFilter() is not None:
+            hsf = layer.hueSaturationFilter()
+            hsf.setColorizeOn(True)
+            hsf.setColorizeColor(QColor("#1B3B6E"))
+            hsf.setColorizeStrength(100)
     else:
         shader = QgsRasterShader()
         ramp = QgsColorRampShader()
         ramp.setColorRampType(QgsColorRampShader.Discrete)
-        if is_color:
+        if color_mode == ColorMode.NIGHT_RED:
+            items = [
+                QgsColorRampShader.ColorRampItem(26.999, QColor(0, 0, 0, 0), "< 27°"),
+                QgsColorRampShader.ColorRampItem(29.999, QColor(93, 173, 226, 180), "27°–30°"),
+                QgsColorRampShader.ColorRampItem(34.999, QColor(46, 109, 164, 205), "30°–35°"),
+                QgsColorRampShader.ColorRampItem(44.999, QColor(40, 53, 147, 225), "35°–45°"),
+                QgsColorRampShader.ColorRampItem(49.999, QColor(26, 35, 100, 235), "45°–50°"),
+                QgsColorRampShader.ColorRampItem(90.0, QColor(12, 18, 56, 245), ">= 50°"),
+            ]
+        elif not bw:
             items = [
                 QgsColorRampShader.ColorRampItem(26.999, QColor(0, 0, 0, 0), "< 27°"),
                 QgsColorRampShader.ColorRampItem(29.999, QColor(246, 224, 94, 195), "27°–30°"),
@@ -1191,7 +1763,12 @@ def _build_slope_shading_style(
         ramp.setColorRampItemList(items)
         shader.setRasterShaderFunction(ramp)
         renderer = QgsSingleBandPseudoColorRenderer(layer.dataProvider(), 1, shader)
-        renderer.setOpacity(0.42 if is_color else 0.35)
+        if color_mode == ColorMode.ALPINE:
+            renderer.setOpacity(0.52)
+        elif color_mode == ColorMode.NIGHT_RED:
+            renderer.setOpacity(0.46)
+        else:
+            renderer.setOpacity(0.42 if not bw else 0.35)
         layer.setRenderer(renderer)
 
     layer.setBlendMode(QPainter.CompositionMode_SourceOver)
@@ -1207,8 +1784,8 @@ def _build_viewshed_style(
     """Style RF / line-of-sight viewshed coverage raster on the lower raster stack.
 
     Supports both 4-band RGBA Byte GeoTIFFs (from ``terrain.build_viewshed_products``)
-    and 1-band binary visibility rasters (0/255), keeping ``BlendNormal`` at 0.52 Color /
-    0.55 B&W opacity right above ``hillshade.tif`` so all upper-stack vectors remain pure.
+    and 1-band binary visibility rasters (0/255), keeping ``BlendNormal`` right above
+    ``hillshade.tif`` so all upper-stack vectors remain pure.
     """
     from qgis.core import (
         QgsBilinearRasterResampler,
@@ -1219,20 +1796,26 @@ def _build_viewshed_style(
     )
     from qgis.PyQt.QtGui import QColor, QPainter
 
-    is_color = color_mode == ColorMode.COLOR
+    bw = _is_bw(color_mode)
     band_count = layer.bandCount() if hasattr(layer, "bandCount") else 4
+    eff_opacity = 0.58 if color_mode == ColorMode.NIGHT_RED else (0.55 if bw else 0.52)
 
     if band_count >= 3:
         renderer = QgsMultiBandColorRenderer(layer.dataProvider(), 1, 2, 3)
         if band_count >= 4:
             renderer.setAlphaBand(4)
-        renderer.setOpacity(0.52 if is_color else 0.55)
+        renderer.setOpacity(eff_opacity)
         layer.setRenderer(renderer)
     else:
         shader = QgsRasterShader()
         ramp = QgsColorRampShader()
         ramp.setColorRampType(QgsColorRampShader.Discrete)
-        if is_color:
+        if color_mode == ColorMode.NIGHT_RED:
+            items = [
+                QgsColorRampShader.ColorRampItem(0.5, QColor(0, 0, 0, 0), "Shadowed"),
+                QgsColorRampShader.ColorRampItem(255.0, QColor(11, 130, 140, 180), "Visible"),
+            ]
+        elif not bw:
             items = [
                 QgsColorRampShader.ColorRampItem(0.5, QColor(0, 0, 0, 0), "Shadowed"),
                 QgsColorRampShader.ColorRampItem(255.0, QColor(0, 212, 146, 170), "Visible"),
@@ -1245,7 +1828,7 @@ def _build_viewshed_style(
         ramp.setColorRampItemList(items)
         shader.setRasterShaderFunction(ramp)
         renderer = QgsSingleBandPseudoColorRenderer(layer.dataProvider(), 1, shader)
-        renderer.setOpacity(0.52 if is_color else 0.55)
+        renderer.setOpacity(eff_opacity)
         layer.setRenderer(renderer)
 
     layer.setBlendMode(QPainter.CompositionMode_SourceOver)
@@ -1264,7 +1847,7 @@ def _build_fema_flood_style(
     """Style FEMA NFHL S_Fld_Haz_Ar polygons (SFHA 100-yr + moderate 500-yr flood zones)."""
     from qgis.core import QgsPalLayerSettings, QgsRuleBasedLabeling, QgsRuleBasedRenderer
 
-    is_color = color_mode == ColorMode.COLOR
+    bw = _is_bw(color_mode)
     sfha_expr = (
         "upper(coalesce(\"sfha_tf\", '')) = 'T' "
         "OR upper(coalesce(\"fld_zone\", '')) LIKE 'A%' "
@@ -1278,19 +1861,19 @@ def _build_fema_flood_style(
     )
 
     root = QgsRuleBasedRenderer.Rule(None)
-    if is_color:
+    if not bw:
         _add_rule(
             root,
             "FEMA SFHA (100-yr Flood Zone)",
             sfha_expr,
             _hatch_fill_symbol(
-                "#1976D2",
+                _pal(color_mode, "fema_hatch"),
                 angle_deg=45.0,
                 spacing_mm=2.2,
                 line_mm=0.15,
-                bg_hex="#1E88E5",
+                bg_hex=_pal(color_mode, "fema_bg"),
                 bg_alpha=34,
-                outline_hex="#1565C0",
+                outline_hex=_pal(color_mode, "fema_stroke"),
                 outline_mm=0.18,
             ),
         )
@@ -1299,12 +1882,12 @@ def _build_fema_flood_style(
             "FEMA 500-yr Flood Zone",
             mod_expr,
             _hatch_fill_symbol(
-                "#64B5F6",
+                _pal(color_mode, "fema_mod_hatch"),
                 angle_deg=135.0,
                 spacing_mm=3.4,
                 line_mm=0.12,
                 dash_vector=[1.4, 1.2],
-                outline_hex="#42A5F5",
+                outline_hex=_pal(color_mode, "fema_mod_outline"),
                 outline_mm=0.14,
                 outline_dash=[1.4, 1.0],
             ),
@@ -1353,7 +1936,7 @@ def _build_fema_flood_style(
     pal.setFormat(
         _make_text_format(
             5.6 + fd,
-            "#0D47A1" if is_color else "#1A1A1A",
+            _pal(color_mode, "fema_label"),
             bold=True,
             halo_hex="#FFFFFF",
             halo_mm=0.6,
@@ -1384,8 +1967,13 @@ def _build_water_polygons_style(
         "OR \"landuse\" IN ('reservoir','basin')"
     )
     root = QgsRuleBasedRenderer.Rule(None)
-    if color_mode == ColorMode.COLOR:
-        sym = _simple_fill_symbol("#A6D1EC", stroke_hex="#3A82B5", stroke_mm=0.20 * wf, stroke_style="solid")
+    if not _is_bw(color_mode):
+        sym = _simple_fill_symbol(
+            _pal(color_mode, "water_fill"),
+            stroke_hex=_pal(color_mode, "water_stroke"),
+            stroke_mm=0.20 * wf,
+            stroke_style="solid",
+        )
     else:
         sym = _hatch_fill_symbol(
             "#6B6B6B",
@@ -1407,7 +1995,7 @@ def _build_water_polygons_style(
     pal.setFormat(
         _make_text_format(
             6.5 + fd,
-            "#1E5B88" if color_mode == ColorMode.COLOR else "#111111",
+            _pal(color_mode, "water_label"),
             italic=True,
             halo_hex="#FFFFFF",
             halo_mm=0.6,
@@ -1435,14 +2023,18 @@ def _build_contours_style(
     rep_mult, min_mult = _density_params(carto.label_density)
 
     root = QgsRuleBasedRenderer.Rule(None)
-    if color_mode == ColorMode.COLOR:
-        idx_color, minor_color = "#8F5B28", "#A87846"
+    idx_color = _pal(color_mode, "contour_idx")
+    minor_color = _pal(color_mode, "contour_minor")
+    label_color = _pal(color_mode, "contour_label")
+    halo_color = _pal(color_mode, "halo")
+    if color_mode == ColorMode.NIGHT_RED:
+        idx_w, minor_w = 0.34 * wf, 0.16 * wf
+    elif color_mode == ColorMode.ALPINE:
+        idx_w, minor_w = 0.33 * wf, 0.15 * wf
+    elif color_mode == ColorMode.COLOR:
         idx_w, minor_w = 0.32 * wf, 0.15 * wf
-        label_color, halo_color = "#78481B", "#FAF9F5"
     else:
-        idx_color, minor_color = "#1A1A1A", "#505050"
         idx_w, minor_w = 0.30 * wf, 0.14 * wf
-        label_color, halo_color = "#111111", "#FFFFFF"
 
     _add_rule(root, "Index Contours", "\"is_index\" = 1", _line_symbol(idx_color, idx_w))
     _add_rule(
@@ -1492,11 +2084,10 @@ def _build_enc_depth_contours_style(
     """Style NOAA ENC depth contours (``enc_depth_contours`` with ``valdco``)."""
     from qgis.core import QgsPalLayerSettings, QgsSingleSymbolRenderer, QgsVectorLayerSimpleLabeling
 
-    is_color = color_mode == ColorMode.COLOR
     wf = scale_width_factor(scale)
     fd = scale_font_delta(scale)
     rep_mult, min_mult = _density_params(carto.label_density)
-    c_hex = "#1565C0" if is_color else "#222222"
+    c_hex = _pal(color_mode, "enc_depth")
 
     layer.setRenderer(QgsSingleSymbolRenderer(_line_symbol(c_hex, 0.22 * wf, dash_vector=[2.2, 1.0])))
 
@@ -1521,16 +2112,15 @@ def _build_nhd_flowlines_style(
     """Style USGS NHD flowlines (perennial, intermittent, ephemeral, canal)."""
     from qgis.core import QgsPalLayerSettings, QgsRuleBasedLabeling, QgsRuleBasedRenderer
 
-    is_color = color_mode == ColorMode.COLOR
     wf = scale_width_factor(scale)
     fd = scale_font_delta(scale)
     rep_mult, min_mult = _density_params(carto.label_density)
     arrow_iv = 34.0 / wf
 
-    perennial_c = "#2474B5" if is_color else "#1A1A1A"
-    intermit_c = "#358AC9" if is_color else "#333333"
-    ephem_c = "#5C9FD4" if is_color else "#555555"
-    halo_c = "#FAF9F5" if is_color else "#FFFFFF"
+    perennial_c = _pal(color_mode, "nhd_perennial")
+    intermit_c = _pal(color_mode, "nhd_intermit")
+    ephem_c = _pal(color_mode, "nhd_ephem")
+    halo_c = _pal(color_mode, "halo")
 
     root = QgsRuleBasedRenderer.Rule(None)
     _add_rule(
@@ -1616,12 +2206,10 @@ def _build_waterways_style(
     arrow_iv = 30.0 / wf
 
     root = QgsRuleBasedRenderer.Rule(None)
-    if color_mode == ColorMode.COLOR:
-        river_c, stream_c, label_c = "#2B79B3", "#3D8AC4", "#1E5B88"
-        halo_c = "#FAF9F5"
-    else:
-        river_c, stream_c, label_c = "#1A1A1A", "#333333", "#111111"
-        halo_c = "#FFFFFF"
+    river_c = _pal(color_mode, "river")
+    stream_c = _pal(color_mode, "stream")
+    label_c = _pal(color_mode, "water_label")
+    halo_c = _pal(color_mode, "halo")
 
     _add_rule(
         root,
@@ -1695,23 +2283,24 @@ def _build_buildings_style(
     from qgis.core import QgsRuleBasedRenderer
 
     root = QgsRuleBasedRenderer.Rule(None)
-    is_color = color_mode == ColorMode.COLOR
 
     if carto.show_buildings:
-        if is_color:
-            sym = _simple_fill_symbol("#6E6E6E", stroke_hex="#404040", stroke_mm=0.10, stroke_style="solid")
-        else:
-            sym = _simple_fill_symbol("#262626", stroke_hex="#000000", stroke_mm=0.10, stroke_style="solid")
+        sym = _simple_fill_symbol(
+            _pal(color_mode, "building_fill"),
+            stroke_hex=_pal(color_mode, "building_stroke"),
+            stroke_mm=0.10,
+            stroke_style="solid",
+        )
         _add_rule(root, "Buildings", "\"building\" IS NOT NULL AND \"building\" != 'no'", sym)
 
     if carto.show_power:
         sub_sym = _hatch_fill_symbol(
-            "#555555" if is_color else "#222222",
+            _pal(color_mode, "substation_hatch"),
             angle_deg=135.0,
             spacing_mm=1.6,
             line_mm=0.12,
-            bg_hex="#E6E2DC" if is_color else "#F2F2F2",
-            outline_hex="#333333" if is_color else "#000000",
+            bg_hex=_pal(color_mode, "substation_bg"),
+            outline_hex=_pal(color_mode, "substation_outline"),
             outline_mm=0.22,
         )
         _add_rule(root, "Power Substations", "\"power\" = 'substation'", sub_sym)
@@ -1732,10 +2321,9 @@ def _build_building_icons_style(
     from qgis.core import QgsRuleBasedRenderer
 
     wf = scale_width_factor(scale)
-    is_color = color_mode == ColorMode.COLOR
-    ink = "#1A1A1A" if is_color else "#000000"
-    red = "#C62828" if is_color else "#000000"
-    blue = "#1B4F72" if is_color else "#000000"
+    ink = _pal(color_mode, "ink")
+    red = _pal(color_mode, "danger")
+    blue = _pal(color_mode, "accent_blue")
 
     root = QgsRuleBasedRenderer.Rule(None)
     if carto.show_buildings:
@@ -1805,22 +2393,22 @@ def _build_transport_style(
     wf = scale_width_factor(scale)
     fd = scale_font_delta(scale)
     rep_mult, min_mult = _density_params(carto.label_density)
-    is_color = color_mode == ColorMode.COLOR
+    bw = _is_bw(color_mode)
 
     root = QgsRuleBasedRenderer.Rule(None)
-    if is_color:
+    if not bw:
         _add_rule(
             root,
             "Motorway / Trunk",
             "\"highway\" IN ('motorway','motorway_link','trunk','trunk_link')",
             _cased_road_symbol(
-                "#5E1D12",
+                _pal(color_mode, "motorway_casing"),
                 1.40 * wf,
-                "#C84B31",
+                _pal(color_mode, "motorway_fill"),
                 0.95 * wf,
                 casing_pass=12,
                 fill_pass=24,
-                centerline_hex="#FAF9F5",
+                centerline_hex=_pal(color_mode, "motorway_center"),
                 centerline_mm=0.14 * wf,
                 centerline_pass=26,
             ),
@@ -1829,52 +2417,80 @@ def _build_transport_style(
             root,
             "Primary Road",
             "\"highway\" IN ('primary','primary_link')",
-            _cased_road_symbol("#6E3A0C", 1.15 * wf, "#D97925", 0.75 * wf, casing_pass=10, fill_pass=22),
+            _cased_road_symbol(
+                _pal(color_mode, "primary_casing"),
+                1.15 * wf,
+                _pal(color_mode, "primary_fill"),
+                0.75 * wf,
+                casing_pass=10,
+                fill_pass=22,
+            ),
         )
         _add_rule(
             root,
             "Secondary Road",
             "\"highway\" IN ('secondary','secondary_link')",
-            _cased_road_symbol("#6E5614", 0.95 * wf, "#E5B742", 0.60 * wf, casing_pass=8, fill_pass=20),
+            _cased_road_symbol(
+                _pal(color_mode, "secondary_casing"),
+                0.95 * wf,
+                _pal(color_mode, "secondary_fill"),
+                0.60 * wf,
+                casing_pass=8,
+                fill_pass=20,
+            ),
         )
         _add_rule(
             root,
             "Tertiary / Residential",
             "\"highway\" IN ('tertiary','tertiary_link','unclassified','residential','living_street','road')",
-            _cased_road_symbol("#4A4A4A", 0.72 * wf, "#FFFFFF", 0.44 * wf, casing_pass=6, fill_pass=18),
+            _cased_road_symbol(
+                _pal(color_mode, "tertiary_casing"),
+                0.72 * wf,
+                _pal(color_mode, "tertiary_fill"),
+                0.44 * wf,
+                casing_pass=6,
+                fill_pass=18,
+            ),
         )
         _add_rule(
             root,
             "Service Road",
             "\"highway\" = 'service'",
-            _cased_road_symbol("#686868", 0.46 * wf, "#F7F7F7", 0.26 * wf, casing_pass=4, fill_pass=16),
+            _cased_road_symbol(
+                _pal(color_mode, "service_casing"),
+                0.46 * wf,
+                _pal(color_mode, "service_fill"),
+                0.26 * wf,
+                casing_pass=4,
+                fill_pass=16,
+            ),
         )
         _add_rule(
             root,
             "Unpaved Track / 4WD",
             "\"highway\" = 'track'",
-            _line_symbol("#5E442B", 0.34 * wf, dash_vector=[2.2, 1.0], render_pass=5),
+            _line_symbol(_pal(color_mode, "track"), 0.34 * wf, dash_vector=[2.2, 1.0], render_pass=5),
         )
         _add_rule(
             root,
             "Trails / Footways / Paths",
             "\"highway\" IN ('path','footway','bridleway','cycleway','steps')",
-            _line_symbol("#3D3D3D", 0.24 * wf, dash_vector=[1.1, 0.9], render_pass=3),
+            _line_symbol(_pal(color_mode, "trail"), 0.24 * wf, dash_vector=[1.1, 0.9], render_pass=3),
         )
         _add_rule(
             root,
             "Railway",
             "\"railway\" IN ('rail','light_rail','narrow_gauge','preserved','tram')",
-            _railway_symbol("#1A1A1A", base_pass=15, wf=wf),
+            _railway_symbol(_pal(color_mode, "rail"), base_pass=15, wf=wf),
         )
         _add_rule(
             root,
             "Runways",
             "\"aeroway\" = 'runway'",
             _cased_road_symbol(
-                "#1A1A1A",
+                _pal(color_mode, "rail"),
                 1.65 * wf,
-                "#666666",
+                _pal(color_mode, "runway_fill"),
                 1.20 * wf,
                 casing_pass=9,
                 fill_pass=21,
@@ -1888,21 +2504,28 @@ def _build_transport_style(
             root,
             "Taxiways",
             "\"aeroway\" = 'taxiway'",
-            _cased_road_symbol("#333333", 0.85 * wf, "#B0B0B0", 0.55 * wf, casing_pass=7, fill_pass=19),
+            _cased_road_symbol(
+                _pal(color_mode, "taxiway_casing"),
+                0.85 * wf,
+                _pal(color_mode, "taxiway_fill"),
+                0.55 * wf,
+                casing_pass=7,
+                fill_pass=19,
+            ),
         )
         if carto.show_power:
             _add_rule(
                 root,
                 "Power Lines",
                 "\"power\" IN ('line','minor_line')",
-                _powerline_symbol("#555555", render_pass=2, wf=wf),
+                _powerline_symbol(_pal(color_mode, "power"), render_pass=2, wf=wf),
             )
         if carto.show_pipelines:
             _add_rule(
                 root,
                 "Pipelines",
                 "\"man_made\" = 'pipeline'",
-                _pipeline_symbol("#6A4C93", render_pass=2, wf=wf),
+                _pipeline_symbol(_pal(color_mode, "pipeline"), render_pass=2, wf=wf),
             )
     else:
         _add_rule(
@@ -2006,7 +2629,7 @@ def _build_transport_style(
     layer.setRenderer(renderer)
 
     # Hierarchical road labeling (shield badge for highway ref + curved street names)
-    halo_hex = "#FAF9F5" if is_color else "#FFFFFF"
+    halo_hex = _pal(color_mode, "halo")
     label_root = QgsRuleBasedLabeling.Rule(None)
 
     # Highway route shield badge on motorway/trunk/primary with ref
@@ -2018,10 +2641,10 @@ def _build_transport_style(
     pal_shield.setFormat(
         _make_text_format(
             5.8 + fd,
-            "#111111",
+            _pal(color_mode, "ink_dark"),
             bold=True,
             badge_fill_hex="#FFFFFF",
-            badge_stroke_hex="#5E1D12" if is_color else "#000000",
+            badge_stroke_hex=_pal(color_mode, "shield_stroke"),
         )
     )
     r_shield = QgsRuleBasedLabeling.Rule(pal_shield)
@@ -2039,7 +2662,7 @@ def _build_transport_style(
     pal_major.isExpression = True
     pal_major.priority = 7
     _configure_curved_line_pal(pal_major, on_line=False, repeat_mm=65.0 * rep_mult, min_feature_mm=14.0 * min_mult)
-    pal_major.setFormat(_make_text_format(6.4 + fd, "#1A1A1A", bold=True, halo_hex=halo_hex, halo_mm=0.7))
+    pal_major.setFormat(_make_text_format(6.4 + fd, _pal(color_mode, "ink"), bold=True, halo_hex=halo_hex, halo_mm=0.7))
     r_major = QgsRuleBasedLabeling.Rule(pal_major)
     r_major.setDescription("Major Road Names")
     r_major.setFilterExpression(
@@ -2065,7 +2688,7 @@ def _build_transport_style(
             min_feature_mm=15.0 * min_mult,
         )
         pal_minor.setFormat(
-            _make_text_format(5.6 + fd, "#2A2A2A" if is_color else "#111111", halo_hex=halo_hex, halo_mm=0.6)
+            _make_text_format(5.6 + fd, _pal(color_mode, "ink_soft"), halo_hex=halo_hex, halo_mm=0.6)
         )
         r_minor = QgsRuleBasedLabeling.Rule(pal_minor)
         r_minor.setDescription("Minor Road & Trail Labels")
@@ -2096,11 +2719,10 @@ def _build_points_style(
 
     wf = scale_width_factor(scale)
     fd = scale_font_delta(scale)
-    is_color = color_mode == ColorMode.COLOR
-    halo_hex = "#FAF9F5" if is_color else "#FFFFFF"
-    ink = "#1A1A1A" if is_color else "#000000"
-    red = "#C62828" if is_color else "#000000"
-    blue = "#1B4F72" if is_color else "#000000"
+    halo_hex = _pal(color_mode, "halo")
+    ink = _pal(color_mode, "ink")
+    red = _pal(color_mode, "danger")
+    blue = _pal(color_mode, "accent_blue")
 
     root = QgsRuleBasedRenderer.Rule(None)
 
@@ -2108,7 +2730,7 @@ def _build_points_style(
     peak_sym = QgsMarkerSymbol.createSimple(
         {
             "name": "triangle",
-            "color": "#111111",
+            "color": _pal(color_mode, "ink_dark"),
             "outline_color": "#FFFFFF",
             "outline_width": "0.28",
             "outline_width_unit": "MM",
@@ -2131,7 +2753,7 @@ def _build_points_style(
         {
             "name": "square",
             "color": "#FFFFFF",
-            "outline_color": "#C84B31" if is_color else "#000000",
+            "outline_color": _pal(color_mode, "exit_stroke"),
             "outline_width": "0.42",
             "outline_width_unit": "MM",
             "size": f"{1.9 * wf:.3f}",
@@ -2151,7 +2773,7 @@ def _build_points_style(
         {
             "name": "circle",
             "color": "#FFFFFF",
-            "outline_color": "#111111",
+            "outline_color": _pal(color_mode, "ink_dark"),
             "outline_width": "0.35",
             "outline_width_unit": "MM",
             "size": f"{2.2 * wf:.3f}",
@@ -2219,8 +2841,8 @@ def _build_points_style(
         pylon_sym = QgsMarkerSymbol.createSimple(
             {
                 "name": "cross2",
-                "color": "#444444" if is_color else "#1A1A1A",
-                "outline_color": "#444444" if is_color else "#1A1A1A",
+                "color": _pal(color_mode, "pylon"),
+                "outline_color": _pal(color_mode, "pylon"),
                 "outline_width": "0.22",
                 "outline_width_unit": "MM",
                 "size": f"{1.1 * wf:.3f}",
@@ -2233,7 +2855,7 @@ def _build_points_style(
     vp_sym = QgsMarkerSymbol.createSimple(
         {
             "name": "diamond",
-            "color": "#333333" if is_color else "#111111",
+            "color": _pal(color_mode, "viewpoint"),
             "outline_color": "#FFFFFF",
             "outline_width": "0.22",
             "outline_width_unit": "MM",
@@ -2246,7 +2868,7 @@ def _build_points_style(
     station_sym = QgsMarkerSymbol.createSimple(
         {
             "name": "square",
-            "color": "#1A1A1A",
+            "color": ink,
             "outline_color": "#FFFFFF",
             "outline_width": "0.25",
             "outline_width_unit": "MM",
@@ -2274,7 +2896,7 @@ def _build_points_style(
     pal_town.isExpression = True
     pal_town.priority = 10
     _configure_point_pal(pal_town, over_point=True)
-    pal_town.setFormat(_make_text_format(9.0 + fd, "#111111", bold=True, halo_hex=halo_hex, halo_mm=0.95))
+    pal_town.setFormat(_make_text_format(9.0 + fd, _pal(color_mode, "ink_dark"), bold=True, halo_hex=halo_hex, halo_mm=0.95))
     r_town = QgsRuleBasedLabeling.Rule(pal_town)
     r_town.setDescription("Cities & Towns")
     r_town.setFilterExpression("\"place\" IN ('city','town') AND \"name\" IS NOT NULL")
@@ -2286,7 +2908,7 @@ def _build_points_style(
     pal_village.isExpression = False
     pal_village.priority = 9
     _configure_point_pal(pal_village, over_point=True)
-    pal_village.setFormat(_make_text_format(7.6 + fd, "#1E1E1E", bold=True, halo_hex=halo_hex, halo_mm=0.85))
+    pal_village.setFormat(_make_text_format(7.6 + fd, ink, bold=True, halo_hex=halo_hex, halo_mm=0.85))
     r_village = QgsRuleBasedLabeling.Rule(pal_village)
     r_village.setDescription("Villages & Suburbs")
     r_village.setFilterExpression("\"place\" IN ('village','suburb') AND \"name\" IS NOT NULL")
@@ -2318,7 +2940,7 @@ def _build_points_style(
     pal_peak.isExpression = True
     pal_peak.priority = 8
     _configure_point_pal(pal_peak, over_point=False, dist_mm=1.6)
-    pal_peak.setFormat(_make_text_format(6.8 + fd, "#111111", bold=True, halo_hex=halo_hex, halo_mm=0.75))
+    pal_peak.setFormat(_make_text_format(6.8 + fd, _pal(color_mode, "ink_dark"), bold=True, halo_hex=halo_hex, halo_mm=0.75))
     r_peak = QgsRuleBasedLabeling.Rule(pal_peak)
     r_peak.setDescription("Peaks & Elevations")
     r_peak.setFilterExpression("\"natural\" IN ('peak','volcano') AND (\"name\" IS NOT NULL OR \"ele\" IS NOT NULL)")
@@ -2336,10 +2958,10 @@ def _build_points_style(
     pal_exit.setFormat(
         _make_text_format(
             6.0 + fd,
-            "#8C1D18" if is_color else "#000000",
+            _pal(color_mode, "exit_text"),
             bold=True,
             badge_fill_hex="#FFFFFF",
-            badge_stroke_hex="#C84B31" if is_color else "#000000",
+            badge_stroke_hex=_pal(color_mode, "exit_stroke"),
         )
     )
     r_exit = QgsRuleBasedLabeling.Rule(pal_exit)
@@ -2357,7 +2979,7 @@ def _build_points_style(
         pal_local.priority = 6
         _configure_point_pal(pal_local, over_point=False, dist_mm=1.3)
         pal_local.setFormat(
-            _make_text_format(6.4 + fd, "#2B2B2B" if is_color else "#111111", halo_hex=halo_hex, halo_mm=0.65)
+            _make_text_format(6.4 + fd, _pal(color_mode, "ink_soft"), halo_hex=halo_hex, halo_mm=0.65)
         )
         r_local = QgsRuleBasedLabeling.Rule(pal_local)
         r_local.setDescription("Localities / Viewpoints / Stations / Saddles")
@@ -2376,7 +2998,7 @@ def _build_points_style(
         pal_poi.priority = 4
         _configure_point_pal(pal_poi, over_point=False, dist_mm=1.6)
         pal_poi.setFormat(
-            _make_text_format(5.6 + fd, "#333333" if is_color else "#111111", halo_hex=halo_hex, halo_mm=0.55)
+            _make_text_format(5.6 + fd, _pal(color_mode, "ink_soft"), halo_hex=halo_hex, halo_mm=0.55)
         )
         r_poi = QgsRuleBasedLabeling.Rule(pal_poi)
         r_poi.setDescription("POI & Facility Names")
@@ -2408,8 +3030,7 @@ def _build_us_towers_style(
 
     wf = scale_width_factor(scale)
     fd = scale_font_delta(scale)
-    is_color = color_mode == ColorMode.COLOR
-    c_hex = "#1B4F72" if is_color else "#000000"
+    c_hex = _pal(color_mode, "accent_blue")
 
     sym = _svg_marker_symbol("obstacle_tower", 3.0 * wf, fill_hex=c_hex, outline_hex=c_hex, icons_root=icons_root)
     layer.setRenderer(QgsSingleSymbolRenderer(sym))
@@ -2444,7 +3065,7 @@ def _build_us_towers_style(
     pal.isExpression = True
     pal.priority = 7
     _configure_point_pal(pal, over_point=False, dist_mm=1.7)
-    pal.setFormat(_make_text_format(5.8 + fd, "#10324A" if is_color else "#000000", bold=True, halo_hex="#FFFFFF", halo_mm=0.65))
+    pal.setFormat(_make_text_format(5.8 + fd, _pal(color_mode, "accent_blue_dark"), bold=True, halo_hex="#FFFFFF", halo_mm=0.65))
     layer.setLabeling(QgsVectorLayerSimpleLabeling(pal))
     layer.setLabelsEnabled(True)
 
@@ -2466,8 +3087,7 @@ def _build_enc_navaids_style(
 
     wf = scale_width_factor(scale)
     fd = scale_font_delta(scale)
-    is_color = color_mode == ColorMode.COLOR
-    c_hex = "#1B4F72" if is_color else "#000000"
+    c_hex = _pal(color_mode, "accent_blue")
 
     sym = _svg_marker_symbol("navaid", 2.6 * wf, fill_hex=c_hex, outline_hex=c_hex, icons_root=icons_root)
     layer.setRenderer(QgsSingleSymbolRenderer(sym))
@@ -2490,10 +3110,8 @@ def _build_mgrs_grid_1km_style(layer: Any, color_mode: ColorMode) -> None:
     from qgis.core import QgsSingleSymbolRenderer
     from qgis.PyQt.QtGui import QPainter
 
-    if color_mode == ColorMode.COLOR:
-        sym = _line_symbol("#1B4F72", 0.18, cap_round=False)
-    else:
-        sym = _line_symbol("#000000", 0.20, cap_round=False)
+    w = 0.20 if color_mode in (ColorMode.BW, ColorMode.NIGHT_RED) else 0.18
+    sym = _line_symbol(_pal(color_mode, "grid_1km"), w, cap_round=False)
     layer.setRenderer(QgsSingleSymbolRenderer(sym))
     layer.setBlendMode(QPainter.CompositionMode_SourceOver)
     layer.setOpacity(1.0)
@@ -2504,10 +3122,8 @@ def _build_mgrs_grid_100km_style(layer: Any, color_mode: ColorMode) -> None:
     from qgis.core import QgsSingleSymbolRenderer
     from qgis.PyQt.QtGui import QPainter
 
-    if color_mode == ColorMode.COLOR:
-        sym = _line_symbol("#10324A", 0.45, cap_round=False)
-    else:
-        sym = _line_symbol("#000000", 0.50, cap_round=False)
+    w = 0.50 if _is_bw(color_mode) else (0.48 if color_mode == ColorMode.NIGHT_RED else 0.45)
+    sym = _line_symbol(_pal(color_mode, "grid_100km"), w, cap_round=False)
     layer.setRenderer(QgsSingleSymbolRenderer(sym))
     layer.setBlendMode(QPainter.CompositionMode_SourceOver)
     layer.setOpacity(1.0)
@@ -2517,10 +3133,8 @@ def _build_mgrs_grid_100km_style(layer: Any, color_mode: ColorMode) -> None:
 def _build_mgrs_zone_boundary_style(layer: Any, color_mode: ColorMode) -> None:
     from qgis.core import QgsSingleSymbolRenderer
 
-    if color_mode == ColorMode.COLOR:
-        sym = _line_symbol("#7B1FA2", 0.55, dash_vector=[3.0, 1.4], cap_round=False)
-    else:
-        sym = _line_symbol("#000000", 0.60, dash_vector=[3.0, 1.4], cap_round=False)
+    w = 0.60 if _is_bw(color_mode) else 0.55
+    sym = _line_symbol(_pal(color_mode, "zone_boundary"), w, dash_vector=[3.0, 1.4], cap_round=False)
     layer.setRenderer(QgsSingleSymbolRenderer(sym))
     layer.setLabelsEnabled(False)
 
@@ -2544,9 +3158,9 @@ def _build_mgrs_square_labels_style(layer: Any, color_mode: ColorMode) -> None:
     pal.setFormat(
         _make_text_format(
             11.0,
-            "#1B4F72" if color_mode == ColorMode.COLOR else "#1A1A1A",
+            _pal(color_mode, "square_label"),
             bold=True,
-            halo_hex="#FAF9F5" if color_mode == ColorMode.COLOR else "#FFFFFF",
+            halo_hex=_pal(color_mode, "halo"),
             halo_mm=1.0,
             halo_opacity=0.85,
             opacity=0.68,
@@ -2564,26 +3178,26 @@ def _build_overlay_style(layer: Any, role: str, color_mode: ColorMode) -> None:
         QgsVectorLayerSimpleLabeling,
     )
 
-    is_color = color_mode == ColorMode.COLOR
-    accent = "#C2185B" if is_color else "#000000"
+    bw = _is_bw(color_mode)
+    accent = _pal(color_mode, "overlay_accent")
 
     if role == "overlay_polygons":
         sym = _simple_fill_symbol(
-            accent if is_color else "transparent",
+            accent if not bw else "transparent",
             stroke_hex=accent,
-            stroke_mm=0.45 if is_color else 0.55,
+            stroke_mm=0.45 if not bw else 0.55,
             stroke_style="dash",
-            fill_opacity=0.14 if is_color else 1.0,
+            fill_opacity=0.14 if not bw else 1.0,
         )
     elif role == "overlay_lines":
-        sym = _line_symbol(accent, 0.55 if is_color else 0.65, dash_vector=[2.5, 1.1])
+        sym = _line_symbol(accent, 0.55 if not bw else 0.65, dash_vector=[2.5, 1.1])
     else:
         sym = QgsMarkerSymbol.createSimple(
             {
                 "name": "diamond",
-                "color": accent if is_color else "#FFFFFF",
-                "outline_color": "#FFFFFF" if is_color else "#000000",
-                "outline_width": "0.35" if is_color else "0.50",
+                "color": accent if not bw else "#FFFFFF",
+                "outline_color": "#FFFFFF" if not bw else "#000000",
+                "outline_width": "0.35" if not bw else "0.50",
                 "outline_width_unit": "MM",
                 "size": "2.8",
                 "size_unit": "MM",
@@ -2670,20 +3284,22 @@ def _build_au_protected_areas_style(
 
     wf = scale_width_factor(scale)
     fd = scale_font_delta(scale)
-    is_color = color_mode == ColorMode.COLOR
+    bw = _is_bw(color_mode)
     ipa_expr = "upper(coalesce(\"type_abbr\", '')) = 'IPA' OR lower(coalesce(\"park_type\", '')) LIKE '%indigenous%'"
 
     root = QgsRuleBasedRenderer.Rule(None)
-    if is_color:
+    if not bw:
+        ipa_c = _pal(color_mode, "park_ipa_stroke")
+        np_c = _pal(color_mode, "park_stroke")
         _add_rule(
             root,
             "Indigenous Protected Areas (IPA)",
             ipa_expr,
             _park_boundary_symbol(
-                "#2E7D6B",
+                ipa_c,
                 0.48 * wf,
                 [3.0, 1.1, 0.7, 1.1],
-                band_hex="#2E7D6B",
+                band_hex=ipa_c,
                 band_alpha=42,
                 band_width_mm=0.95 * wf,
                 band_offset_mm=0.52 * wf,
@@ -2695,10 +3311,10 @@ def _build_au_protected_areas_style(
             "National Parks & Reserves (CAPAD)",
             f"NOT ({ipa_expr})",
             _park_boundary_symbol(
-                "#2B7A3E",
+                np_c,
                 0.48 * wf,
                 [3.4, 1.3],
-                band_hex="#2B7A3E",
+                band_hex=np_c,
                 band_alpha=46,
                 band_width_mm=1.0 * wf,
                 band_offset_mm=0.55 * wf,
@@ -2756,9 +3372,9 @@ def _build_au_protected_areas_style(
     pal.setFormat(
         _make_text_format(
             6.6 + fd,
-            "#1E5C2E" if is_color else "#1A1A1A",
+            _pal(color_mode, "park_label"),
             bold=True,
-            halo_hex="#FAF9F5" if is_color else "#FFFFFF",
+            halo_hex=_pal(color_mode, "halo"),
             halo_mm=0.75,
         )
     )
@@ -2782,29 +3398,35 @@ def _build_au_hydro_polys_style(
 
     wf = scale_width_factor(scale)
     fd = scale_font_delta(scale)
-    is_color = color_mode == ColorMode.COLOR
+    bw = _is_bw(color_mode)
     perennial_expr = "lower(coalesce(\"perenniality\", 'perennial')) = 'perennial'"
 
     root = QgsRuleBasedRenderer.Rule(None)
-    if is_color:
+    if not bw:
         _add_rule(
             root,
             "GA Perennial Waterbody",
             perennial_expr,
-            _simple_fill_symbol("#A6D1EC", stroke_hex="#3A82B5", stroke_mm=0.20 * wf, stroke_style="solid", fill_opacity=0.65),
+            _simple_fill_symbol(
+                _pal(color_mode, "water_fill"),
+                stroke_hex=_pal(color_mode, "water_stroke"),
+                stroke_mm=0.20 * wf,
+                stroke_style="solid",
+                fill_opacity=0.65,
+            ),
         )
         _add_rule(
             root,
             "GA Non-Perennial / Dry Lake",
             f"NOT ({perennial_expr})",
             _hatch_fill_symbol(
-                "#4B8EC2",
+                _pal(color_mode, "au_dry_hatch"),
                 angle_deg=0.0,
                 spacing_mm=1.8,
                 line_mm=0.12,
-                bg_hex="#CBE3F2",
+                bg_hex=_pal(color_mode, "au_dry_bg"),
                 bg_alpha=110,
-                outline_hex="#3A82B5",
+                outline_hex=_pal(color_mode, "water_stroke"),
                 outline_mm=0.18 * wf,
                 outline_dash=[1.8, 1.0],
                 dash_vector=[1.6, 1.2],
@@ -2850,7 +3472,7 @@ def _build_au_hydro_polys_style(
     pal.setFormat(
         _make_text_format(
             6.2 + fd,
-            "#1E5B88" if is_color else "#111111",
+            _pal(color_mode, "water_label"),
             italic=True,
             halo_hex="#FFFFFF",
             halo_mm=0.6,
@@ -2878,13 +3500,12 @@ def _build_au_hydro_lines_style(
     wf = scale_width_factor(scale)
     fd = scale_font_delta(scale)
     rep_mult, min_mult = _density_params(carto.label_density)
-    is_color = color_mode == ColorMode.COLOR
     arrow_iv = 34.0 / wf
 
-    major_c = "#2474B5" if is_color else "#1A1A1A"
-    minor_c = "#2E80BF" if is_color else "#2B2B2B"
-    nonper_c = "#3D8AC4" if is_color else "#444444"
-    halo_c = "#FAF9F5" if is_color else "#FFFFFF"
+    major_c = _pal(color_mode, "au_hydro_major")
+    minor_c = _pal(color_mode, "au_hydro_minor")
+    nonper_c = _pal(color_mode, "au_hydro_nonper")
+    halo_c = _pal(color_mode, "halo")
 
     root = QgsRuleBasedRenderer.Rule(None)
     _add_rule(
@@ -2955,8 +3576,7 @@ def _build_au_hydro_points_style(
 
     wf = scale_width_factor(scale)
     fd = scale_font_delta(scale)
-    is_color = color_mode == ColorMode.COLOR
-    c_hex = "#1B6CA8" if is_color else "#000000"
+    c_hex = _pal(color_mode, "au_bore")
 
     sym = _svg_marker_symbol("water_bore", 2.6 * wf, fill_hex=c_hex, outline_hex=c_hex, icons_root=icons_root)
     layer.setRenderer(QgsSingleSymbolRenderer(sym))
@@ -2983,7 +3603,7 @@ def _build_au_hydro_points_style(
     pal.setFormat(
         _make_text_format(
             5.8 + fd,
-            "#145282" if is_color else "#000000",
+            _pal(color_mode, "au_bore_label"),
             bold=True,
             halo_hex="#FFFFFF",
             halo_mm=0.65,
@@ -3006,8 +3626,7 @@ def _build_au_power_lines_style(
     wf = scale_width_factor(scale)
     fd = scale_font_delta(scale)
     rep_mult, min_mult = _density_params(carto.label_density)
-    is_color = color_mode == ColorMode.COLOR
-    c_hex = "#4A4A4A" if is_color else "#1A1A1A"
+    c_hex = _pal(color_mode, "au_power")
 
     layer.setRenderer(QgsSingleSymbolRenderer(_powerline_symbol(c_hex, render_pass=2, wf=wf * 1.15)))
 
@@ -3049,8 +3668,7 @@ def _build_au_substations_style(
 
     wf = scale_width_factor(scale)
     fd = scale_font_delta(scale)
-    is_color = color_mode == ColorMode.COLOR
-    c_hex = "#3D3D3D" if is_color else "#000000"
+    c_hex = _pal(color_mode, "au_sub")
 
     sym = QgsMarkerSymbol.createSimple(
         {
@@ -3100,8 +3718,7 @@ def _build_au_pipelines_style(
     wf = scale_width_factor(scale)
     fd = scale_font_delta(scale)
     rep_mult, min_mult = _density_params(carto.label_density)
-    is_color = color_mode == ColorMode.COLOR
-    c_hex = "#6A4C93" if is_color else "#1A1A1A"
+    c_hex = _pal(color_mode, "pipeline")
 
     layer.setRenderer(QgsSingleSymbolRenderer(_pipeline_symbol(c_hex, render_pass=2, wf=wf * 1.05)))
 
@@ -3136,11 +3753,10 @@ def _build_au_runways_style(
     from qgis.core import QgsSingleSymbolRenderer
 
     wf = scale_width_factor(scale)
-    is_color = color_mode == ColorMode.COLOR
     sym = _cased_road_symbol(
-        "#1A1A1A" if is_color else "#000000",
+        _pal(color_mode, "rail"),
         1.55 * wf,
-        "#666666" if is_color else "#444444",
+        _pal(color_mode, "runway_fill"),
         1.10 * wf,
         casing_pass=9,
         fill_pass=21,
@@ -3166,8 +3782,7 @@ def _build_au_airfields_style(
 
     wf = scale_width_factor(scale)
     fd = scale_font_delta(scale)
-    is_color = color_mode == ColorMode.COLOR
-    c_hex = "#1B4F72" if is_color else "#000000"
+    c_hex = _pal(color_mode, "accent_blue")
 
     sym = _svg_marker_symbol("airfield", 3.0 * wf, fill_hex=c_hex, outline_hex=c_hex, icons_root=icons_root)
     layer.setRenderer(QgsSingleSymbolRenderer(sym))
@@ -3177,7 +3792,7 @@ def _build_au_airfields_style(
     pal.isExpression = False
     pal.priority = 8
     _configure_point_pal(pal, over_point=False, dist_mm=1.8)
-    pal.setFormat(_make_text_format(6.2 + fd, "#10324A" if is_color else "#000000", bold=True, halo_hex="#FFFFFF", halo_mm=0.7))
+    pal.setFormat(_make_text_format(6.2 + fd, _pal(color_mode, "accent_blue_dark"), bold=True, halo_hex="#FFFFFF", halo_mm=0.7))
     layer.setLabeling(QgsVectorLayerSimpleLabeling(pal))
     layer.setLabelsEnabled(True)
 
@@ -3195,8 +3810,7 @@ def _build_au_homesteads_style(
 
     wf = scale_width_factor(scale)
     fd = scale_font_delta(scale)
-    is_color = color_mode == ColorMode.COLOR
-    c_hex = "#1A1A1A" if is_color else "#000000"
+    c_hex = _pal(color_mode, "ink")
 
     sym = _svg_marker_symbol("homestead", 2.7 * wf, fill_hex=c_hex, outline_hex=c_hex, icons_root=icons_root)
     layer.setRenderer(QgsSingleSymbolRenderer(sym))
@@ -3210,7 +3824,7 @@ def _build_au_homesteads_style(
     pal.isExpression = False
     pal.priority = 7
     _configure_point_pal(pal, over_point=False, dist_mm=1.7)
-    pal.setFormat(_make_text_format(6.1 + fd, c_hex, bold=True, halo_hex="#FAF9F5" if is_color else "#FFFFFF", halo_mm=0.65))
+    pal.setFormat(_make_text_format(6.1 + fd, c_hex, bold=True, halo_hex=_pal(color_mode, "halo"), halo_mm=0.65))
     layer.setLabeling(QgsVectorLayerSimpleLabeling(pal))
     layer.setLabelsEnabled(True)
 
@@ -3262,27 +3876,27 @@ def _build_au_state_trails_style(
     scale: int = 25000,
     carto: CartoOptions = _DEFAULT_CARTO,
 ) -> None:
-    """Style NSW & VIC high-res Fire Trails, Management Trails, 4WD Tracks, and Walking Tracks."""
+    """Style AU State, NZ DOC, USFS/NPS, and CA CanVec Fire Trails, 4WD Tracks, and Walking Tracks."""
     from qgis.core import QgsPalLayerSettings, QgsRuleBasedLabeling, QgsRuleBasedRenderer
 
     wf = scale_width_factor(scale)
     fd = scale_font_delta(scale)
     rep_mult, min_mult = _density_params(carto.label_density)
-    is_color = color_mode == ColorMode.COLOR
-    halo_c = "#FAF9F5" if is_color else "#FFFFFF"
+    bw = _is_bw(color_mode)
+    halo_c = _pal(color_mode, "halo")
 
     fire_filter = "lower(coalesce(\"trail_class\", '')) IN ('fire_trail','management_trail')"
     fourwd_filter = "lower(coalesce(\"trail_class\", '')) = '4wd_track'"
     walk_filter = f"NOT ({fire_filter}) AND NOT ({fourwd_filter})"
 
     root = QgsRuleBasedRenderer.Rule(None)
-    if is_color:
+    if not bw:
         _add_rule(
             root,
             "Fire & Management Trails",
             fire_filter,
             _halo_dashed_line_symbol(
-                "#D95F02",
+                _pal(color_mode, "state_fire_trail"),
                 0.56 * wf,
                 [3.0, 1.1],
                 halo_hex=halo_c,
@@ -3295,13 +3909,13 @@ def _build_au_state_trails_style(
             root,
             "4WD Tracks",
             fourwd_filter,
-            _line_symbol("#7F4F24", 0.42 * wf, dash_vector=[2.4, 1.0], cap_round=False, render_pass=10),
+            _line_symbol(_pal(color_mode, "state_4wd"), 0.42 * wf, dash_vector=[2.4, 1.0], cap_round=False, render_pass=10),
         )
         _add_rule(
             root,
             "Walking Tracks",
             walk_filter,
-            _line_symbol("#A63603", 0.30 * wf, dash_vector=[1.4, 0.9], cap_round=False, render_pass=8),
+            _line_symbol(_pal(color_mode, "state_walk"), 0.30 * wf, dash_vector=[1.4, 0.9], cap_round=False, render_pass=8),
         )
     else:
         _add_rule(
@@ -3359,7 +3973,7 @@ def _build_au_state_trails_style(
     ft_pal.setFormat(
         _make_text_format(
             5.9 + fd,
-            "#A83F00" if is_color else "#000000",
+            _pal(color_mode, "state_fire_label"),
             bold=True,
             halo_hex="#FFFFFF",
             halo_mm=0.68,
@@ -3378,7 +3992,7 @@ def _build_au_state_trails_style(
     trk_pal.setFormat(
         _make_text_format(
             5.5 + fd,
-            "#6B2A0A" if is_color else "#1A1A1A",
+            _pal(color_mode, "state_walk_label"),
             italic=False,
             halo_hex=halo_c,
             halo_mm=0.58,
@@ -3402,7 +4016,7 @@ def _build_au_state_pois_style(
     carto: CartoOptions = _DEFAULT_CARTO,
     icons_root: Path | None = None,
 ) -> None:
-    """Style NSW & VIC Alpine Huts, Campgrounds, Trig Stations, Lookouts, and Picnic Sites."""
+    """Style AU State, NZ DOC, USFS/NPS, and CA CanVec Huts, Campgrounds, Trigs, Lookouts, and Sites."""
     from qgis.core import (
         QgsMarkerSymbol,
         QgsPalLayerSettings,
@@ -3412,11 +4026,10 @@ def _build_au_state_pois_style(
 
     wf = scale_width_factor(scale)
     fd = scale_font_delta(scale)
-    is_color = color_mode == ColorMode.COLOR
-    ink = "#1A1A1A" if is_color else "#000000"
-    hut_c = "#7A3E1D" if is_color else "#000000"
-    camp_c = "#1E6B3A" if is_color else "#000000"
-    lookout_c = "#1B4F72" if is_color else "#111111"
+    ink = _pal(color_mode, "ink")
+    hut_c = _pal(color_mode, "poi_hut")
+    camp_c = _pal(color_mode, "poi_camp")
+    lookout_c = _pal(color_mode, "poi_lookout")
 
     root = QgsRuleBasedRenderer.Rule(None)
     _add_rule(
@@ -3506,7 +4119,7 @@ def _build_au_state_pois_style(
     hc_pal.setFormat(
         _make_text_format(
             6.0 + fd,
-            "#4A230D" if is_color else "#000000",
+            _pal(color_mode, "poi_hc_label"),
             bold=True,
             halo_hex="#FFFFFF",
             halo_mm=0.72,
@@ -3529,7 +4142,7 @@ def _build_au_state_pois_style(
         rec_pal.setFormat(
             _make_text_format(
                 5.5 + fd,
-                lookout_c if is_color else "#1A1A1A",
+                lookout_c if not _is_bw(color_mode) else "#1A1A1A",
                 italic=True,
                 halo_hex="#FFFFFF",
                 halo_mm=0.6,
@@ -3592,13 +4205,12 @@ def _build_waypoint_route_style(
     *,
     scale: int = 25000,
 ) -> None:
-    """Style tactical waypoint connecting route legs (vivid magenta in Color, bold black in B&W)."""
+    """Style tactical waypoint connecting route legs across all 4 cartographic themes."""
     from qgis.core import QgsSingleSymbolRenderer
 
     wf = scale_width_factor(scale)
-    is_color = color_mode == ColorMode.COLOR
     sym = _halo_dashed_line_symbol(
-        "#C2185B" if is_color else "#111111",
+        _pal(color_mode, "wp_route"),
         0.55 * wf,
         [3.2, 1.4],
         halo_hex="#FFFFFF",
@@ -3621,40 +4233,40 @@ def _build_waypoint_points_style(
 
     wf = scale_width_factor(scale)
     fd = scale_font_delta(scale)
-    is_color = color_mode == ColorMode.COLOR
+    bw = _is_bw(color_mode)
     sz = 2.6 * wf
 
     root = QgsRuleBasedRenderer.Rule(None)
-    if is_color:
+    if not bw:
         _add_rule(
             root,
             "Camp Waypoint",
             "lower(coalesce(\"category\", '')) = 'camp'",
-            _waypoint_badge_symbol("circle", "#1E7E34", "#0D4D1D", sz),
+            _waypoint_badge_symbol("circle", _pal(color_mode, "wp_camp"), _pal(color_mode, "wp_camp_border"), sz),
         )
         _add_rule(
             root,
             "Water Waypoint",
             "lower(coalesce(\"category\", '')) = 'water'",
-            _waypoint_badge_symbol("circle", "#1565C0", "#0A3A70", sz),
+            _waypoint_badge_symbol("circle", _pal(color_mode, "wp_water"), _pal(color_mode, "wp_water_border"), sz),
         )
         _add_rule(
             root,
             "Hazard Waypoint",
             "lower(coalesce(\"category\", '')) = 'hazard'",
-            _waypoint_badge_symbol("diamond", "#D84315", "#7F2307", sz + 0.3),
+            _waypoint_badge_symbol("diamond", _pal(color_mode, "wp_hazard"), _pal(color_mode, "wp_hazard_border"), sz + 0.3),
         )
         _add_rule(
             root,
             "LZ Waypoint",
             "lower(coalesce(\"category\", '')) = 'lz'",
-            _waypoint_badge_symbol("pentagon", "#6A1B9A", "#3B0A59", sz + 0.2),
+            _waypoint_badge_symbol("pentagon", _pal(color_mode, "wp_lz"), _pal(color_mode, "wp_lz_border"), sz + 0.2),
         )
         _add_rule(
             root,
             "Standard Waypoint",
             "lower(coalesce(\"category\", '')) NOT IN ('camp','water','hazard','lz')",
-            _waypoint_badge_symbol("circle", "#C2185B", "#7A0D38", sz),
+            _waypoint_badge_symbol("circle", _pal(color_mode, "wp_std"), _pal(color_mode, "wp_std_border"), sz),
         )
     else:
         _add_rule(
@@ -3708,7 +4320,7 @@ def _build_waypoint_points_style(
     pal.setFormat(
         _make_text_format(
             6.5 + fd,
-            "#880E4F" if is_color else "#000000",
+            _pal(color_mode, "wp_label"),
             bold=True,
             halo_hex="#FFFFFF",
             halo_mm=0.85,
@@ -3729,9 +4341,8 @@ def _build_viewshed_rings_style(
     from qgis.core import QgsSingleSymbolRenderer
 
     wf = scale_width_factor(scale)
-    is_color = color_mode == ColorMode.COLOR
     sym = _halo_dashed_line_symbol(
-        "#00897B" if is_color else "#222222",
+        _pal(color_mode, "viewshed_ring"),
         0.38 * wf,
         [2.6, 1.4],
         halo_hex="#FFFFFF",
@@ -3756,9 +4367,8 @@ def _build_viewshed_observers_style(
 
     wf = scale_width_factor(scale)
     fd = scale_font_delta(scale)
-    is_color = color_mode == ColorMode.COLOR
-    fill_c = "#00695C" if is_color else "#000000"
-    outline_c = "#004D40" if is_color else "#000000"
+    fill_c = _pal(color_mode, "viewshed_obs")
+    outline_c = _pal(color_mode, "viewshed_obs_out")
 
     sym = _svg_marker_symbol(
         "observer",
@@ -3794,10 +4404,359 @@ def _build_viewshed_observers_style(
     pal.setFormat(
         _make_text_format(
             6.3 + fd,
-            "#004D40" if is_color else "#000000",
+            outline_c,
             bold=True,
             halo_hex="#FFFFFF",
             halo_mm=0.85,
+            halo_opacity=0.98,
+        )
+    )
+    layer.setLabeling(QgsVectorLayerSimpleLabeling(pal))
+    layer.setLabelsEnabled(True)
+
+
+def _build_public_lands_style(
+    layer: Any,
+    color_mode: ColorMode,
+    *,
+    scale: int = 25000,
+    carto: CartoOptions = _DEFAULT_CARTO,
+) -> None:
+    """Style US PAD-US/USFS/NPS/BLM & Canada Parks/Protected Areas (``public_lands``)."""
+    from qgis.core import QgsPalLayerSettings, QgsRuleBasedLabeling, QgsRuleBasedRenderer
+
+    wf = scale_width_factor(scale)
+    fd = scale_font_delta(scale)
+    bw = _is_bw(color_mode)
+
+    np_expr = (
+        "lower(coalesce(\"designation\", '')) LIKE '%wilderness%' "
+        "OR lower(coalesce(\"designation\", '')) LIKE '%national park%' "
+        "OR upper(coalesce(\"manager\", '')) IN ('NPS','PC','PARKS CANADA')"
+    )
+    nf_expr = (
+        f"NOT ({np_expr}) AND ("
+        "upper(coalesce(\"manager\", '')) IN ('USFS','FS') "
+        "OR lower(coalesce(\"designation\", '')) LIKE '%forest%'"
+        ")"
+    )
+    blm_expr = f"NOT ({np_expr}) AND NOT ({nf_expr})"
+
+    root = QgsRuleBasedRenderer.Rule(None)
+    if not bw:
+        np_c = _pal(color_mode, "public_np_stroke")
+        nf_c = _pal(color_mode, "public_nf_stroke")
+        blm_c = _pal(color_mode, "public_blm_stroke")
+        _add_rule(
+            root,
+            "National Parks & Wilderness",
+            np_expr,
+            _park_boundary_symbol(
+                np_c,
+                0.50 * wf,
+                [3.4, 1.2],
+                band_hex=np_c,
+                band_alpha=46,
+                band_width_mm=1.05 * wf,
+                band_offset_mm=0.55 * wf,
+                tint_alpha=12,
+            ),
+        )
+        _add_rule(
+            root,
+            "National & Crown Forests",
+            nf_expr,
+            _park_boundary_symbol(
+                nf_c,
+                0.44 * wf,
+                [2.8, 1.2, 0.7, 1.2],
+                band_hex=nf_c,
+                band_alpha=38,
+                band_width_mm=0.90 * wf,
+                band_offset_mm=0.48 * wf,
+                tint_alpha=10,
+            ),
+        )
+        _add_rule(
+            root,
+            "BLM / Public Lands",
+            blm_expr,
+            _park_boundary_symbol(
+                blm_c,
+                0.40 * wf,
+                [2.4, 1.1, 0.6, 1.1],
+                band_hex=blm_c,
+                band_alpha=34,
+                band_width_mm=0.80 * wf,
+                band_offset_mm=0.45 * wf,
+                tint_alpha=10,
+            ),
+        )
+    else:
+        _add_rule(
+            root,
+            "National Parks & Wilderness",
+            np_expr,
+            _park_boundary_symbol(
+                "#1A1A1A",
+                0.48 * wf,
+                [3.2, 1.1, 0.7, 1.1],
+                band_hex="#555555",
+                band_alpha=180,
+                band_width_mm=0.14,
+                band_offset_mm=0.55,
+            ),
+        )
+        _add_rule(
+            root,
+            "National & Crown Forests",
+            nf_expr,
+            _park_boundary_symbol(
+                "#262626",
+                0.42 * wf,
+                [2.6, 1.2],
+                band_hex="#666666",
+                band_alpha=160,
+                band_width_mm=0.12,
+                band_offset_mm=0.50,
+            ),
+        )
+        _add_rule(
+            root,
+            "BLM / Public Lands",
+            blm_expr,
+            _park_boundary_symbol(
+                "#333333",
+                0.38 * wf,
+                [1.8, 1.0, 0.5, 1.0],
+                band_hex="#777777",
+                band_alpha=150,
+                band_width_mm=0.12,
+                band_offset_mm=0.45,
+            ),
+        )
+
+    layer.setRenderer(QgsRuleBasedRenderer(root))
+
+    if carto.label_density == DensityLevel.LOW:
+        layer.setLabelsEnabled(False)
+        return
+
+    label_root = QgsRuleBasedLabeling.Rule(None)
+    pal = QgsPalLayerSettings()
+    pal.fieldName = (
+        "CASE "
+        "WHEN \"name\" IS NOT NULL AND length(trim(\"name\")) > 0 "
+        "AND \"manager\" IS NOT NULL AND length(trim(\"manager\")) > 0 "
+        "AND strpos(upper(\"name\"), upper(trim(\"manager\"))) = 0 "
+        "THEN upper(trim(\"name\")) || ' (' || upper(trim(\"manager\")) || ')' "
+        "WHEN \"name\" IS NOT NULL AND length(trim(\"name\")) > 0 THEN upper(trim(\"name\")) "
+        "ELSE '' END"
+    )
+    pal.isExpression = True
+    pal.priority = 4
+    pal.setFormat(
+        _make_text_format(
+            6.5 + fd,
+            _pal(color_mode, "public_label"),
+            bold=True,
+            halo_hex=_pal(color_mode, "halo"),
+            halo_mm=0.75,
+        )
+    )
+    rule = QgsRuleBasedLabeling.Rule(pal)
+    rule.setDescription("Public Lands Labels")
+    rule.setFilterExpression("\"name\" IS NOT NULL AND length(trim(\"name\")) > 0")
+    label_root.appendChild(rule)
+    layer.setLabeling(QgsRuleBasedLabeling(label_root))
+    layer.setLabelsEnabled(True)
+
+
+def _build_tactical_sectors_style(
+    layer: Any,
+    color_mode: ColorMode,
+    *,
+    scale: int = 25000,
+) -> None:
+    """Style user-authored tactical sectors and AOI corridors (``tactical_sectors``)."""
+    from qgis.core import QgsPalLayerSettings, QgsSingleSymbolRenderer, QgsVectorLayerSimpleLabeling
+
+    wf = scale_width_factor(scale)
+    fd = scale_font_delta(scale)
+    bw = _is_bw(color_mode)
+    sec_c = _pal(color_mode, "tactical_sector")
+
+    if not bw:
+        sym = _hatch_fill_symbol(
+            sec_c,
+            angle_deg=45.0,
+            spacing_mm=3.6,
+            line_mm=0.12 * wf,
+            bg_hex=sec_c,
+            bg_alpha=28,
+            outline_hex=sec_c,
+            outline_mm=0.52 * wf,
+            outline_dash=[3.2, 1.2],
+        )
+    else:
+        sym = _hatch_fill_symbol(
+            "#333333",
+            angle_deg=45.0,
+            spacing_mm=3.2,
+            line_mm=0.14 * wf,
+            outline_hex="#000000",
+            outline_mm=0.55 * wf,
+            outline_dash=[3.2, 1.2],
+        )
+    layer.setRenderer(QgsSingleSymbolRenderer(sym))
+
+    lbl_expr = (
+        "CASE "
+        "WHEN \"label\" IS NOT NULL AND length(trim(\"label\")) > 0 "
+        "AND \"area_km2\" IS NOT NULL AND to_real(\"area_km2\") > 0 "
+        "THEN upper(trim(\"label\")) || '\\n' || round(to_real(\"area_km2\"), 2) || ' km²' "
+        "WHEN \"label\" IS NOT NULL AND length(trim(\"label\")) > 0 THEN upper(trim(\"label\")) "
+        "ELSE '' END"
+    )
+    pal = QgsPalLayerSettings()
+    pal.fieldName = lbl_expr
+    pal.isExpression = True
+    pal.priority = 9
+    pal.setFormat(
+        _make_text_format(
+            6.3 + fd,
+            sec_c,
+            bold=True,
+            halo_hex="#FFFFFF",
+            halo_mm=0.80,
+            halo_opacity=0.96,
+        )
+    )
+    layer.setLabeling(QgsVectorLayerSimpleLabeling(pal))
+    layer.setLabelsEnabled(True)
+
+
+def _build_tactical_rings_style(
+    layer: Any,
+    color_mode: ColorMode,
+    *,
+    scale: int = 25000,
+) -> None:
+    """Style concentric tactical range rings (``tactical_rings``) with distance callouts."""
+    from qgis.core import QgsPalLayerSettings, QgsSingleSymbolRenderer, QgsVectorLayerSimpleLabeling
+
+    wf = scale_width_factor(scale)
+    fd = scale_font_delta(scale)
+    ring_c = _pal(color_mode, "tactical_ring")
+
+    sym = _halo_dashed_line_symbol(
+        ring_c,
+        0.42 * wf,
+        [2.4, 1.1],
+        halo_hex="#FFFFFF",
+        halo_width_mm=0.78 * wf,
+        halo_alpha=200,
+        render_pass=29,
+    )
+    layer.setRenderer(QgsSingleSymbolRenderer(sym))
+
+    lbl_expr = (
+        "CASE "
+        "WHEN \"label\" IS NOT NULL AND length(trim(\"label\")) > 0 THEN trim(\"label\") "
+        "WHEN \"radius_km\" IS NOT NULL AND to_real(\"radius_km\") > 0 "
+        "THEN CASE WHEN abs(to_real(\"radius_km\") - round(to_real(\"radius_km\"))) < 0.01 "
+        "THEN to_int(round(to_real(\"radius_km\"))) || ' km' "
+        "ELSE round(to_real(\"radius_km\"), 2) || ' km' END "
+        "ELSE '' END"
+    )
+    pal = QgsPalLayerSettings()
+    pal.fieldName = lbl_expr
+    pal.isExpression = True
+    pal.priority = 9
+    _configure_curved_line_pal(pal, on_line=True, repeat_mm=65.0, min_feature_mm=8.0)
+    pal.setFormat(
+        _make_text_format(
+            5.8 + fd,
+            ring_c,
+            bold=True,
+            halo_hex="#FFFFFF",
+            halo_mm=0.75,
+            halo_opacity=0.96,
+        )
+    )
+    layer.setLabeling(QgsVectorLayerSimpleLabeling(pal))
+    layer.setLabelsEnabled(True)
+
+
+def _build_tactical_lines_style(
+    layer: Any,
+    color_mode: ColorMode,
+    *,
+    scale: int = 25000,
+) -> None:
+    """Style tactical bearing lines, pinned ruler legs, and RF LOS links (``tactical_lines``)."""
+    from qgis.core import QgsPalLayerSettings, QgsRuleBasedRenderer, QgsVectorLayerSimpleLabeling
+
+    wf = scale_width_factor(scale)
+    fd = scale_font_delta(scale)
+    line_c = _pal(color_mode, "tactical_line")
+    rf_c = _pal(color_mode, "tactical_rf_line")
+    lbl_c = _pal(color_mode, "tactical_label")
+
+    root = QgsRuleBasedRenderer.Rule(None)
+    _add_rule(
+        root,
+        "RF Point-to-Point Link",
+        "lower(coalesce(\"kind\", '')) = 'rf_link'",
+        _halo_dashed_line_symbol(
+            rf_c,
+            0.50 * wf,
+            [3.4, 1.0, 0.8, 1.0],
+            halo_hex="#FFFFFF",
+            halo_width_mm=0.95 * wf,
+            halo_alpha=215,
+            render_pass=31,
+        ),
+    )
+    _add_rule(
+        root,
+        "Bearing / Tactical Line",
+        "lower(coalesce(\"kind\", '')) != 'rf_link'",
+        _halo_dashed_line_symbol(
+            line_c,
+            0.55 * wf,
+            [4.2, 1.3],
+            halo_hex="#FFFFFF",
+            halo_width_mm=1.0 * wf,
+            halo_alpha=220,
+            render_pass=31,
+        ),
+    )
+    renderer = QgsRuleBasedRenderer(root)
+    renderer.setUsingSymbolLevels(True)
+    layer.setRenderer(renderer)
+
+    lbl_expr = (
+        "CASE "
+        "WHEN \"label\" IS NOT NULL AND length(trim(\"label\")) > 0 THEN trim(\"label\") "
+        "WHEN \"distance_km\" IS NOT NULL AND \"bearing_mag_deg\" IS NOT NULL "
+        "THEN round(to_real(\"distance_km\"), 2) || ' km · ' || "
+        "lpad(to_string(to_int(round(to_real(\"bearing_mag_deg\")))), 3, '0') || '°M' "
+        "WHEN \"distance_km\" IS NOT NULL THEN round(to_real(\"distance_km\"), 2) || ' km' "
+        "ELSE '' END"
+    )
+    pal = QgsPalLayerSettings()
+    pal.fieldName = lbl_expr
+    pal.isExpression = True
+    pal.priority = 10
+    _configure_curved_line_pal(pal, on_line=False, repeat_mm=80.0, min_feature_mm=8.0)
+    pal.setFormat(
+        _make_text_format(
+            6.1 + fd,
+            lbl_c,
+            bold=True,
+            halo_hex="#FFFFFF",
+            halo_mm=0.82,
             halo_opacity=0.98,
         )
     )
@@ -3830,6 +4789,8 @@ def apply_programmatic_style(
         _build_fema_flood_style(layer, color_mode, scale=scale, carto=opts)
     elif role == "au_protected_areas":
         _build_au_protected_areas_style(layer, color_mode, scale=scale, carto=opts)
+    elif role == "public_lands":
+        _build_public_lands_style(layer, color_mode, scale=scale, carto=opts)
     elif role == "water_polygons":
         _build_water_polygons_style(layer, color_mode, scale=scale, carto=opts)
     elif role == "au_hydro_polys":
@@ -3884,6 +4845,12 @@ def apply_programmatic_style(
         _build_mgrs_square_labels_style(layer, color_mode)
     elif role in ("overlay_polygons", "overlay_lines", "overlay_points"):
         _build_overlay_style(layer, role, color_mode)
+    elif role == "tactical_sectors":
+        _build_tactical_sectors_style(layer, color_mode, scale=scale)
+    elif role == "tactical_rings":
+        _build_tactical_rings_style(layer, color_mode, scale=scale)
+    elif role == "tactical_lines":
+        _build_tactical_lines_style(layer, color_mode, scale=scale)
     elif role == "waypoint_route":
         _build_waypoint_route_style(layer, color_mode, scale=scale)
     elif role == "waypoint_points":
@@ -4129,7 +5096,12 @@ def populate_project_layers(
 
     au_state_trail_entries: list[tuple[str, Path, set[str]]] = []
     seen_state_paths: set[Path] = set()
-    unified_trail_kinds = (*AU_STATE_TRAIL_OVERLAY_KINDS, NZOverlayKind.NZ_DOC_TRAILS)
+    unified_trail_kinds = (
+        *AU_STATE_TRAIL_OVERLAY_KINDS,
+        NZOverlayKind.NZ_DOC_TRAILS,
+        USOverlayKind.US_TRAILS,
+        CAOverlayKind.CA_CANVEC_TRAILS,
+    )
     for st_kind in unified_trail_kinds:
         raw_st = regional.get(st_kind.value) or regional.get(st_kind.value.replace("-", "_"))
         if raw_st is None:
@@ -4145,9 +5117,30 @@ def populate_project_layers(
                 label_prefix = "AU State"
             elif st_kind.value == "nz-doc-trails":
                 label_prefix = "NZ DOC"
+            elif st_kind.value == "us-trails":
+                label_prefix = "USFS / NPS"
+            elif st_kind.value == "ca-canvec-trails":
+                label_prefix = "CA CanVec"
             else:
                 label_prefix = st_kind.value.split("-")[1].upper()
             au_state_trail_entries.append((label_prefix, st_path, st_layers))
+
+    public_lands_entries: list[tuple[str, Path]] = []
+    seen_pl_paths: set[Path] = set()
+    for pl_key, pl_label in (
+        (USOverlayKind.US_PUBLIC_LANDS.value, "US Public Lands"),
+        (CAOverlayKind.CA_CANVEC_TRAILS.value, "CA Protected Areas"),
+    ):
+        raw_pl = regional.get(pl_key) or regional.get(pl_key.replace("-", "_"))
+        if raw_pl is None:
+            continue
+        pl_path = Path(raw_pl)
+        resolved_pl = pl_path.resolve()
+        if resolved_pl in seen_pl_paths:
+            continue
+        if "public_lands" in set(_list_gpkg_layers(pl_path)):
+            seen_pl_paths.add(resolved_pl)
+            public_lands_entries.append((pl_label, pl_path))
 
     fema_layers = set(_list_gpkg_layers(fema_path)) if fema_path else set()
     nhd_layers = set(_list_gpkg_layers(nhd_path)) if nhd_path else set()
@@ -4165,6 +5158,12 @@ def populate_project_layers(
         else None
     )
     vs_obs_layers = set(_list_gpkg_layers(vs_obs_path)) if vs_obs_path else set()
+    tactical_path = (
+        workspace.tactical_graphics_gpkg
+        if (workspace.tactical_graphics_gpkg and workspace.tactical_graphics_gpkg.is_file())
+        else None
+    )
+    tactical_layers = set(_list_gpkg_layers(tactical_path)) if tactical_path else set()
 
     ordered_top_to_bottom: list[Any] = []
 
@@ -4172,7 +5171,7 @@ def populate_project_layers(
         if layer is not None:
             ordered_top_to_bottom.append(layer)
 
-    # 0. Tactical Custom Waypoints & RF/LOS Viewshed Observers on very top (highest visibility)
+    # 0. Tactical Custom Waypoints, RF/LOS Viewshed Observers, and Tactical Graphics on very top
     if waypoints_path:
         if "waypoint_points" in waypoints_layers:
             _push(
@@ -4207,6 +5206,41 @@ def populate_project_layers(
                     "viewshed_rings",
                     "LOS / RF Max Range",
                     role="viewshed_rings",
+                    workspace=workspace,
+                )
+            )
+
+    if tactical_path:
+        if "tactical_lines" in tactical_layers:
+            _push(
+                _load_vector_layer(
+                    project,
+                    tactical_path,
+                    "tactical_lines",
+                    "Tactical Bearing & RF Lines",
+                    role="tactical_lines",
+                    workspace=workspace,
+                )
+            )
+        if "tactical_rings" in tactical_layers:
+            _push(
+                _load_vector_layer(
+                    project,
+                    tactical_path,
+                    "tactical_rings",
+                    "Tactical Range Rings",
+                    role="tactical_rings",
+                    workspace=workspace,
+                )
+            )
+        if "tactical_sectors" in tactical_layers:
+            _push(
+                _load_vector_layer(
+                    project,
+                    tactical_path,
+                    "tactical_sectors",
+                    "Tactical Sectors & AOIs",
+                    role="tactical_sectors",
                     workspace=workspace,
                 )
             )
@@ -4331,11 +5365,13 @@ def populate_project_layers(
     if au_hydro_path and "au_hydro_polys" in au_hydro_layers:
         _push(_load_vector_layer(project, au_hydro_path, "au_hydro_polys", "AU Waterbodies", role="au_hydro_polys", workspace=workspace))
 
-    # 10. Regional Area Overlays (FEMA Flood Zones + CAPAD AU Parks/IPAs; strictly below contours & roads!)
+    # 10. Regional Area Overlays (FEMA Flood Zones + CAPAD AU Parks/IPAs + US/CA Public Lands; strictly below contours & roads!)
     if fema_path and "fema_flood" in fema_layers:
         _push(_load_vector_layer(project, fema_path, "fema_flood", "FEMA Flood Zones", role="fema_flood", workspace=workspace))
     if au_parks_path and "au_protected_areas" in au_parks_layers:
         _push(_load_vector_layer(project, au_parks_path, "au_protected_areas", "AU Protected Areas", role="au_protected_areas", workspace=workspace))
+    for pl_label, pl_path in public_lands_entries:
+        _push(_load_vector_layer(project, pl_path, "public_lands", pl_label, role="public_lands", workspace=workspace))
 
     # 10.5. Slope-Angle Avalanche Shading (bottom raster stack right above viewshed & hillshade; vectors stay pure!)
     if carto.show_slope_shading and workspace.slope_tif is not None and workspace.slope_tif.is_file():
@@ -4421,6 +5457,11 @@ def export_qml_styles(styles_root: Path | None = None) -> list[Path]:
             "MultiPolygon?crs=EPSG:32752"
             "&field=name:string&field=park_type:string&field=type_abbr:string&field=iucn:string&field=state:string",
             "au_protected_areas",
+        ),
+        "public_lands": (
+            "MultiPolygon?crs=EPSG:32613"
+            "&field=name:string&field=manager:string&field=designation:string&field=state:string",
+            "public_lands",
         ),
         "water_polygons": (
             "MultiPolygon?crs=EPSG:32756"
@@ -4545,6 +5586,24 @@ def export_qml_styles(styles_root: Path | None = None) -> list[Path]:
         "overlay_polygons": ("MultiPolygon?crs=EPSG:32756&field=name:string", "overlay_polygons"),
         "overlay_lines": ("LineString?crs=EPSG:32756&field=name:string", "overlay_lines"),
         "overlay_points": ("Point?crs=EPSG:32756&field=name:string", "overlay_points"),
+        "tactical_sectors": (
+            "MultiPolygon?crs=EPSG:32756"
+            "&field=label:string&field=kind:string&field=area_km2:double&field=color:string&field=notes:string",
+            "tactical_sectors",
+        ),
+        "tactical_rings": (
+            "LineString?crs=EPSG:32756"
+            "&field=label:string&field=base_label:string&field=radius_km:double"
+            "&field=radius_m:double&field=color:string&field=notes:string",
+            "tactical_rings",
+        ),
+        "tactical_lines": (
+            "LineString?crs=EPSG:32756"
+            "&field=label:string&field=kind:string&field=distance_km:double"
+            "&field=bearing_true_deg:double&field=bearing_grid_deg:double"
+            "&field=bearing_mag_deg:double&field=bearing_mils:double&field=color:string&field=notes:string",
+            "tactical_lines",
+        ),
         "waypoint_route": ("LineString?crs=EPSG:32756&field=total_km:double", "waypoint_route"),
         "waypoint_points": (
             "Point?crs=EPSG:32756&field=seq:integer&field=code:string&field=label:string"
@@ -4599,7 +5658,7 @@ def export_qml_styles(styles_root: Path | None = None) -> list[Path]:
                     text = marker + text
                 path.write_text(text, encoding="utf-8")
 
-        for mode in (ColorMode.COLOR, ColorMode.BW):
+        for mode in (ColorMode.COLOR, ColorMode.BW, ColorMode.NIGHT_RED, ColorMode.ALPINE):
             mode_dir = root / mode.value
             mode_dir.mkdir(parents=True, exist_ok=True)
 
