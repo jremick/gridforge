@@ -4,6 +4,7 @@ Generates:
   - 100.00 mm Printer Scale Verification & MGRS Romer / 6400-mil Protractor page
   - Tactical Route Card & Waypoint Log page
   - Route Overview & DEM Elevation Profile page
+  - Atlas Overview & Sheet Index Cover Page (Grid Atlases & GPX Strip Atlases)
   - Lossless multi-page PDF merge via ``pypdf.PdfWriter``
 
 Subprocess isolation ensures the FastAPI web backend never imports PyQt5 or Qt.
@@ -18,22 +19,36 @@ import os
 import subprocess
 import sys
 import tempfile
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from pydantic import BaseModel
 from pypdf import PdfWriter
 
-from gridforge.config import DeclinationInfo, SheetLayout, Units
+from gridforge.config import BBox, DeclinationInfo, SheetLayout, Units
 from gridforge.geo.strip_atlas import (
     KM_TO_MILES,
     METERS_TO_FEET,
     ElevationProfileData,
     StripAtlasPlan,
+    StripSheetPlan,
 )
 from gridforge.geo.waypoints import RouteMetrics
 
 PDF_DPI: int = 300
 MM_TO_PX: float = PDF_DPI / 25.4
+
+
+class AtlasIndexSheet(BaseModel):
+    """Single sheet footprint entry rendered on the Atlas Overview & Sheet Index Cover Page."""
+
+    sheet_id: str
+    page_number: int = 1
+    center_lat: float
+    center_lon: float
+    center_mgrs_10m: str
+    utm_bbox: BBox
 
 
 def merge_pdf_pages(pdf_paths: list[Path], output_pdf: Path) -> Path:
@@ -146,6 +161,57 @@ def render_elevation_profile_pdf(
         "bw": bool(bw),
     }
     return _spawn_supplement_worker("elevation-profile", payload, output_pdf)
+
+
+def render_atlas_index_pdf(
+    sheets: Sequence[AtlasIndexSheet | StripSheetPlan],
+    *,
+    page_width_mm: float,
+    page_height_mm: float,
+    scale: int,
+    utm_epsg: int,
+    title: str,
+    overlap_pct: float = 0.0,
+    route_utm: list[tuple[float, float]] | None = None,
+    output_pdf: Path,
+    bw: bool = False,
+) -> Path:
+    """Render an exact-mm pure-vector Atlas Overview & Sheet Index Cover Page.
+
+    Works seamlessly for both Grid Atlases (``A1..C3``) and GPX/GeoJSON Strip Atlases
+    (``S1..Sn``). Accepts either ``AtlasIndexSheet`` or ``StripSheetPlan`` entries.
+    """
+    if not sheets:
+        raise ValueError("render_atlas_index_pdf() requires at least one sheet.")
+
+    normalized: list[AtlasIndexSheet] = []
+    for idx, sh in enumerate(sheets, start=1):
+        if isinstance(sh, AtlasIndexSheet):
+            normalized.append(sh)
+        else:
+            normalized.append(
+                AtlasIndexSheet(
+                    sheet_id=sh.sheet_id,
+                    page_number=int(getattr(sh, "index", idx)) + 1,
+                    center_lat=float(sh.center_lat),
+                    center_lon=float(sh.center_lon),
+                    center_mgrs_10m=str(sh.center_mgrs_10m),
+                    utm_bbox=sh.utm_bbox,
+                )
+            )
+
+    payload = {
+        "sheets": [json.loads(s.model_dump_json()) for s in normalized],
+        "page_width_mm": float(page_width_mm),
+        "page_height_mm": float(page_height_mm),
+        "scale": int(scale),
+        "utm_epsg": int(utm_epsg),
+        "title": str(title or "GRIDFORGE ATLAS"),
+        "overlap_pct": float(overlap_pct),
+        "route_utm": [[float(x), float(y)] for x, y in route_utm] if route_utm else None,
+        "bw": bool(bw),
+    }
+    return _spawn_supplement_worker("atlas-index", payload, output_pdf)
 
 
 # ---------------------------------------------------------------------------
@@ -1144,6 +1210,559 @@ def _render_elevation_profile_in_process(spec: dict[str, Any], output_pdf: Path)
         painter.end()
 
 
+def _pick_nice_step_m(span_m: float, target_ticks: int = 5) -> float:
+    raw = max(span_m, 100.0) / max(1, target_ticks)
+    for step in (500.0, 1000.0, 2000.0, 5000.0, 10000.0, 20000.0, 50000.0, 100000.0):
+        if step >= raw:
+            return step
+    return 100000.0
+
+
+def _pick_scalebar_distance_m(mm_per_m: float, min_mm: float = 18.0, max_mm: float = 54.0) -> float:
+    candidates = (250.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0, 20000.0, 50000.0, 100000.0)
+    best = candidates[0]
+    for d in candidates:
+        length_mm = d * mm_per_m
+        if min_mm <= length_mm <= max_mm:
+            return d
+        if length_mm < max_mm:
+            best = d
+    return best
+
+
+def _render_atlas_index_in_process(spec: dict[str, Any], output_pdf: Path) -> None:
+    from PyQt5.QtCore import QPointF, QRectF, Qt
+    from PyQt5.QtGui import QBrush, QColor, QPainter, QPainterPath, QPolygonF
+
+    sheets = [AtlasIndexSheet.model_validate(s) for s in spec["sheets"]]
+    page_w = float(spec["page_width_mm"])
+    page_h = float(spec["page_height_mm"])
+    scale = int(spec["scale"])
+    utm_epsg = int(spec["utm_epsg"])
+    title = str(spec.get("title") or "GRIDFORGE ATLAS")
+    overlap_pct = float(spec.get("overlap_pct") or 0.0)
+    raw_route = spec.get("route_utm") or []
+    route_utm: list[tuple[float, float]] = [(float(pt[0]), float(pt[1])) for pt in raw_route]
+    bw = bool(spec.get("bw", False))
+
+    ink = "#000000" if bw else "#111820"
+    muted = "#333333" if bw else "#4B5563"
+    stripe = "#F2F2F2" if bw else "#F5F7FA"
+    border = "#222222" if bw else "#94A3B8"
+    sheet_stroke = "#111111" if bw else "#1B4F72"
+    sheet_fill = QColor(235, 235, 235, 115) if bw else QColor(214, 234, 248, 115)
+    overlap_color = QColor(35, 35, 35, 95) if bw else QColor(27, 79, 114, 95)
+    route_col = "#000000" if bw else "#C0392B"
+    start_col = "#FFFFFF" if bw else "#1E8449"
+    end_col = "#000000" if bw else "#C0392B"
+    canvas_bg = "#FFFFFF" if bw else "#FAFBFD"
+
+    all_min_x = min(s.utm_bbox.min_x for s in sheets)
+    all_max_x = max(s.utm_bbox.max_x for s in sheets)
+    all_min_y = min(s.utm_bbox.min_y for s in sheets)
+    all_max_y = max(s.utm_bbox.max_y for s in sheets)
+    cov_w_km = max(0.01, (all_max_x - all_min_x) / 1000.0)
+    cov_h_km = max(0.01, (all_max_y - all_min_y) / 1000.0)
+
+    view_min_x, view_max_x = all_min_x, all_max_x
+    view_min_y, view_max_y = all_min_y, all_max_y
+    for rx, ry in route_utm:
+        view_min_x = min(view_min_x, rx)
+        view_max_x = max(view_max_x, rx)
+        view_min_y = min(view_min_y, ry)
+        view_max_y = max(view_max_y, ry)
+
+    span_x = max(view_max_x - view_min_x, 250.0)
+    span_y = max(view_max_y - view_min_y, 250.0)
+
+    writer = _setup_pdf_writer(output_pdf, page_w, page_h)
+    painter = QPainter()
+    if not painter.begin(writer):
+        raise RuntimeError(f"Failed to start QPainter for '{output_pdf}'.")
+
+    try:
+        margin = 12.0
+        inner_w = page_w - 2.0 * margin
+        sheet_word = "SHEET" if len(sheets) == 1 else "SHEETS"
+
+        # Outer page border
+        painter.setPen(_make_pen(ink, 0.35))
+        painter.drawRect(QRectF(_px(margin), _px(margin), _px(inner_w), _px(page_h - 2.0 * margin)))
+
+        # Header banner
+        painter.fillRect(QRectF(_px(margin), _px(margin), _px(inner_w), _px(12.0)), QColor(ink))
+        _draw_text_box(
+            painter,
+            margin + 4.0,
+            margin + 1.0,
+            inner_w - 8.0,
+            10.0,
+            f"ATLAS OVERVIEW & SHEET INDEX  —  {title.upper()}",
+            pt=9.5,
+            bold=True,
+            color_hex="#FFFFFF",
+        )
+
+        # Telemetry bar
+        summary_y = margin + 14.0
+        summary_h = 10.5
+        painter.fillRect(
+            QRectF(_px(margin + 2.0), _px(summary_y), _px(inner_w - 4.0), _px(summary_h)),
+            QColor(stripe),
+        )
+        painter.setPen(_make_pen(border, 0.2))
+        painter.drawRect(
+            QRectF(_px(margin + 2.0), _px(summary_y), _px(inner_w - 4.0), _px(summary_h))
+        )
+
+        overlap_txt = f"  |  OVERLAP: {overlap_pct:.0f}%" if overlap_pct > 0.0 else ""
+        _draw_text_box(
+            painter,
+            margin + 5.0,
+            summary_y + 1.0,
+            inner_w * 0.64,
+            8.5,
+            f"{len(sheets)} {sheet_word}  |  SCALE 1:{scale:,}  |  UTM EPSG:{utm_epsg}{overlap_txt}",
+            pt=7.2,
+            bold=True,
+            color_hex=ink,
+        )
+        _draw_text_box(
+            painter,
+            margin + inner_w * 0.64,
+            summary_y + 1.0,
+            inner_w * 0.36 - 5.0,
+            8.5,
+            f"COVERAGE: {cov_w_km:.1f} × {cov_h_km:.1f} km",
+            pt=7.2,
+            bold=True,
+            align="right",
+            color_hex=ink,
+        )
+
+        # Dynamic vertical budget: schematic overview map box + full index table
+        footer_y = page_h - margin - 6.0
+        usable_bottom = footer_y - 2.5
+        map_x = margin + 2.0
+        map_y = summary_y + summary_h + 3.5
+        map_w = inner_w - 4.0
+        avail_total = usable_bottom - map_y
+
+        is_landscape = page_w > page_h
+        if len(sheets) <= 6 and not is_landscape:
+            row_h = 6.8
+        elif len(sheets) <= 9 and not is_landscape:
+            row_h = 6.0
+        elif len(sheets) <= 8:
+            row_h = 5.6
+        else:
+            row_h = 4.9
+
+        tbl_header_h = 6.8
+        tbl_section_gap = 7.5
+        needed_table_h = tbl_section_gap + tbl_header_h + len(sheets) * row_h + 2.0
+        max_map_h = min(132.0 if not is_landscape else 92.0, avail_total * 0.62)
+        min_map_h = 50.0 if is_landscape else 64.0
+        map_h = max(min_map_h, min(max_map_h, avail_total - needed_table_h))
+
+        # --- 1. TRUE-PROPORTION SCHEMATIC OVERVIEW MAP BOX ---
+        painter.fillRect(QRectF(_px(map_x), _px(map_y), _px(map_w), _px(map_h)), QColor(canvas_bg))
+
+        pad_l = 16.0
+        pad_r = 18.0
+        pad_t = 9.0
+        pad_b = 14.5
+        draw_w = max(20.0, map_w - pad_l - pad_r)
+        draw_h = max(20.0, map_h - pad_t - pad_b)
+
+        mm_per_m = min(draw_w / span_x, draw_h / span_y)
+        used_w = span_x * mm_per_m
+        used_h = span_y * mm_per_m
+        origin_x = map_x + pad_l + (draw_w - used_w) * 0.5
+        origin_y = map_y + pad_t + (draw_h - used_h) * 0.5
+
+        def _sx(e: float) -> float:
+            return origin_x + (e - view_min_x) * mm_per_m
+
+        def _sy(n: float) -> float:
+            return origin_y + (view_max_y - n) * mm_per_m
+
+        # Clip coordinate grid & sheet boxes cleanly inside map_x..map_x+map_w
+        painter.save()
+        painter.setClipRect(QRectF(_px(map_x + 0.3), _px(map_y + 0.3), _px(map_w - 0.6), _px(map_h - 0.6)))
+
+        # Subtle UTM reference gridlines
+        grid_step_m = _pick_nice_step_m(max(span_x, span_y), target_ticks=5)
+        e_grid_min = view_min_x - (origin_x - map_x) / mm_per_m
+        e_grid_max = view_min_x + (map_x + map_w - origin_x) / mm_per_m
+        n_grid_min = view_max_y - (map_y + map_h - origin_y) / mm_per_m
+        n_grid_max = view_max_y + (origin_y - map_y) / mm_per_m
+
+        e0 = math.ceil(e_grid_min / grid_step_m) * grid_step_m
+        e_cur = e0
+        while e_cur <= e_grid_max:
+            gx = _sx(e_cur)
+            if map_x + 12.0 <= gx <= map_x + map_w - 14.0:
+                painter.setPen(_make_pen("#E2E8F0" if not bw else "#D6D6D6", 0.12))
+                painter.drawLine(QPointF(_px(gx), _px(map_y)), QPointF(_px(gx), _px(map_y + map_h)))
+                _draw_text_box(
+                    painter,
+                    gx - 10.0,
+                    map_y + 0.8,
+                    20.0,
+                    3.6,
+                    f"{int(round(e_cur / 1000.0))}k E",
+                    pt=5.0,
+                    mono=True,
+                    align="center",
+                    color_hex=muted,
+                )
+            e_cur += grid_step_m
+
+        n0 = math.ceil(n_grid_min / grid_step_m) * grid_step_m
+        n_cur = n0
+        while n_cur <= n_grid_max:
+            gy = _sy(n_cur)
+            if map_y + 5.0 <= gy <= map_y + map_h - 11.0:
+                painter.setPen(_make_pen("#E2E8F0" if not bw else "#D6D6D6", 0.12))
+                painter.drawLine(QPointF(_px(map_x), _px(gy)), QPointF(_px(map_x + map_w), _px(gy)))
+                _draw_text_box(
+                    painter,
+                    map_x + 1.0,
+                    gy - 1.8,
+                    13.5,
+                    3.6,
+                    f"{int(round(n_cur / 1000.0))}k N",
+                    pt=5.0,
+                    mono=True,
+                    align="left",
+                    color_hex=muted,
+                )
+            n_cur += grid_step_m
+
+        # Sheet rectangles
+        for sh in sheets:
+            rx0 = _sx(sh.utm_bbox.min_x)
+            ry0 = _sy(sh.utm_bbox.max_y)
+            rw = sh.utm_bbox.width * mm_per_m
+            rh = sh.utm_bbox.height * mm_per_m
+            rect = QRectF(_px(rx0), _px(ry0), _px(rw), _px(rh))
+            painter.fillRect(rect, sheet_fill)
+            painter.setPen(_make_pen(sheet_stroke, 0.36))
+            painter.drawRect(rect)
+
+        # Pairwise overlap hatching
+        has_overlap_hatch = False
+        hatch_brush = QBrush(overlap_color, Qt.BDiagPattern)
+        for i in range(len(sheets)):
+            a = sheets[i].utm_bbox
+            for j in range(i + 1, len(sheets)):
+                b = sheets[j].utm_bbox
+                ix0 = max(a.min_x, b.min_x)
+                ix1 = min(a.max_x, b.max_x)
+                iy0 = max(a.min_y, b.min_y)
+                iy1 = min(a.max_y, b.max_y)
+                if (ix1 - ix0) > 1.0 and (iy1 - iy0) > 1.0:
+                    has_overlap_hatch = True
+                    orect = QRectF(
+                        _px(_sx(ix0)),
+                        _px(_sy(iy1)),
+                        _px((ix1 - ix0) * mm_per_m),
+                        _px((iy1 - iy0) * mm_per_m),
+                    )
+                    painter.fillRect(orect, hatch_brush)
+                    painter.setPen(_make_pen(sheet_stroke, 0.18, dashed=True))
+                    painter.drawRect(orect)
+
+        # Explicit overlap_pct inset hatch band when grid sheets touch without geometric overlap
+        if overlap_pct > 0.0 and not has_overlap_hatch:
+            has_overlap_hatch = True
+            frac = min(0.20, max(0.02, overlap_pct / 200.0))
+            for sh in sheets:
+                b = sh.utm_bbox
+                dx = b.width * frac
+                dy = b.height * frac
+                inner_rect = QRectF(
+                    _px(_sx(b.min_x + dx)),
+                    _px(_sy(b.max_y - dy)),
+                    _px((b.width - 2.0 * dx) * mm_per_m),
+                    _px((b.height - 2.0 * dy) * mm_per_m),
+                )
+                painter.setPen(_make_pen(sheet_stroke, 0.16, dashed=True))
+                painter.drawRect(inner_rect)
+
+        # Optional GPX / GeoJSON route polyline drawn right through the sheet boxes
+        if len(route_utm) >= 2:
+            path = QPainterPath()
+            path.moveTo(_px(_sx(route_utm[0][0])), _px(_sy(route_utm[0][1])))
+            for rx, ry in route_utm[1:]:
+                path.lineTo(_px(_sx(rx)), _px(_sy(ry)))
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(_make_pen("#FFFFFF", 1.15))
+            painter.drawPath(path)
+            painter.setPen(_make_pen(route_col, 0.58, dashed=bw))
+            painter.drawPath(path)
+
+            # Start marker (circle) & Finish marker (square)
+            st_x, st_y = _sx(route_utm[0][0]), _sy(route_utm[0][1])
+            en_x, en_y = _sx(route_utm[-1][0]), _sy(route_utm[-1][1])
+            painter.setPen(_make_pen(ink, 0.25))
+            painter.setBrush(QColor(start_col))
+            painter.drawEllipse(QPointF(_px(st_x), _px(st_y)), _px(1.3), _px(1.3))
+            painter.setBrush(QColor(end_col))
+            painter.drawRect(QRectF(_px(en_x - 1.2), _px(en_y - 1.2), _px(2.4), _px(2.4)))
+            painter.setBrush(Qt.NoBrush)
+
+        # Bold centered sheet IDs on crisp white pills
+        for sh in sheets:
+            cx = _sx((sh.utm_bbox.min_x + sh.utm_bbox.max_x) * 0.5)
+            cy = _sy((sh.utm_bbox.min_y + sh.utm_bbox.max_y) * 0.5)
+            sw_mm = sh.utm_bbox.width * mm_per_m
+            sh_mm = sh.utm_bbox.height * mm_per_m
+
+            pill_w = min(max(10.0, len(sh.sheet_id) * 3.4 + 4.0), max(8.0, sw_mm - 1.5))
+            show_sub = sh_mm >= 16.0 and sw_mm >= 14.0
+            pill_h = 8.4 if show_sub else 5.4
+            pill_rect = QRectF(_px(cx - pill_w * 0.5), _px(cy - pill_h * 0.5), _px(pill_w), _px(pill_h))
+            painter.fillRect(pill_rect, QColor(255, 255, 255, 225))
+            painter.setPen(_make_pen(sheet_stroke, 0.18))
+            painter.drawRect(pill_rect)
+
+            id_pt = 8.4 if sw_mm >= 22.0 else (7.0 if sw_mm >= 14.0 else 6.0)
+            if show_sub:
+                _draw_text_box(
+                    painter,
+                    cx - pill_w * 0.5,
+                    cy - pill_h * 0.5 + 0.3,
+                    pill_w,
+                    4.6,
+                    sh.sheet_id,
+                    pt=id_pt,
+                    bold=True,
+                    mono=True,
+                    align="center",
+                    color_hex=ink,
+                )
+                _draw_text_box(
+                    painter,
+                    cx - pill_w * 0.5,
+                    cy + 0.4,
+                    pill_w,
+                    3.6,
+                    f"p.{sh.page_number}",
+                    pt=5.2,
+                    align="center",
+                    color_hex=muted,
+                )
+            else:
+                _draw_text_box(
+                    painter,
+                    cx - pill_w * 0.5,
+                    cy - pill_h * 0.5,
+                    pill_w,
+                    pill_h,
+                    sh.sheet_id,
+                    pt=id_pt,
+                    bold=True,
+                    mono=True,
+                    align="center",
+                    color_hex=ink,
+                )
+
+        # North Arrow badge (top-right inside map box)
+        na_w, na_h = 11.0, 15.0
+        na_x = map_x + map_w - na_w - 2.5
+        na_y = map_y + 2.5
+        painter.fillRect(QRectF(_px(na_x), _px(na_y), _px(na_w), _px(na_h)), QColor(255, 255, 255, 235))
+        painter.setPen(_make_pen(border, 0.18))
+        painter.drawRect(QRectF(_px(na_x), _px(na_y), _px(na_w), _px(na_h)))
+        _draw_text_box(
+            painter, na_x, na_y + 0.4, na_w, 4.2, "N", pt=7.0, bold=True, align="center", color_hex=ink
+        )
+        ax = na_x + na_w * 0.5
+        ay_top = na_y + 5.0
+        ay_bot = na_y + 13.5
+        left_tri = QPolygonF(
+            [
+                QPointF(_px(ax), _px(ay_top)),
+                QPointF(_px(ax - 2.4), _px(ay_bot)),
+                QPointF(_px(ax), _px(ay_bot - 2.0)),
+            ]
+        )
+        right_tri = QPolygonF(
+            [
+                QPointF(_px(ax), _px(ay_top)),
+                QPointF(_px(ax + 2.4), _px(ay_bot)),
+                QPointF(_px(ax), _px(ay_bot - 2.0)),
+            ]
+        )
+        painter.setPen(_make_pen(ink, 0.2))
+        painter.setBrush(QColor(ink))
+        painter.drawPolygon(left_tri)
+        painter.setBrush(QColor("#FFFFFF"))
+        painter.drawPolygon(right_tri)
+        painter.setBrush(Qt.NoBrush)
+
+        # True-proportion schematic scale bar (bottom-left inside map box)
+        sb_dist_m = _pick_scalebar_distance_m(mm_per_m)
+        sb_len_mm = sb_dist_m * mm_per_m
+        sb_badge_w = max(28.0, sb_len_mm + 14.0)
+        sb_badge_h = 8.8
+        sb_x = map_x + 2.5
+        sb_y = map_y + map_h - sb_badge_h - 2.0
+        painter.fillRect(
+            QRectF(_px(sb_x), _px(sb_y), _px(sb_badge_w), _px(sb_badge_h)),
+            QColor(255, 255, 255, 235),
+        )
+        painter.setPen(_make_pen(border, 0.18))
+        painter.drawRect(QRectF(_px(sb_x), _px(sb_y), _px(sb_badge_w), _px(sb_badge_h)))
+
+        bar_x = sb_x + 4.0
+        bar_y = sb_y + 4.8
+        bar_h = 2.0
+        half_len = sb_len_mm * 0.5
+        painter.fillRect(QRectF(_px(bar_x), _px(bar_y), _px(half_len), _px(bar_h)), QColor(ink))
+        painter.fillRect(
+            QRectF(_px(bar_x + half_len), _px(bar_y), _px(half_len), _px(bar_h)),
+            QColor("#FFFFFF"),
+        )
+        painter.setPen(_make_pen(ink, 0.22))
+        painter.drawRect(QRectF(_px(bar_x), _px(bar_y), _px(sb_len_mm), _px(bar_h)))
+        dist_lbl = f"{int(sb_dist_m)} m" if sb_dist_m < 1000.0 else f"{sb_dist_m / 1000.0:g} km"
+        _draw_text_box(painter, bar_x - 2.0, sb_y + 0.6, 8.0, 3.6, "0", pt=5.4, bold=True, color_hex=ink)
+        _draw_text_box(
+            painter,
+            bar_x + sb_len_mm - 12.0,
+            sb_y + 0.6,
+            18.0,
+            3.6,
+            dist_lbl,
+            pt=5.4,
+            bold=True,
+            align="right",
+            color_hex=ink,
+        )
+
+        # Compact legend badge (bottom-right) if route or overlap hatch is drawn
+        legend_items: list[str] = []
+        if len(route_utm) >= 2:
+            legend_items.append("route")
+        if has_overlap_hatch:
+            legend_items.append("overlap")
+        if legend_items:
+            leg_w = 24.0 * len(legend_items) + 4.0
+            leg_h = 7.4
+            leg_x = map_x + map_w - leg_w - 2.5
+            leg_y = map_y + map_h - leg_h - 2.0
+            painter.fillRect(
+                QRectF(_px(leg_x), _px(leg_y), _px(leg_w), _px(leg_h)),
+                QColor(255, 255, 255, 235),
+            )
+            painter.setPen(_make_pen(border, 0.18))
+            painter.drawRect(QRectF(_px(leg_x), _px(leg_y), _px(leg_w), _px(leg_h)))
+            lx = leg_x + 3.0
+            if "route" in legend_items:
+                painter.setPen(_make_pen(route_col, 0.55, dashed=bw))
+                painter.drawLine(QPointF(_px(lx), _px(leg_y + leg_h * 0.5)), QPointF(_px(lx + 6.0), _px(leg_y + leg_h * 0.5)))
+                _draw_text_box(painter, lx + 7.2, leg_y + 1.0, 14.0, 5.4, "Route", pt=5.4, bold=True, color_hex=ink)
+                lx += 23.0
+            if "overlap" in legend_items:
+                ov_box = QRectF(_px(lx), _px(leg_y + 1.7), _px(5.5), _px(4.0))
+                painter.fillRect(ov_box, hatch_brush)
+                painter.setPen(_make_pen(sheet_stroke, 0.2))
+                painter.drawRect(ov_box)
+                _draw_text_box(painter, lx + 6.8, leg_y + 1.0, 15.0, 5.4, "Overlap", pt=5.4, bold=True, color_hex=ink)
+
+        painter.restore()
+
+        # Crisp outer map box frame
+        painter.setPen(_make_pen(ink, 0.30))
+        painter.drawRect(QRectF(_px(map_x), _px(map_y), _px(map_w), _px(map_h)))
+
+        # --- 2. SHEET INDEX TABLE ---
+        tbl_x = map_x
+        tbl_w = map_w
+        tbl_title_y = map_y + map_h + 2.5
+        _draw_text_box(
+            painter,
+            tbl_x,
+            tbl_title_y,
+            tbl_w,
+            4.5,
+            f"SHEET INDEX TABLE  ({len(sheets)} {sheet_word}  |  1:{scale:,}  |  EPSG:{utm_epsg}  |  COVERAGE {cov_w_km:.1f} × {cov_h_km:.1f} km)",
+            pt=7.0,
+            bold=True,
+            color_hex=ink,
+        )
+
+        tbl_y = tbl_title_y + 5.0
+        cols = [
+            ("SHEET", 0.09, "center"),
+            ("PAGE", 0.09, "center"),
+            ("CENTER MGRS (10 m)", 0.26, "left"),
+            ("CENTER LAT / LON", 0.22, "left"),
+            ("UTM EXTENT (E / N)", 0.34, "left"),
+        ]
+
+        painter.fillRect(QRectF(_px(tbl_x), _px(tbl_y), _px(tbl_w), _px(tbl_header_h)), QColor(ink))
+        cx = tbl_x
+        for hdr, frac, align in cols:
+            cw = tbl_w * frac
+            _draw_text_box(
+                painter, cx + 1.0, tbl_y, cw - 2.0, tbl_header_h, hdr, pt=6.2, bold=True, color_hex="#FFFFFF", align=align
+            )
+            cx += cw
+
+        cur_y = tbl_y + tbl_header_h
+        row_pt = 6.0 if row_h >= 5.8 else 5.5
+        for idx_s, sh in enumerate(sheets):
+            if cur_y + row_h > usable_bottom:
+                break
+            if idx_s % 2 == 1:
+                painter.fillRect(QRectF(_px(tbl_x), _px(cur_y), _px(tbl_w), _px(row_h)), QColor(stripe))
+            vals = [
+                (sh.sheet_id, True, True),
+                (f"Page {sh.page_number}", False, False),
+                (sh.center_mgrs_10m, True, True),
+                (f"{sh.center_lat:.5f}, {sh.center_lon:.5f}", False, True),
+                (
+                    f"E {int(round(sh.utm_bbox.min_x))}–{int(round(sh.utm_bbox.max_x))} | "
+                    f"N {int(round(sh.utm_bbox.min_y))}–{int(round(sh.utm_bbox.max_y))}",
+                    False,
+                    True,
+                ),
+            ]
+            cx = tbl_x
+            for (txt, is_b, is_m), (_, frac, align) in zip(vals, cols):
+                cw = tbl_w * frac
+                _draw_text_box(
+                    painter, cx + 1.0, cur_y, cw - 2.0, row_h, txt, pt=row_pt, bold=is_b, mono=is_m, color_hex=ink, align=align
+                )
+                cx += cw
+            painter.setPen(_make_pen(border, 0.15))
+            painter.drawLine(QPointF(_px(tbl_x), _px(cur_y + row_h)), QPointF(_px(tbl_x + tbl_w), _px(cur_y + row_h)))
+            cur_y += row_h
+
+        painter.setPen(_make_pen(ink, 0.25))
+        painter.drawRect(QRectF(_px(tbl_x), _px(tbl_y), _px(tbl_w), _px(cur_y - tbl_y)))
+
+        # Footer
+        _draw_text_box(
+            painter,
+            margin + 4.0,
+            footer_y,
+            inner_w - 8.0,
+            5.0,
+            f"GridForge Atlas Overview & Sheet Index  |  Scale 1:{scale:,}  |  EPSG:{utm_epsg}  |  "
+            f"{len(sheets)} {sheet_word.lower()} ({cov_w_km:.1f} × {cov_h_km:.1f} km)",
+            pt=6.2,
+            align="center",
+            color_hex=muted,
+        )
+    finally:
+        painter.end()
+
+
 def _set_exact_mediabox_mm(pdf_path: Path, page_width_mm: float, page_height_mm: float) -> None:
     """Set exact floating-point PDF MediaBox dimensions in points (Qt5 QPdfWriter rounds to int pts)."""
     from pypdf import PdfReader
@@ -1169,7 +1788,7 @@ def _set_exact_mediabox_mm(pdf_path: Path, page_width_mm: float, page_height_mm:
 
 def _worker_main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="GridForge supplemental vector PDF generator")
-    parser.add_argument("mode", choices=["calibration", "route-card", "elevation-profile"])
+    parser.add_argument("mode", choices=["calibration", "route-card", "elevation-profile", "atlas-index"])
     parser.add_argument("spec_json", type=Path)
     parser.add_argument("output_pdf", type=Path)
     args = parser.parse_args(argv)
@@ -1197,6 +1816,9 @@ def _worker_main(argv: list[str] | None = None) -> int:
                 spec["layout"]["page_width_mm"],
                 spec["layout"]["page_height_mm"],
             )
+        elif args.mode == "atlas-index":
+            _render_atlas_index_in_process(spec, args.output_pdf)
+            _set_exact_mediabox_mm(args.output_pdf, spec["page_width_mm"], spec["page_height_mm"])
     finally:
         qt_app.quit()
         del qt_app

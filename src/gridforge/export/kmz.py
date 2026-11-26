@@ -22,6 +22,7 @@ from gridforge.config import (
     GarminProfile,
     JobWorkspace,
 )
+from gridforge.export._atomic import staged_archive
 from gridforge.export.raster import render_collarless_geotiff
 
 
@@ -297,8 +298,6 @@ def export_garmin_kmz(
     caller_out = Path(output_kmz)
     resolved_out = caller_out.resolve()
     resolved_out.parent.mkdir(parents=True, exist_ok=True)
-    if resolved_out.exists():
-        resolved_out.unlink()
 
     layout = workspace.layout
     spec = layout.spec
@@ -306,7 +305,10 @@ def export_garmin_kmz(
 
     gdal.UseExceptions()
 
-    with tempfile.TemporaryDirectory(prefix="gridforge_kmz_") as tmp_dir_str:
+    with (
+        staged_archive(resolved_out) as staged,
+        tempfile.TemporaryDirectory(prefix="gridforge_kmz_") as tmp_dir_str,
+    ):
         tmp_dir = Path(tmp_dir_str)
 
         if collarless_tif is not None and Path(collarless_tif).is_file():
@@ -420,7 +422,7 @@ def export_garmin_kmz(
             raise RuntimeError(f"Failed to open KMZ tile source '{tile_source_tif}'.")
 
         try:
-            with zipfile.ZipFile(resolved_out, mode="w") as zf:
+            with zipfile.ZipFile(staged, mode="w") as zf:
                 for r in range(rows):
                     y0, y1 = y_bounds[r], y_bounds[r + 1]
                     th = y1 - y0
@@ -460,15 +462,15 @@ def export_garmin_kmz(
         finally:
             ds = None
 
-    elapsed = round(time.perf_counter() - t0, 3)
-    return ExportResult(
-        format=ExportFormat.KMZ,
-        output_path=caller_out,
-        file_size_bytes=resolved_out.stat().st_size,
-        tile_count=len(overlays),
-        min_zoom=None,
-        max_zoom=None,
-        max_tile_px=(max_w_seen, max_h_seen),
-        max_tile_bytes=max_bytes_seen,
-        elapsed_seconds=elapsed,
-    )
+        elapsed = round(time.perf_counter() - t0, 3)
+        return ExportResult(
+            format=ExportFormat.KMZ,
+            output_path=caller_out,
+            file_size_bytes=staged.stat().st_size,
+            tile_count=len(overlays),
+            min_zoom=None,
+            max_zoom=None,
+            max_tile_px=(max_w_seen, max_h_seen),
+            max_tile_bytes=max_bytes_seen,
+            elapsed_seconds=elapsed,
+        )
