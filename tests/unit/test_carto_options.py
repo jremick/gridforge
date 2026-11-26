@@ -110,7 +110,7 @@ def test_multiscale_factors() -> None:
 
 
 def test_all_qml_styles_roundtrip(tmp_path: Path) -> None:
-    assert len(STYLE_ROLES) == 39
+    assert len(STYLE_ROLES) == 43
     _run_pyqgis_snippet(
         f"""
         from osgeo import gdal
@@ -143,6 +143,7 @@ def test_all_qml_styles_roundtrip(tmp_path: Path) -> None:
             "landcover": "MultiPolygon",
             "fema_flood": "MultiPolygon",
             "au_protected_areas": "MultiPolygon",
+            "public_lands": "MultiPolygon",
             "water_polygons": "MultiPolygon",
             "au_hydro_polys": "MultiPolygon",
             "contours": "LineString",
@@ -172,13 +173,16 @@ def test_all_qml_styles_roundtrip(tmp_path: Path) -> None:
             "overlay_polygons": "MultiPolygon",
             "overlay_lines": "LineString",
             "overlay_points": "Point",
+            "tactical_sectors": "MultiPolygon",
+            "tactical_rings": "LineString",
+            "tactical_lines": "LineString",
             "waypoint_route": "LineString",
             "waypoint_points": "Point",
             "viewshed_rings": "LineString",
             "viewshed_observers": "Point",
         }}
 
-        for mode in (ColorMode.COLOR, ColorMode.BW):
+        for mode in (ColorMode.COLOR, ColorMode.BW, ColorMode.NIGHT_RED, ColorMode.ALPINE):
             assert get_qml_path("hillshade", mode).is_file()
             rl = QgsRasterLayer(str(tif), "hs")
             assert apply_layer_style(rl, "hillshade", mode, prefer_qml=True) is True
@@ -1242,3 +1246,309 @@ def test_pr1_pr2_pr5_cli_and_runner_regressions(
     assert res_export.exit_code == 0, res_export.output
     assert captured["export_pack_dir"] == renamed_pack.resolve()
     assert captured["export_grid"] is False
+
+
+def test_v14_themes_public_lands_tactical_and_cli(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+
+    from typer.testing import CliRunner
+
+    from gridforge import cli as cli_mod
+    from gridforge.config import (
+        CAOverlayKind,
+        ColorMode,
+        DeclinationInfo,
+        DemSourceKind,
+        JobWorkspace,
+        MGRSGridMeta,
+        RFLinkSpec,
+        RenderResult,
+        SheetSpec,
+        TacticalGraphic,
+        USOverlayKind,
+    )
+    from gridforge.geo.crs import compute_sheet_layout
+    from gridforge.geo.tactical import write_tactical_graphics_gpkg
+    from gridforge.render.styles import _THEME_PALETTE
+    from gridforge.sources.dem_ca_hrdem import CanadaHRDEMSource
+
+    # 1. Night-Red red-headlamp physics invariant: zero red/orange ink on critical features (low Red channel!)
+    nr = _THEME_PALETTE[ColorMode.NIGHT_RED]
+    critical_keys = (
+        "ink",
+        "danger",
+        "accent_blue",
+        "contour_idx",
+        "contour_minor",
+        "contour_label",
+        "water_stroke",
+        "river",
+        "stream",
+        "motorway_casing",
+        "motorway_fill",
+        "primary_casing",
+        "primary_fill",
+        "track",
+        "trail",
+        "rail",
+        "grid_1km",
+        "grid_100km",
+        "state_fire_trail",
+        "state_walk",
+        "wp_route",
+        "wp_hazard",
+        "viewshed_ring",
+        "viewshed_obs",
+        "tactical_sector",
+        "tactical_ring",
+        "tactical_line",
+        "tactical_rf_line",
+    )
+    for k in critical_keys:
+        hex_c = nr[k].lstrip("#")
+        r_ch = int(hex_c[0:2], 16)
+        assert r_ch <= 65, f"NIGHT_RED critical color {k}={nr[k]} has too much red reflectance (R={r_ch})"
+
+    # 2. Runner resolves DemSourceKind.CA_HRDEM -> CanadaHRDEMSource
+    ca_spec_src = SheetSpec(center_lat=51.178, center_lon=-115.571, dem_source=DemSourceKind.CA_HRDEM)
+    assert isinstance(_resolve_elevation_source(ca_spec_src, None), CanadaHRDEMSource)
+
+    # 3. CLI v1.4.0 parsers (`--rf-link`, `--range-ring` with ':' and '/', `--tactical-line` 4-arg and ';')
+    links = cli_mod._parse_rf_links(["-36.456,148.263,-36.420,148.300,915,10,2,RelayA,BaseB"])
+    assert len(links) == 1
+    assert links[0].freq_mhz == 915.0
+    assert links[0].from_height_m == 10.0
+    assert links[0].from_label == "RelayA" and links[0].to_label == "BaseB"
+
+    rings = cli_mod._parse_range_rings(["-36.456,148.263,1:3:5,LZ Alpha", "-36.456,148.263,0.5/2.0"])
+    assert len(rings) == 2
+    assert rings[0].radii_km == [1.0, 3.0, 5.0] and rings[0].label == "LZ Alpha"
+    assert rings[1].radii_km == [0.5, 2.0] and rings[1].label == ""
+
+    lines = cli_mod._parse_tactical_lines(
+        [
+            "-36.456,148.263,-36.420,148.300,Ridge Azimuth",
+            "-36.456,148.263;-36.440,148.280;-36.420,148.300,MultiLeg",
+        ]
+    )
+    assert len(lines) == 2
+    assert len(lines[0].points) == 2 and lines[0].label == "Ridge Azimuth"
+    assert len(lines[1].points) == 3 and lines[1].label == "MultiLeg"
+
+    # 4. CLI `render --color-mode night-red`, `--ca-overlay`, `--rf-link`, `--rf-link-card`, `--gpkg`, `--osmand`, `--field-bundle`
+    captured: dict[str, object] = {}
+
+    def _fake_render(spec, output_pdf, **kwargs):
+        captured["spec"] = spec
+        captured["kwargs"] = kwargs
+        return RenderResult(
+            output_pdf=Path(output_pdf),
+            page_width_mm=210.0,
+            page_height_mm=297.0,
+            scale=spec.scale,
+            utm_epsg=32611,
+            elapsed_seconds=0.1,
+        )
+
+    monkeypatch.setattr(cli_mod, "run_render_job", _fake_render)
+    cli_runner = CliRunner()
+    res = cli_runner.invoke(
+        cli_mod.app,
+        [
+            "render",
+            "--center",
+            "51.178,-115.571",
+            "--color-mode",
+            "night-red",
+            "--dem-source",
+            "ca-hrdem",
+            "--ca-overlay",
+            "ca-canvec-trails",
+            "--rf-link",
+            "51.178,-115.571,51.190,-115.550,915,8,2,Sulphur,Banff",
+            "--rf-link-card",
+            "--range-ring",
+            "51.178,-115.571,1:3:5,Camp",
+            "--tactical-line",
+            "51.178,-115.571,51.190,-115.550,Leg1",
+            "--gpkg",
+            str(tmp_path / "banff.gpkg"),
+            "--osmand",
+            str(tmp_path / "banff.sqlitedb"),
+            "--field-bundle",
+            str(tmp_path / "banff_bundle.zip"),
+            "--output",
+            str(tmp_path / "banff.pdf"),
+        ],
+    )
+    assert res.exit_code == 0, res.output
+    sp: SheetSpec = captured["spec"]  # type: ignore[assignment]
+    kw: dict[str, object] = captured["kwargs"]  # type: ignore[assignment]
+    assert sp.color_mode == ColorMode.NIGHT_RED
+    assert sp.dem_source == DemSourceKind.CA_HRDEM
+    assert sp.ca_overlays == [CAOverlayKind.CA_CANVEC_TRAILS]
+    assert len(sp.rf_links) == 1 and sp.include_rf_link_card is True
+    assert len(sp.tactical_graphics) == 2
+    assert kw["gpkg_out"] == tmp_path / "banff.gpkg"
+    assert kw["osmand_out"] == tmp_path / "banff.sqlitedb"
+    assert kw["field_bundle_out"] == tmp_path / "banff_bundle.zip"
+
+    # 5. CLI `gridforge pack list-regions --group na --json` (8 NA regions) & `gridforge basemap-pack`
+    res_reg = cli_runner.invoke(cli_mod.app, ["pack", "list-regions", "--group", "na", "--json"])
+    assert res_reg.exit_code == 0, res_reg.output
+    na_regions = json.loads(res_reg.output)
+    assert len(na_regions) == 8 and all(r["group"] == "na" for r in na_regions)
+
+    import gridforge.packs.basemap_builder as bmb
+
+    def _fake_basemap(region, output_mbtiles, **kwargs):
+        p = Path(output_mbtiles)
+        p.write_bytes(b"SQLite format 3\x00" + b"0" * 64)
+        captured["basemap_region"] = region
+        captured["basemap_kwargs"] = kwargs
+        return p
+
+    monkeypatch.setattr(bmb, "build_basemap_for_region", _fake_basemap)
+    bm_out = tmp_path / "basemap.mbtiles"
+    res_bm = cli_runner.invoke(
+        cli_mod.app,
+        ["basemap-pack", "--region", "ca-banff", "--output", str(bm_out), "--min-zoom", "7", "--max-zoom", "10", "--json"],
+    )
+    assert res_bm.exit_code == 0, res_bm.output
+    assert captured["basemap_region"] == "ca-banff"
+    assert json.loads(res_bm.output)["max_zoom"] == 10
+
+    # 6. PyQGIS verification of `night-red` + `alpine`, `public_lands`, `us-trails`/`ca-canvec-trails`,
+    #    `tactical_graphics.gpkg` (sectors/rings/lines), `CGVD2013` datum, and Map Key rows
+    from osgeo import ogr, osr
+
+    ogr.UseExceptions()
+    osr.UseExceptions()
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(32611)
+    srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    drv = ogr.GetDriverByName("GPKG")
+
+    ca_gpkg = tmp_path / "ca_canvec_trails.gpkg"
+    cds = drv.CreateDataSource(str(ca_gpkg))
+    lt = cds.CreateLayer("au_state_trails", srs=srs, geom_type=ogr.wkbMultiLineString)
+    for fn in ("name", "trail_class", "surface", "state"):
+        lt.CreateField(ogr.FieldDefn(fn, ogr.OFTString))
+    lp = cds.CreateLayer("au_state_pois", srs=srs, geom_type=ogr.wkbPoint)
+    lp.CreateField(ogr.FieldDefn("name", ogr.OFTString))
+    lp.CreateField(ogr.FieldDefn("poi_type", ogr.OFTString))
+    lp.CreateField(ogr.FieldDefn("elev_m", ogr.OFTReal))
+    lp.CreateField(ogr.FieldDefn("state", ogr.OFTString))
+    lpl = cds.CreateLayer("public_lands", srs=srs, geom_type=ogr.wkbMultiPolygon)
+    for fn in ("name", "manager", "designation", "state"):
+        lpl.CreateField(ogr.FieldDefn(fn, ogr.OFTString))
+    cds = None
+
+    empty_osm = tmp_path / "empty_ca_osm.gpkg"
+    eds = drv.CreateDataSource(str(empty_osm))
+    eds.CreateLayer("lines", srs=srs, geom_type=ogr.wkbLineString)
+    eds = None
+
+    tg_gpkg = write_tactical_graphics_gpkg(
+        [
+            TacticalGraphic(kind="range_ring", label="Camp", points=[(51.178, -115.571)], radii_km=[1.0, 2.0]),
+            TacticalGraphic(
+                kind="sector",
+                label="AOI North",
+                points=[(51.17, -115.58), (51.19, -115.58), (51.19, -115.56), (51.17, -115.56)],
+            ),
+            TacticalGraphic(kind="bearing_line", label="Approach", points=[(51.178, -115.571), (51.188, -115.560)]),
+        ],
+        32611,
+        tmp_path / "tactical_graphics.gpkg",
+        rf_links=[
+            RFLinkSpec(
+                from_lat=51.178,
+                from_lon=-115.571,
+                to_lat=51.188,
+                to_lon=-115.560,
+                freq_mhz=915.0,
+            )
+        ],
+    )
+    assert tg_gpkg is not None and tg_gpkg.is_file()
+
+    for test_mode, expected_badge in ((ColorMode.NIGHT_RED, "NIGHT-RED"), (ColorMode.ALPINE, "ALPINE")):
+        spec_m = SheetSpec(
+            center_lat=51.178,
+            center_lon=-115.571,
+            scale=25000,
+            color_mode=test_mode,
+            dem_source=DemSourceKind.CA_HRDEM,
+            ca_overlays=[CAOverlayKind.CA_CANVEC_TRAILS],
+            us_overlays=[USOverlayKind.US_PUBLIC_LANDS],
+        )
+        lay_m = compute_sheet_layout(spec_m)
+        ws_m = JobWorkspace(
+            job_dir=tmp_path,
+            layout=lay_m,
+            declination=DeclinationInfo(
+                decimal_year=2026.5,
+                magnetic_declination_deg=14.2,
+                annual_change_deg=-0.12,
+                grid_convergence_deg=-0.4,
+                gm_angle_deg=14.6,
+                gm_angle_mils=259.6,
+                grid_convergence_mils=-7.1,
+            ),
+            mgrs_meta=MGRSGridMeta(
+                gzd="11U",
+                square_ids_100km=["PG"],
+                center_mgrs_10m="11U PG 0000 0000",
+                grid_spacing_mm=40.0,
+                crosses_100km_boundary=False,
+                crosses_utm_zone_boundary=False,
+                ticks=[],
+            ),
+            osm_gpkg=empty_osm,
+            terrain_gpkg=empty_osm,
+            hillshade_tif=tmp_path / "missing_hs.tif",
+            dem_utm_tif=tmp_path / "missing_dem.tif",
+            mgrs_gpkg=empty_osm,
+            declination_svg=tmp_path / "decl.svg",
+            grid_ref_svg=tmp_path / "grid.svg",
+            contour_interval_display="10 m (index 50 m)",
+            attributions=["Parks Canada & NRCan (OGL-Canada)"],
+            vertical_datum="CGVD2013",
+            dem_source_name="ca-hrdem",
+            regional_overlays={"ca-canvec-trails": ca_gpkg, "us-public-lands": ca_gpkg},
+            tactical_graphics_gpkg=tg_gpkg,
+        )
+        ws_json = ws_m.model_dump_json()
+        _run_pyqgis_snippet(
+            f"""
+            from qgis.core import QgsLayoutItemLabel, QgsProject
+            from gridforge.config import JobWorkspace
+            from gridforge.render.layout import build_print_layout
+            from gridforge.render.styles import populate_project_layers
+
+            ws_obj = JobWorkspace.model_validate_json({ws_json!r})
+            proj = QgsProject.instance()
+            proj.clear()
+            layers = populate_project_layers(proj, ws_obj, include_grid=False)
+            names = [l.name() for l in layers]
+            assert "Tactical Bearing & RF Lines" in names, names
+            assert "Tactical Range Rings" in names, names
+            assert "Tactical Sectors & AOIs" in names, names
+            assert "CA CanVec Fire Trails & Tracks" in names, names
+            assert "CA CanVec Huts, Camps & Trigs" in names, names
+            assert any("Public Lands" in n or "Protected Areas" in n for n in names), names
+
+            pl, _mi = build_print_layout(proj, ws_obj, layers)
+            labels = [it.text() for it in pl.items() if isinstance(it, QgsLayoutItemLabel)]
+            assert any("CGVD2013" in t for t in labels), labels
+            assert any({expected_badge!r} in t for t in labels), labels
+            assert any("Public Lands / Park" in t for t in labels), labels
+            assert any("Tactical Markup" in t for t in labels), labels
+            del pl, _mi
+            layers.clear()
+            proj.clear()
+            """
+        )

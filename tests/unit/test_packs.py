@@ -20,7 +20,9 @@ from gridforge.packs.builder import (
     resolve_pack_directory,
 )
 from gridforge.packs.catalog import (
+    ALL_REGIONS,
     AUSTRALIA_REGIONS,
+    REGION_GROUPS,
     compute_utm_zones_for_bbox,
     list_regions,
     resolve_region,
@@ -55,9 +57,11 @@ def _make_mock_overlay_gpkg(path: Path, layer_name: str, field_name: str) -> Pat
 class TestPackCatalog:
     def test_catalog_contains_all_8_states_and_7_tactical_regions(self) -> None:
         regions = list_regions()
-        assert len(regions) == 15
-        states = {r.region_id for r in regions if r.category == "state"}
-        tactical = {r.region_id for r in regions if r.category == "tactical"}
+        assert len(regions) == 29
+        assert len(ALL_REGIONS) == 29
+        assert REGION_GROUPS == ("au_tactical", "au_state", "nz", "na")
+        states = {r.region_id for r in list_regions("au_state")}
+        tactical = {r.region_id for r in list_regions("au_tactical")}
         assert states == {"act", "tas", "vic", "nsw", "sa", "qld", "nt", "wa"}
         assert tactical == {
             "blue-mountains",
@@ -69,6 +73,8 @@ class TestPackCatalog:
             "far-north-qld",
         }
         assert len(AUSTRALIA_REGIONS) == 15
+        assert len(list_regions("nz")) == 6
+        assert len(list_regions("na")) == 8
 
     def test_resolve_region_catalog_and_custom_bbox(self) -> None:
         bm = resolve_region("BLUE_MOUNTAINS")
@@ -154,8 +160,10 @@ class TestOfflinePackBuilder:
         assert manifest.vertical_datum == "AHD"
         assert manifest.osm_pbf_path == "osm.osm.pbf"
         assert manifest.dem_path == "dem.tif"
+        assert manifest.basemap_path == "basemap.mbtiles"
         assert (out_dir / "osm.osm.pbf").is_file()
         assert (out_dir / "dem.tif").is_file()
+        assert (out_dir / "basemap.mbtiles").is_file()
         assert manifest.size_bytes > 0
         assert set(manifest.overlays.keys()) == {"au-hydro", "au-parks"}
 

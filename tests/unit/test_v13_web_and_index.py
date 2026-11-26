@@ -449,13 +449,15 @@ class TestPackManagerAPI:
         )
         client = TestClient(app, base_url="http://localhost:8080")
 
-        # 1. All 15 Australia regions listed (8 state + 7 tactical)
+        # 1. All 29 curated grouped regions listed (7 AU tactical + 8 AU state + 6 NZ + 8 NA)
         reg_resp = client.get("/api/packs/regions")
         assert reg_resp.status_code == 200
         regions = reg_resp.json()["regions"]
-        assert len(regions) == 15
-        assert sum(1 for r in regions if r["kind"] == "state") == 8
-        assert sum(1 for r in regions if r["kind"] == "tactical") == 7
+        assert len(regions) == 29
+        assert sum(1 for r in regions if r["group"] == "au_state") == 8
+        assert sum(1 for r in regions if r["group"] == "au_tactical") == 7
+        assert sum(1 for r in regions if r["group"] == "nz") == 6
+        assert sum(1 for r in regions if r["group"] == "na") == 8
         assert all(r["id"] == r["region_id"] for r in regions)
 
         # 2. Invalid region rejected with 422

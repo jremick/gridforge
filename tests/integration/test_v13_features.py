@@ -517,12 +517,14 @@ class TestOfflineV13Features:
             tile_oob = client.get("/api/basemap/10/0/0.png")
             assert tile_oob.status_code == 204
 
-            # 4. Pack Manager regions catalog -> all 15 built-in Australian regions
+            # 4. Pack Manager regions catalog -> includes all 15 built-in Australian regions (+ v1.4 NZ/NA)
             regions = client.get("/api/packs/regions")
             assert regions.status_code == 200, f"/api/packs/regions failed: {regions.text}"
             rbody = regions.json()
             rlist = rbody["regions"] if isinstance(rbody, dict) and "regions" in rbody else rbody
-            assert len(rlist) == 15, f"Expected 15 AU regions, got {len(rlist)}"
+            assert len(rlist) >= 15, f"Expected >= 15 built-in regions, got {len(rlist)}"
+            au_regions = [r for r in rlist if r.get("group", "").startswith("au") or r.get("country") == "AU"]
+            assert len(au_regions) == 15 or len(rlist) == 15, f"Expected 15 AU regions in {len(rlist)} total"
 
             tasks = client.get("/api/packs/tasks")
             assert tasks.status_code == 200
