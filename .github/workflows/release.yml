@@ -4,6 +4,13 @@ on:
   push:
     tags:
       - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Git tag to build and publish (e.g. v1.3.0)"
+        required: false
+        default: "v1.3.0"
+        type: string
 
 permissions:
   contents: read
@@ -18,8 +25,36 @@ jobs:
     name: Build & Push linux/amd64 + linux/arm64 to GHCR
     runs-on: ubuntu-latest
     steps:
+      - name: Resolve release tag
+        id: resolve
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            TAG="${INPUT_TAG:-v1.3.0}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          if [[ ! "${TAG}" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)(-.*)?$ ]]; then
+            echo "Invalid semver tag: ${TAG}" >&2
+            exit 1
+          fi
+          MINOR="v${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+          if [[ -z "${BASH_REMATCH[4]}" ]]; then
+            IS_LATEST="true"
+          else
+            IS_LATEST="false"
+          fi
+          {
+            echo "tag=${TAG}"
+            echo "minor=${MINOR}"
+            echo "is_latest=${IS_LATEST}"
+          } >> "${GITHUB_OUTPUT}"
+
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.resolve.outputs.tag }}
 
       - name: Set up QEMU for multi-arch builds
         uses: docker/setup-qemu-action@v3
@@ -40,14 +75,15 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=semver,pattern=v{{version}}
-            type=semver,pattern=v{{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ !contains(github.ref, '-') }}
+            type=raw,value=${{ steps.resolve.outputs.tag }}
+            type=raw,value=${{ steps.resolve.outputs.minor }}
+            type=raw,value=latest,enable=${{ steps.resolve.outputs.is_latest }}
           labels: |
             org.opencontainers.image.title=GridForge
             org.opencontainers.image.description=Open-source military-style MGRS topographic map generator, print studio & offline device exporter (Headless PyQGIS 3.40 LTR)
             org.opencontainers.image.source=https://github.com/jremick/gridforge
             org.opencontainers.image.url=https://github.com/jremick/gridforge
+            org.opencontainers.image.version=${{ steps.resolve.outputs.tag }}
             org.opencontainers.image.licenses=GPL-3.0
 
       - name: Build and push multi-arch image
