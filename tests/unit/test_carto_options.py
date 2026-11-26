@@ -105,7 +105,9 @@ def test_all_svg_icons_exist_and_parse_xml() -> None:
 
 
 def test_multiscale_factors() -> None:
+    assert scale_width_factor(10000) == scale_width_factor(12500) > scale_width_factor(15000)
     assert scale_width_factor(15000) > scale_width_factor(25000) > scale_width_factor(50000)
+    assert scale_font_delta(10000) == scale_font_delta(12500) > scale_font_delta(15000)
     assert scale_font_delta(15000) > scale_font_delta(25000) > scale_font_delta(50000)
 
 
@@ -1291,7 +1293,10 @@ def test_v14_themes_public_lands_tactical_and_cli(
         "primary_casing",
         "primary_fill",
         "track",
+        "track_rough",
         "trail",
+        "cliff",
+        "barrier",
         "rail",
         "grid_1km",
         "grid_100km",

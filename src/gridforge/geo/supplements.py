@@ -691,14 +691,20 @@ def _render_calibration_in_process(spec: dict[str, Any], output_pdf: Path) -> No
 
         # --- 4. TRUE-SCALE MGRS ROMER SCALE CORNERS ---
         romer_top = ir_y + 13.0
+        romer_heading = (
+            "MGRS ROMER SCALE CORNERS (100 m subdivisions — align 0-corner on target, read Right then Up)"
+        )
+        if scale <= 15000:
+            km_mm_active = 1_000_000.0 / float(scale)
+            romer_heading += f"  ·  1:{scale:,} active: 1 km = {km_mm_active:.2f} mm (use 100 mm ruler above)"
         _draw_text_box(
             painter,
             hr_x,
             romer_top,
-            135.0,
+            155.0,
             5.0,
-            "MGRS ROMER SCALE CORNERS (100 m subdivisions — align 0-corner on target, read Right then Up)",
-            pt=7.0,
+            romer_heading,
+            pt=6.8 if scale <= 15000 else 7.0,
             bold=True,
             color_hex=ink,
         )

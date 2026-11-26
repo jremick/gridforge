@@ -403,7 +403,7 @@ def render_cmd(
         25000,
         "--scale",
         "-s",
-        help="Map scale denominator (15000, 24000, 25000, 48000, 50000).",
+        help="Map scale denominator (10000, 12500, 15000, 24000, 25000, 48000, 50000).",
     ),
     paper: PaperSize = typer.Option(
         PaperSize.A4,
@@ -456,7 +456,14 @@ def render_cmd(
         "--dpi",
         min=72,
         max=1200,
-        help="Export DPI (default 300).",
+        help="Print PDF DPI (default 300; up to 600 recommended for ultra-sharp raster hillshade).",
+    ),
+    export_dpi: Optional[int] = typer.Option(
+        None,
+        "--export-dpi",
+        min=72,
+        max=1200,
+        help="Override rasterization DPI for accompanying digital exports (defaults to --dpi).",
     ),
     dem_source: DemSourceKind = typer.Option(
         DemSourceKind.AUTO,
@@ -799,7 +806,7 @@ def render_cmd(
             garmin_profile=garmin_profile,
             max_tiles=max_tiles,
             export_include_grid=grid and export_grid,
-            export_dpi=dpi,
+            export_dpi=export_dpi if export_dpi is not None else dpi,
         )
 
     if json_output:
@@ -836,7 +843,7 @@ def export_cmd(
         25000,
         "--scale",
         "-s",
-        help="Map scale denominator (15000, 24000, 25000, 48000, 50000).",
+        help="Map scale denominator (10000, 12500, 15000, 24000, 25000, 48000, 50000).",
     ),
     paper: PaperSize = typer.Option(
         PaperSize.A4,
@@ -1103,7 +1110,7 @@ def inspect_cmd(
         25000,
         "--scale",
         "-s",
-        help="Map scale denominator (15000, 24000, 25000, 48000, 50000).",
+        help="Map scale denominator (10000, 12500, 15000, 24000, 25000, 48000, 50000).",
     ),
     paper: PaperSize = typer.Option(
         PaperSize.A4,

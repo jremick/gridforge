@@ -157,7 +157,10 @@ _THEME_PALETTE: dict[ColorMode, dict[str, str]] = {
         "service_casing": "#686868",
         "service_fill": "#F7F7F7",
         "track": "#5E442B",
+        "track_rough": "#704A26",
         "trail": "#3D3D3D",
+        "cliff": "#4A3B2C",
+        "barrier": "#6E6860",
         "rail": "#1A1A1A",
         "runway_fill": "#666666",
         "taxiway_casing": "#333333",
@@ -283,7 +286,10 @@ _THEME_PALETTE: dict[ColorMode, dict[str, str]] = {
         "service_casing": "#444444",
         "service_fill": "#FFFFFF",
         "track": "#1A1A1A",
+        "track_rough": "#2A2A2A",
         "trail": "#1A1A1A",
+        "cliff": "#1A1A1A",
+        "barrier": "#4A4A4A",
         "rail": "#000000",
         "runway_fill": "#444444",
         "taxiway_casing": "#000000",
@@ -390,7 +396,10 @@ _THEME_PALETTE: dict[ColorMode, dict[str, str]] = {
         "service_casing": "#3A4A59",
         "service_fill": "#F5F7F9",
         "track": "#1B3144",
+        "track_rough": "#1B3B4B",
         "trail": "#142330",
+        "cliff": "#1E2D3D",
+        "barrier": "#2B3D4F",
         "rail": "#0A1219",
         "runway_fill": "#3B4A59",
         "taxiway_casing": "#182430",
@@ -516,7 +525,10 @@ _THEME_PALETTE: dict[ColorMode, dict[str, str]] = {
         "service_casing": "#5D6B78",
         "service_fill": "#F4F7FA",
         "track": "#4A5866",
+        "track_rough": "#4E5D6C",
         "trail": "#23313F",
+        "cliff": "#2C3E50",
+        "barrier": "#52606D",
         "rail": "#14202B",
         "runway_fill": "#5A6775",
         "taxiway_casing": "#2C3A47",
@@ -668,6 +680,8 @@ def map_background_hex(color_mode: ColorMode) -> str:
 
 def scale_width_factor(scale: int) -> float:
     """Return cartographic line/symbol width multiplier across supported scales."""
+    if scale <= 12500:
+        return 1.24
     if scale <= 15000:
         return 1.15
     if scale >= 48000:
@@ -677,6 +691,8 @@ def scale_width_factor(scale: int) -> float:
 
 def scale_font_delta(scale: int) -> float:
     """Return subtle point-size delta for multi-scale typography balance."""
+    if scale <= 12500:
+        return 0.6
     if scale <= 15000:
         return 0.4
     if scale >= 48000:
@@ -1246,6 +1262,51 @@ def _railway_symbol(color_hex: str = "#1A1A1A", base_pass: int = 15, wf: float =
     )
     ticks.setSubSymbol(tick_marker)
     sym.appendSymbolLayer(ticks)
+    return sym
+
+
+def _cliff_symbol(color_hex: str, render_pass: int = 4, wf: float = 1.0) -> Any:
+    """Create USGS/NATO topographic cliff escarpment line with downslope hachure ticks."""
+    from qgis.core import (
+        QgsLineSymbol,
+        QgsMarkerLineSymbolLayer,
+        QgsMarkerSymbol,
+        QgsSimpleLineSymbolLayer,
+        QgsUnitTypes,
+    )
+    from qgis.PyQt.QtCore import Qt
+    from qgis.PyQt.QtGui import QColor
+
+    sym = QgsLineSymbol()
+    sym.deleteSymbolLayer(0)
+
+    edge = QgsSimpleLineSymbolLayer(QColor(color_hex), 0.24 * wf)
+    edge.setWidthUnit(QgsUnitTypes.RenderMillimeters)
+    edge.setPenCapStyle(Qt.FlatCap)
+    edge.setPenJoinStyle(Qt.RoundJoin)
+    edge.setRenderingPass(render_pass)
+    sym.appendSymbolLayer(edge)
+
+    hachures = QgsMarkerLineSymbolLayer(True, 1.8 * wf)
+    hachures.setIntervalUnit(QgsUnitTypes.RenderMillimeters)
+    hachures.setRenderingPass(render_pass)
+
+    tick_marker = QgsMarkerSymbol.createSimple(
+        {
+            "name": "line",
+            "color": color_hex,
+            "outline_color": color_hex,
+            "outline_width": f"{0.20 * wf:.3f}",
+            "outline_width_unit": "MM",
+            "size": f"{1.05 * wf:.3f}",
+            "size_unit": "MM",
+            "angle": "0",
+            "offset": f"0,{0.48 * wf:.3f}",
+            "offset_unit": "MM",
+        }
+    )
+    hachures.setSubSymbol(tick_marker)
+    sym.appendSymbolLayer(hachures)
     return sym
 
 
@@ -2467,16 +2528,59 @@ def _build_transport_style(
         )
         _add_rule(
             root,
-            "Unpaved Track / 4WD",
-            "\"highway\" = 'track'",
+            "Unpaved Track (Graded)",
+            "\"highway\" = 'track' AND (\"tracktype\" IS NULL OR \"tracktype\" NOT IN ('grade4','grade5'))",
             _line_symbol(_pal(color_mode, "track"), 0.34 * wf, dash_vector=[2.2, 1.0], render_pass=5),
         )
         _add_rule(
             root,
+            "Rough 4WD Track (Grade 4-5)",
+            "\"highway\" = 'track' AND \"tracktype\" IN ('grade4','grade5')",
+            _line_symbol(
+                _pal(color_mode, "track_rough"),
+                0.30 * wf,
+                dash_vector=[1.4, 0.7, 0.4, 0.7],
+                render_pass=5,
+            ),
+        )
+        _add_rule(
+            root,
             "Trails / Footways / Paths",
-            "\"highway\" IN ('path','footway','bridleway','cycleway','steps')",
+            "\"highway\" IN ('path','footway','bridleway','cycleway')",
             _line_symbol(_pal(color_mode, "trail"), 0.24 * wf, dash_vector=[1.1, 0.9], render_pass=3),
         )
+        _add_rule(
+            root,
+            "Steps / Stairways",
+            "\"highway\" = 'steps'",
+            _line_symbol(_pal(color_mode, "trail"), 0.36 * wf, dash_vector=[0.55, 0.45], cap_round=False, render_pass=4),
+        )
+        _add_rule(
+            root,
+            "Cliffs & Escarpments",
+            "\"natural\" = 'cliff'",
+            _cliff_symbol(_pal(color_mode, "cliff"), render_pass=4, wf=wf),
+        )
+        _add_rule(
+            root,
+            "Stream Fords",
+            "\"ford\" = 'yes'",
+            _line_symbol(_pal(color_mode, "river"), 0.48 * wf, dash_vector=[0.65, 0.55], render_pass=25),
+        )
+        if scale <= 25000:
+            _add_rule(
+                root,
+                "Walls & Retaining Walls",
+                "\"barrier\" IN ('wall','retaining_wall','city_wall')",
+                _line_symbol(_pal(color_mode, "barrier"), 0.22 * wf, cap_round=False, render_pass=2),
+            )
+        if scale <= 15000:
+            _add_rule(
+                root,
+                "Fences",
+                "\"barrier\" = 'fence'",
+                _line_symbol(_pal(color_mode, "barrier"), 0.15 * wf, dash_vector=[1.3, 0.65], render_pass=1),
+            )
         _add_rule(
             root,
             "Railway",
@@ -2570,16 +2674,54 @@ def _build_transport_style(
         )
         _add_rule(
             root,
-            "Unpaved Track / 4WD",
-            "\"highway\" = 'track'",
+            "Unpaved Track (Graded)",
+            "\"highway\" = 'track' AND (\"tracktype\" IS NULL OR \"tracktype\" NOT IN ('grade4','grade5'))",
             _line_symbol("#1A1A1A", 0.34 * wf, dash_vector=[2.2, 1.0], render_pass=5),
         )
         _add_rule(
             root,
+            "Rough 4WD Track (Grade 4-5)",
+            "\"highway\" = 'track' AND \"tracktype\" IN ('grade4','grade5')",
+            _line_symbol("#2A2A2A", 0.30 * wf, dash_vector=[1.4, 0.7, 0.4, 0.7], render_pass=5),
+        )
+        _add_rule(
+            root,
             "Trails / Footways / Paths",
-            "\"highway\" IN ('path','footway','bridleway','cycleway','steps')",
+            "\"highway\" IN ('path','footway','bridleway','cycleway')",
             _line_symbol("#1A1A1A", 0.24 * wf, dash_vector=[0.85, 0.85], render_pass=3),
         )
+        _add_rule(
+            root,
+            "Steps / Stairways",
+            "\"highway\" = 'steps'",
+            _line_symbol("#1A1A1A", 0.36 * wf, dash_vector=[0.55, 0.45], cap_round=False, render_pass=4),
+        )
+        _add_rule(
+            root,
+            "Cliffs & Escarpments",
+            "\"natural\" = 'cliff'",
+            _cliff_symbol("#1A1A1A", render_pass=4, wf=wf),
+        )
+        _add_rule(
+            root,
+            "Stream Fords",
+            "\"ford\" = 'yes'",
+            _line_symbol("#1A1A1A", 0.48 * wf, dash_vector=[0.65, 0.55], render_pass=25),
+        )
+        if scale <= 25000:
+            _add_rule(
+                root,
+                "Walls & Retaining Walls",
+                "\"barrier\" IN ('wall','retaining_wall','city_wall')",
+                _line_symbol("#4A4A4A", 0.22 * wf, cap_round=False, render_pass=2),
+            )
+        if scale <= 15000:
+            _add_rule(
+                root,
+                "Fences",
+                "\"barrier\" = 'fence'",
+                _line_symbol("#4A4A4A", 0.15 * wf, dash_vector=[1.3, 0.65], render_pass=1),
+            )
         _add_rule(
             root,
             "Railway",
@@ -2878,6 +3020,119 @@ def _build_points_style(
     )
     _add_rule(root, "Railway Stations", "\"railway\" IN ('station','halt')", station_sym)
 
+    # Backcountry Water & Terrain Micro-Features
+    waterfall_sym = QgsMarkerSymbol.createSimple(
+        {
+            "name": "diamond",
+            "color": _pal(color_mode, "river"),
+            "outline_color": "#FFFFFF",
+            "outline_width": "0.26",
+            "outline_width_unit": "MM",
+            "size": f"{1.75 * wf:.3f}",
+            "size_unit": "MM",
+        }
+    )
+    _add_rule(root, "Waterfalls & Rapids", "\"waterway\" IN ('waterfall','rapids')", waterfall_sym)
+
+    spring_sym = QgsMarkerSymbol.createSimple(
+        {
+            "name": "circle",
+            "color": "#FFFFFF",
+            "outline_color": _pal(color_mode, "stream"),
+            "outline_width": "0.34",
+            "outline_width_unit": "MM",
+            "size": f"{1.35 * wf:.3f}",
+            "size_unit": "MM",
+        }
+    )
+    _add_rule(root, "Natural Springs", "\"natural\" = 'spring'", spring_sym)
+
+    ford_sym = QgsMarkerSymbol.createSimple(
+        {
+            "name": "square",
+            "color": "#FFFFFF",
+            "outline_color": _pal(color_mode, "river"),
+            "outline_width": "0.32",
+            "outline_width_unit": "MM",
+            "size": f"{1.45 * wf:.3f}",
+            "size_unit": "MM",
+            "angle": "45",
+        }
+    )
+    _add_rule(root, "Fords", "\"ford\" = 'yes' OR \"highway\" = 'ford'", ford_sym)
+
+    cave_sym = QgsMarkerSymbol.createSimple(
+        {
+            "name": "semi_circle",
+            "color": _pal(color_mode, "cliff"),
+            "outline_color": "#FFFFFF",
+            "outline_width": "0.22",
+            "outline_width_unit": "MM",
+            "size": f"{1.65 * wf:.3f}",
+            "size_unit": "MM",
+        }
+    )
+    _add_rule(root, "Cave Entrances", "\"natural\" = 'cave_entrance'", cave_sym)
+
+    trig_sym = QgsMarkerSymbol.createSimple(
+        {
+            "name": "triangle",
+            "color": "#FFFFFF",
+            "outline_color": _pal(color_mode, "ink_dark"),
+            "outline_width": "0.34",
+            "outline_width_unit": "MM",
+            "size": f"{2.0 * wf:.3f}",
+            "size_unit": "MM",
+        }
+    )
+    _add_rule(root, "Survey Points & Trigs", "\"man_made\" = 'survey_point'", trig_sym)
+
+    ruins_sym = QgsMarkerSymbol.createSimple(
+        {
+            "name": "square",
+            "color": "#FFFFFF",
+            "outline_color": _pal(color_mode, "ink_soft"),
+            "outline_width": "0.30",
+            "outline_width_unit": "MM",
+            "size": f"{1.45 * wf:.3f}",
+            "size_unit": "MM",
+        }
+    )
+    _add_rule(root, "Historic Ruins & Forts", "\"historic\" IN ('ruins','castle','fort')", ruins_sym)
+
+    if scale <= 25000:
+        cairn_sym = QgsMarkerSymbol.createSimple(
+            {
+                "name": "circle",
+                "color": _pal(color_mode, "cliff"),
+                "outline_color": "#FFFFFF",
+                "outline_width": "0.18",
+                "outline_width_unit": "MM",
+                "size": f"{1.10 * wf:.3f}",
+                "size_unit": "MM",
+            }
+        )
+        _add_rule(root, "Cairns & Rock Outcrops", "\"man_made\" = 'cairn' OR \"natural\" = 'rock'", cairn_sym)
+
+    if scale <= 15000:
+        gate_sym = QgsMarkerSymbol.createSimple(
+            {
+                "name": "cross2",
+                "color": _pal(color_mode, "barrier"),
+                "outline_color": _pal(color_mode, "barrier"),
+                "outline_width": "0.24",
+                "outline_width_unit": "MM",
+                "size": f"{1.05 * wf:.3f}",
+                "size_unit": "MM",
+            }
+        )
+        _add_rule(
+            root,
+            "Gates, Stiles & Cattle Grids",
+            "\"barrier\" IN ('gate','stile','kissing_gate','cattle_grid','lift_gate')",
+            gate_sym,
+        )
+
     place_sym = QgsMarkerSymbol.createSimple({"name": "circle", "color": "0,0,0,0", "outline_style": "no", "size": "0.01"})
     _add_rule(
         root,
@@ -2982,10 +3237,12 @@ def _build_points_style(
             _make_text_format(6.4 + fd, _pal(color_mode, "ink_soft"), halo_hex=halo_hex, halo_mm=0.65)
         )
         r_local = QgsRuleBasedLabeling.Rule(pal_local)
-        r_local.setDescription("Localities / Viewpoints / Stations / Saddles")
+        r_local.setDescription("Localities / Viewpoints / Stations / Saddles / Backcountry POIs")
         r_local.setFilterExpression(
             "(\"place\" IN ('hamlet','locality') OR \"tourism\" IN ('viewpoint','alpine_hut','wilderness_hut') "
-            "OR \"railway\" IN ('station','halt') OR \"natural\" = 'saddle') "
+            "OR \"railway\" IN ('station','halt') OR \"natural\" IN ('saddle','spring','cave_entrance') "
+            "OR \"waterway\" = 'waterfall' OR \"man_made\" = 'survey_point' "
+            "OR \"historic\" IN ('ruins','castle','fort')) "
             "AND \"name\" IS NOT NULL"
         )
         label_root.appendChild(r_local)
@@ -5510,7 +5767,8 @@ def export_qml_styles(styles_root: Path | None = None) -> list[Path]:
             "&field=tracktype:string&field=railway:string&field=aeroway:string"
             "&field=power:string&field=voltage:string&field=man_made:string"
             "&field=substance:string&field=location:string&field=bridge:string"
-            "&field=tunnel:string&field=layer:string&field=oneway:string",
+            "&field=tunnel:string&field=layer:string&field=oneway:string"
+            "&field=natural:string&field=barrier:string&field=ford:string",
             "transport",
         ),
         "au_power_lines": (
@@ -5537,7 +5795,7 @@ def export_qml_styles(styles_root: Path | None = None) -> list[Path]:
             "&field=religion:string&field=emergency:string&field=shop:string"
             "&field=historic:string&field=place:string&field=power:string"
             "&field=man_made:string&field=tower:type:string&field=communication:string"
-            "&field=tourism:string",
+            "&field=tourism:string&field=waterway:string&field=barrier:string&field=ford:string",
             "points",
         ),
         "au_state_pois": (

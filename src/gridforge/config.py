@@ -252,7 +252,7 @@ class CartoOptions(BaseModel):
     show_slope_shading: bool = False
 
 
-VALID_SCALES: tuple[int, ...] = (15000, 24000, 25000, 48000, 50000)
+VALID_SCALES: tuple[int, ...] = (10000, 12500, 15000, 24000, 25000, 48000, 50000)
 
 
 class SheetSpec(BaseModel):

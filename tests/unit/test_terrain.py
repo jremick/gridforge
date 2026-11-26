@@ -249,6 +249,45 @@ def test_contour_density_and_lidar_resolution_selection() -> None:
     assert choose_warp_resolution_and_z(5.0) == (5.0, 1.15)
     assert choose_warp_resolution_and_z(30.0) == (10.0, 1.15)
 
+    # Fine tactical scales (1:10k, 1:12.5k, 1:15k) preserve true 1.0 m LiDAR with safe memory pixel cap
+    assert choose_warp_resolution_and_z(1.0, scale=10000, max_extent_m=2400.0) == (1.0, 1.0)
+    assert choose_warp_resolution_and_z(1.0, scale=12500, max_extent_m=3200.0) == (1.0, 1.0)
+    res_a3_15k, z_a3 = choose_warp_resolution_and_z(1.0, scale=15000, max_extent_m=6200.0)
+    assert z_a3 == 1.0
+    assert 6200.0 / res_a3_15k <= 4096.0
+
+    # Fine contour intervals (2 m / 5 ft on high-res DEMs, clamped to 5 m / 10 ft on 30 m SRTM)
+    assert choose_contour_interval(10000, Units.METRIC, 300.0, DensityLevel.NORMAL, native_res_m=1.0) == (
+        5.0,
+        5,
+        "5 m (index 25 m)",
+    )
+    assert choose_contour_interval(10000, Units.METRIC, 300.0, DensityLevel.HIGH, native_res_m=1.0) == (
+        2.0,
+        5,
+        "2 m (index 10 m)",
+    )
+    assert choose_contour_interval(12500, Units.METRIC, 300.0, DensityLevel.HIGH, native_res_m=30.0) == (
+        5.0,
+        5,
+        "5 m (index 25 m)",
+    )
+    assert choose_contour_interval(10000, Units.IMPERIAL, 300.0, DensityLevel.NORMAL, native_res_m=1.0) == (
+        10.0,
+        5,
+        "10 ft (index 50 ft)",
+    )
+    assert choose_contour_interval(10000, Units.IMPERIAL, 300.0, DensityLevel.HIGH, native_res_m=1.0) == (
+        5.0,
+        5,
+        "5 ft (index 25 ft)",
+    )
+    assert choose_contour_interval(10000, Units.IMPERIAL, 300.0, DensityLevel.HIGH, native_res_m=30.0) == (
+        10.0,
+        5,
+        "10 ft (index 50 ft)",
+    )
+
 
 @pytest.mark.skipif(not HAS_GDAL_TERRAIN, reason="GDAL CLI tools required for terrain pipeline tests")
 def test_build_terrain_products_high_density_and_hillshade_off(tmp_path: Path) -> None:

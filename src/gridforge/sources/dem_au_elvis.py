@@ -34,6 +34,8 @@ QLD_LIDAR_ATTRIBUTION: Final[str] = (
     "Elevation data: © State of Queensland (Department of Resources) QldDem LiDAR (CC BY 4.0)"
 )
 QLD_MAX_EXPORT_PX: Final[int] = 2048
+QLD_MAX_EXPORT_WIDTH_PX: Final[int] = 4096
+QLD_MAX_EXPORT_HEIGHT_PX: Final[int] = 2048
 
 # Tier 1 & 2: Geoscience Australia National 5 m LiDAR WCS -> DEA SRTM 1s COG (CC BY 4.0, AHD)
 GA_5M_LIDAR_WCS_URL: Final[str] = (
@@ -79,17 +81,20 @@ def qld_export_size_for_bbox(
     *,
     target_res_m: float = 2.0,
     max_px: int = QLD_MAX_EXPORT_PX,
+    max_width_px: int | None = None,
+    max_height_px: int | None = None,
 ) -> tuple[int, int]:
-    """Compute ``(width_px, height_px)`` for QLD ``QldDem`` export capped under 20 MB Float32."""
+    """Compute ``(width_px, height_px)`` for QLD ``QldDem`` export within server pixel limits."""
     mid_lat = 0.5 * (bbox.min_y + bbox.max_y)
     cos_lat = max(0.2, math.cos(math.radians(mid_lat)))
     width_m = max(1.0, bbox.width * 111320.0 * cos_lat)
     height_m = max(1.0, bbox.height * 111320.0)
     px_w = max(64, int(round(width_m / target_res_m)))
     px_h = max(64, int(round(height_m / target_res_m)))
-    peak = max(px_w, px_h)
-    if peak > max_px:
-        scale = max_px / float(peak)
+    lim_w = max_width_px if max_width_px is not None else max_px
+    lim_h = max_height_px if max_height_px is not None else max_px
+    scale = min(1.0, lim_w / float(px_w), lim_h / float(px_h))
+    if scale < 1.0:
         px_w = max(64, int(round(px_w * scale)))
         px_h = max(64, int(round(px_h * scale)))
     return (px_w, px_h)
@@ -342,17 +347,26 @@ class AUElvisDEMSource:
         work_dir: Path,
         out_tif: Path,
     ) -> bool:
-        """Attempt Tier-0 Queensland 2 m LiDAR DEM via ``QldDem/ImageServer`` (AHD, CC BY 4.0)."""
+        """Attempt Tier-0 Queensland 1 m / 2 m LiDAR DEM via ``QldDem/ImageServer`` (AHD, CC BY 4.0)."""
         if layout.spec.scale > 25000 or not is_in_qld_lidar_coverage(clip_bbox):
             return False
 
-        px_w, px_h = qld_export_size_for_bbox(clip_bbox)
+        fine_scale = layout.spec.scale <= 15000
+        target_res_m = 1.0 if fine_scale else 2.0
+        tier_label = "qld-1m-lidar" if fine_scale else "qld-2m-lidar"
+        cache_tag = "au_qld1m" if fine_scale else "au_qld2m"
+        px_w, px_h = qld_export_size_for_bbox(
+            clip_bbox,
+            target_res_m=target_res_m,
+            max_width_px=QLD_MAX_EXPORT_WIDTH_PX if fine_scale else QLD_MAX_EXPORT_PX,
+            max_height_px=QLD_MAX_EXPORT_HEIGHT_PX,
+        )
         key = _bbox_hash(clip_bbox)
-        cache_path = self.cache_dir / "clips" / f"au_qld2m_{px_w}x{px_h}_{key}.tif"
+        cache_path = self.cache_dir / "clips" / f"{cache_tag}_{px_w}x{px_h}_{key}.tif"
         if self.use_clip_cache and cache_path.is_file() and cache_path.stat().st_size > 0:
-            logger.info("Using cached QLD 2m LiDAR clip: %s", cache_path)
+            logger.info("Using cached QLD %sm LiDAR clip: %s", int(target_res_m), cache_path)
             shutil.copy2(cache_path, out_tif)
-            self.resolved_tier = "qld-2m-lidar"
+            self.resolved_tier = tier_label
             self.resolved_attribution = QLD_LIDAR_ATTRIBUTION
             self.resolved_vertical_datum = self.vertical_datum
             return True
@@ -417,7 +431,7 @@ class AUElvisDEMSource:
             return False
 
         tmp_qld.replace(out_tif)
-        self.resolved_tier = "qld-2m-lidar"
+        self.resolved_tier = tier_label
         self.resolved_attribution = QLD_LIDAR_ATTRIBUTION
         self.resolved_vertical_datum = self.vertical_datum
         if self.use_clip_cache and out_tif.is_file() and out_tif.stat().st_size > 0:

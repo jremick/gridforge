@@ -27,8 +27,11 @@ logger = logging.getLogger(__name__)
 FEET_PER_METER: Final[float] = 3.280839895013123
 DEM_NODATA: Final[float] = -9999.0
 DEFAULT_TARGET_RES_M: Final[float] = 10.0
-MIN_TARGET_RES_M: Final[float] = 2.0
+MIN_TARGET_RES_M: Final[float] = 1.0
+STANDARD_MIN_TARGET_RES_M: Final[float] = 2.0
 LIDAR_NATIVE_THRESHOLD_M: Final[float] = 3.0
+HIGH_RES_CONTOUR_DEM_THRESHOLD_M: Final[float] = 10.0
+MAX_DEM_WARP_DIM_PX: Final[int] = 4096
 
 
 class TerrainResult(BaseModel):
@@ -53,42 +56,65 @@ def choose_contour_interval(
     units: Units,
     relief_m: float,
     density: DensityLevel = DensityLevel.NORMAL,
+    *,
+    native_res_m: float | None = None,
 ) -> tuple[float, int, str]:
     """Select military topographic contour interval, index multiplier, and collar display text.
 
-    Honors ``density``:
+    Honors ``density`` and supports ultra-fine ``2 m`` / ``5 ft`` contours on fine
+    tactical scales (``<= 1:12,500``) when backed by high-resolution DEMs (``<= 10 m``):
     - ``LOW``: ``2x`` normal interval
-    - ``NORMAL``: standard military topographic interval
-    - ``HIGH``: ``0.5x`` normal interval (clamped to minimum ``5 m`` / ``10 ft``)
+    - ``NORMAL``: standard military topographic interval (``5 m`` / ``10 ft`` at ``<= 1:12.5k``)
+    - ``HIGH``: ``0.5x`` normal interval (down to ``2 m`` / ``5 ft`` on fine LiDAR scales,
+      otherwise clamped to ``5 m`` / ``10 ft``)
 
     Returns:
         ``(interval_in_unit, index_multiplier, display_str)`` where ``index_multiplier`` is ``5``.
     """
     index_mult = 5
+    can_ultra_fine = (
+        scale <= 12500
+        and (native_res_m is None or native_res_m <= HIGH_RES_CONTOUR_DEM_THRESHOLD_M)
+    )
 
     if units == Units.IMPERIAL:
-        if scale <= 15000:
+        if scale <= 12500:
+            base = 10.0
+            min_interval = 5.0 if can_ultra_fine else 10.0
+        elif scale <= 15000:
             base = 20.0
+            min_interval = 10.0
         elif scale <= 25000:
             base = 40.0
+            min_interval = 10.0
         else:
             base = 80.0
-        min_interval = 10.0
+            min_interval = 10.0
         unit_label = "ft"
     else:
-        if scale <= 15000:
+        if scale <= 12500:
+            base = 5.0
+            min_interval = 2.0 if can_ultra_fine else 5.0
+        elif scale <= 15000:
             base = 10.0
+            min_interval = 5.0
         elif scale <= 25000:
             base = 20.0 if relief_m > 1200.0 else 10.0
+            min_interval = 5.0
         else:
             base = 20.0
-        min_interval = 5.0
+            min_interval = 5.0
         unit_label = "m"
 
     if density == DensityLevel.LOW:
         interval = base * 2.0
     elif density == DensityLevel.HIGH:
-        interval = max(min_interval, base * 0.5)
+        half = base * 0.5
+        # Snap 2.5 m -> standard cartographic 2 m contour interval when ultra-fine allowed.
+        if units == Units.METRIC and half < 3.0 and min_interval <= 2.0:
+            interval = 2.0
+        else:
+            interval = max(min_interval, half)
     else:
         interval = base
 
@@ -96,19 +122,35 @@ def choose_contour_interval(
     return (interval, index_mult, f"{int(round(interval))} {unit_label} (index {index_val} {unit_label})")
 
 
-def choose_warp_resolution_and_z(native_res_m: float) -> tuple[float, float]:
+def choose_warp_resolution_and_z(
+    native_res_m: float,
+    *,
+    scale: int = 25000,
+    max_extent_m: float | None = None,
+) -> tuple[float, float]:
     """Choose ``(target_res_m, hillshade_z_factor)`` from input DEM native pixel resolution.
 
-    Preserves crisp 2.0 m LiDAR micro-terrain (with ``z=1.0``) when input DEM resolution
-    is ``<= 3.0 m`` (e.g., USGS 3DEP 1 m), preserves finer intermediate DEMs (3–10 m),
-    and upsamples 30 m GLO-30 / 10 m DEMs smoothly to ``10.0 m`` (with ``z=1.15``).
+    Preserves true ``1.0 m`` LiDAR micro-terrain on fine tactical scales (``<= 1:15,000``)
+    and crisp ``2.0 m`` LiDAR on standard scales (``> 1:15,000``) when input DEM resolution
+    is ``<= 3.0 m`` (e.g., USGS 3DEP 1 m, Canada HRDEM 1 m, NZ LINZ 1 m, QLD 1 m LiDAR),
+    while enforcing ``MAX_DEM_WARP_DIM_PX`` (4096 px) to keep worker memory safely < 2 GB.
     """
     if native_res_m <= LIDAR_NATIVE_THRESHOLD_M:
-        target = max(MIN_TARGET_RES_M, round(native_res_m, 2))
-        return (target, 1.0)
-    if native_res_m < DEFAULT_TARGET_RES_M:
-        return (round(native_res_m, 2), 1.15)
-    return (DEFAULT_TARGET_RES_M, 1.15)
+        floor_res = MIN_TARGET_RES_M if scale <= 15000 else STANDARD_MIN_TARGET_RES_M
+        target = max(floor_res, round(native_res_m, 2))
+        z_factor = 1.0
+    elif native_res_m < DEFAULT_TARGET_RES_M:
+        target = round(native_res_m, 2)
+        z_factor = 1.15
+    else:
+        target = DEFAULT_TARGET_RES_M
+        z_factor = 1.15
+
+    if max_extent_m is not None and max_extent_m > 0.0:
+        min_safe_res = math.ceil((max_extent_m / float(MAX_DEM_WARP_DIM_PX)) * 10.0) / 10.0
+        target = max(target, round(min_safe_res, 2))
+
+    return (target, z_factor)
 
 
 def _estimate_native_resolution_m(dem_raw_path: Path, center_lat: float) -> float:
@@ -1245,8 +1287,12 @@ def build_terrain_products(
     terrain_gpkg = work_dir / "terrain.gpkg"
 
     native_res_m = _estimate_native_resolution_m(src_dem, layout.spec.center_lat)
-    target_res, z_factor = choose_warp_resolution_and_z(native_res_m)
     b = layout.utm_fetch_bbox
+    target_res, z_factor = choose_warp_resolution_and_z(
+        native_res_m,
+        scale=layout.spec.scale,
+        max_extent_m=max(b.width, b.height),
+    )
 
     # 1. Warp raw DEM to exact sheet UTM CRS with smooth cubic resampling
     warp_cmd = [
@@ -1320,12 +1366,13 @@ def build_terrain_products(
         )
         _run_subprocess(hillshade_cmd, context="gdaldem hillshade")
 
-    # 4. Generate contours honoring units + carto.contour_density
+    # 4. Generate contours honoring units + carto.contour_density + DEM resolution
     interval, index_mult, interval_display = choose_contour_interval(
         layout.spec.scale,
         layout.spec.units,
         relief_m,
         density=layout.spec.carto.contour_density,
+        native_res_m=native_res_m,
     )
     index_interval = interval * index_mult
 

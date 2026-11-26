@@ -55,7 +55,7 @@ def round_enclosing_bbox(bbox: BBox, step_deg: float = 0.001) -> BBox:
 def bbox_cache_key(bbox: BBox) -> str:
     """Compute a deterministic SHA256 cache key for an enclosing 0.001°-rounded bbox."""
     rounded = round_enclosing_bbox(bbox, step_deg=0.001)
-    payload = f"v3:{rounded.min_x:.3f},{rounded.min_y:.3f},{rounded.max_x:.3f},{rounded.max_y:.3f}"
+    payload = f"v4:{rounded.min_x:.3f},{rounded.min_y:.3f},{rounded.max_x:.3f},{rounded.max_y:.3f}"
     return hashlib.sha256(payload.encode("ascii")).hexdigest()
 
 
@@ -78,9 +78,12 @@ def build_overpass_query(
     return (
         f"[out:xml][timeout:{timeout_s}][maxsize:{maxsize_bytes}];\n"
         "(\n"
-        f'  node["natural"~"^(peak|saddle|volcano|spring|water|cave_entrance|cliff)$"]({coords});\n'
+        f'  node["natural"~"^(peak|saddle|volcano|spring|water|cave_entrance|cliff|rock)$"]({coords});\n'
+        f'  node["waterway"~"^(waterfall|rapids)$"]({coords});\n'
         f'  node["place"]({coords});\n'
-        f'  node["highway"="motorway_junction"]({coords});\n'
+        f'  node["highway"~"^(motorway_junction|ford)$"]({coords});\n'
+        f'  node["ford"="yes"]({coords});\n'
+        f'  node["barrier"~"^(gate|stile|kissing_gate|cattle_grid|lift_gate)$"]({coords});\n'
         f'  node["railway"~"^(station|halt|stop|tram_stop|level_crossing)$"]({coords});\n'
         f'  node["aeroway"]({coords});\n'
         f'  node["amenity"~"^(hospital|clinic|fire_station|police|school|college|university|place_of_worship|fuel|shelter)$"]({coords});\n'
@@ -93,6 +96,7 @@ def build_overpass_query(
         f'  way["railway"]({coords});\n'
         f'  way["aeroway"]({coords});\n'
         f'  way["waterway"]({coords});\n'
+        f'  way["barrier"~"^(fence|wall|retaining_wall|city_wall)$"]({coords});\n'
         f'  way["natural"~"^(water|wood|forest|scrub|heath|grassland|fell|wetland|mud|bare_rock|scree|shingle|sand|beach|coastline|cliff)$"]({coords});\n'
         f'  way["landuse"~"^(forest|wood|meadow|grass|orchard|vineyard|farmland|recreation_ground|residential|commercial|industrial|retail|military|reservoir|basin)$"]({coords});\n'
         f'  way["leisure"~"^(park|nature_reserve|golf_course|recreation_ground)$"]({coords});\n'

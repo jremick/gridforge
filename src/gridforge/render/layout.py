@@ -7,6 +7,7 @@ extent so 1 km MGRS grid lines measure exact physical spacing with a protractor.
 from __future__ import annotations
 
 from datetime import date
+import os
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +49,8 @@ _ALL_TRAIL_OVERLAY_KEYS: frozenset[str] = _AU_STATE_TRAIL_KEYS | _NZ_TRAIL_KEYS 
 # Per-scale metric & imperial scale bar parameters calibrated to fit cleanly in ~40 mm width.
 # Format: (units_per_segment, segments_left, segments_right, unit_label, subdivision_count)
 _METRIC_SCALEBAR_SPEC: dict[int, tuple[float, int, int, str, int]] = {
+    10000: (100.0, 1, 3, "m", 2),   # 400 m = 40.00 mm
+    12500: (100.0, 1, 4, "m", 2),   # 500 m = 40.00 mm
     15000: (200.0, 1, 2, "m", 2),   # 600 m = 40.00 mm
     24000: (250.0, 1, 3, "m", 2),   # 1000 m = 41.67 mm
     25000: (250.0, 1, 3, "m", 2),   # 1000 m = 40.00 mm
@@ -56,6 +59,8 @@ _METRIC_SCALEBAR_SPEC: dict[int, tuple[float, int, int, str, int]] = {
 }
 
 _IMPERIAL_SCALEBAR_SPEC: dict[int, tuple[float, int, int, str, int]] = {
+    10000: (250.0, 1, 4, "ft", 2),   # 1250 ft = 38.10 mm
+    12500: (500.0, 1, 2, "ft", 2),   # 1500 ft = 36.58 mm
     15000: (500.0, 1, 3, "ft", 2),   # 2000 ft = 40.64 mm
     24000: (1000.0, 1, 2, "ft", 2),  # 3000 ft = 38.10 mm
     25000: (1000.0, 1, 2, "ft", 2),  # 3000 ft = 36.58 mm
@@ -1046,9 +1051,10 @@ def _render_compact_map_key(
         halign="center",
         valign="center",
     )
+    sheet_brand = (os.environ.get("GRIDFORGE_BRAND_NAME") or "GridForge").strip() or "GridForge"
     _add_label(
         print_layout,
-        "GRIDFORGE TOPOGRAPHIC SHEET",
+        f"{sheet_brand.upper()} TOPOGRAPHIC SHEET",
         x_mm + 1.0,
         meta_y + 2.1,
         w_mm - 2.0,
