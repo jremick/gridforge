@@ -966,24 +966,52 @@ def build_au_overlay_sources(
             )
             normalized_overrides[key_str] = Path(raw_path)
 
-    from gridforge.sources.overlays_au_states import NSWTrailsSource, VICTrailsSource
+    from gridforge.sources.overlays_au_states import (
+        ACTTrailsSource,
+        AutoStateTrailsSource,
+        NSWTrailsSource,
+        QLDTrailsSource,
+        TASTrailsSource,
+        VICTrailsSource,
+    )
 
     registry: dict[AUOverlayKind, type[_BaseAUOverlaySource]] = {
         AUOverlayKind.AU_HYDRO: GAHydroSource,
         AUOverlayKind.AU_PARKS: CAPADParksSource,
         AUOverlayKind.AU_INFRA: GAInfraSource,
         AUOverlayKind.AU_AVIATION: GAAviationSource,
+        AUOverlayKind.AU_STATE_TRAILS: AutoStateTrailsSource,
         AUOverlayKind.AU_NSW_TRAILS: NSWTrailsSource,
         AUOverlayKind.AU_VIC_TRAILS: VICTrailsSource,
+        AUOverlayKind.AU_TAS_TRAILS: TASTrailsSource,
+        AUOverlayKind.AU_QLD_TRAILS: QLDTrailsSource,
+        AUOverlayKind.AU_ACT_TRAILS: ACTTrailsSource,
     }
 
-    sources: dict[str, OverlaySource] = {}
-    for raw_kind in kinds:
-        kind = (
-            raw_kind
-            if isinstance(raw_kind, AUOverlayKind)
-            else AUOverlayKind(str(raw_kind).lower().replace("_", "-"))
+    west_kinds = {
+        AUOverlayKind.AU_WA_TRAILS,
+        AUOverlayKind.AU_SA_TRAILS,
+        AUOverlayKind.AU_NT_TRAILS,
+    }
+    requested_kinds: list[AUOverlayKind] = [
+        raw_kind
+        if isinstance(raw_kind, AUOverlayKind)
+        else AUOverlayKind(str(raw_kind).lower().replace("_", "-"))
+        for raw_kind in kinds
+    ]
+    if any(k in west_kinds for k in requested_kinds):
+        from gridforge.sources.overlays_au_states_west import (
+            NTTrailsSource,
+            SATrailsSource,
+            WATrailsSource,
         )
+
+        registry[AUOverlayKind.AU_WA_TRAILS] = WATrailsSource
+        registry[AUOverlayKind.AU_SA_TRAILS] = SATrailsSource
+        registry[AUOverlayKind.AU_NT_TRAILS] = NTTrailsSource
+
+    sources: dict[str, OverlaySource] = {}
+    for kind in requested_kinds:
         if kind.value in sources:
             continue
         cls = registry[kind]

@@ -18,10 +18,26 @@ from gridforge.sources.overlays_au import (
     build_au_overlay_sources,
 )
 from gridforge.sources.overlays_au_states import (
+    ACTTrailsSource,
+    AutoStateTrailsSource,
     NSWTrailsSource,
+    QLDTrailsSource,
+    TASTrailsSource,
     VICTrailsSource,
+    is_in_act_coverage,
     is_in_nsw_coverage,
+    is_in_nt_coverage,
+    is_in_qld_coverage,
+    is_in_sa_coverage,
+    is_in_tas_coverage,
     is_in_vic_coverage,
+    is_in_wa_coverage,
+    resolve_intersecting_states,
+)
+from gridforge.sources.overlays_au_states_west import (
+    NTTrailsSource,
+    SATrailsSource,
+    WATrailsSource,
 )
 from gridforge.sources.overlays_us import (
     FAATowersSource,
@@ -32,8 +48,10 @@ from gridforge.sources.overlays_us import (
 )
 
 __all__ = [
+    "ACTTrailsSource",
     "AUElvisDEMSource",
     "AutoDEMSource",
+    "AutoStateTrailsSource",
     "CAPADParksSource",
     "CopernicusGLO30Source",
     "ElevationSource",
@@ -47,16 +65,28 @@ __all__ = [
     "NHDHydroSource",
     "NOAAENCSource",
     "NSWTrailsSource",
+    "NTTrailsSource",
     "OverpassOSMSource",
     "OverlaySource",
+    "QLDTrailsSource",
+    "SATrailsSource",
+    "TASTrailsSource",
     "USGS3DEPSource",
     "UserOverlaySource",
     "VICTrailsSource",
     "VectorSource",
+    "WATrailsSource",
     "build_au_overlay_sources",
     "build_us_overlay_sources",
+    "is_in_act_coverage",
     "is_in_australia_coverage",
     "is_in_nsw_coverage",
+    "is_in_nt_coverage",
+    "is_in_qld_coverage",
+    "is_in_sa_coverage",
+    "is_in_tas_coverage",
     "is_in_us_3dep_coverage",
     "is_in_vic_coverage",
+    "is_in_wa_coverage",
+    "resolve_intersecting_states",
 ]

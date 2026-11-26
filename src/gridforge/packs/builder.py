@@ -64,6 +64,7 @@ _ALL_AU_OVERLAYS: tuple[AUOverlayKind, ...] = (
     AUOverlayKind.AU_PARKS,
     AUOverlayKind.AU_INFRA,
     AUOverlayKind.AU_AVIATION,
+    AUOverlayKind.AU_STATE_TRAILS,
 )
 
 
@@ -477,22 +478,29 @@ def _extract_au_overlays(
         "au-parks": "Protected areas: CAPAD 2025 © Commonwealth of Australia (DCCEEW) (CC BY 4.0)",
         "au-infra": "Energy infrastructure: © Commonwealth of Australia (Geoscience Australia) (CC BY 4.0)",
         "au-aviation": "Aviation & cultural features: © Commonwealth of Australia (Geoscience Australia) (CC BY 4.0)",
+        "au-state-trails": "Australian State Trails, Huts & Trig Stations (CC BY 4.0)",
     }
 
+    # When local_overlay_overrides is explicitly supplied (e.g. air-gapped pack build/CI),
+    # honor only the specified local overlays and avoid unexpected live cloud fetches.
     cloud_sources: dict[str, Any] = {}
-    need_cloud = [k for k in _ALL_AU_OVERLAYS if k.value not in normalized_overrides]
-    if need_cloud:
+    if local_overlay_overrides is None:
         try:
             from gridforge.sources.overlays_au import build_au_overlay_sources
 
-            cloud_sources = build_au_overlay_sources(need_cloud)
+            cloud_sources = build_au_overlay_sources(_ALL_AU_OVERLAYS)
         except Exception as exc:
             logger.warning("Unable to import AU cloud overlay sources (%s); skipping cloud overlays", exc)
 
     spatial_tiles = _iter_spatial_tiles(bbox, overlay_tile_deg)
 
-    for kind in _ALL_AU_OVERLAYS:
-        key = kind.value
+    # Preserve canonical overlay ordering, plus any extra state-specific keys in local_overlay_overrides
+    ordered_keys: list[str] = [k.value for k in _ALL_AU_OVERLAYS]
+    for extra_key in normalized_overrides:
+        if extra_key not in ordered_keys:
+            ordered_keys.append(extra_key)
+
+    for key in ordered_keys:
         slug = key.replace("-", "_")
         target_gpkg = overlays_dir / f"{slug}.gpkg"
         if target_gpkg.exists():
@@ -510,15 +518,21 @@ def _extract_au_overlays(
                 continue
             if target_gpkg.is_file() and any(c > 0 for _, c in _list_gpkg_layer_counts(target_gpkg)):
                 overlay_rel_paths[key] = f"overlays/{slug}.gpkg"
-                attributions.append(default_attrs[key])
+                attr = default_attrs.get(key, default_attrs["au-state-trails"])
+                if attr not in attributions:
+                    attributions.append(attr)
             elif target_gpkg.exists():
                 target_gpkg.unlink()
+            continue
+
+        if local_overlay_overrides is not None:
             continue
 
         src = cloud_sources.get(key)
         if src is None:
             continue
 
+        tile_attrs: list[str] = []
         for tile_bbox in spatial_tiles:
             tile_layout = _make_tile_layout(tile_bbox)
             with tempfile.TemporaryDirectory(prefix=f"gf_pack_{slug}_") as tile_tmp:
@@ -528,6 +542,11 @@ def _extract_au_overlays(
                     logger.warning("Overlay %s tile %s failed (%s); continuing", key, tile_bbox, exc)
                     continue
                 if chunk_gpkg is not None and Path(chunk_gpkg).is_file():
+                    resolved_attrs = getattr(src, "resolved_attributions", None)
+                    if resolved_attrs:
+                        for ra in resolved_attrs:
+                            if ra and ra not in tile_attrs:
+                                tile_attrs.append(str(ra))
                     try:
                         _append_gpkg_layers_wgs84(Path(chunk_gpkg), target_gpkg)
                     except Exception as exc:
@@ -535,9 +554,14 @@ def _extract_au_overlays(
 
         if target_gpkg.is_file() and any(c > 0 for _, c in _list_gpkg_layer_counts(target_gpkg)):
             overlay_rel_paths[key] = f"overlays/{slug}.gpkg"
-            attr = str(getattr(src, "attribution", "") or default_attrs[key])
-            if attr and attr not in attributions:
-                attributions.append(attr)
+            if tile_attrs:
+                for attr in tile_attrs:
+                    if attr not in attributions:
+                        attributions.append(attr)
+            else:
+                attr = str(getattr(src, "attribution", "") or default_attrs.get(key, ""))
+                if attr and attr not in attributions:
+                    attributions.append(attr)
         elif target_gpkg.exists():
             target_gpkg.unlink()
 
