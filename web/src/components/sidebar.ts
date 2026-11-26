@@ -8,6 +8,7 @@ import {
   DENSITY_OPTIONS,
   HILLSHADE_OPTIONS,
   LOCATION_PRESETS,
+  NZ_OVERLAY_OPTIONS,
   PAPER_OPTIONS,
   SCALE_OPTIONS,
   US_OVERLAY_OPTIONS,
@@ -29,6 +30,7 @@ import type {
   HillshadeStrength,
   LocationPreset,
   MBTilesFormat,
+  NZOverlayKind,
   Orientation,
   PackSummary,
   PaperSize,
@@ -49,12 +51,27 @@ export interface SidebarCallbacks {
   onAutoStripPlan: () => void;
   onClearStripPlan: () => void;
   onToggleMarkupMode: () => void;
+  onToggleViewshedMode: () => void;
   onWaypointEdit: (
     index: number,
     patch: { label?: string; category?: WaypointCategory }
   ) => void;
   onWaypointDelete: (index: number) => void;
   onWaypointsClear: () => void;
+  onViewshedEdit: (
+    id: string,
+    patch: {
+      label?: string;
+      observer_height_m?: number;
+      target_height_m?: number;
+      max_distance_m?: number;
+    },
+    recompute: boolean
+  ) => void;
+  onViewshedRecompute: (id: string) => void;
+  onViewshedDelete: (id: string) => void;
+  onViewshedsClear: () => void;
+  onManagePacks: () => void;
   onRefreshPacks: () => void;
   onSubmitJob: () => void;
   onCopyCli: () => void;
@@ -84,6 +101,8 @@ export class SidebarPanel {
   private paperSelect!: HTMLSelectElement;
   private atlasGridEl!: HTMLElement;
   private atlasSublabelEl!: HTMLElement;
+  private foldMarksCheck!: HTMLInputElement;
+  private sheetAtlasIndexCheck!: HTMLInputElement;
   private demSelect!: HTMLSelectElement;
   private packSelect!: HTMLSelectElement;
   private stateAutoCheck!: HTMLInputElement;
@@ -104,6 +123,14 @@ export class SidebarPanel {
   private wpRouteCardCheck!: HTMLInputElement;
   private wpListEl!: HTMLElement;
   private wpTotalEl!: HTMLElement;
+  private viewshedSectionEl!: HTMLDetailsElement;
+  private viewshedPillEl!: HTMLElement;
+  private vsToggleBtn!: HTMLButtonElement;
+  private vsClearBtn!: HTMLButtonElement;
+  private vsDefObsInput!: HTMLInputElement;
+  private vsDefTgtInput!: HTMLInputElement;
+  private vsDefRadInput!: HTMLInputElement;
+  private vsListEl!: HTMLElement;
   private outPdfCheck!: HTMLInputElement;
   private outGeoPdfCheck!: HTMLInputElement;
   private outMbtilesCheck!: HTMLInputElement;
@@ -116,6 +143,7 @@ export class SidebarPanel {
   private outCalibrationCheck!: HTMLInputElement;
   private outRouteCardCheck!: HTMLInputElement;
   private outElevProfileCheck!: HTMLInputElement;
+  private outAtlasIndexCheck!: HTMLInputElement;
   private generateBtn!: HTMLButtonElement;
   private formErrorEl!: HTMLElement;
   private sheetPillEl!: HTMLElement;
@@ -124,6 +152,7 @@ export class SidebarPanel {
 
   private activePresetId: string | null = "blue-mountains";
   private markupMode = false;
+  private viewshedMode = false;
   private planningStrip = false;
   private routeMetrics: RouteMetricsResponse | null = null;
 
@@ -145,6 +174,7 @@ export class SidebarPanel {
     this.root.className = "gf-sidebar";
     this.render();
     this.bindEvents();
+    this.setPacks([]);
     this.syncControlsFromState();
   }
 
@@ -185,6 +215,18 @@ export class SidebarPanel {
       (o) => `
         <label class="gf-check-row">
           <input type="checkbox" data-au-overlay="${o.value}" />
+          <span class="gf-check-text">
+            <span class="gf-check-title">${escapeHtml(o.label)}</span>
+            <span class="gf-check-hint">${escapeHtml(o.hint)}</span>
+          </span>
+        </label>
+      `
+    ).join("");
+
+    const nzOverlaysHtml = NZ_OVERLAY_OPTIONS.map(
+      (o) => `
+        <label class="gf-check-row">
+          <input type="checkbox" data-nz-overlay="${o.value}" />
           <span class="gf-check-text">
             <span class="gf-check-title">${escapeHtml(o.label)}</span>
             <span class="gf-check-hint">${escapeHtml(o.hint)}</span>
@@ -315,6 +357,16 @@ export class SidebarPanel {
               <div class="gf-atlas-grid" data-role="atlas-grid">
                 ${atlasBtnsHtml}
               </div>
+              <div class="gf-atlas-extras">
+                <label class="gf-toggle-chip" title="Draw 0.20 mm corner registration & fold/join marks for multi-sheet assembly">
+                  <input type="checkbox" data-role="fold-marks" />
+                  <span>Fold / Join Marks</span>
+                </label>
+                <label class="gf-toggle-chip" title="Prepend pure-vector Atlas Overview & Sheet Index cover page">
+                  <input type="checkbox" data-role="sheet-atlas-index" />
+                  <span>Atlas Index Cover</span>
+                </label>
+              </div>
             </div>
 
             <div class="gf-field-row">
@@ -367,7 +419,10 @@ export class SidebarPanel {
             <div class="gf-field">
               <label class="gf-label" for="gf-pack-select">
                 <span>Offline Pack</span>
-                <button type="button" class="gf-mini-btn" data-role="refresh-packs" title="Reload installed packs">↻</button>
+                <span class="gf-label-actions">
+                  <button type="button" class="gf-mini-btn gf-manage-packs-btn" data-role="manage-packs" title="Build or manage air-gapped offline packs">Manage Packs</button>
+                  <button type="button" class="gf-mini-btn" data-role="refresh-packs" title="Reload installed packs">↻</button>
+                </span>
               </label>
               <select id="gf-pack-select" class="gf-select">
                 <option value="">Cloud-Native On-Demand</option>
@@ -389,6 +444,11 @@ export class SidebarPanel {
                 </div>
               </div>
               ${auOverlaysHtml}
+            </div>
+
+            <div class="gf-overlay-group">
+              <span class="gf-overlay-heading">New Zealand Overlays (CC BY 4.0)</span>
+              ${nzOverlaysHtml}
             </div>
 
             <div class="gf-overlay-group">
@@ -505,6 +565,71 @@ export class SidebarPanel {
             <div class="gf-wp-total hidden" data-role="wp-total"></div>
           </div>
         </details>
+
+        <!-- 6. RF / Line-of-Sight Viewshed -->
+        <details class="gf-section" data-role="viewshed-section">
+          <summary class="gf-section-summary">
+            <span class="gf-section-title-group">
+              <span class="gf-section-index">06</span>
+              <span class="gf-section-title">RF / Viewshed</span>
+            </span>
+            <span class="gf-section-meta">
+              <span class="gf-section-pill" data-role="viewshed-pill">Off</span>
+              ${CHEVRON_SVG}
+            </span>
+          </summary>
+          <div class="gf-section-body">
+            <div class="gf-wp-controls">
+              <button type="button" class="gf-wp-markup-btn gf-vs-toggle-btn" data-role="vs-toggle">
+                <span>📡 Drop Observer</span>
+              </button>
+              <button type="button" class="gf-mini-btn danger" data-role="vs-clear-all" disabled>
+                Clear All
+              </button>
+            </div>
+
+            <div class="gf-field-row-3">
+              <div class="gf-field">
+                <label class="gf-label" for="gf-vs-obs-h">Obs H (m)</label>
+                <input
+                  id="gf-vs-obs-h"
+                  class="gf-input mono"
+                  type="number"
+                  min="0"
+                  max="500"
+                  step="0.5"
+                  value="2"
+                />
+              </div>
+              <div class="gf-field">
+                <label class="gf-label" for="gf-vs-tgt-h">Tgt H (m)</label>
+                <input
+                  id="gf-vs-tgt-h"
+                  class="gf-input mono"
+                  type="number"
+                  min="0"
+                  max="500"
+                  step="0.5"
+                  value="1.5"
+                />
+              </div>
+              <div class="gf-field">
+                <label class="gf-label" for="gf-vs-rad-km">Max (km)</label>
+                <input
+                  id="gf-vs-rad-km"
+                  class="gf-input mono"
+                  type="number"
+                  min="0.25"
+                  max="25"
+                  step="0.5"
+                  value="10"
+                />
+              </div>
+            </div>
+
+            <div class="gf-wp-list" data-role="vs-list"></div>
+          </div>
+        </details>
       </div>
 
       <!-- Sticky Outputs & Generate Footer -->
@@ -531,9 +656,13 @@ export class SidebarPanel {
                 <input type="checkbox" data-role="out-route-card" />
                 <span>Route Card</span>
               </label>
-              <label class="gf-inline-check" title="Prepend DEM Elevation Profile & Strip Index cover page">
+              <label class="gf-inline-check" title="Prepend DEM Elevation Profile cover page">
                 <input type="checkbox" data-role="out-elev-profile" />
                 <span>Elev Profile</span>
+              </label>
+              <label class="gf-inline-check" title="Prepend Atlas Overview & Sheet Index cover page">
+                <input type="checkbox" data-role="out-atlas-index" />
+                <span>Atlas Index</span>
               </label>
             </div>
           </div>
@@ -580,7 +709,8 @@ export class SidebarPanel {
             type="button"
             class="gf-cli-btn"
             data-role="copy-cli"
-            title="Copy reproducible docker compose CLI command"
+            aria-label="Copy CLI command"
+            title="Copy Docker Compose command"
           >
             <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
               <path d="M2.5 4.5L6 8L2.5 11.5M7.5 11.5H13.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
@@ -599,6 +729,10 @@ export class SidebarPanel {
     this.paperSelect = this.q<HTMLSelectElement>("#gf-paper-select");
     this.atlasGridEl = this.q("[data-role='atlas-grid']");
     this.atlasSublabelEl = this.q("[data-role='atlas-sublabel']");
+    this.foldMarksCheck = this.q<HTMLInputElement>("[data-role='fold-marks']");
+    this.sheetAtlasIndexCheck = this.q<HTMLInputElement>(
+      "[data-role='sheet-atlas-index']"
+    );
     this.demSelect = this.q<HTMLSelectElement>("#gf-dem-select");
     this.packSelect = this.q<HTMLSelectElement>("#gf-pack-select");
     this.stateAutoCheck = this.q<HTMLInputElement>("[data-role='au-state-auto']");
@@ -625,6 +759,16 @@ export class SidebarPanel {
     );
     this.wpListEl = this.q("[data-role='wp-list']");
     this.wpTotalEl = this.q("[data-role='wp-total']");
+    this.viewshedSectionEl = this.q<HTMLDetailsElement>(
+      "[data-role='viewshed-section']"
+    );
+    this.viewshedPillEl = this.q("[data-role='viewshed-pill']");
+    this.vsToggleBtn = this.q<HTMLButtonElement>("[data-role='vs-toggle']");
+    this.vsClearBtn = this.q<HTMLButtonElement>("[data-role='vs-clear-all']");
+    this.vsDefObsInput = this.q<HTMLInputElement>("#gf-vs-obs-h");
+    this.vsDefTgtInput = this.q<HTMLInputElement>("#gf-vs-tgt-h");
+    this.vsDefRadInput = this.q<HTMLInputElement>("#gf-vs-rad-km");
+    this.vsListEl = this.q("[data-role='vs-list']");
     this.outPdfCheck = this.q<HTMLInputElement>("[data-role='out-pdf']");
     this.outGeoPdfCheck = this.q<HTMLInputElement>("[data-role='out-geopdf']");
     this.outMbtilesCheck = this.q<HTMLInputElement>("[data-role='out-mbtiles']");
@@ -648,6 +792,9 @@ export class SidebarPanel {
     );
     this.outElevProfileCheck = this.q<HTMLInputElement>(
       "[data-role='out-elev-profile']"
+    );
+    this.outAtlasIndexCheck = this.q<HTMLInputElement>(
+      "[data-role='out-atlas-index']"
     );
     this.generateBtn = this.q<HTMLButtonElement>("[data-role='generate-btn']");
     this.formErrorEl = this.q("[data-role='form-error']");
@@ -806,6 +953,13 @@ export class SidebarPanel {
       this.callbacks.onFootprintParamsChange();
     });
 
+    const syncAtlasIndexChecks = (checked: boolean) => {
+      this.state.include_atlas_index = checked;
+      this.sheetAtlasIndexCheck.checked = checked;
+      this.outAtlasIndexCheck.checked = checked;
+      this.callbacks.onStateChange();
+    };
+
     this.root
       .querySelectorAll<HTMLButtonElement>("[data-atlas-cols]")
       .forEach((btn) => {
@@ -819,13 +973,32 @@ export class SidebarPanel {
           ) {
             return;
           }
+          const wasSingle = this.state.grid_cols * this.state.grid_rows === 1;
           this.state.grid_cols = cols;
           this.state.grid_rows = rows;
+          if (wasSingle && cols * rows > 1) {
+            this.state.include_atlas_index = true;
+            this.sheetAtlasIndexCheck.checked = true;
+            this.outAtlasIndexCheck.checked = true;
+          } else if (cols * rows === 1) {
+            this.state.include_atlas_index = false;
+            this.sheetAtlasIndexCheck.checked = false;
+            this.outAtlasIndexCheck.checked = false;
+          }
           this.updateAtlasButtons();
           this.updateSectionPills();
           this.callbacks.onFootprintParamsChange({ fitAfterLoad: true });
         });
       });
+
+    this.foldMarksCheck.addEventListener("change", () => {
+      this.state.show_fold_marks = this.foldMarksCheck.checked;
+      this.callbacks.onStateChange();
+    });
+
+    this.sheetAtlasIndexCheck.addEventListener("change", () => {
+      syncAtlasIndexChecks(this.sheetAtlasIndexCheck.checked);
+    });
 
     this.bindSegmented("orientation", (val) => {
       this.state.orientation = val as Orientation;
@@ -853,6 +1026,10 @@ export class SidebarPanel {
       this.state.pack_id = this.packSelect.value;
       this.updateSectionPills();
       this.callbacks.onStateChange();
+    });
+
+    this.q("[data-role='manage-packs']").addEventListener("click", () => {
+      this.callbacks.onManagePacks();
     });
 
     this.q("[data-role='refresh-packs']").addEventListener("click", () => {
@@ -901,6 +1078,25 @@ export class SidebarPanel {
             }
           } else {
             this.state.au_overlays = this.state.au_overlays.filter(
+              (k) => k !== kind
+            );
+          }
+          this.updateSectionPills();
+          this.callbacks.onStateChange();
+        });
+      });
+
+    this.root
+      .querySelectorAll<HTMLInputElement>("[data-nz-overlay]")
+      .forEach((cb) => {
+        cb.addEventListener("change", () => {
+          const kind = cb.dataset.nzOverlay as NZOverlayKind;
+          if (cb.checked) {
+            if (!this.state.nz_overlays.includes(kind)) {
+              this.state.nz_overlays = [...this.state.nz_overlays, kind];
+            }
+          } else {
+            this.state.nz_overlays = this.state.nz_overlays.filter(
               (k) => k !== kind
             );
           }
@@ -1024,7 +1220,7 @@ export class SidebarPanel {
       }
     });
 
-    // Waypoints Section 05 events
+    // Section 05 Waypoints
     this.wpMarkupBtn.addEventListener("click", () => {
       this.callbacks.onToggleMarkupMode();
     });
@@ -1068,6 +1264,86 @@ export class SidebarPanel {
       this.callbacks.onWaypointDelete(idx);
     });
 
+    // Section 06 RF / Viewshed
+    this.vsToggleBtn.addEventListener("click", () => {
+      this.callbacks.onToggleViewshedMode();
+    });
+
+    this.vsClearBtn.addEventListener("click", () => {
+      this.callbacks.onViewshedsClear();
+    });
+
+    const clampNum = (val: string, min: number, max: number, fallback: number) => {
+      const n = Number(val);
+      if (!Number.isFinite(n)) return fallback;
+      return Math.min(max, Math.max(min, n));
+    };
+
+    this.vsDefObsInput.addEventListener("change", () => {
+      const v = clampNum(this.vsDefObsInput.value, 0, 500, 2);
+      this.state.viewshedDefaults.observer_height_m = v;
+      this.vsDefObsInput.value = String(v);
+    });
+
+    this.vsDefTgtInput.addEventListener("change", () => {
+      const v = clampNum(this.vsDefTgtInput.value, 0, 500, 1.5);
+      this.state.viewshedDefaults.target_height_m = v;
+      this.vsDefTgtInput.value = String(v);
+    });
+
+    this.vsDefRadInput.addEventListener("change", () => {
+      const v = clampNum(this.vsDefRadInput.value, 0.25, 25, 10);
+      this.state.viewshedDefaults.max_distance_km = v;
+      this.vsDefRadInput.value = String(v);
+    });
+
+    this.vsListEl.addEventListener("change", (e) => {
+      const target = e.target as HTMLElement | null;
+      if (!(target instanceof HTMLInputElement)) return;
+      const id = target.dataset.vsId;
+      const field = target.dataset.vsField;
+      if (!id || !field) return;
+      if (field === "label") {
+        this.callbacks.onViewshedEdit(
+          id,
+          { label: target.value.trim() || "Observer" },
+          false
+        );
+      } else if (field === "obs_h") {
+        this.callbacks.onViewshedEdit(
+          id,
+          { observer_height_m: clampNum(target.value, 0, 500, 2) },
+          true
+        );
+      } else if (field === "tgt_h") {
+        this.callbacks.onViewshedEdit(
+          id,
+          { target_height_m: clampNum(target.value, 0, 500, 1.5) },
+          true
+        );
+      } else if (field === "rad_km") {
+        this.callbacks.onViewshedEdit(
+          id,
+          { max_distance_m: clampNum(target.value, 0.25, 25, 10) * 1000 },
+          true
+        );
+      }
+    });
+
+    this.vsListEl.addEventListener("click", (e) => {
+      const target = e.target as HTMLElement | null;
+      const btn = target?.closest<HTMLButtonElement>("button[data-vs-action]");
+      if (!btn) return;
+      const action = btn.dataset.vsAction;
+      const id = btn.dataset.vsId;
+      if (!id) return;
+      if (action === "delete") {
+        this.callbacks.onViewshedDelete(id);
+      } else if (action === "recompute") {
+        this.callbacks.onViewshedRecompute(id);
+      }
+    });
+
     // Outputs
     const syncOutputControls = () => {
       const pdfOn = this.state.outputs.pdf;
@@ -1075,6 +1351,7 @@ export class SidebarPanel {
       this.outCalibrationCheck.disabled = !pdfOn;
       this.outRouteCardCheck.disabled = !pdfOn;
       this.outElevProfileCheck.disabled = !pdfOn;
+      this.outAtlasIndexCheck.disabled = !pdfOn;
       this.suppPagesBoxEl.style.opacity = pdfOn ? "1" : "0.45";
       if (!pdfOn) {
         this.state.outputs.geopdf = false;
@@ -1095,12 +1372,12 @@ export class SidebarPanel {
       } else {
         this.setFormError(null);
       }
-      this.callbacks.onStateChange();
     };
 
     this.outPdfCheck.addEventListener("change", () => {
       this.state.outputs.pdf = this.outPdfCheck.checked;
       syncOutputControls();
+      this.callbacks.onFootprintParamsChange();
     });
 
     this.outGeoPdfCheck.addEventListener("change", () => {
@@ -1122,9 +1399,14 @@ export class SidebarPanel {
       this.callbacks.onStateChange();
     });
 
+    this.outAtlasIndexCheck.addEventListener("change", () => {
+      syncAtlasIndexChecks(this.outAtlasIndexCheck.checked);
+    });
+
     this.outMbtilesCheck.addEventListener("change", () => {
       this.state.outputs.mbtiles = this.outMbtilesCheck.checked;
       syncOutputControls();
+      this.callbacks.onStateChange();
     });
 
     this.outMbtilesFmt.addEventListener("change", () => {
@@ -1136,6 +1418,7 @@ export class SidebarPanel {
     this.outKmzCheck.addEventListener("change", () => {
       this.state.outputs.kmz = this.outKmzCheck.checked;
       syncOutputControls();
+      this.callbacks.onStateChange();
     });
 
     this.outGarminProfile.addEventListener("change", () => {
@@ -1467,6 +1750,90 @@ export class SidebarPanel {
     }
   }
 
+  renderViewshedsList(): void {
+    const entries = this.state.viewsheds;
+    this.vsClearBtn.disabled = entries.length === 0;
+    this.vsToggleBtn.classList.toggle("active", this.viewshedMode);
+    this.vsToggleBtn.innerHTML = this.viewshedMode
+      ? `<span>📡 LOS ON (Click Map)</span>`
+      : `<span>📡 Drop Observer</span>`;
+
+    if (entries.length === 0) {
+      this.viewshedPillEl.textContent = "Off";
+      this.vsListEl.innerHTML = `
+        <div class="gf-wp-empty">
+          Toggle <strong>📡 LOS</strong> (or press <kbd>V</kbd>) and click a summit or repeater site to preview real DEM line-of-sight RF coverage.
+        </div>
+      `;
+      return;
+    }
+
+    const totalArea = entries.reduce(
+      (sum, e) => sum + (e.preview?.visible_area_km2 ?? 0),
+      0
+    );
+    const anyLoading = entries.some((e) => e.loading);
+    this.viewshedPillEl.textContent = anyLoading
+      ? `${entries.length} OBS · …`
+      : totalArea > 0
+        ? `${entries.length} OBS · ${totalArea.toFixed(1)} km²`
+        : `${entries.length} OBS`;
+
+    this.vsListEl.innerHTML = entries
+      .map((entry, idx) => {
+        const code = `OBS${idx + 1}`;
+        const o = entry.observer;
+        const maxKm = Number((o.max_distance_m / 1000).toFixed(2));
+
+        let statusHtml: string;
+        if (entry.loading) {
+          statusHtml = `<span class="gf-vs-loading">Computing DEM line-of-sight…</span>`;
+        } else if (entry.error) {
+          statusHtml = `<span class="gf-vs-err">${escapeHtml(entry.error)}</span>`;
+        } else if (entry.preview) {
+          const elevText =
+            entry.preview.observer_elev_m !== null
+              ? `${Math.round(entry.preview.observer_elev_m)} m`
+              : "—";
+          statusHtml = `
+            <span class="gf-vs-area">Visible: ${entry.preview.visible_area_km2.toFixed(1)} km²</span>
+            <span>Elev: ${escapeHtml(elevText)}</span>
+            <span class="gf-wp-mgrs" title="Observer 10m MGRS">${escapeHtml(entry.preview.observer_mgrs_10m)}</span>
+          `;
+        } else {
+          statusHtml = `<span>${o.lat.toFixed(4)}, ${o.lon.toFixed(4)}</span>`;
+        }
+
+        return `
+          <div class="gf-wp-row gf-vs-row">
+            <div class="gf-wp-top">
+              <span class="gf-wp-code gf-vs-code mono">${code}</span>
+              <input
+                type="text"
+                class="gf-wp-name-input"
+                data-vs-id="${escapeHtml(entry.id)}"
+                data-vs-field="label"
+                value="${escapeHtml(o.label)}"
+                maxlength="60"
+                aria-label="Observer ${idx + 1} label"
+              />
+              <button type="button" class="gf-wp-del" data-vs-action="recompute" data-vs-id="${escapeHtml(entry.id)}" title="Recompute viewshed">↻</button>
+              <button type="button" class="gf-wp-del" data-vs-action="delete" data-vs-id="${escapeHtml(entry.id)}" title="Remove ${code}">×</button>
+            </div>
+            <div class="gf-vs-params mono">
+              <label>Obs <input type="number" min="0" max="500" step="0.5" value="${o.observer_height_m}" data-vs-id="${escapeHtml(entry.id)}" data-vs-field="obs_h" />m</label>
+              <label>Tgt <input type="number" min="0" max="500" step="0.5" value="${o.target_height_m}" data-vs-id="${escapeHtml(entry.id)}" data-vs-field="tgt_h" />m</label>
+              <label>R <input type="number" min="0.25" max="25" step="0.5" value="${maxKm}" data-vs-id="${escapeHtml(entry.id)}" data-vs-field="rad_km" />km</label>
+            </div>
+            <div class="gf-wp-meta gf-vs-meta mono">
+              ${statusHtml}
+            </div>
+          </div>
+        `;
+      })
+      .join("");
+  }
+
   private updateSectionPills(): void {
     const scaleK = `1:${Math.round(this.state.scale / 1000)}k`;
     const paperLbl = this.state.paper.toUpperCase();
@@ -1479,16 +1846,20 @@ export class SidebarPanel {
     this.sheetPillEl.textContent = `${scaleK} · ${paperLbl} ${orientShort}${stripSuffix}`;
 
     const overlayCount =
-      this.state.au_overlays.length + this.state.us_overlays.length;
+      this.state.au_overlays.length +
+      this.state.nz_overlays.length +
+      this.state.us_overlays.length;
     const demShort = this.state.pack_id
       ? "Pack"
       : this.state.dem_source === "auto"
         ? "Auto"
         : this.state.dem_source === "au-elvis"
           ? "AU GA"
-          : this.state.dem_source === "usgs3dep"
-            ? "3DEP"
-            : "GLO-30";
+          : this.state.dem_source === "nz-linz"
+            ? "NZ LINZ"
+            : this.state.dem_source === "usgs3dep"
+              ? "3DEP"
+              : "GLO-30";
     this.overlayPillEl.textContent =
       overlayCount > 0 ? `${demShort} · +${overlayCount}` : demShort;
 
@@ -1521,6 +1892,8 @@ export class SidebarPanel {
     this.titleInput.value = this.state.title;
     this.scaleSelect.value = String(this.state.scale);
     this.paperSelect.value = this.state.paper;
+    this.foldMarksCheck.checked = this.state.show_fold_marks;
+    this.sheetAtlasIndexCheck.checked = this.state.include_atlas_index;
     this.setSegmentedValue("orientation", this.state.orientation);
     this.setSegmentedValue("color_mode", this.state.color_mode);
     this.setSegmentedValue("units", this.state.units);
@@ -1534,6 +1907,14 @@ export class SidebarPanel {
       .forEach((cb) => {
         cb.checked = this.state.au_overlays.includes(
           cb.dataset.auOverlay as AUOverlayKind
+        );
+      });
+
+    this.root
+      .querySelectorAll<HTMLInputElement>("[data-nz-overlay]")
+      .forEach((cb) => {
+        cb.checked = this.state.nz_overlays.includes(
+          cb.dataset.nzOverlay as NZOverlayKind
         );
       });
 
@@ -1559,6 +1940,16 @@ export class SidebarPanel {
         }
       });
 
+    this.vsDefObsInput.value = String(
+      this.state.viewshedDefaults.observer_height_m
+    );
+    this.vsDefTgtInput.value = String(
+      this.state.viewshedDefaults.target_height_m
+    );
+    this.vsDefRadInput.value = String(
+      this.state.viewshedDefaults.max_distance_km
+    );
+
     const pdfOn = this.state.outputs.pdf;
     this.outPdfCheck.checked = pdfOn;
     this.outGeoPdfCheck.checked = this.state.outputs.geopdf;
@@ -1570,6 +1961,8 @@ export class SidebarPanel {
     this.wpRouteCardCheck.checked = this.state.include_route_card;
     this.outElevProfileCheck.checked = this.state.include_elevation_profile;
     this.outElevProfileCheck.disabled = !pdfOn;
+    this.outAtlasIndexCheck.checked = this.state.include_atlas_index;
+    this.outAtlasIndexCheck.disabled = !pdfOn;
     this.suppPagesBoxEl.style.opacity = pdfOn ? "1" : "0.45";
 
     this.outMbtilesCheck.checked = this.state.outputs.mbtiles;
@@ -1586,6 +1979,7 @@ export class SidebarPanel {
 
     this.syncFileDisplay();
     this.renderWaypointsList();
+    this.renderViewshedsList();
     this.updateAtlasButtons();
     this.updatePresetButtons();
     this.updateSectionPills();
@@ -1601,6 +1995,11 @@ export class SidebarPanel {
     this.renderWaypointsList();
   }
 
+  setViewshedMode(active: boolean): void {
+    this.viewshedMode = active;
+    this.renderViewshedsList();
+  }
+
   setRouteMetrics(metrics: RouteMetricsResponse | null): void {
     this.routeMetrics = metrics;
     this.renderWaypointsList();
@@ -1608,6 +2007,10 @@ export class SidebarPanel {
 
   openWaypointsSection(): void {
     this.waypointsSectionEl.open = true;
+  }
+
+  openViewshedSection(): void {
+    this.viewshedSectionEl.open = true;
   }
 
   setCenterInput(value: string, clearPreset = false): void {
@@ -1631,13 +2034,13 @@ export class SidebarPanel {
         return `<option value="${escapeHtml(p.pack_id)}">${escapeHtml(p.name)} (${escapeHtml(meta)})</option>`;
       }),
     ];
-    this.packSelect.innerHTML = options.join("");
-    if (prev && packs.some((p) => p.pack_id === prev)) {
-      this.packSelect.value = prev;
-    } else {
-      this.state.pack_id = "";
-      this.packSelect.value = "";
+    if (prev && !packs.some((p) => p.pack_id === prev)) {
+      options.push(
+        `<option value="${escapeHtml(prev)}">${escapeHtml(prev)} (unavailable)</option>`
+      );
     }
+    this.packSelect.innerHTML = options.join("");
+    this.packSelect.value = prev;
     this.updateSectionPills();
   }
 

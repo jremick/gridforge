@@ -6,7 +6,7 @@ export type ColorMode = "color" | "bw";
 export type Units = "metric" | "imperial";
 export type DensityLevel = "low" | "normal" | "high";
 export type HillshadeStrength = "off" | "light" | "normal" | "strong";
-export type DemSourceKind = "auto" | "au-elvis" | "glo30" | "usgs3dep";
+export type DemSourceKind = "auto" | "au-elvis" | "nz-linz" | "glo30" | "usgs3dep";
 export type AUStateTrailKind =
   | "au-nsw-trails"
   | "au-vic-trails"
@@ -16,7 +16,6 @@ export type AUStateTrailKind =
   | "au-sa-trails"
   | "au-nt-trails"
   | "au-act-trails";
-
 export type AUOverlayKind =
   | "au-state-trails"
   | AUStateTrailKind
@@ -24,11 +23,13 @@ export type AUOverlayKind =
   | "au-parks"
   | "au-infra"
   | "au-aviation";
+export type NZOverlayKind = "nz-doc-trails";
 export type USOverlayKind = "fema" | "nhd" | "towers" | "enc";
 export type WaypointCategory = "waypoint" | "camp" | "water" | "hazard" | "lz";
 export type MBTilesFormat = "png" | "jpg";
 export type GarminProfile = "standard" | "modern";
-export type BasemapId = "opentopo" | "osm" | "satellite";
+export type BasemapId = "opentopo" | "osm" | "satellite" | "offline";
+export type PackDemTier = "srtm-1s" | "glo30" | "au-elvis";
 
 export type JobStatus =
   | "queued"
@@ -66,6 +67,43 @@ export interface WaypointInput {
   lon: number;
   category: WaypointCategory;
   notes?: string | null;
+}
+
+export interface ViewshedObserver {
+  label: string;
+  lat: number;
+  lon: number;
+  observer_height_m: number;
+  target_height_m: number;
+  max_distance_m: number;
+}
+
+export interface ViewshedPreviewResponse {
+  observer_mgrs_10m: string;
+  observer_elev_m: number | null;
+  utm_epsg: number;
+  max_distance_m: number;
+  visible_area_km2: number;
+  viewshed_geojson: FeatureCollection;
+  range_ring_geojson: FeatureCollection;
+}
+
+export interface ViewshedEntry {
+  id: string;
+  observer: ViewshedObserver;
+  loading: boolean;
+  error: string | null;
+  preview: ViewshedPreviewResponse | null;
+}
+
+export interface BasemapInfoResponse {
+  available: boolean;
+  name: string | null;
+  format: "png" | "jpg" | null;
+  minzoom: number;
+  maxzoom: number;
+  bounds: number[] | null;
+  attribution: string | null;
 }
 
 export interface RouteMetricsWaypoint {
@@ -151,6 +189,35 @@ export interface PacksResponse {
   packs: PackSummary[];
 }
 
+export interface PackRegionPreset {
+  region_id: string;
+  name: string;
+  kind: "state" | "tactical";
+  bbox_wgs84: BBox;
+  utm_zones: string[];
+  description?: string;
+}
+
+export interface PackBuildRequest {
+  region_or_bbox: string;
+  name?: string | null;
+  include_osm: boolean;
+  include_dem: boolean;
+  include_overlays: boolean;
+  dem_tier: PackDemTier;
+}
+
+export interface PackBuildTask {
+  task_id: string;
+  status: "queued" | "running" | "succeeded" | "failed";
+  region: string;
+  stage?: string | null;
+  message?: string | null;
+  elapsed_seconds?: number | null;
+  error?: string | null;
+  manifest?: PackSummary | null;
+}
+
 export interface GeocodeResult {
   display_name: string;
   short_name: string;
@@ -222,16 +289,20 @@ export interface CreateJobPayload {
   dem_source: DemSourceKind;
   pack_id: string | null;
   au_overlays: AUOverlayKind[];
+  nz_overlays: NZOverlayKind[];
   us_overlays: USOverlayKind[];
   carto: CartoOptions;
   outputs: OutputOptions;
   grid_cols: number;
   grid_rows: number;
   waypoints: WaypointInput[];
+  viewsheds: ViewshedObserver[];
   strip_sheets?: StripSheetPlan[];
   include_calibration_page: boolean;
   include_route_card: boolean;
   include_elevation_profile: boolean;
+  include_atlas_index: boolean;
+  show_fold_marks: boolean;
 }
 
 export interface JobArtifact {
@@ -279,15 +350,24 @@ export interface AppFormState {
   dem_source: DemSourceKind;
   pack_id: string;
   au_overlays: AUOverlayKind[];
+  nz_overlays: NZOverlayKind[];
   us_overlays: USOverlayKind[];
   carto: CartoOptions;
   outputs: OutputOptions;
   overlayFile: File | null;
   waypoints: WaypointInput[];
+  viewsheds: ViewshedEntry[];
+  viewshedDefaults: {
+    observer_height_m: number;
+    target_height_m: number;
+    max_distance_km: number;
+  };
   stripPlan: StripPlanResponse | null;
   include_calibration_page: boolean;
   include_route_card: boolean;
   include_elevation_profile: boolean;
+  include_atlas_index: boolean;
+  show_fold_marks: boolean;
 }
 
 export interface LocationPreset {

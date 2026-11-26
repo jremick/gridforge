@@ -13,7 +13,13 @@ import {
   DEFAULT_MAP_ZOOM,
   WAYPOINT_CATEGORY_OPTIONS,
 } from "./presets";
-import type { BasemapId, WaypointCategory, WaypointInput } from "./types";
+import type {
+  BasemapId,
+  BasemapInfoResponse,
+  ViewshedEntry,
+  WaypointCategory,
+  WaypointInput,
+} from "./types";
 
 const EMPTY_FC: FeatureCollection = {
   type: "FeatureCollection",
@@ -24,11 +30,19 @@ const CATEGORY_COLOR_MAP: Record<WaypointCategory, string> = Object.fromEntries(
   WAYPOINT_CATEGORY_OPTIONS.map((o) => [o.value, o.color])
 ) as Record<WaypointCategory, string>;
 
+const EXTERNAL_SOURCE_IDS = new Set([
+  "osm-standard",
+  "opentopomap",
+  "esri-imagery",
+]);
+
 export interface GridForgeMapCallbacks {
   onCenterDrag: (lat: number, lon: number) => void;
   onCenterCommit: (lat: number, lon: number) => void;
   onMapMarkupClick?: (lat: number, lon: number) => void;
+  onMapViewshedClick?: (lat: number, lon: number) => void;
   onCursorMove?: (lat: number, lon: number) => void;
+  onExternalTileFailure?: () => void;
 }
 
 export interface GridForgeMapOptions {
@@ -77,6 +91,14 @@ function buildInitialStyle(): maplibregl.StyleSpecification {
         type: "geojson",
         data: EMPTY_FC,
       },
+      "viewshed-coverage": {
+        type: "geojson",
+        data: EMPTY_FC,
+      },
+      "viewshed-rings": {
+        type: "geojson",
+        data: EMPTY_FC,
+      },
       "strip-route": {
         type: "geojson",
         data: EMPTY_FC,
@@ -90,6 +112,10 @@ function buildInitialStyle(): maplibregl.StyleSpecification {
         data: EMPTY_FC,
       },
       "waypoints-points": {
+        type: "geojson",
+        data: EMPTY_FC,
+      },
+      "viewshed-observers": {
         type: "geojson",
         data: EMPTY_FC,
       },
@@ -127,6 +153,36 @@ function buildInitialStyle(): maplibregl.StyleSpecification {
         layout: { visibility: "none" },
         paint: {
           "raster-opacity": 1,
+        },
+      },
+      {
+        id: "viewshed-coverage-fill",
+        type: "fill",
+        source: "viewshed-coverage",
+        paint: {
+          "fill-color": "#10B981",
+          "fill-opacity": 0.28,
+        },
+      },
+      {
+        id: "viewshed-coverage-outline",
+        type: "line",
+        source: "viewshed-coverage",
+        paint: {
+          "line-color": "#34D399",
+          "line-width": 1.2,
+          "line-opacity": 0.78,
+        },
+      },
+      {
+        id: "viewshed-rings-line",
+        type: "line",
+        source: "viewshed-rings",
+        paint: {
+          "line-color": "#10B981",
+          "line-width": 1.5,
+          "line-dasharray": [5, 4],
+          "line-opacity": 0.8,
         },
       },
       {
@@ -268,6 +324,17 @@ function buildInitialStyle(): maplibregl.StyleSpecification {
           "icon-anchor": "bottom",
         },
       },
+      {
+        id: "viewshed-observers-layer",
+        type: "symbol",
+        source: "viewshed-observers",
+        layout: {
+          "icon-image": ["get", "icon_id"],
+          "icon-allow-overlap": true,
+          "icon-ignore-placement": true,
+          "icon-anchor": "bottom",
+        },
+      },
     ],
   };
 }
@@ -329,17 +396,19 @@ function renderSheetBadgeImage(label: string): {
   return { width: w, height: h, data: new Uint8Array(img.data.buffer) };
 }
 
-function renderWaypointPinImage(
+function renderPinBadgeImage(
   code: string,
-  accentColor: string
+  accentColor: string,
+  withRadarDot = false
 ): {
   width: number;
   height: number;
   data: Uint8Array;
 } | null {
   const scale = 2;
-  const logicalW = Math.max(40, 16 + code.length * 7.5);
-  const badgeH = 21;
+  const extraLeft = withRadarDot ? 11 : 0;
+  const logicalW = Math.max(42, 16 + extraLeft + code.length * 7.5);
+  const badgeH = 22;
   const tipH = 7;
   const w = Math.ceil(logicalW * scale);
   const h = (badgeH + tipH) * scale;
@@ -353,7 +422,6 @@ function renderWaypointPinImage(
   const bh = badgeH * scale;
   const r = 5 * scale;
 
-  // Pointer triangle
   ctx.beginPath();
   ctx.moveTo(w / 2 - 5 * scale, bh - 2 * scale);
   ctx.lineTo(w / 2, h - 1 * scale);
@@ -362,7 +430,6 @@ function renderWaypointPinImage(
   ctx.fillStyle = accentColor;
   ctx.fill();
 
-  // Pill badge
   ctx.beginPath();
   ctx.roundRect(inset, inset, w - inset * 2, bh - inset * 1.5, r);
   ctx.fillStyle = "rgba(15, 20, 25, 0.94)";
@@ -371,12 +438,24 @@ function renderWaypointPinImage(
   ctx.strokeStyle = accentColor;
   ctx.stroke();
 
-  // Crisp code text
+  if (withRadarDot) {
+    const cx = 10.5 * scale;
+    const cy = bh / 2;
+    ctx.beginPath();
+    ctx.arc(cx, cy, 4 * scale, 0, Math.PI * 2);
+    ctx.fillStyle = "rgba(16, 185, 129, 0.28)";
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(cx, cy, 2.2 * scale, 0, Math.PI * 2);
+    ctx.fillStyle = accentColor;
+    ctx.fill();
+  }
+
   ctx.fillStyle = "#F8FAFC";
   ctx.font = `700 ${10.5 * scale}px "JetBrains Mono", "SF Mono", ui-monospace, monospace`;
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
-  ctx.fillText(code, w / 2, bh / 2 + 0.5 * scale);
+  ctx.fillText(code, w / 2 + (extraLeft * scale) / 2, bh / 2 + 0.5 * scale);
 
   const img = ctx.getImageData(0, 0, w, h);
   return { width: w, height: h, data: new Uint8Array(img.data.buffer) };
@@ -481,11 +560,16 @@ export class GridForgeMap {
   private pendingGrid: FeatureCollection | null = null;
   private pendingStripRoute: FeatureCollection | null = null;
   private pendingWaypoints: WaypointInput[] | null = null;
+  private pendingViewsheds: ViewshedEntry[] | null = null;
+  private pendingOfflineBasemap: BasemapInfoResponse | null = null;
+  private offlineBasemapReady = false;
+  private reportedExternalTileFail = false;
   private currentFootprint: FeatureCollection | null = null;
   private currentBasemap: BasemapId = "opentopo";
   private suppressClickUntil = 0;
   private draggingMarker = false;
   private markupMode = false;
+  private viewshedMode = false;
 
   constructor(
     container: HTMLElement,
@@ -542,6 +626,10 @@ export class GridForgeMap {
     this.map.on("click", (e) => {
       if (performance.now() < this.suppressClickUntil) return;
       const { lat, lng } = e.lngLat;
+      if (this.viewshedMode) {
+        callbacks.onMapViewshedClick?.(lat, lng);
+        return;
+      }
       if (this.markupMode) {
         callbacks.onMapMarkupClick?.(lat, lng);
         return;
@@ -554,8 +642,26 @@ export class GridForgeMap {
       callbacks.onCursorMove?.(e.lngLat.lat, e.lngLat.lng);
     });
 
+    this.map.on("error", (ev) => {
+      const srcId = (ev as { sourceId?: string }).sourceId;
+      if (
+        this.offlineBasemapReady &&
+        !this.reportedExternalTileFail &&
+        this.currentBasemap !== "offline" &&
+        srcId &&
+        EXTERNAL_SOURCE_IDS.has(srcId)
+      ) {
+        this.reportedExternalTileFail = true;
+        callbacks.onExternalTileFailure?.();
+      }
+    });
+
     this.map.on("load", () => {
       this.isLoaded = true;
+      if (this.pendingOfflineBasemap) {
+        this.attachOfflineBasemapLayer(this.pendingOfflineBasemap);
+        this.pendingOfflineBasemap = null;
+      }
       this.applyBasemapVisibility();
       if (this.pendingFootprint || this.pendingGrid) {
         this.applyGeoJson(
@@ -573,12 +679,69 @@ export class GridForgeMap {
         this.applyWaypoints(this.pendingWaypoints);
         this.pendingWaypoints = null;
       }
+      if (this.pendingViewsheds) {
+        this.applyViewsheds(this.pendingViewsheds);
+        this.pendingViewsheds = null;
+      }
     });
+  }
+
+  enableOfflineBasemap(info: BasemapInfoResponse): void {
+    if (!info.available || !info.format) return;
+    if (!this.isLoaded) {
+      this.pendingOfflineBasemap = info;
+      return;
+    }
+    this.attachOfflineBasemapLayer(info);
+  }
+
+  private attachOfflineBasemapLayer(info: BasemapInfoResponse): void {
+    if (!info.available || !info.format) return;
+    if (this.map.getSource("offline-mbtiles")) {
+      this.offlineBasemapReady = true;
+      return;
+    }
+
+    const ext = info.format === "jpg" ? "jpg" : "png";
+    const sourceSpec: maplibregl.RasterSourceSpecification = {
+      type: "raster",
+      tiles: [`/api/basemap/{z}/{x}/{y}.${ext}`],
+      tileSize: 256,
+      minzoom: info.minzoom ?? 0,
+      maxzoom: info.maxzoom ?? 18,
+      attribution: info.attribution || info.name || "Local Offline MBTiles Basemap",
+    };
+    if (info.bounds && info.bounds.length === 4) {
+      sourceSpec.bounds = info.bounds as [number, number, number, number];
+    }
+
+    this.map.addSource("offline-mbtiles", sourceSpec);
+    this.map.addLayer(
+      {
+        id: "basemap-offline",
+        type: "raster",
+        source: "offline-mbtiles",
+        layout: {
+          visibility: this.currentBasemap === "offline" ? "visible" : "none",
+        },
+        paint: {
+          "raster-opacity": 1,
+        },
+      },
+      "viewshed-coverage-fill"
+    );
+    this.offlineBasemapReady = true;
+    this.applyBasemapVisibility();
   }
 
   setMarkupMode(active: boolean): void {
     this.markupMode = active;
     this.container.classList.toggle("markup-active", active);
+  }
+
+  setViewshedMode(active: boolean): void {
+    this.viewshedMode = active;
+    this.container.classList.toggle("los-active", active);
   }
 
   setBasemap(basemap: BasemapId): void {
@@ -593,6 +756,8 @@ export class GridForgeMap {
       this.currentBasemap === "osm" || this.currentBasemap === "opentopo";
     const showOpenTopo = this.currentBasemap === "opentopo";
     const showSat = this.currentBasemap === "satellite";
+    const showOffline =
+      this.currentBasemap === "offline" && this.offlineBasemapReady;
 
     this.map.setLayoutProperty(
       "basemap-osm-underlay",
@@ -609,6 +774,13 @@ export class GridForgeMap {
       "visibility",
       showSat ? "visible" : "none"
     );
+    if (this.map.getLayer("basemap-offline")) {
+      this.map.setLayoutProperty(
+        "basemap-offline",
+        "visibility",
+        showOffline ? "visible" : "none"
+      );
+    }
   }
 
   private ensureSheetLabelImages(labels: string[]): void {
@@ -629,7 +801,18 @@ export class GridForgeMap {
     const iconId = `wp-pin-${code}-${category}`;
     if (!this.map.hasImage(iconId)) {
       const color = CATEGORY_COLOR_MAP[category] ?? "#EC4899";
-      const rendered = renderWaypointPinImage(code, color);
+      const rendered = renderPinBadgeImage(code, color, false);
+      if (rendered) {
+        this.map.addImage(iconId, rendered, { pixelRatio: 2 });
+      }
+    }
+    return iconId;
+  }
+
+  private ensureObserverPinImage(code: string): string {
+    const iconId = `obs-pin-${code}`;
+    if (!this.map.hasImage(iconId)) {
+      const rendered = renderPinBadgeImage(code, "#10B981", true);
       if (rendered) {
         this.map.addImage(iconId, rendered, { pixelRatio: 2 });
       }
@@ -672,6 +855,10 @@ export class GridForgeMap {
     this.applyGeoJson(footprint, gridData);
   }
 
+  clearFootprint(): void {
+    this.updateFootprint(EMPTY_FC, EMPTY_FC);
+  }
+
   updateStripRoute(routeGeoJson: FeatureCollection | null): void {
     const fc = routeGeoJson ?? EMPTY_FC;
     if (!this.isLoaded) {
@@ -687,6 +874,38 @@ export class GridForgeMap {
       return;
     }
     this.applyWaypoints(waypoints);
+  }
+
+  updateViewsheds(entries: ViewshedEntry[]): void {
+    if (!this.isLoaded) {
+      this.pendingViewsheds = [...entries];
+      return;
+    }
+    this.applyViewsheds(entries);
+  }
+
+  getFootprintBBoxString(): string | null {
+    if (!this.currentFootprint) return null;
+    const pts = collectPositions(this.currentFootprint);
+    if (pts.length === 0) return null;
+    let minLon = Infinity;
+    let minLat = Infinity;
+    let maxLon = -Infinity;
+    let maxLat = -Infinity;
+    for (const p of pts) {
+      const lon = p[0];
+      const lat = p[1];
+      if (typeof lon === "number" && typeof lat === "number") {
+        if (lon < minLon) minLon = lon;
+        if (lon > maxLon) maxLon = lon;
+        if (lat < minLat) minLat = lat;
+        if (lat > maxLat) maxLat = lat;
+      }
+    }
+    if (!Number.isFinite(minLon)) return null;
+    // Slight padding around current sheet for a practical mini pack
+    const pad = 0.05;
+    return `${(minLon - pad).toFixed(4)},${(minLat - pad).toFixed(4)},${(maxLon + pad).toFixed(4)},${(maxLat + pad).toFixed(4)}`;
   }
 
   private applyGeoJson(
@@ -769,6 +988,47 @@ export class GridForgeMap {
 
     legsSrc?.setData(legsFc);
     ptsSrc?.setData(pointsFc);
+  }
+
+  private applyViewsheds(entries: ViewshedEntry[]): void {
+    const coverageFeatures: Feature[] = [];
+    const ringFeatures: Feature[] = [];
+    const observerFeatures: Feature<Point>[] = [];
+
+    for (let idx = 0; idx < entries.length; idx += 1) {
+      const entry = entries[idx];
+      if (!entry) continue;
+      const code = `OBS${idx + 1}`;
+      const iconId = this.ensureObserverPinImage(code);
+      observerFeatures.push({
+        type: "Feature",
+        properties: { code, label: entry.observer.label, icon_id: iconId },
+        geometry: {
+          type: "Point",
+          coordinates: [entry.observer.lon, entry.observer.lat],
+        },
+      });
+      if (entry.preview?.viewshed_geojson?.features) {
+        coverageFeatures.push(...entry.preview.viewshed_geojson.features);
+      }
+      if (entry.preview?.range_ring_geojson?.features) {
+        ringFeatures.push(...entry.preview.range_ring_geojson.features);
+      }
+    }
+
+    const covSrc = this.map.getSource("viewshed-coverage") as
+      | maplibregl.GeoJSONSource
+      | undefined;
+    const ringSrc = this.map.getSource("viewshed-rings") as
+      | maplibregl.GeoJSONSource
+      | undefined;
+    const obsSrc = this.map.getSource("viewshed-observers") as
+      | maplibregl.GeoJSONSource
+      | undefined;
+
+    covSrc?.setData({ type: "FeatureCollection", features: coverageFeatures });
+    ringSrc?.setData({ type: "FeatureCollection", features: ringFeatures });
+    obsSrc?.setData({ type: "FeatureCollection", features: observerFeatures });
   }
 
   fitFootprint(sidebarWidthPx = 368): void {

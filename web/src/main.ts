@@ -2,15 +2,18 @@ import "./styles.css";
 import {
   cancelJob,
   deleteJob,
+  fetchBasemapInfo,
   fetchFootprint,
   fetchHealth,
   fetchJobs,
   fetchPacks,
   fetchRouteMetrics,
   fetchStripPlan,
+  fetchViewshedPreview,
   submitJob,
 } from "./api";
 import { JobsDrawer } from "./components/jobsDrawer";
+import { PacksModal } from "./components/packsModal";
 import { SidebarPanel } from "./components/sidebar";
 import { TelemetryBar } from "./components/telemetry";
 import { GridForgeMap } from "./map";
@@ -18,6 +21,7 @@ import {
   ALL_AU_OVERLAY_KINDS,
   BASEMAP_OPTIONS,
   DEM_SOURCE_OPTIONS,
+  NZ_OVERLAY_OPTIONS,
   PAPER_OPTIONS,
   SCALE_OPTIONS,
   US_OVERLAY_OPTIONS,
@@ -38,10 +42,12 @@ import type {
   GeocodeResult,
   JobRecord,
   LocationPreset,
+  NZOverlayKind,
   Orientation,
   PaperSize,
   USOverlayKind,
   Units,
+  ViewshedEntry,
   WaypointCategory,
 } from "./types";
 
@@ -55,6 +61,7 @@ const VALID_SCALES = new Set(SCALE_OPTIONS.map((s) => s.value));
 const VALID_PAPERS = new Set<string>(PAPER_OPTIONS.map((p) => p.value));
 const VALID_DEMS = new Set<string>(DEM_SOURCE_OPTIONS.map((d) => d.value));
 const VALID_AU_OV = new Set<string>(ALL_AU_OVERLAY_KINDS);
+const VALID_NZ_OV = new Set<string>(NZ_OVERLAY_OPTIONS.map((o) => o.value));
 const VALID_US_OV = new Set<string>(US_OVERLAY_OPTIONS.map((o) => o.value));
 
 function hydrateStateFromUrl(state: AppFormState): {
@@ -108,12 +115,20 @@ function hydrateStateFromUrl(state: AppFormState): {
     state.dem_source = demParam as DemSourceKind;
   }
 
+  const packParam = params.get("pack")?.trim();
+  if (packParam && /^[a-zA-Z0-9_-]{1,64}$/.test(packParam)) {
+    state.pack_id = packParam;
+  }
+
   const gridParam = params.get("grid")?.toLowerCase();
   if (gridParam) {
     const match = /^([1-3])x([1-3])$/.exec(gridParam);
     if (match) {
       state.grid_cols = Number(match[1]);
       state.grid_rows = Number(match[2]);
+      if (state.grid_cols * state.grid_rows > 1) {
+        state.include_atlas_index = true;
+      }
     }
   }
 
@@ -130,6 +145,14 @@ function hydrateStateFromUrl(state: AppFormState): {
       .filter((s): s is AUOverlayKind => VALID_AU_OV.has(s));
   }
 
+  const nzParam = params.get("nz")?.trim();
+  if (nzParam) {
+    state.nz_overlays = nzParam
+      .split(",")
+      .map((s) => s.trim().toLowerCase())
+      .filter((s): s is NZOverlayKind => VALID_NZ_OV.has(s));
+  }
+
   const usParam = params.get("us")?.trim();
   if (usParam) {
     state.us_overlays = usParam
@@ -141,9 +164,59 @@ function hydrateStateFromUrl(state: AppFormState): {
   if (params.get("slope") === "1" || params.get("slope") === "true") {
     state.carto.show_slope_shading = true;
   }
-
   if (params.get("cal") === "1") {
     state.include_calibration_page = true;
+  }
+  if (params.get("fold") === "1") {
+    state.show_fold_marks = true;
+  }
+  if (params.get("index") === "1") {
+    state.include_atlas_index = true;
+  } else if (params.get("index") === "0") {
+    state.include_atlas_index = false;
+  }
+
+  const losParam = params.get("los")?.trim();
+  if (losParam) {
+    const parts = losParam.split(";").slice(0, 4);
+    parts.forEach((raw, idx) => {
+      const segs = raw.split(",");
+      const lat = Number(segs[0]);
+      const lon = Number(segs[1]);
+      if (
+        !Number.isFinite(lat) ||
+        !Number.isFinite(lon) ||
+        lat < -80 ||
+        lat > 84 ||
+        lon < -180 ||
+        lon > 180
+      ) {
+        return;
+      }
+      const obsH = Number.isFinite(Number(segs[2]))
+        ? Math.min(500, Math.max(0, Number(segs[2])))
+        : 2;
+      const tgtH = Number.isFinite(Number(segs[3]))
+        ? Math.min(500, Math.max(0, Number(segs[3])))
+        : 1.5;
+      const maxKm = Number.isFinite(Number(segs[4]))
+        ? Math.min(25, Math.max(0.25, Number(segs[4])))
+        : 10;
+      state.viewsheds.push({
+        id: `vs-init-${idx + 1}`,
+        observer: {
+          label: `OBS${idx + 1}`,
+          lat,
+          lon,
+          observer_height_m: obsH,
+          target_height_m: tgtH,
+          max_distance_m: maxKm * 1000,
+        },
+        loading: false,
+        error: null,
+        preview: null,
+      });
+    });
   }
 
   return { hasCustomCenter, needsFlyToResolvedCenter };
@@ -155,7 +228,10 @@ class GridForgeApp {
   private readonly telemetry: TelemetryBar;
   private readonly sidebar: SidebarPanel;
   private readonly drawer: JobsDrawer;
+  private readonly packsModal: PacksModal;
   private readonly map: GridForgeMap;
+  private readonly basemapSwitcherEl: HTMLElement;
+  private readonly offlineReadyBadgeEl: HTMLButtonElement;
   private readonly footprintBannerEl: HTMLElement;
   private readonly mapHintEl: HTMLElement;
   private readonly mapHintTextEl: HTMLElement;
@@ -163,10 +239,12 @@ class GridForgeApp {
   private readonly toastContainerEl: HTMLElement;
   private readonly collapseBtnEl: HTMLButtonElement;
   private readonly markupToolbarBtn: HTMLButtonElement;
+  private readonly losToolbarBtn: HTMLButtonElement;
 
   private sidebarCollapsed = false;
   private drawerOpen = false;
   private markupMode = false;
+  private viewshedMode = false;
   private activeBasemap: BasemapId = "opentopo";
   private latestFootprint: FootprintResponse | null = null;
   private jobs: JobRecord[] = [];
@@ -177,11 +255,14 @@ class GridForgeApp {
   private stripAbort: AbortController | null = null;
   private metricsTimer: number | null = null;
   private metricsAbort: AbortController | null = null;
+  private viewshedAborts = new Map<string, AbortController>();
   private jobsPollTimer: number | null = null;
+  private viewshedSeq = 1;
 
   constructor(root: HTMLElement) {
     const urlHydration = hydrateStateFromUrl(this.state);
     this.initialFlyToResolved = urlHydration.needsFlyToResolvedCenter;
+    this.viewshedSeq = this.state.viewsheds.length + 1;
 
     root.innerHTML = `
       <div class="gf-shell" data-role="shell">
@@ -200,13 +281,26 @@ class GridForgeApp {
           <aside data-role="sidebar"></aside>
 
           <div class="gf-map-toolbar">
-            <div class="gf-basemap-switcher" role="group" aria-label="Basemap switcher">
+            <button
+              type="button"
+              class="gf-offline-ready-pill hidden"
+              data-role="offline-ready-pill"
+              title="External tiles failed — click to switch to local Offline MBTiles basemap"
+            >Offline Basemap Ready</button>
+            <div class="gf-basemap-switcher" data-role="basemap-switcher" role="group" aria-label="Basemap switcher">
               ${BASEMAP_OPTIONS.map(
                 (b) =>
                   `<button type="button" class="gf-basemap-btn ${b.id === this.activeBasemap ? "active" : ""}" data-basemap="${escapeHtml(b.id)}">${escapeHtml(b.label)}</button>`
               ).join("")}
             </div>
             <div class="gf-map-actions">
+              <button
+                type="button"
+                class="gf-map-icon-btn gf-los-btn"
+                data-map-action="los"
+                aria-pressed="false"
+                title="Toggle RF / Line-of-Sight viewshed observer drop mode (V)"
+              >📡 LOS</button>
               <button
                 type="button"
                 class="gf-map-icon-btn gf-markup-btn"
@@ -230,11 +324,17 @@ class GridForgeApp {
 
           <aside data-role="drawer"></aside>
         </main>
+        <div data-role="packs-modal"></div>
         <div class="gf-toast-container" data-role="toasts"></div>
       </div>
     `;
 
     this.shellEl = this.q(root, "[data-role='shell']");
+    this.basemapSwitcherEl = this.q(root, "[data-role='basemap-switcher']");
+    this.offlineReadyBadgeEl = this.q<HTMLButtonElement>(
+      root,
+      "[data-role='offline-ready-pill']"
+    );
     this.footprintBannerEl = this.q(root, "[data-role='footprint-banner']");
     this.mapHintEl = this.q(root, "[data-role='map-hint']");
     this.mapHintTextEl = this.q(root, "[data-role='map-hint-text']");
@@ -248,10 +348,29 @@ class GridForgeApp {
       root,
       "[data-map-action='markup']"
     );
+    this.losToolbarBtn = this.q<HTMLButtonElement>(
+      root,
+      "[data-map-action='los']"
+    );
 
     this.telemetry = new TelemetryBar(this.q(root, "[data-role='topbar']"), {
       onToggleDrawer: () => this.setDrawerOpen(!this.drawerOpen),
       onCopyMgrs: (mgrs) => this.copyText(mgrs, `Copied ${mgrs}`),
+    });
+
+    this.packsModal = new PacksModal(this.q(root, "[data-role='packs-modal']"), {
+      onPacksUpdated: (packs) => {
+        this.sidebar.setPacks(packs);
+        void this.loadHealth();
+      },
+      onSelectPack: (packId) => {
+        this.state.pack_id = packId;
+        this.sidebar.syncControlsFromState();
+        this.syncUrlFromState();
+        this.showToast(`Selected offline pack "${packId}"`, "success");
+      },
+      onToast: (msg, kind) => this.showToast(msg, kind),
+      getCurrentBBoxString: () => this.map.getFootprintBBoxString(),
     });
 
     this.sidebar = new SidebarPanel(
@@ -315,14 +434,31 @@ class GridForgeApp {
           void this.runStripPlan({ fitAfterLoad: true, silentToast: false }),
         onClearStripPlan: () => this.clearStripPlanInternal(true),
         onToggleMarkupMode: () => this.setMarkupMode(!this.markupMode),
+        onToggleViewshedMode: () => this.setViewshedMode(!this.viewshedMode),
         onWaypointEdit: (idx, patch) => this.handleWaypointEdit(idx, patch),
         onWaypointDelete: (idx) => this.handleWaypointDelete(idx),
         onWaypointsClear: () => this.handleWaypointsClear(),
+        onViewshedEdit: (id, patch, recompute) =>
+          this.handleViewshedEdit(id, patch, recompute),
+        onViewshedRecompute: (id) => void this.computeViewshedEntry(id),
+        onViewshedDelete: (id) => this.handleViewshedDelete(id),
+        onViewshedsClear: () => this.handleViewshedsClear(),
+        onManagePacks: () => this.packsModal.open(),
         onRefreshPacks: () => void this.loadPacks(true),
         onSubmitJob: () => void this.handleSubmitJob(),
         onCopyCli: () => {
-          const cmd = buildCliCommand(this.state);
-          this.copyText(cmd, "Copied CLI command!");
+          const result = buildCliCommand(this.state);
+          if ("error" in result) {
+            this.sidebar.setFormError(result.error);
+            return;
+          }
+          this.sidebar.setFormError(null);
+          this.copyText(
+            result.command,
+            this.state.overlayFile
+              ? "Command copied. Place the selected file in ./out/inputs/ before running."
+              : "Command copied. Run from the project directory. Results appear in ./out/."
+          );
         },
       },
       urlHydration.hasCustomCenter ? null : "blue-mountains"
@@ -360,8 +496,12 @@ class GridForgeApp {
           this.scheduleFootprint();
         },
         onMapMarkupClick: (lat, lon) => this.handleAddWaypoint(lat, lon),
+        onMapViewshedClick: (lat, lon) => this.handleAddViewshed(lat, lon),
         onCursorMove: (lat, lon) => {
           this.cursorCoordsEl.textContent = `${lat.toFixed(4)}, ${lon.toFixed(4)}`;
+        },
+        onExternalTileFailure: () => {
+          this.offlineReadyBadgeEl.classList.remove("hidden");
         },
       },
       {
@@ -391,25 +531,28 @@ class GridForgeApp {
       window.setTimeout(() => this.map.resize(), 240);
     });
 
-    root
-      .querySelectorAll<HTMLButtonElement>("[data-basemap]")
-      .forEach((btn) => {
-        btn.addEventListener("click", () => {
-          const id = btn.dataset.basemap as BasemapId;
-          this.activeBasemap = id;
-          this.map.setBasemap(id);
-          root
-            .querySelectorAll<HTMLButtonElement>("[data-basemap]")
-            .forEach((b) => b.classList.toggle("active", b === btn));
-        });
-      });
+    this.basemapSwitcherEl.addEventListener("click", (e) => {
+      const target = e.target as HTMLElement | null;
+      const btn = target?.closest<HTMLButtonElement>("[data-basemap]");
+      if (!btn) return;
+      const id = btn.dataset.basemap as BasemapId;
+      this.selectBasemap(id);
+    });
+
+    this.offlineReadyBadgeEl.addEventListener("click", () => {
+      this.selectBasemap("offline");
+      this.offlineReadyBadgeEl.classList.add("hidden");
+      this.showToast("Switched to local Offline MBTiles basemap", "info");
+    });
 
     root
       .querySelectorAll<HTMLButtonElement>("[data-map-action]")
       .forEach((btn) => {
         btn.addEventListener("click", () => {
           const action = btn.dataset.mapAction;
-          if (action === "markup") {
+          if (action === "los") {
+            this.setViewshedMode(!this.viewshedMode);
+          } else if (action === "markup") {
             this.setMarkupMode(!this.markupMode);
           } else if (action === "fit") {
             this.fitSheetOnMap();
@@ -432,7 +575,22 @@ class GridForgeApp {
         tag === "SELECT" ||
         Boolean(target?.isContentEditable);
 
-      if (e.key === "/" && !inInput) {
+      if (e.key === "Escape") {
+        if (this.packsModal.opened) {
+          this.packsModal.close();
+        } else if (this.viewshedMode) {
+          this.setViewshedMode(false);
+        } else if (this.markupMode) {
+          this.setMarkupMode(false);
+        } else if (this.drawerOpen) {
+          this.setDrawerOpen(false);
+        }
+        return;
+      }
+
+      if (this.packsModal.opened || inInput) return;
+
+      if (e.key === "/") {
         e.preventDefault();
         if (this.sidebarCollapsed) {
           this.collapseBtnEl.click();
@@ -440,7 +598,6 @@ class GridForgeApp {
         this.sidebar.focusCenterInput();
       } else if (
         (e.key === "f" || e.key === "F") &&
-        !inInput &&
         !e.ctrlKey &&
         !e.metaKey &&
         !e.altKey
@@ -449,35 +606,76 @@ class GridForgeApp {
         this.fitSheetOnMap();
       } else if (
         (e.key === "m" || e.key === "M") &&
-        !inInput &&
         !e.ctrlKey &&
         !e.metaKey &&
         !e.altKey
       ) {
         e.preventDefault();
         this.setMarkupMode(!this.markupMode);
-      } else if (e.key === "Escape") {
-        if (this.markupMode) {
-          this.setMarkupMode(false);
-        } else if (this.drawerOpen) {
-          this.setDrawerOpen(false);
-        }
+      } else if (
+        (e.key === "v" || e.key === "V") &&
+        !e.ctrlKey &&
+        !e.metaKey &&
+        !e.altKey
+      ) {
+        e.preventDefault();
+        this.setViewshedMode(!this.viewshedMode);
       }
     });
   }
 
+  private selectBasemap(id: BasemapId): void {
+    this.activeBasemap = id;
+    this.map.setBasemap(id);
+    if (id === "offline") {
+      this.offlineReadyBadgeEl.classList.add("hidden");
+    }
+    this.basemapSwitcherEl
+      .querySelectorAll<HTMLButtonElement>("[data-basemap]")
+      .forEach((b) => b.classList.toggle("active", b.dataset.basemap === id));
+  }
+
+  private updateMapHintForMode(): void {
+    this.mapHintEl.classList.toggle("markup-active", this.markupMode);
+    this.mapHintEl.classList.toggle("los-active", this.viewshedMode);
+    if (this.viewshedMode) {
+      this.mapHintTextEl.textContent =
+        "LOS ON: click map to place observer · V to exit";
+    } else if (this.markupMode) {
+      this.mapHintTextEl.textContent =
+        "Markup ON: click map to drop WP · M to exit";
+    } else {
+      this.mapHintTextEl.textContent = "Click map or drag reticle · F to fit";
+    }
+  }
+
   private setMarkupMode(active: boolean): void {
+    if (active && this.viewshedMode) {
+      this.setViewshedMode(false);
+    }
     this.markupMode = active;
     this.map.setMarkupMode(active);
     this.sidebar.setMarkupMode(active);
     this.markupToolbarBtn.classList.toggle("active", active);
     this.markupToolbarBtn.setAttribute("aria-pressed", String(active));
-    this.mapHintEl.classList.toggle("markup-active", active);
-    this.mapHintTextEl.textContent = active
-      ? "Markup ON: click map to drop WP · M to exit"
-      : "Click map or drag reticle · F to fit";
+    this.updateMapHintForMode();
     if (active) {
       this.sidebar.openWaypointsSection();
+    }
+  }
+
+  private setViewshedMode(active: boolean): void {
+    if (active && this.markupMode) {
+      this.setMarkupMode(false);
+    }
+    this.viewshedMode = active;
+    this.map.setViewshedMode(active);
+    this.sidebar.setViewshedMode(active);
+    this.losToolbarBtn.classList.toggle("active", active);
+    this.losToolbarBtn.setAttribute("aria-pressed", String(active));
+    this.updateMapHintForMode();
+    if (active) {
+      this.sidebar.openViewshedSection();
     }
   }
 
@@ -491,12 +689,42 @@ class GridForgeApp {
       syncMarker: true,
       fitAfterLoad: this.state.grid_cols * this.state.grid_rows > 1,
     });
+    void this.loadBasemapInfo();
     void this.loadHealth();
     void this.loadPacks(false);
     void this.pollJobsOnce();
 
+    if (this.state.viewsheds.length > 0) {
+      this.sidebar.openViewshedSection();
+      this.map.updateViewsheds(this.state.viewsheds);
+      for (const vs of this.state.viewsheds) {
+        void this.computeViewshedEntry(vs.id);
+      }
+    }
+
     window.setInterval(() => void this.loadHealth(), HEALTH_POLL_MS);
     window.setInterval(() => this.drawer.tickElapsed(), 1000);
+  }
+
+  private async loadBasemapInfo(): Promise<void> {
+    try {
+      const info = await fetchBasemapInfo();
+      if (!info.available || !info.format) return;
+      this.map.enableOfflineBasemap(info);
+      if (!this.basemapSwitcherEl.querySelector("[data-basemap='offline']")) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "gf-basemap-btn";
+        btn.dataset.basemap = "offline";
+        btn.textContent = "Offline";
+        btn.title = info.name
+          ? `Local Offline MBTiles (${info.name})`
+          : "Local Offline MBTiles Basemap";
+        this.basemapSwitcherEl.appendChild(btn);
+      }
+    } catch {
+      // Offline basemap endpoint optional / unavailable
+    }
   }
 
   private syncUrlFromState(): void {
@@ -510,6 +738,9 @@ class GridForgeApp {
     if (this.state.dem_source !== "auto") {
       params.set("dem", this.state.dem_source);
     }
+    if (this.state.pack_id) {
+      params.set("pack", this.state.pack_id);
+    }
     if (this.state.grid_cols !== 1 || this.state.grid_rows !== 1) {
       params.set("grid", `${this.state.grid_cols}x${this.state.grid_rows}`);
     }
@@ -519,6 +750,9 @@ class GridForgeApp {
     if (this.state.au_overlays.length > 0) {
       params.set("au", this.state.au_overlays.join(","));
     }
+    if (this.state.nz_overlays.length > 0) {
+      params.set("nz", this.state.nz_overlays.join(","));
+    }
     if (this.state.us_overlays.length > 0) {
       params.set("us", this.state.us_overlays.join(","));
     }
@@ -527,6 +761,21 @@ class GridForgeApp {
     }
     if (this.state.include_calibration_page) {
       params.set("cal", "1");
+    }
+    if (this.state.show_fold_marks) {
+      params.set("fold", "1");
+    }
+    if (this.state.include_atlas_index) {
+      params.set("index", "1");
+    }
+    if (this.state.viewsheds.length > 0) {
+      const encoded = this.state.viewsheds
+        .map((v) => {
+          const o = v.observer;
+          return `${o.lat.toFixed(5)},${o.lon.toFixed(5)},${o.observer_height_m},${o.target_height_m},${Number((o.max_distance_m / 1000).toFixed(2))}`;
+        })
+        .join(";");
+      params.set("los", encoded);
     }
     const nextUrl = `${window.location.pathname}?${params.toString()}`;
     window.history.replaceState(null, "", nextUrl);
@@ -561,6 +810,7 @@ class GridForgeApp {
     }
     if (preset.au_overlays) {
       this.state.au_overlays = [...preset.au_overlays];
+      this.state.nz_overlays = [];
       this.state.us_overlays = [];
     }
     this.sidebar.setTitlePlaceholder(preset.defaultTitle);
@@ -603,6 +853,7 @@ class GridForgeApp {
 
       this.state.stripPlan = plan;
       this.state.include_elevation_profile = true;
+      this.state.include_atlas_index = true;
 
       const anchor = plan.sheets[0];
       if (anchor) {
@@ -620,6 +871,7 @@ class GridForgeApp {
       this.map.updateStripRoute(plan.route_geojson);
       this.telemetry.updateStripPlan(plan);
       this.sidebar.syncControlsFromState(true);
+      this.syncUrlFromState();
       this.setFootprintError(null);
 
       if (options.fitAfterLoad) {
@@ -651,14 +903,137 @@ class GridForgeApp {
     this.stripAbort = null;
     if (!this.state.stripPlan) return;
     this.state.stripPlan = null;
+    if (this.state.grid_cols * this.state.grid_rows === 1) {
+      this.state.include_atlas_index = false;
+    }
     this.map.updateStripRoute(null);
     this.sidebar.syncControlsFromState();
+    this.syncUrlFromState();
     if (restoreFootprint) {
       this.requestFootprintImmediate({
         flyToResult: false,
         syncMarker: false,
       });
     }
+  }
+
+  // ---------- RF / LOS Viewshed Tool ----------
+
+  private handleAddViewshed(lat: number, lon: number): void {
+    const seq = this.viewshedSeq++;
+    const id = `vs-${seq}`;
+    const d = this.state.viewshedDefaults;
+    const entry: ViewshedEntry = {
+      id,
+      observer: {
+        label: `OBS${seq}`,
+        lat: Number(lat.toFixed(6)),
+        lon: Number(lon.toFixed(6)),
+        observer_height_m: d.observer_height_m,
+        target_height_m: d.target_height_m,
+        max_distance_m: d.max_distance_km * 1000,
+      },
+      loading: true,
+      error: null,
+      preview: null,
+    };
+
+    this.state.viewsheds = [...this.state.viewsheds, entry];
+    this.sidebar.openViewshedSection();
+    this.sidebar.renderViewshedsList();
+    this.map.updateViewsheds(this.state.viewsheds);
+    this.syncUrlFromState();
+    void this.computeViewshedEntry(id);
+  }
+
+  private handleViewshedEdit(
+    id: string,
+    patch: {
+      label?: string;
+      observer_height_m?: number;
+      target_height_m?: number;
+      max_distance_m?: number;
+    },
+    recompute: boolean
+  ): void {
+    this.state.viewsheds = this.state.viewsheds.map((e) =>
+      e.id === id
+        ? {
+            ...e,
+            observer: {
+              ...e.observer,
+              ...patch,
+            },
+          }
+        : e
+    );
+    this.syncUrlFromState();
+    if (recompute) {
+      void this.computeViewshedEntry(id);
+    } else {
+      this.map.updateViewsheds(this.state.viewsheds);
+    }
+  }
+
+  private async computeViewshedEntry(id: string): Promise<void> {
+    const entry = this.state.viewsheds.find((e) => e.id === id);
+    if (!entry) return;
+
+    this.viewshedAborts.get(id)?.abort();
+    const controller = new AbortController();
+    this.viewshedAborts.set(id, controller);
+
+    this.state.viewsheds = this.state.viewsheds.map((e) =>
+      e.id === id ? { ...e, loading: true, error: null } : e
+    );
+    this.sidebar.renderViewshedsList();
+
+    try {
+      const preview = await fetchViewshedPreview(
+        entry.observer,
+        this.state.dem_source,
+        this.state.pack_id || null,
+        controller.signal
+      );
+      if (controller.signal.aborted) return;
+
+      this.state.viewsheds = this.state.viewsheds.map((e) =>
+        e.id === id ? { ...e, loading: false, error: null, preview } : e
+      );
+      this.sidebar.renderViewshedsList();
+      this.map.updateViewsheds(this.state.viewsheds);
+    } catch (err) {
+      if (controller.signal.aborted) return;
+      const msg =
+        err instanceof Error ? err.message : "Viewshed computation failed";
+      this.state.viewsheds = this.state.viewsheds.map((e) =>
+        e.id === id ? { ...e, loading: false, error: msg } : e
+      );
+      this.sidebar.renderViewshedsList();
+      this.showToast(`Viewshed error: ${msg}`, "error");
+    } finally {
+      if (this.viewshedAborts.get(id) === controller) {
+        this.viewshedAborts.delete(id);
+      }
+    }
+  }
+
+  private handleViewshedDelete(id: string): void {
+    this.viewshedAborts.get(id)?.abort();
+    this.viewshedAborts.delete(id);
+    this.state.viewsheds = this.state.viewsheds.filter((e) => e.id !== id);
+    this.sidebar.renderViewshedsList();
+    this.map.updateViewsheds(this.state.viewsheds);
+    this.syncUrlFromState();
+  }
+
+  private handleViewshedsClear(): void {
+    for (const ctrl of this.viewshedAborts.values()) ctrl.abort();
+    this.viewshedAborts.clear();
+    this.state.viewsheds = [];
+    this.sidebar.renderViewshedsList();
+    this.map.updateViewsheds([]);
+    this.syncUrlFromState();
   }
 
   // ---------- Waypoints & Tactical Route Metrics ----------
@@ -808,8 +1183,8 @@ class GridForgeApp {
           paper: this.state.paper,
           orientation: this.state.orientation,
           units: this.state.units,
-          grid_cols: this.state.grid_cols,
-          grid_rows: this.state.grid_rows,
+          grid_cols: this.state.outputs.pdf ? this.state.grid_cols : 1,
+          grid_rows: this.state.outputs.pdf ? this.state.grid_rows : 1,
         },
         controller.signal
       );
@@ -838,6 +1213,9 @@ class GridForgeApp {
       if (controller.signal.aborted) return;
       const msg =
         err instanceof Error ? err.message : "Failed to compute footprint";
+      this.latestFootprint = null;
+      this.telemetry.updateFootprint(null);
+      this.map.clearFootprint();
       this.setFootprintError(msg);
     }
   }
@@ -870,12 +1248,17 @@ class GridForgeApp {
         this.showToast(
           res.packs.length > 0
             ? `Loaded ${res.packs.length} offline pack${res.packs.length === 1 ? "" : "s"}`
-            : "No offline packs installed — using Cloud-Native On-Demand",
+            : "No offline packs installed",
           "info"
         );
       }
     } catch {
-      this.sidebar.setPacks([]);
+      if (notify) {
+        this.showToast(
+          "Could not refresh offline packs. Your selection is unchanged.",
+          "error"
+        );
+      }
     }
   }
 
@@ -929,18 +1312,23 @@ class GridForgeApp {
       dem_source: this.state.dem_source,
       pack_id: this.state.pack_id || null,
       au_overlays: [...this.state.au_overlays],
+      nz_overlays: [...this.state.nz_overlays],
       us_overlays: [...this.state.us_overlays],
       carto: { ...this.state.carto },
       outputs: { ...this.state.outputs },
       grid_cols: this.state.stripPlan ? 1 : this.state.grid_cols,
       grid_rows: this.state.stripPlan ? 1 : this.state.grid_rows,
       waypoints: this.state.waypoints.map((wp) => ({ ...wp })),
+      viewsheds: this.state.viewsheds.map((v) => ({ ...v.observer })),
       include_calibration_page:
         this.state.outputs.pdf && this.state.include_calibration_page,
       include_route_card:
         this.state.outputs.pdf && this.state.include_route_card,
       include_elevation_profile:
         this.state.outputs.pdf && this.state.include_elevation_profile,
+      include_atlas_index:
+        this.state.outputs.pdf && this.state.include_atlas_index,
+      show_fold_marks: this.state.show_fold_marks,
     };
 
     if (this.state.stripPlan && this.state.stripPlan.sheets.length > 0) {

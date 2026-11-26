@@ -1,16 +1,23 @@
 import type {
+  BasemapInfoResponse,
   CreateJobPayload,
+  DemSourceKind,
   FootprintRequest,
   FootprintResponse,
   GeocodeResponse,
   HealthResponse,
   JobRecord,
   Orientation,
+  PackBuildRequest,
+  PackBuildTask,
+  PackRegionPreset,
   PacksResponse,
   PaperSize,
   RouteMetricsResponse,
   StripPlanResponse,
   Units,
+  ViewshedObserver,
+  ViewshedPreviewResponse,
   WaypointInput,
 } from "./types";
 
@@ -70,8 +77,70 @@ export function fetchHealth(): Promise<HealthResponse> {
   return requestJson<HealthResponse>("/api/health");
 }
 
+export function fetchBasemapInfo(): Promise<BasemapInfoResponse> {
+  return requestJson<BasemapInfoResponse>("/api/basemap/info");
+}
+
 export function fetchPacks(): Promise<PacksResponse> {
   return requestJson<PacksResponse>("/api/packs");
+}
+
+interface RawPackRegion {
+  region_id?: string;
+  id?: string;
+  name: string;
+  kind?: string;
+  bbox_wgs84: PackRegionPreset["bbox_wgs84"];
+  utm_zones?: string[];
+  description?: string;
+}
+
+export async function fetchPackRegions(): Promise<PackRegionPreset[]> {
+  const data = await requestJson<
+    RawPackRegion[] | { regions: RawPackRegion[] }
+  >("/api/packs/regions");
+  const rawList = Array.isArray(data) ? data : data.regions;
+  return rawList.map((r) => ({
+    region_id: r.region_id ?? r.id ?? r.name,
+    name: r.name,
+    kind: r.kind === "state" ? "state" : "tactical",
+    bbox_wgs84: r.bbox_wgs84,
+    utm_zones: r.utm_zones ?? [],
+    description: r.description,
+  }));
+}
+
+export function startPackBuild(
+  req: PackBuildRequest
+): Promise<PackBuildTask> {
+  return requestJson<PackBuildTask>("/api/packs/build", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(req),
+  });
+}
+
+export async function fetchPackTasks(): Promise<PackBuildTask[]> {
+  const data = await requestJson<PackBuildTask[] | { tasks: PackBuildTask[] }>(
+    "/api/packs/tasks"
+  );
+  return Array.isArray(data) ? data : data.tasks;
+}
+
+export function fetchPackTask(taskId: string): Promise<PackBuildTask> {
+  return requestJson<PackBuildTask>(
+    `/api/packs/tasks/${encodeURIComponent(taskId)}`
+  );
+}
+
+export async function deletePack(packId: string): Promise<void> {
+  const res = await fetch(`/api/packs/${encodeURIComponent(packId)}`, {
+    method: "DELETE",
+  });
+  if (!res.ok) {
+    const detail = await parseErrorDetail(res);
+    throw new ApiError(detail, res.status);
+  }
 }
 
 export function fetchGeocode(
@@ -96,6 +165,24 @@ export function fetchFootprint(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(req),
+    signal,
+  });
+}
+
+export function fetchViewshedPreview(
+  observer: ViewshedObserver,
+  demSource: DemSourceKind = "auto",
+  packId?: string | null,
+  signal?: AbortSignal
+): Promise<ViewshedPreviewResponse> {
+  return requestJson<ViewshedPreviewResponse>("/api/viewshed-preview", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      observer,
+      dem_source: demSource,
+      pack_id: packId || null,
+    }),
     signal,
   });
 }
