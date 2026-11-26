@@ -64,10 +64,15 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Run offline unit and integration tests
+      - name: Run offline unit, integration, and hosted E2E tests
         run: |
           docker run --rm \
             -v "${{ github.workspace }}/tests:/app/tests:ro" \
             -v "${{ github.workspace }}/examples:/app/examples:ro" \
+            -v "${{ github.workspace }}/web/src:/app/web/src:ro" \
+            -v "${{ github.workspace }}/Dockerfile:/app/Dockerfile:ro" \
+            -v "${{ github.workspace }}/railway.toml:/app/railway.toml:ro" \
+            -v "${{ github.workspace }}/docker-compose.yml:/app/docker-compose.yml:ro" \
+            -v "${{ github.workspace }}/docker-compose.ghcr.yml:/app/docker-compose.ghcr.yml:ro" \
             gridforge:ci \
-            pytest -q tests/unit tests/integration
+            pytest -q tests/unit tests/integration tests/e2e
