@@ -53,6 +53,7 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
         "pypdf>=4.2" \
         "pillow>=10.3" \
         "fastapi>=0.115" \
+        "starlette>=1.9" \
         "uvicorn[standard]>=0.30" \
         "python-multipart>=0.0.9" \
         "pytest>=8.0"

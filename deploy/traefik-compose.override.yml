@@ -1,0 +1,39 @@
+# Traefik v3 HTTPS Compose Override for GridForge
+#
+# Usage:
+#   GRIDFORGE_HOST=maps.example.com \
+#   GRIDFORGE_ALLOWED_HOSTS=maps.example.com \
+#   FORWARDED_ALLOW_IPS="*" \
+#   docker compose -f docker-compose.ghcr.yml -f deploy/traefik-compose.override.yml up -d
+#
+# Prerequisites:
+#   - An existing Traefik v3 proxy attached to the external `traefik` Docker network
+#   - A certificate resolver named `letsencrypt` (adjust label below if different)
+#   - Set `GRIDFORGE_ALLOWED_HOSTS` to your public hostname and `FORWARDED_ALLOW_IPS`
+#     to your Traefik container IP/CIDR (so `X-Forwarded-Proto` is trusted)
+#   - Optional forward-auth or basic-auth middleware if exposing to the public internet
+
+services:
+  web:
+    # Remove direct host port binding when routing exclusively through Traefik
+    ports: !reset []
+    environment:
+      - GRIDFORGE_ALLOWED_HOSTS=${GRIDFORGE_ALLOWED_HOSTS:-${GRIDFORGE_HOST:-maps.example.com}}
+      - FORWARDED_ALLOW_IPS=${FORWARDED_ALLOW_IPS:-127.0.0.1}
+    networks:
+      - default
+      - traefik
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=traefik"
+      - "traefik.http.routers.gridforge.rule=Host(`${GRIDFORGE_HOST:-maps.example.com}`)"
+      - "traefik.http.routers.gridforge.entrypoints=websecure"
+      - "traefik.http.routers.gridforge.tls=true"
+      - "traefik.http.routers.gridforge.tls.certresolver=letsencrypt"
+      - "traefik.http.services.gridforge.loadbalancer.server.port=8080"
+      # Optional: attach an existing Traefik auth middleware (e.g. Authelia / BasicAuth)
+      # - "traefik.http.routers.gridforge.middlewares=authelia@docker"
+
+networks:
+  traefik:
+    external: true

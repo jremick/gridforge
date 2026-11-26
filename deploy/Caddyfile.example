@@ -1,0 +1,46 @@
+# GridForge HTTPS Reverse Proxy Example (Caddy v2)
+#
+# Copy to /etc/caddy/Caddyfile (or mount into a Caddy container on the same
+# Docker network as GridForge) and replace maps.example.com with your domain.
+#
+# GridForge does not implement built-in user authentication; if exposing beyond
+# a trusted LAN or Tailnet, enable basic_auth (below) or forward-auth (Authelia,
+# Authentik, Cloudflare Access, etc.).
+#
+# Required GridForge web container environment variables behind a reverse proxy:
+#   GRIDFORGE_ALLOWED_HOSTS=maps.example.com
+#   FORWARDED_ALLOW_IPS=127.0.0.1   # (or your Caddy container IP / Docker bridge subnet)
+#
+# Caddy preserves the original `Host` header (including port) and sends
+# `X-Forwarded-Proto` automatically so GridForge's TrustedHost and
+# SameOriginWrites middleware verify same-origin browser writes cleanly.
+
+maps.example.com {
+	encode zstd gzip
+
+	# Optional HTTP Basic Auth (generate hash with: `caddy hash-password`)
+	# basic_auth {
+	# 	operator $2a$14$REPLACE_WITH_BCRYPT_HASH
+	# }
+
+	# Allow GPX/GeoJSON/CSV route & overlay uploads up to 50 MB
+	request_body {
+		max_size 50MB
+	}
+
+	header {
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "SAMEORIGIN"
+		Referrer-Policy "strict-origin-when-cross-origin"
+	}
+
+	# Use `web:8080` if Caddy shares the Docker Compose network, or
+	# `127.0.0.1:8080` when running Caddy directly on the Docker host.
+	reverse_proxy 127.0.0.1:8080 {
+		flush_interval -1
+		transport http {
+			read_timeout 180s
+			write_timeout 180s
+		}
+	}
+}

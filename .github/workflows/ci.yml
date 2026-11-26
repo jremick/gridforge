@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: Web Studio (TypeScript + Vite)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run Copy CLI unit tests
+        run: npm test
+
+      - name: Typecheck and build SPA
+        run: npm run build
+
+  docker-ci:
+    name: Headless PyQGIS Docker Build & Offline Test Suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build gridforge:ci image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: gridforge:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run offline unit and integration tests
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}/tests:/app/tests:ro" \
+            -v "${{ github.workspace }}/examples:/app/examples:ro" \
+            gridforge:ci \
+            pytest -q tests/unit tests/integration
