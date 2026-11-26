@@ -17,6 +17,11 @@ import httpx
 
 from gridforge.config import BBox, SheetLayout
 from gridforge.sources.dem_au_elvis import AUElvisDEMSource, is_in_australia_coverage
+from gridforge.sources.dem_ca_hrdem import (
+    CanadaHRDEMSource,
+    classify_north_america_country,
+    is_in_canada_coverage,
+)
 from gridforge.sources.dem_copernicus import (
     CopernicusGLO30Source,
     GDAL_VSICURL_ENV,
@@ -50,9 +55,29 @@ def _bboxes_intersect(a: tuple[float, float, float, float], b: tuple[float, floa
 
 
 def is_in_us_3dep_coverage(bbox: BBox) -> bool:
-    """Return ``True`` if a WGS84 bounding box overlaps US 3DEP coverage bounds."""
-    target = bbox.as_tuple()
-    return any(_bboxes_intersect(target, box) for box in US_3DEP_COVERAGE_BOXES)
+    """Return ``True`` if a WGS84 bounding box falls within United States 3DEP coverage.
+
+    Uses the accurate US–Canada international border polyline so Canadian areas near the 49th
+    parallel, Great Lakes, St. Lawrence, and Yukon/BC panhandle route to Canada HRDEM rather
+    than erroneously matching coarse US rectangles.
+    """
+    cx = 0.5 * (bbox.min_x + bbox.max_x)
+    cy = 0.5 * (bbox.min_y + bbox.max_y)
+    center_country = classify_north_america_country(cy, cx)
+    if center_country == "US":
+        return True
+    if center_country == "CA":
+        return False
+    # Outside interior border regions: fall back to checking any corner inside US boxes
+    for lon, lat in (
+        (bbox.min_x, bbox.min_y),
+        (bbox.max_x, bbox.min_y),
+        (bbox.min_x, bbox.max_y),
+        (bbox.max_x, bbox.max_y),
+    ):
+        if classify_north_america_country(lat, lon) == "US":
+            return True
+    return False
 
 
 def _round_enclosing_bbox(bbox: BBox, step_deg: float = 0.001) -> BBox:
@@ -405,7 +430,7 @@ class USGS3DEPSource:
 
 
 class AutoDEMSource:
-    """Automatic 4-way DEM router: USGS 3DEP (US), GA/ELVIS (AU), LINZ (NZ), Copernicus GLO-30 globally."""
+    """Automatic 5-way DEM router: USGS 3DEP (US), NRCan HRDEM (CA), GA/QLD (AU), LINZ (NZ), GLO-30 globally."""
 
     name: str = "auto-dem"
     attribution: str = CopernicusGLO30Source.attribution
@@ -415,11 +440,13 @@ class AutoDEMSource:
         cache_dir: Path | str | None = None,
         *,
         usgs_source: USGS3DEPSource | None = None,
+        ca_source: CanadaHRDEMSource | None = None,
         au_source: AUElvisDEMSource | None = None,
         nz_source: NZLinzDEMSource | None = None,
         copernicus_source: CopernicusGLO30Source | None = None,
     ) -> None:
         self.usgs_source = usgs_source or USGS3DEPSource(cache_dir=cache_dir)
+        self.ca_source = ca_source or CanadaHRDEMSource(cache_dir=cache_dir)
         self.au_source = au_source or AUElvisDEMSource(cache_dir=cache_dir)
         self.nz_source = nz_source or NZLinzDEMSource(cache_dir=cache_dir)
         self.copernicus_source = copernicus_source or CopernicusGLO30Source(cache_dir=cache_dir)
@@ -429,14 +456,15 @@ class AutoDEMSource:
         self.attribution = self.resolved_attribution
 
     def fetch_dem(self, layout: SheetLayout, work_dir: Path) -> Path:
-        """Select regional high-res DEM (USGS 3DEP in US, GA/QLD in AU, LINZ in NZ) or Copernicus GLO-30 globally."""
-        if is_in_us_3dep_coverage(layout.wgs84_fetch_bbox):
+        """Select regional high-res DEM (US -> CA -> AU -> NZ) or Copernicus GLO-30 globally."""
+        bbox = layout.wgs84_fetch_bbox
+        if is_in_us_3dep_coverage(bbox):
             try:
                 path = self.usgs_source.fetch_dem(layout, work_dir)
             except Exception as exc:
                 logger.warning(
                     "USGS 3DEP fetch unavailable for %s (%s); falling back to Copernicus GLO-30",
-                    layout.wgs84_fetch_bbox.as_tuple(),
+                    bbox.as_tuple(),
                     exc,
                 )
             else:
@@ -449,13 +477,32 @@ class AutoDEMSource:
                 )
                 self.attribution = self.resolved_attribution
                 return path
-        elif is_in_australia_coverage(layout.wgs84_fetch_bbox):
+        elif is_in_canada_coverage(bbox):
+            try:
+                path = self.ca_source.fetch_dem(layout, work_dir)
+            except Exception as exc:
+                logger.warning(
+                    "Canada NRCan HRDEM fetch unavailable for %s (%s); falling back to Copernicus GLO-30",
+                    bbox.as_tuple(),
+                    exc,
+                )
+            else:
+                self.resolved_source_name = getattr(self.ca_source, "resolved_source_name", self.ca_source.name)
+                self.resolved_vertical_datum = getattr(
+                    self.ca_source, "resolved_vertical_datum", self.ca_source.vertical_datum
+                )
+                self.resolved_attribution = getattr(
+                    self.ca_source, "resolved_attribution", self.ca_source.attribution
+                )
+                self.attribution = self.resolved_attribution
+                return path
+        elif is_in_australia_coverage(bbox):
             try:
                 path = self.au_source.fetch_dem(layout, work_dir)
             except Exception as exc:
                 logger.warning(
                     "Australia GA DEM fetch unavailable for %s (%s); falling back to Copernicus GLO-30",
-                    layout.wgs84_fetch_bbox.as_tuple(),
+                    bbox.as_tuple(),
                     exc,
                 )
             else:
@@ -468,13 +515,13 @@ class AutoDEMSource:
                 )
                 self.attribution = self.resolved_attribution
                 return path
-        elif is_in_nz_coverage(layout.wgs84_fetch_bbox):
+        elif is_in_nz_coverage(bbox):
             try:
                 path = self.nz_source.fetch_dem(layout, work_dir)
             except Exception as exc:
                 logger.warning(
                     "New Zealand LINZ DEM fetch unavailable for %s (%s); falling back to Copernicus GLO-30",
-                    layout.wgs84_fetch_bbox.as_tuple(),
+                    bbox.as_tuple(),
                     exc,
                 )
             else:

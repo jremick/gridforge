@@ -4,6 +4,11 @@ from __future__ import annotations
 
 from gridforge.sources.base import ElevationSource, OverlaySource, VectorSource
 from gridforge.sources.dem_au_elvis import AUElvisDEMSource, is_in_australia_coverage
+from gridforge.sources.dem_ca_hrdem import (
+    CanadaHRDEMSource,
+    classify_north_america_country,
+    is_in_canada_coverage,
+)
 from gridforge.sources.dem_copernicus import CopernicusGLO30Source
 from gridforge.sources.dem_local import LocalDEMSource
 from gridforge.sources.dem_nz_linz import NZLinzDEMSource, is_in_nz_coverage
@@ -40,6 +45,11 @@ from gridforge.sources.overlays_au_states_west import (
     SATrailsSource,
     WATrailsSource,
 )
+from gridforge.sources.overlays_ca import (
+    CACanVecTrailsSource,
+    build_ca_overlay_sources,
+    is_in_ca_overlay_coverage,
+)
 from gridforge.sources.overlays_nz import (
     NZDocTrailsSource,
     build_nz_overlay_sources,
@@ -50,6 +60,8 @@ from gridforge.sources.overlays_us import (
     FEMAFloodSource,
     NHDHydroSource,
     NOAAENCSource,
+    USPublicLandsSource,
+    USTrailsSource,
     build_us_overlay_sources,
 )
 
@@ -58,7 +70,9 @@ __all__ = [
     "AUElvisDEMSource",
     "AutoDEMSource",
     "AutoStateTrailsSource",
+    "CACanVecTrailsSource",
     "CAPADParksSource",
+    "CanadaHRDEMSource",
     "CopernicusGLO30Source",
     "ElevationSource",
     "FAATowersSource",
@@ -80,15 +94,21 @@ __all__ = [
     "SATrailsSource",
     "TASTrailsSource",
     "USGS3DEPSource",
+    "USPublicLandsSource",
+    "USTrailsSource",
     "UserOverlaySource",
     "VICTrailsSource",
     "VectorSource",
     "WATrailsSource",
     "build_au_overlay_sources",
+    "build_ca_overlay_sources",
     "build_nz_overlay_sources",
     "build_us_overlay_sources",
+    "classify_north_america_country",
     "is_in_act_coverage",
     "is_in_australia_coverage",
+    "is_in_ca_overlay_coverage",
+    "is_in_canada_coverage",
     "is_in_nsw_coverage",
     "is_in_nt_coverage",
     "is_in_nz_coverage",

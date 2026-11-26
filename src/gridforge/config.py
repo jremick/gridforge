@@ -38,6 +38,8 @@ class ColorMode(str, Enum):
 
     COLOR = "color"
     BW = "bw"
+    NIGHT_RED = "night-red"
+    ALPINE = "alpine"
 
 
 class Units(str, Enum):
@@ -72,6 +74,7 @@ class DemSourceKind(str, Enum):
     USGS3DEP = "usgs3dep"
     AU_ELVIS = "au-elvis"
     NZ_LINZ = "nz-linz"
+    CA_HRDEM = "ca-hrdem"
 
 
 class USOverlayKind(str, Enum):
@@ -81,6 +84,8 @@ class USOverlayKind(str, Enum):
     NHD = "nhd"
     TOWERS = "towers"
     ENC = "enc"
+    US_TRAILS = "us-trails"
+    US_PUBLIC_LANDS = "us-public-lands"
 
 
 class AUOverlayKind(str, Enum):
@@ -120,12 +125,21 @@ class NZOverlayKind(str, Enum):
     NZ_DOC_TRAILS = "nz-doc-trails"
 
 
+class CAOverlayKind(str, Enum):
+    """Optional Canada OGL-Canada thematic overlay layers."""
+
+    CA_CANVEC_TRAILS = "ca-canvec-trails"
+
+
 class ExportFormat(str, Enum):
-    """Offline handheld/ATAK map archive export formats."""
+    """Offline handheld/ATAK/OsmAnd map archive export formats."""
 
     MBTILES = "mbtiles"
     KMZ = "kmz"
     BOTH = "both"
+    GPKG = "gpkg"
+    OSMAND = "osmand"
+    BUNDLE = "bundle"
 
 
 class GarminProfile(str, Enum):
@@ -179,6 +193,50 @@ class ViewshedObserver(BaseModel):
     max_distance_m: float = Field(default=10000.0, ge=250.0, le=25000.0)
 
 
+class RFLinkSpec(BaseModel):
+    """Point-to-point RF / Fresnel zone line-of-sight link specification."""
+
+    from_lat: float = Field(..., ge=-80.0, le=84.0)
+    from_lon: float = Field(..., ge=-180.0, le=180.0)
+    to_lat: float = Field(..., ge=-80.0, le=84.0)
+    to_lon: float = Field(..., ge=-180.0, le=180.0)
+    from_height_m: float = Field(default=2.0, ge=0.0, le=500.0)
+    to_height_m: float = Field(default=2.0, ge=0.0, le=500.0)
+    freq_mhz: float = Field(default=915.0, gt=0.0, le=100000.0)
+    k_factor: float = Field(default=4.0 / 3.0, gt=0.1, le=5.0)
+    from_label: str = Field(default="OBS1", min_length=1, max_length=60)
+    to_label: str = Field(default="OBS2", min_length=1, max_length=60)
+
+
+class TacticalGraphic(BaseModel):
+    """User-authored tactical range ring, bearing line, corridor, or sector AOI."""
+
+    kind: Literal["bearing_line", "range_ring", "corridor", "sector"]
+    label: str = Field(default="", max_length=80)
+    points: list[tuple[float, float]] = Field(default_factory=list)
+    radii_km: list[float] = Field(default_factory=lambda: [1.0, 3.0, 5.0])
+    color: str | None = None
+    notes: str | None = None
+
+    @field_validator("points")
+    @classmethod
+    def _validate_points(cls, pts: list[tuple[float, float]]) -> list[tuple[float, float]]:
+        for lat, lon in pts:
+            if not -80.0 <= lat <= 84.0:
+                raise ValueError(f"Tactical graphic latitude {lat} is outside UTM bounds [-80.0, 84.0].")
+            if not -180.0 <= lon <= 180.0:
+                raise ValueError(f"Tactical graphic longitude {lon} must be within [-180.0, 180.0].")
+        return pts
+
+    @field_validator("radii_km")
+    @classmethod
+    def _validate_radii_km(cls, radii: list[float]) -> list[float]:
+        for r in radii:
+            if not 0.0 < r <= 500.0:
+                raise ValueError(f"Tactical graphic radius {r} km must be within (0, 500].")
+        return radii
+
+
 class CartoOptions(BaseModel):
     """Phase 2+ cartographic density and layer visibility controls."""
 
@@ -224,12 +282,16 @@ class SheetSpec(BaseModel):
     us_overlays: list[USOverlayKind] = Field(default_factory=list)
     au_overlays: list[AUOverlayKind] = Field(default_factory=list)
     nz_overlays: list[NZOverlayKind] = Field(default_factory=list)
+    ca_overlays: list[CAOverlayKind] = Field(default_factory=list)
     waypoints: list[WaypointInput] = Field(default_factory=list)
     viewsheds: list[ViewshedObserver] = Field(default_factory=list)
+    rf_links: list[RFLinkSpec] = Field(default_factory=list)
+    tactical_graphics: list[TacticalGraphic] = Field(default_factory=list)
     include_calibration_page: bool = False
     include_route_card: bool = False
     include_elevation_profile: bool = False
     include_atlas_index: bool = False
+    include_rf_link_card: bool = False
     show_fold_marks: bool = False
 
     @field_validator("center_lat")
@@ -375,6 +437,10 @@ class JobWorkspace(BaseModel):
     waypoints_gpkg: Path | None = None
     viewshed_tif: Path | None = None
     viewshed_observers_gpkg: Path | None = None
+    tactical_graphics_gpkg: Path | None = None
+    gpkg_tiles_path: Path | None = None
+    osmand_sqlitedb_path: Path | None = None
+    field_bundle_zip_path: Path | None = None
 
 
 class RenderResult(BaseModel):
@@ -415,6 +481,7 @@ class PackManifest(BaseModel):
     vertical_datum: str = "AHD"
     dem_attribution: str | None = None
     osm_pbf_path: str | None = None
+    basemap_path: str | None = None
     overlays: dict[str, str] = Field(default_factory=dict)
     attributions: list[str] = Field(default_factory=list)
     created_at: str

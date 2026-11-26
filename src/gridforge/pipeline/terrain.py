@@ -16,6 +16,7 @@ from gridforge.config import (
     ColorMode,
     DensityLevel,
     HillshadeStrength,
+    RFLinkSpec,
     SheetLayout,
     Units,
     ViewshedObserver,
@@ -360,8 +361,24 @@ nv 0 0 0 0
 90.0 15 15 15 180
 """
 
+# Red-headlamp-safe slope shading (cool dark slate/navy tones that remain legible under red LED)
+SLOPE_COLOR_TABLE_NIGHT_RED: Final[str] = """\
+nv 0 0 0 0
+0.0 0 0 0 0
+29.999 0 0 0 0
+30.0 71 85 105 110
+34.999 71 85 105 110
+35.0 30 58 95 150
+44.999 30 58 95 150
+45.0 15 23 42 185
+90.0 15 23 42 185
+"""
+
 VIEWSHED_RGBA_COLOR: Final[tuple[int, int, int, int]] = (0, 212, 146, 130)
 VIEWSHED_RGBA_BW: Final[tuple[int, int, int, int]] = (80, 80, 80, 95)
+VIEWSHED_RGBA_NIGHT_RED: Final[tuple[int, int, int, int]] = (0, 168, 196, 120)
+SPEED_OF_LIGHT_M_S: Final[float] = 299_792_458.0
+EARTH_RADIUS_M: Final[float] = 6_371_000.0
 
 
 def _sample_dem_point_elev(ds: Any, x: float, y: float) -> float | None:
@@ -651,9 +668,12 @@ def build_viewshed_products(
                 obs_ds = None
 
         # Emit 4-band RGBA Byte GeoTIFF aligned 1:1 with dem_utm_tif
-        r_val, g_val, b_val, a_val = (
-            VIEWSHED_RGBA_BW if color_mode == ColorMode.BW else VIEWSHED_RGBA_COLOR
-        )
+        if color_mode == ColorMode.BW:
+            r_val, g_val, b_val, a_val = VIEWSHED_RGBA_BW
+        elif color_mode == ColorMode.NIGHT_RED:
+            r_val, g_val, b_val, a_val = VIEWSHED_RGBA_NIGHT_RED
+        else:
+            r_val, g_val, b_val, a_val = VIEWSHED_RGBA_COLOR
         visible_bool = combined_mask > 0
         driver = gdal.GetDriverByName("GTiff")
         dst_ds = driver.Create(
@@ -892,6 +912,244 @@ def compute_viewshed_geojson(
     }
 
 
+def _sample_dem_bilinear(ds: Any, x: float, y: float) -> float | None:
+    """Bilinear Float32 elevation sample at projected ``(x, y)`` with nearest-valid fallback."""
+    from osgeo import gdal  # type: ignore[import-untyped]
+
+    gt = ds.GetGeoTransform()
+    cols = ds.RasterXSize
+    rows = ds.RasterYSize
+    fx = (x - gt[0]) / gt[1] - 0.5
+    fy = (y - gt[3]) / gt[5] - 0.5
+    if fx < -0.5 or fx > cols - 0.5 or fy < -0.5 or fy > rows - 0.5:
+        return None
+
+    x0 = max(0, min(cols - 1, int(math.floor(fx))))
+    y0 = max(0, min(rows - 1, int(math.floor(fy))))
+    x1 = min(cols - 1, x0 + 1)
+    y1 = min(rows - 1, y0 + 1)
+    wx = max(0.0, min(1.0, fx - x0))
+    wy = max(0.0, min(1.0, fy - y0))
+
+    band = ds.GetRasterBand(1)
+    nodata = band.GetNoDataValue()
+    w = x1 - x0 + 1
+    h = y1 - y0 + 1
+    raw = band.ReadRaster(x0, y0, w, h, w, h, gdal.GDT_Float32)
+    if not raw:
+        return None
+    vals = struct.unpack(f"={w * h}f", raw)
+
+    def _valid(v: float) -> bool:
+        return math.isfinite(v) and (nodata is None or abs(v - nodata) > 1e-3)
+
+    if w == 2 and h == 2:
+        v00, v10, v01, v11 = vals
+        if _valid(v00) and _valid(v10) and _valid(v01) and _valid(v11):
+            return float(
+                v00 * (1.0 - wx) * (1.0 - wy)
+                + v10 * wx * (1.0 - wy)
+                + v01 * (1.0 - wx) * wy
+                + v11 * wx * wy
+            )
+
+    good = [v for v in vals if _valid(v)]
+    return float(sum(good) / len(good)) if good else None
+
+
+def compute_rf_link_profile(
+    dem_utm_tif: Path,
+    link: RFLinkSpec,
+    utm_epsg: int,
+    *,
+    date_iso: str | None = None,
+    num_samples: int = 200,
+) -> dict[str, Any]:
+    """Compute a curved-Earth point-to-point RF Fresnel zone & LOS link profile over ``dem_utm_tif``.
+
+    Implements ITU/standard radio refraction (default ``k = 4/3``), 1st Fresnel zone radius
+    ``r1 = sqrt(lambda * d1 * d2 / (d1 + d2))``, 60% Fresnel clearance check, Free-Space Path
+    Loss (``FSPL = 20*log10(d_km) + 20*log10(f_MHz) + 32.45``), and WMM2025 True / Grid /
+    Magnetic bearings + NATO mils + 10 m MGRS coordinates.
+    """
+    import pyproj
+    from osgeo import gdal  # type: ignore[import-untyped]
+    from pygeomag import GeoMag
+    from pyproj import Geod, Transformer
+
+    from gridforge.geo.declination import (
+        DEG_TO_NATO_MILS,
+        WMM2025_MAX_YEAR,
+        WMM2025_MIN_YEAR,
+        _parse_date_to_decimal_year,
+    )
+    from gridforge.geo.strip_atlas import _format_mgrs_10m
+
+    gdal.UseExceptions()
+    ds = gdal.Open(str(dem_utm_tif), gdal.GA_ReadOnly)
+    if ds is None:
+        raise RuntimeError(f"GDAL could not open UTM DEM for RF link profile: {dem_utm_tif}")
+
+    geod = Geod(ellps="WGS84")
+    fwd_az, _back_az, dist_m = geod.inv(
+        float(link.from_lon),
+        float(link.from_lat),
+        float(link.to_lon),
+        float(link.to_lat),
+    )
+    dist_m = max(0.0, float(dist_m))
+    distance_km = dist_m / 1000.0
+    bearing_true_deg = float(fwd_az) % 360.0
+
+    to_utm = Transformer.from_crs("EPSG:4326", f"EPSG:{int(utm_epsg)}", always_xy=True)
+    x0, y0 = to_utm.transform(float(link.from_lon), float(link.from_lat))
+    x1, y1 = to_utm.transform(float(link.to_lon), float(link.to_lat))
+
+    n_pts = max(2, int(num_samples))
+    raw_elevs: list[float | None] = []
+    try:
+        band = ds.GetRasterBand(1)
+        try:
+            _, _, mean_elev, _ = band.ComputeStatistics(False)
+            fallback_elev = float(mean_elev) if math.isfinite(mean_elev) else 0.0
+        except Exception:
+            fallback_elev = 0.0
+
+        for i in range(n_pts):
+            t = i / (n_pts - 1)
+            sx = float(x0) + t * (float(x1) - float(x0))
+            sy = float(y0) + t * (float(y1) - float(y0))
+            raw_elevs.append(_sample_dem_bilinear(ds, sx, sy))
+    finally:
+        ds = None
+
+    # Fill any isolated nodata gaps smoothly from neighbors or raster mean
+    valid_vals = [v for v in raw_elevs if v is not None]
+    default_elev = valid_vals[0] if valid_vals else fallback_elev
+    elevs: list[float] = []
+    last_good = default_elev
+    for v in raw_elevs:
+        if v is not None:
+            last_good = v
+            elevs.append(v)
+        else:
+            elevs.append(last_good)
+
+    from_elev_m = elevs[0]
+    to_elev_m = elevs[-1]
+
+    # True -> Grid & WMM2025 Magnetic bearings + NATO mils
+    proj = pyproj.Proj(f"EPSG:{int(utm_epsg)}")
+    gamma = float(proj.get_factors(float(link.from_lon), float(link.from_lat)).meridian_convergence)
+    bearing_grid_deg = (bearing_true_deg - gamma) % 360.0
+
+    dec_year = _parse_date_to_decimal_year(date_iso)
+    clamped_year = min(WMM2025_MAX_YEAR, max(WMM2025_MIN_YEAR, dec_year))
+    mag_decl = float(
+        GeoMag().calculate(
+            glat=float(link.from_lat),
+            glon=float(link.from_lon),
+            alt=from_elev_m / 1000.0,
+            time=clamped_year,
+        ).d
+    )
+    bearing_mag_deg = (bearing_true_deg - mag_decl) % 360.0
+    bearing_mils = (bearing_mag_deg * DEG_TO_NATO_MILS) % 6400.0
+
+    # Wavelength (m) and effective curved-Earth radius (m)
+    freq_mhz = float(link.freq_mhz)
+    wavelength_m = SPEED_OF_LIGHT_M_S / (freq_mhz * 1_000_000.0)
+    r_eff_m = float(link.k_factor) * EARTH_RADIUS_M
+
+    tx_ant_m = from_elev_m + float(link.from_height_m)
+    rx_ant_m = to_elev_m + float(link.to_height_m)
+
+    samples: list[dict[str, float]] = []
+    interior_clearances: list[float] = []
+    interior_fresnel_pcts: list[float] = []
+
+    for i in range(n_pts):
+        t = i / (n_pts - 1)
+        d1 = t * dist_m
+        d2 = (1.0 - t) * dist_m
+        bulge_m = (d1 * d2) / (2.0 * r_eff_m) if r_eff_m > 0 else 0.0
+        eff_terrain_m = elevs[i] + bulge_m
+        los_m = tx_ant_m * (1.0 - t) + rx_ant_m * t
+
+        r1 = math.sqrt((wavelength_m * d1 * d2) / dist_m) if (dist_m > 0.0 and d1 > 0.0 and d2 > 0.0) else 0.0
+        fresnel_lo_m = los_m - r1
+        fresnel_hi_m = los_m + r1
+        fresnel60_lo_m = los_m - 0.6 * r1
+        clearance_m = los_m - eff_terrain_m
+
+        if 0 < i < n_pts - 1:
+            interior_clearances.append(clearance_m)
+            if r1 > 0.01:
+                interior_fresnel_pcts.append((clearance_m / r1) * 100.0)
+
+        samples.append(
+            {
+                "dist_km": round(d1 / 1000.0, 4),
+                "terrain_m": round(eff_terrain_m, 2),
+                "los_m": round(los_m, 2),
+                "fresnel_lo_m": round(fresnel_lo_m, 2),
+                "fresnel_hi_m": round(fresnel_hi_m, 2),
+                "fresnel60_lo_m": round(fresnel60_lo_m, 2),
+                "clearance_m": round(clearance_m, 2),
+            }
+        )
+
+    if interior_clearances:
+        min_clearance_m = min(interior_clearances)
+    else:
+        min_clearance_m = min(float(link.from_height_m), float(link.to_height_m))
+
+    if interior_fresnel_pcts:
+        min_fresnel_pct = min(interior_fresnel_pcts)
+    else:
+        min_fresnel_pct = 100.0 if min_clearance_m > 0.0 else 0.0
+
+    los_clear = bool(min_clearance_m > 0.0)
+    fresnel_60pct_clear = bool(los_clear and min_fresnel_pct >= 60.0)
+    if fresnel_60pct_clear:
+        status = "CLEAR"
+    elif los_clear:
+        status = "MARGINAL"
+    else:
+        status = "OBSTRUCTED"
+
+    fspl_db = (
+        20.0 * math.log10(distance_km) + 20.0 * math.log10(freq_mhz) + 32.44778
+        if distance_km > 1e-6
+        else 0.0
+    )
+
+    return {
+        "status": status,
+        "from_label": link.from_label,
+        "to_label": link.to_label,
+        "from_height_m": float(link.from_height_m),
+        "to_height_m": float(link.to_height_m),
+        "k_factor": float(link.k_factor),
+        "distance_km": round(distance_km, 4),
+        "freq_mhz": round(freq_mhz, 3),
+        "fspl_db": round(fspl_db, 2),
+        "min_clearance_m": round(min_clearance_m, 2),
+        "min_fresnel_pct": round(min_fresnel_pct, 1),
+        "los_clear": los_clear,
+        "fresnel_60pct_clear": fresnel_60pct_clear,
+        "bearing_true_deg": round(bearing_true_deg, 2),
+        "bearing_grid_deg": round(bearing_grid_deg, 2),
+        "bearing_mag_deg": round(bearing_mag_deg, 2),
+        "bearing_mils": round(bearing_mils, 1),
+        "from_elev_m": round(from_elev_m, 2),
+        "to_elev_m": round(to_elev_m, 2),
+        "from_mgrs": _format_mgrs_10m(float(link.from_lat), float(link.from_lon)),
+        "to_mgrs": _format_mgrs_10m(float(link.to_lat), float(link.to_lon)),
+        "samples": samples,
+    }
+
+
 def build_slope_shading(
     dem_utm_tif: Path,
     color_mode: ColorMode,
@@ -909,7 +1167,12 @@ def build_slope_shading(
     color_table_txt = work_dir / "slope_color_table.txt"
     slope_tif = work_dir / "slope_shading.tif"
 
-    table_text = SLOPE_COLOR_TABLE_BW if color_mode == ColorMode.BW else SLOPE_COLOR_TABLE_COLOR
+    if color_mode == ColorMode.BW:
+        table_text = SLOPE_COLOR_TABLE_BW
+    elif color_mode == ColorMode.NIGHT_RED:
+        table_text = SLOPE_COLOR_TABLE_NIGHT_RED
+    else:
+        table_text = SLOPE_COLOR_TABLE_COLOR
     try:
         slope_cmd = [
             "gdaldem",

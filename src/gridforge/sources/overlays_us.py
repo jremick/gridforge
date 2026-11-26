@@ -42,6 +42,29 @@ DEFAULT_ENC_NAVAID_LAYERS: Final[tuple[tuple[int, str], ...]] = (
     (6, "buoy"),
     (11, "light"),
 )
+DEFAULT_USFS_TRAILS_ENDPOINT: Final[str] = (
+    "https://apps.fs.usda.gov/arcx/rest/services/EDW/EDW_TrailNFSPublish_01/MapServer/0/query"
+)
+DEFAULT_USFS_REC_ENDPOINT: Final[str] = (
+    "https://apps.fs.usda.gov/arcx/rest/services/EDW/EDW_RecreationOpportunities_01/MapServer/0/query"
+)
+DEFAULT_NPS_TRAILS_ENDPOINT: Final[str] = (
+    "https://mapservices.nps.gov/arcgis/rest/services/NationalDatasets/NPS_Public_Trails/FeatureServer/0/query"
+)
+DEFAULT_NPS_POIS_ENDPOINT: Final[str] = (
+    "https://mapservices.nps.gov/arcgis/rest/services/NationalDatasets/NPS_Public_POIs_Geographic/FeatureServer/0/query"
+)
+DEFAULT_PADUS_FEE_ENDPOINT: Final[str] = (
+    "https://services.arcgis.com/v01gqwM5QqNysAAi/arcgis/rest/services/"
+    "Federal_Fee_Managers_Authoritative_PADUS/FeatureServer/0/query"
+)
+DEFAULT_USFS_WILDERNESS_ENDPOINT: Final[str] = (
+    "https://apps.fs.usda.gov/arcx/rest/services/EDW/EDW_Wilderness_01/MapServer/0/query"
+)
+DEFAULT_PADUS_ACCESS_ENDPOINT: Final[str] = (
+    "https://services.arcgis.com/v01gqwM5QqNysAAi/arcgis/rest/services/"
+    "PADUS_Public_Access/FeatureServer/0/query"
+)
 
 
 def _round_enclosing_bbox(bbox: BBox, step_deg: float = 0.001) -> BBox:
@@ -130,6 +153,7 @@ def _query_arcgis_geojson(
     cache_path: Path,
     where: str = "1=1",
     out_fields: str = "*",
+    extra_params: Mapping[str, str] | None = None,
     timeout_s: float = 25.0,
     page_size: int = 1000,
     max_pages: int = 5,
@@ -177,6 +201,8 @@ def _query_arcgis_geojson(
                         "resultRecordCount": str(page_size),
                         "resultOffset": str(offset),
                     }
+                    if extra_params:
+                        params.update(extra_params)
                     try:
                         resp = http.get(url, params=params, headers={"User-Agent": USER_AGENT})
                         resp.raise_for_status()
@@ -334,13 +360,48 @@ def _write_projected_gpkg_layers(
                 geom.FlattenTo2D()
                 if geom.Transform(transform) != 0:
                     continue
-                if not geom.Intersects(clip_poly):
-                    continue
-                if geom_type != ogr.wkbPoint:
-                    clipped = geom.Intersection(clip_poly)
-                    if clipped is None or clipped.IsEmpty():
+                if geom_type in (ogr.wkbPolygon, ogr.wkbMultiPolygon):
+                    try:
+                        if not geom.IsValid():
+                            repaired = geom.MakeValid()
+                            if repaired is not None and not repaired.IsEmpty():
+                                geom = repaired
+                    except RuntimeError:
+                        try:
+                            repaired = geom.Buffer(0.0)
+                            if repaired is not None and not repaired.IsEmpty():
+                                geom = repaired
+                        except RuntimeError:
+                            continue
+                try:
+                    if not geom.Intersects(clip_poly):
                         continue
-                    geom = clipped
+                    if geom_type != ogr.wkbPoint:
+                        clipped = geom.Intersection(clip_poly)
+                        if clipped is None or clipped.IsEmpty():
+                            continue
+                        geom = clipped
+                except RuntimeError:
+                    repaired = None
+                    try:
+                        repaired = geom.MakeValid()
+                    except RuntimeError:
+                        pass
+                    if repaired is None or repaired.IsEmpty():
+                        try:
+                            repaired = geom.Buffer(0.0)
+                        except RuntimeError:
+                            continue
+                    if repaired is None or repaired.IsEmpty():
+                        continue
+                    try:
+                        if not repaired.Intersects(clip_poly):
+                            continue
+                        geom = repaired.Intersection(clip_poly) if geom_type != ogr.wkbPoint else repaired
+                    except RuntimeError:
+                        continue
+                    if geom is None or geom.IsEmpty():
+                        continue
 
                 geom = _coerce_geometry_type(geom, geom_type)
                 if geom is None or geom.IsEmpty():
@@ -798,6 +859,431 @@ class NOAAENCSource(_BaseUSOverlaySource):
         )
 
 
+def _classify_us_trail_class(raw_type: str, raw_use: str = "", raw_class: str = "") -> str:
+    text = f"{raw_type} {raw_use} {raw_class}".lower()
+    if any(k in text for k in ("4wd", "ohv", "motor", "atv", "jeep")):
+        return "4wd_track"
+    if any(k in text for k in ("bicycle", "bike", "mtb", "cycling")) and "hiker" not in text:
+        return "mtb_track"
+    if any(k in text for k in ("horse", "pack", "saddle", "equestrian")) and "hiker" not in text:
+        return "bridle_track"
+    return "walking_track"
+
+
+def _classify_us_poi_type(raw_type: str, raw_name: str = "") -> str:
+    text = f"{raw_type} {raw_name}".lower()
+    if any(k in text for k in ("hut", "cabin", "shelter", "lookout tower", "lodge")):
+        return "hut"
+    if any(k in text for k in ("camp", "rv ", "tent", "backcountry site")):
+        return "campground"
+    if any(k in text for k in ("picnic", "day use", "day-use")):
+        return "picnic"
+    if any(k in text for k in ("water", "spring", "fountain", "well")):
+        return "water"
+    if any(k in text for k in ("overlook", "lookout", "view", "vista", "summit", "peak")):
+        return "lookout"
+    if any(k in text for k in ("trailhead", "parking", "visitor", "ranger", "information", "recreation area")):
+        return "trailhead"
+    return "lookout"
+
+
+def _normalize_padus_manager(raw_mgr: str) -> str:
+    m = raw_mgr.strip()
+    low = m.lower()
+    if low in ("usfs", "fs") or "forest service" in low:
+        return "USFS"
+    if low == "nps" or "national park" in low:
+        return "NPS"
+    if low == "blm" or "land management" in low:
+        return "BLM"
+    if low in ("fws", "usfws") or "fish and wildlife" in low:
+        return "FWS"
+    if low == "dod" or "defense" in low:
+        return "DOD"
+    if "state" in low:
+        return "State"
+    return m or "Federal"
+
+
+def _normalize_padus_designation(raw_des: str, raw_name: str = "") -> str:
+    text = f"{raw_des} {raw_name}".lower()
+    if "wilderness" in text:
+        return "Wilderness Area"
+    if "national park" in text or raw_des.strip().upper() == "NP":
+        return "National Park"
+    if "national forest" in text or raw_des.strip().upper() == "NF":
+        return "National Forest"
+    if "national monument" in text or raw_des.strip().upper() == "NM":
+        return "National Monument"
+    if "wildlife refuge" in text or raw_des.strip().upper() == "NWR":
+        return "Wildlife Refuge"
+    if "blm" in text or "land management" in text:
+        return "BLM Public Land"
+    if "state park" in text:
+        return "State Park"
+    return raw_des.strip() or "Public Land"
+
+
+class USTrailsSource(_BaseUSOverlaySource):
+    """USFS National Forest & NPS Public Trails and Recreation POIs (Public Domain).
+
+    Writes the unified 2-layer UTM GeoPackage schema (``au_state_trails`` + ``au_state_pois``,
+    ``state='US'``) shared with Australian, New Zealand, and Canadian trail overlays.
+    """
+
+    name: str = "us-trails"
+    overlay_key: str = "us-trails"
+    attribution: str = (
+        "US Trails & Recreation: U.S. Forest Service (USFS) & National Park Service (NPS) (Public Domain)"
+    )
+
+    def __init__(
+        self,
+        *,
+        usfs_trails_url: str | None = None,
+        usfs_rec_url: str | None = None,
+        nps_trails_url: str | None = None,
+        nps_pois_url: str | None = None,
+        cache_dir: Path | str | None = None,
+        local_gpkg: Path | str | None = None,
+        timeout_s: float = 25.0,
+        client: httpx.Client | None = None,
+    ) -> None:
+        super().__init__(
+            cache_dir=cache_dir,
+            local_gpkg=local_gpkg,
+            timeout_s=timeout_s,
+            client=client,
+        )
+        self.usfs_trails_url = usfs_trails_url or os.environ.get(
+            "GRIDFORGE_USFS_TRAILS_URL", DEFAULT_USFS_TRAILS_ENDPOINT
+        )
+        self.usfs_rec_url = usfs_rec_url or os.environ.get(
+            "GRIDFORGE_USFS_REC_URL", DEFAULT_USFS_REC_ENDPOINT
+        )
+        self.nps_trails_url = nps_trails_url or os.environ.get(
+            "GRIDFORGE_NPS_TRAILS_URL", DEFAULT_NPS_TRAILS_ENDPOINT
+        )
+        self.nps_pois_url = nps_pois_url or os.environ.get(
+            "GRIDFORGE_NPS_POIS_URL", DEFAULT_NPS_POIS_ENDPOINT
+        )
+
+    def fetch_overlay(self, layout: SheetLayout, work_dir: Path) -> Path | None:
+        from gridforge.sources.dem_usgs3dep import is_in_us_3dep_coverage
+        from gridforge.sources.overlays_au_states import clean_feature_name, write_state_trails_gpkg
+
+        work_dir.mkdir(parents=True, exist_ok=True)
+        out_gpkg = work_dir / "us_trails.gpkg"
+        if self.local_gpkg is not None:
+            return _clip_and_reproject_local_gpkg(
+                self.local_gpkg,
+                layout,
+                out_gpkg,
+                ("au_state_trails", "au_state_pois"),
+            )
+
+        if not is_in_us_3dep_coverage(layout.wgs84_fetch_bbox):
+            logger.debug("Sheet bbox outside US coverage; skipping us-trails")
+            return None
+
+        query_bbox = _round_enclosing_bbox(layout.wgs84_fetch_bbox)
+        bhash = _bbox_hash(query_bbox)
+
+        usfs_trails = _query_arcgis_geojson(
+            [self.usfs_trails_url],
+            query_bbox,
+            cache_path=self.cache_dir / f"usfs_trails_{bhash}.json",
+            out_fields="trail_name,trail_type,trail_class,national_trail_designation",
+            timeout_s=self.timeout_s,
+            client=self._injected_client,
+        )
+        nps_trails = _query_arcgis_geojson(
+            [self.nps_trails_url],
+            query_bbox,
+            cache_path=self.cache_dir / f"nps_trails_{bhash}.json",
+            out_fields="TRLNAME,MAPLABEL,TRLSURFACE,TRLCLASS,TRLUSE,TRLTYPE",
+            timeout_s=self.timeout_s,
+            client=self._injected_client,
+        )
+        usfs_rec = _query_arcgis_geojson(
+            [self.usfs_rec_url],
+            query_bbox,
+            cache_path=self.cache_dir / f"usfs_rec_{bhash}.json",
+            out_fields="recareaname,markeractivity,markeractivitygroup,forestname",
+            timeout_s=self.timeout_s,
+            client=self._injected_client,
+        )
+        nps_pois = _query_arcgis_geojson(
+            [self.nps_pois_url],
+            query_bbox,
+            cache_path=self.cache_dir / f"nps_pois_{bhash}.json",
+            out_fields="POINAME,MAPLABEL,POITYPE,UNITNAME",
+            timeout_s=self.timeout_s,
+            client=self._injected_client,
+        )
+
+        trail_rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for feat in usfs_trails:
+            props = feat.get("properties") or {}
+            name = clean_feature_name(_prop_ci(props, "trail_name", "name"))
+            if name and name.isupper() and len(name) > 3:
+                name = name.title()
+            tclass = _classify_us_trail_class(
+                str(_prop_ci(props, "trail_type") or ""),
+                raw_class=str(_prop_ci(props, "trail_class") or ""),
+            )
+            trail_rows.append(
+                (
+                    feat["geometry"],
+                    {"name": name, "trail_class": tclass, "surface": "", "state": "US"},
+                )
+            )
+
+        for feat in nps_trails:
+            props = feat.get("properties") or {}
+            name = clean_feature_name(_prop_ci(props, "MAPLABEL", "TRLNAME", "name"))
+            tclass = _classify_us_trail_class(
+                str(_prop_ci(props, "TRLTYPE") or ""),
+                raw_use=str(_prop_ci(props, "TRLUSE") or ""),
+                raw_class=str(_prop_ci(props, "TRLCLASS") or ""),
+            )
+            surface = str(_prop_ci(props, "TRLSURFACE") or "").strip()
+            trail_rows.append(
+                (
+                    feat["geometry"],
+                    {"name": name, "trail_class": tclass, "surface": surface, "state": "US"},
+                )
+            )
+
+        poi_rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        seen_pois: set[str] = set()
+        for feat in usfs_rec:
+            props = feat.get("properties") or {}
+            name = clean_feature_name(_prop_ci(props, "recareaname", "name"))
+            if not name or name.lower() in seen_pois:
+                continue
+            seen_pois.add(name.lower())
+            hint = f"{_prop_ci(props, 'markeractivity') or ''} {_prop_ci(props, 'markeractivitygroup') or ''}"
+            poi_rows.append(
+                (
+                    feat["geometry"],
+                    {
+                        "name": name,
+                        "poi_type": _classify_us_poi_type(hint, name),
+                        "elev_m": None,
+                        "state": "US",
+                    },
+                )
+            )
+
+        for feat in nps_pois:
+            props = feat.get("properties") or {}
+            name = clean_feature_name(_prop_ci(props, "MAPLABEL", "POINAME", "name"))
+            if not name or name.lower() in seen_pois:
+                continue
+            seen_pois.add(name.lower())
+            ptype = str(_prop_ci(props, "POITYPE") or "")
+            poi_rows.append(
+                (
+                    feat["geometry"],
+                    {
+                        "name": name,
+                        "poi_type": _classify_us_poi_type(ptype, name),
+                        "elev_m": None,
+                        "state": "US",
+                    },
+                )
+            )
+
+        return write_state_trails_gpkg(out_gpkg, layout, trail_rows, poi_rows)
+
+
+class USPublicLandsSource(_BaseUSOverlaySource):
+    """USGS PAD-US & USFS Wilderness public land polygons (Public Domain).
+
+    Writes a single UTM polygon layer ``public_lands`` (``name``, ``manager``, ``designation``,
+    ``state='US'``) into ``work_dir / "us_public_lands.gpkg"``.
+    """
+
+    name: str = "us-public-lands"
+    overlay_key: str = "us-public-lands"
+    attribution: str = "US Public Lands & Wilderness: USGS PAD-US & U.S. Forest Service (Public Domain)"
+
+    def __init__(
+        self,
+        *,
+        padus_fee_url: str | None = None,
+        usfs_wilderness_url: str | None = None,
+        padus_access_url: str | None = None,
+        cache_dir: Path | str | None = None,
+        local_gpkg: Path | str | None = None,
+        timeout_s: float = 25.0,
+        client: httpx.Client | None = None,
+    ) -> None:
+        super().__init__(
+            cache_dir=cache_dir,
+            local_gpkg=local_gpkg,
+            timeout_s=timeout_s,
+            client=client,
+        )
+        self.padus_fee_url = padus_fee_url or os.environ.get(
+            "GRIDFORGE_PADUS_FEE_URL", DEFAULT_PADUS_FEE_ENDPOINT
+        )
+        self.usfs_wilderness_url = usfs_wilderness_url or os.environ.get(
+            "GRIDFORGE_USFS_WILDERNESS_URL", DEFAULT_USFS_WILDERNESS_ENDPOINT
+        )
+        self.padus_access_url = padus_access_url or os.environ.get(
+            "GRIDFORGE_PADUS_ACCESS_URL", DEFAULT_PADUS_ACCESS_ENDPOINT
+        )
+
+    def fetch_overlay(self, layout: SheetLayout, work_dir: Path) -> Path | None:
+        from gridforge.sources.dem_usgs3dep import is_in_us_3dep_coverage
+        from gridforge.sources.overlays_au_states import clean_feature_name
+
+        work_dir.mkdir(parents=True, exist_ok=True)
+        out_gpkg = work_dir / "us_public_lands.gpkg"
+        if self.local_gpkg is not None:
+            return _clip_and_reproject_local_gpkg(
+                self.local_gpkg,
+                layout,
+                out_gpkg,
+                ("public_lands",),
+            )
+
+        if not is_in_us_3dep_coverage(layout.wgs84_fetch_bbox):
+            logger.debug("Sheet bbox outside US coverage; skipping us-public-lands")
+            return None
+
+        query_bbox = _round_enclosing_bbox(layout.wgs84_fetch_bbox)
+        bhash = _bbox_hash(query_bbox)
+
+        fee_feats = _query_arcgis_geojson(
+            [self.padus_fee_url],
+            query_bbox,
+            cache_path=self.cache_dir / f"us_padus_fee_{bhash}.json",
+            out_fields="Unit_Nm,Mang_Name,Loc_Ds,Des_Tp,Category",
+            extra_params={"maxAllowableOffset": "0.0004"},
+            timeout_s=self.timeout_s,
+            client=self._injected_client,
+        )
+        wilderness_feats = _query_arcgis_geojson(
+            [self.usfs_wilderness_url],
+            query_bbox,
+            cache_path=self.cache_dir / f"us_usfs_wilderness_{bhash}.json",
+            out_fields="wildernessname",
+            extra_params={"maxAllowableOffset": "0.0004"},
+            timeout_s=self.timeout_s,
+            client=self._injected_client,
+        )
+        access_feats = _query_arcgis_geojson(
+            [self.padus_access_url],
+            query_bbox,
+            cache_path=self.cache_dir / f"us_padus_access_{bhash}.json",
+            where="Category='Designation' OR MngTp_Reclass IN ('Federal','State')",
+            out_fields="Unit_Nm,MngNm_Desc,DesTp_Desc,Category",
+            extra_params={"maxAllowableOffset": "0.0004"},
+            timeout_s=self.timeout_s,
+            client=self._injected_client,
+        )
+
+        rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        seen: set[str] = set()
+
+        for feat in wilderness_feats:
+            props = feat.get("properties") or {}
+            name = clean_feature_name(_prop_ci(props, "wildernessname", "name"))
+            if not name:
+                continue
+            key = f"{name.lower()}|wilderness area"
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(
+                (
+                    feat["geometry"],
+                    {
+                        "name": name,
+                        "manager": "USFS",
+                        "designation": "Wilderness Area",
+                        "state": "US",
+                    },
+                )
+            )
+
+        for feat in fee_feats:
+            props = feat.get("properties") or {}
+            name = clean_feature_name(_prop_ci(props, "Unit_Nm", "name"))
+            if not name:
+                continue
+            manager = _normalize_padus_manager(str(_prop_ci(props, "Mang_Name", "Loc_Mang") or ""))
+            designation = _normalize_padus_designation(
+                str(_prop_ci(props, "Loc_Ds", "Des_Tp") or ""), name
+            )
+            key = f"{name.lower()}|{designation.lower()}"
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(
+                (
+                    feat["geometry"],
+                    {
+                        "name": name,
+                        "manager": manager,
+                        "designation": designation,
+                        "state": "US",
+                    },
+                )
+            )
+
+        for feat in access_feats:
+            props = feat.get("properties") or {}
+            name = clean_feature_name(_prop_ci(props, "Unit_Nm", "name"))
+            if not name:
+                continue
+            manager = _normalize_padus_manager(str(_prop_ci(props, "MngNm_Desc", "MngTp_Desc") or ""))
+            designation = _normalize_padus_designation(str(_prop_ci(props, "DesTp_Desc") or ""), name)
+            key = f"{name.lower()}|{designation.lower()}"
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(
+                (
+                    feat["geometry"],
+                    {
+                        "name": name,
+                        "manager": manager,
+                        "designation": designation,
+                        "state": "US",
+                    },
+                )
+            )
+
+        if not rows:
+            return None
+
+        from osgeo import ogr  # type: ignore[import-untyped]
+
+        layer_specs = [
+            (
+                "public_lands",
+                ogr.wkbMultiPolygon,
+                (
+                    ("name", ogr.OFTString),
+                    ("manager", ogr.OFTString),
+                    ("designation", ogr.OFTString),
+                    ("state", ogr.OFTString),
+                ),
+                rows,
+            ),
+        ]
+        return _write_projected_gpkg_layers(
+            out_gpkg,
+            layout.utm_epsg,
+            layout.utm_fetch_bbox,
+            layer_specs,
+        )
+
+
 def build_us_overlay_sources(
     kinds: Sequence[USOverlayKind | str],
     local_overrides: Mapping[str | USOverlayKind, Path | str] | None = None,
@@ -807,7 +1293,11 @@ def build_us_overlay_sources(
     normalized_overrides: dict[str, Path] = {}
     if local_overrides:
         for raw_key, raw_path in local_overrides.items():
-            key_str = raw_key.value if isinstance(raw_key, USOverlayKind) else str(raw_key).lower()
+            key_str = (
+                raw_key.value
+                if isinstance(raw_key, USOverlayKind)
+                else str(raw_key).lower().replace("_", "-")
+            )
             normalized_overrides[key_str] = Path(raw_path)
 
     registry: dict[USOverlayKind, type[_BaseUSOverlaySource]] = {
@@ -815,11 +1305,17 @@ def build_us_overlay_sources(
         USOverlayKind.NHD: NHDHydroSource,
         USOverlayKind.TOWERS: FAATowersSource,
         USOverlayKind.ENC: NOAAENCSource,
+        USOverlayKind.US_TRAILS: USTrailsSource,
+        USOverlayKind.US_PUBLIC_LANDS: USPublicLandsSource,
     }
 
     sources: dict[str, OverlaySource] = {}
     for raw_kind in kinds:
-        kind = raw_kind if isinstance(raw_kind, USOverlayKind) else USOverlayKind(str(raw_kind).lower())
+        kind = (
+            raw_kind
+            if isinstance(raw_kind, USOverlayKind)
+            else USOverlayKind(str(raw_kind).lower().replace("_", "-"))
+        )
         if kind.value in sources:
             continue
         cls = registry[kind]
