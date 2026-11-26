@@ -1,5 +1,12 @@
 import type {
+  AcceptInviteRequest,
+  AdminSettingsRequest,
+  AdminSettingsResponse,
+  AdminUsageResponse,
+  AdminUsersResponse,
   BasemapInfoResponse,
+  CreateInviteRequest,
+  CreateInviteResponse,
   CreateJobPayload,
   DemSourceKind,
   FootprintRequest,
@@ -7,6 +14,7 @@ import type {
   GeocodeResponse,
   HealthResponse,
   JobRecord,
+  LoginRequest,
   Orientation,
   PackBuildRequest,
   PackBuildTask,
@@ -16,11 +24,15 @@ import type {
   PaperSize,
   RFLinkProfileResponse,
   RFLinkSpec,
+  RevokeInviteResponse,
   RouteMetricsResponse,
   RulerMetricsResponse,
   SavedProject,
+  SessionResponse,
   StripPlanResponse,
   Units,
+  UpdateUserRequest,
+  UpdateUserResponse,
   ViewshedObserver,
   ViewshedPreviewResponse,
   WaypointInput,
@@ -38,44 +50,89 @@ export class ApiError extends Error {
 
 async function parseErrorDetail(res: Response): Promise<string> {
   try {
-    const contentType = res.headers.get("content-type") ?? "";
-    if (contentType.includes("application/json")) {
-      const body = (await res.json()) as {
+    const contentType = (res.headers.get("content-type") ?? "").toLowerCase();
+    const rawText = await res.text();
+    const trimmed = rawText.trim();
+    if (contentType.includes("application/json") && trimmed) {
+      let body: {
         detail?: unknown;
         message?: unknown;
-      };
-      if (typeof body.detail === "string") return body.detail;
-      if (Array.isArray(body.detail)) {
-        return body.detail
-          .map((item: unknown) => {
-            if (item && typeof item === "object" && "msg" in item) {
-              const loc =
-                "loc" in item && Array.isArray((item as { loc?: unknown[] }).loc)
-                  ? `${((item as { loc: unknown[] }).loc).join(".")}: `
-                  : "";
-              return `${loc}${String((item as { msg: unknown }).msg)}`;
-            }
-            return String(item);
-          })
-          .join("; ");
+        error?: unknown;
+      } | null = null;
+      try {
+        body = JSON.parse(trimmed) as {
+          detail?: unknown;
+          message?: unknown;
+          error?: unknown;
+        };
+      } catch (parseErr) {
+        if (parseErr instanceof SyntaxError) {
+          console.debug(
+            "Failed to parse JSON error response:",
+            parseErr.message
+          );
+        } else {
+          console.warn(
+            "Unexpected error parsing JSON error response:",
+            parseErr
+          );
+        }
       }
-      if (typeof body.message === "string") return body.message;
+      if (body && typeof body === "object") {
+        if (typeof body.detail === "string" && body.detail.trim()) {
+          return body.detail;
+        }
+        if (Array.isArray(body.detail)) {
+          const formatted = body.detail
+            .map((item: unknown) => {
+              if (item && typeof item === "object" && "msg" in item) {
+                const loc =
+                  "loc" in item &&
+                  Array.isArray((item as { loc?: unknown[] }).loc)
+                    ? `${(item as { loc: unknown[] }).loc.join(".")}: `
+                    : "";
+                return `${loc}${String((item as { msg: unknown }).msg)}`;
+              }
+              return typeof item === "object" && item !== null
+                ? JSON.stringify(item)
+                : String(item);
+            })
+            .join("; ");
+          if (formatted.trim()) return formatted;
+        }
+        if (body.detail && typeof body.detail === "object") {
+          return JSON.stringify(body.detail).slice(0, 220);
+        }
+        if (typeof body.message === "string" && body.message.trim()) {
+          return body.message;
+        }
+        if (typeof body.error === "string" && body.error.trim()) {
+          return body.error;
+        }
+      }
     }
-    const text = await res.text();
-    if (text.trim()) return text.slice(0, 220);
-  } catch {
-    // Ignore parse fallback failure
+    if (trimmed) return trimmed.slice(0, 220);
+  } catch (err) {
+    console.warn("Failed to read HTTP error response body:", err);
   }
   return `HTTP ${res.status} ${res.statusText}`;
 }
 
 async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(url, init);
+  const res = await fetch(url, { credentials: "same-origin", ...init });
   if (!res.ok) {
     const detail = await parseErrorDetail(res);
     throw new ApiError(detail, res.status);
   }
   return (await res.json()) as T;
+}
+
+async function requestVoid(url: string, init?: RequestInit): Promise<void> {
+  const res = await fetch(url, { credentials: "same-origin", ...init });
+  if (!res.ok) {
+    const detail = await parseErrorDetail(res);
+    throw new ApiError(detail, res.status);
+  }
 }
 
 export function fetchHealth(): Promise<HealthResponse> {
@@ -152,13 +209,9 @@ export async function fetchPackTasks(): Promise<PackBuildTask[]> {
 }
 
 export async function deletePack(packId: string): Promise<void> {
-  const res = await fetch(`/api/packs/${encodeURIComponent(packId)}`, {
+  return requestVoid(`/api/packs/${encodeURIComponent(packId)}`, {
     method: "DELETE",
   });
-  if (!res.ok) {
-    const detail = await parseErrorDetail(res);
-    throw new ApiError(detail, res.status);
-  }
 }
 
 export function fetchGeocode(
@@ -191,11 +244,19 @@ export function fetchViewshedPreview(
   observer: ViewshedObserver,
   demSource: DemSourceKind = "auto",
   packId?: string | null,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  turnstileToken?: string | null
 ): Promise<ViewshedPreviewResponse> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+  };
+  const trimmedToken = turnstileToken?.trim();
+  if (trimmedToken) {
+    headers["X-Turnstile-Token"] = trimmedToken;
+  }
   return requestJson<ViewshedPreviewResponse>("/api/viewshed-preview", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers,
     body: JSON.stringify({
       observer,
       dem_source: demSource,
@@ -209,11 +270,19 @@ export function fetchRFLinkProfile(
   spec: RFLinkSpec,
   demSource: DemSourceKind = "auto",
   packId?: string | null,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  turnstileToken?: string | null
 ): Promise<RFLinkProfileResponse> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+  };
+  const trimmedToken = turnstileToken?.trim();
+  if (trimmedToken) {
+    headers["X-Turnstile-Token"] = trimmedToken;
+  }
   return requestJson<RFLinkProfileResponse>("/api/rf-link-profile", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers,
     body: JSON.stringify({
       ...spec,
       dem_source: demSource,
@@ -225,16 +294,24 @@ export function fetchRFLinkProfile(
 
 export function fetchRulerMetrics(
   points: { lat: number; lon: number }[],
-  demSource?: DemSourceKind,
+  demSource?: DemSourceKind | null,
   packId?: string | null,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  turnstileToken?: string | null
 ): Promise<RulerMetricsResponse> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+  };
+  const trimmedToken = turnstileToken?.trim();
+  if (trimmedToken) {
+    headers["X-Turnstile-Token"] = trimmedToken;
+  }
   return requestJson<RulerMetricsResponse>("/api/ruler-metrics", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers,
     body: JSON.stringify({
       points,
-      dem_source: demSource ?? "auto",
+      dem_source: demSource === undefined ? "auto" : demSource,
       pack_id: packId || null,
     }),
     signal,
@@ -346,13 +423,9 @@ export async function createProject(req: {
 }
 
 export async function deleteProject(projectId: string): Promise<void> {
-  const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}`, {
+  return requestVoid(`/api/projects/${encodeURIComponent(projectId)}`, {
     method: "DELETE",
   });
-  if (!res.ok) {
-    const detail = await parseErrorDetail(res);
-    throw new ApiError(detail, res.status);
-  }
 }
 
 export async function fetchJobs(): Promise<JobRecord[]> {
@@ -364,15 +437,21 @@ export async function fetchJobs(): Promise<JobRecord[]> {
 
 export function submitJob(
   payload: CreateJobPayload,
-  overlayFile?: File | null
+  overlayFile?: File | null,
+  turnstileToken?: string | null
 ): Promise<JobRecord> {
   const form = new FormData();
   form.append("payload", JSON.stringify(payload));
   if (overlayFile) {
     form.append("overlay_file", overlayFile, overlayFile.name);
   }
+  const trimmedToken = turnstileToken?.trim();
+  const headers = trimmedToken
+    ? { "X-Turnstile-Token": trimmedToken }
+    : undefined;
   return requestJson<JobRecord>("/api/jobs", {
     method: "POST",
+    headers,
     body: form,
   });
 }
@@ -385,13 +464,9 @@ export function cancelJob(jobId: string): Promise<JobRecord> {
 }
 
 export async function deleteJob(jobId: string): Promise<void> {
-  const res = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`, {
+  return requestVoid(`/api/jobs/${encodeURIComponent(jobId)}`, {
     method: "DELETE",
   });
-  if (!res.ok) {
-    const detail = await parseErrorDetail(res);
-    throw new ApiError(detail, res.status);
-  }
 }
 
 export function artifactDownloadUrl(
@@ -417,4 +492,93 @@ export function artifactPreviewUrl(
 
 export function jobThumbnailUrl(jobId: string): string {
   return `/api/jobs/${encodeURIComponent(jobId)}/thumbnail.png`;
+}
+
+export function fetchSession(signal?: AbortSignal): Promise<SessionResponse> {
+  return requestJson<SessionResponse>("/api/auth/session", { signal });
+}
+
+export function loginWithPassword(
+  req: LoginRequest
+): Promise<SessionResponse> {
+  return requestJson<SessionResponse>("/api/auth/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(req),
+  });
+}
+
+export function logoutSession(): Promise<SessionResponse> {
+  return requestJson<SessionResponse>("/api/auth/logout", {
+    method: "POST",
+  });
+}
+
+export function acceptInvite(
+  req: AcceptInviteRequest
+): Promise<SessionResponse> {
+  return requestJson<SessionResponse>("/api/auth/accept-invite", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(req),
+  });
+}
+
+export function googleAuthStartUrl(inviteToken?: string | null): string {
+  const trimmed = inviteToken?.trim() ?? "";
+  if (trimmed) {
+    return `/api/auth/google/start?invite_token=${encodeURIComponent(trimmed)}`;
+  }
+  return "/api/auth/google/start";
+}
+
+export function fetchAdminUsage(): Promise<AdminUsageResponse> {
+  return requestJson<AdminUsageResponse>("/api/admin/usage");
+}
+
+export function fetchAdminUsers(): Promise<AdminUsersResponse> {
+  return requestJson<AdminUsersResponse>("/api/admin/users");
+}
+
+export function createAdminInvite(
+  req: CreateInviteRequest
+): Promise<CreateInviteResponse> {
+  return requestJson<CreateInviteResponse>("/api/admin/invites", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(req),
+  });
+}
+
+export function revokeAdminInvite(
+  inviteId: string
+): Promise<RevokeInviteResponse> {
+  return requestJson<RevokeInviteResponse>(
+    `/api/admin/invites/${encodeURIComponent(inviteId)}`,
+    { method: "DELETE" }
+  );
+}
+
+export function updateAdminUser(
+  userId: string,
+  req: UpdateUserRequest
+): Promise<UpdateUserResponse> {
+  return requestJson<UpdateUserResponse>(
+    `/api/admin/users/${encodeURIComponent(userId)}`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(req),
+    }
+  );
+}
+
+export function updateAdminSettings(
+  req: AdminSettingsRequest
+): Promise<AdminSettingsResponse> {
+  return requestJson<AdminSettingsResponse>("/api/admin/settings", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(req),
+  });
 }

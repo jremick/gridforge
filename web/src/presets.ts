@@ -522,11 +522,23 @@ export const LOCATION_PRESETS: readonly LocationPreset[] = [
 ];
 
 export const SCALE_OPTIONS: readonly { value: number; label: string }[] = [
+  { value: 10000, label: "1:10,000" },
+  { value: 12500, label: "1:12,500" },
   { value: 15000, label: "1:15,000" },
   { value: 24000, label: "1:24,000" },
   { value: 25000, label: "1:25,000" },
   { value: 48000, label: "1:48,000" },
   { value: 50000, label: "1:50,000" },
+];
+
+export const DPI_OPTIONS: readonly {
+  value: number;
+  label: string;
+  shortLabel: string;
+}[] = [
+  { value: 300, label: "300 DPI (Standard)", shortLabel: "300 DPI" },
+  { value: 450, label: "450 DPI (High)", shortLabel: "450 DPI" },
+  { value: 600, label: "600 DPI (Ultra)", shortLabel: "600 DPI" },
 ];
 
 export const PAPER_OPTIONS: readonly {
@@ -742,6 +754,7 @@ export const HILLSHADE_OPTIONS: readonly {
 ];
 
 export const BASEMAP_OPTIONS: readonly { id: BasemapId; label: string }[] = [
+  { id: "vector", label: "Vector HD" },
   { id: "opentopo", label: "OpenTopoMap" },
   { id: "osm", label: "OSM Standard" },
   { id: "satellite", label: "Esri Imagery" },
@@ -776,6 +789,7 @@ export function createInitialFormState(): AppFormState {
     orientation: "portrait",
     color_mode: "color",
     units: "metric",
+    dpi: 300,
     grid_cols: 1,
     grid_rows: 1,
     dem_source: "auto",
@@ -807,6 +821,7 @@ export function createInitialFormState(): AppFormState {
       gpkg_tiles: false,
       osmand_sqlitedb: false,
       field_bundle_zip: false,
+      export_dpi: 300,
     },
     overlayFile: null,
     waypoints: [],
@@ -930,7 +945,7 @@ const STAGE_LABELS: Record<string, string> = {
   building_terrain: "Generating contours & hillshade",
   viewshed: "Computing RF / LOS viewshed",
   rendering: "Rendering PyQGIS map sheet",
-  rendering_pdf: "Rendering 300 DPI print PDF",
+  rendering_pdf: "Rendering print PDF",
   rendering_supplements: "Generating RF Link / Route Card / Index",
   merging_atlas: "Merging multi-sheet Atlas PDF",
   exporting_mbtiles: "Exporting ATAK .mbtiles",
@@ -984,8 +999,12 @@ function shellQuote(arg: string): string {
   return "'" + arg.replace(/'/g, "'\\''") + "'";
 }
 
+function formatScaleK(scale: number): string {
+  return scale % 1000 === 0 ? `${scale / 1000}k` : `${Number((scale / 1000).toFixed(1))}k`;
+}
+
 function slugifyFilename(state: AppFormState): string {
-  const raw = state.title.trim() || `sheet_${Math.round(state.scale / 1000)}k`;
+  const raw = state.title.trim() || `sheet_${formatScaleK(state.scale)}`;
   const slug = raw
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "_")
@@ -1182,6 +1201,10 @@ export function buildCliCommand(state: AppFormState): CliCopyResult {
   }
 
   if (pdfEnabled) {
+    if (state.dpi !== 300) args.push(`--dpi ${state.dpi}`);
+    if (digital && state.outputs.export_dpi !== state.dpi) {
+      args.push(`--export-dpi ${state.outputs.export_dpi}`);
+    }
     if (state.outputs.geopdf) args.push("--geopdf");
     if (state.show_fold_marks) args.push("--fold-marks");
     if (state.include_atlas_index) args.push("--atlas-index");
@@ -1212,12 +1235,24 @@ export function buildCliCommand(state: AppFormState): CliCopyResult {
     }
     args.push(`--output /out/${slug}.pdf`);
   } else if (state.outputs.gpkg_tiles) {
+    if (state.outputs.export_dpi !== 300) {
+      args.push(`--dpi ${state.outputs.export_dpi}`);
+    }
     args.push(`--format gpkg`, `--output /out/${slug}.gpkg`);
   } else if (state.outputs.osmand_sqlitedb) {
+    if (state.outputs.export_dpi !== 300) {
+      args.push(`--dpi ${state.outputs.export_dpi}`);
+    }
     args.push(`--format osmand`, `--output /out/${slug}.sqlitedb`);
   } else if (state.outputs.field_bundle_zip) {
+    if (state.outputs.export_dpi !== 300) {
+      args.push(`--dpi ${state.outputs.export_dpi}`);
+    }
     args.push(`--format bundle`, `--output /out/${slug}_field_bundle.zip`);
   } else {
+    if (state.outputs.export_dpi !== 300) {
+      args.push(`--dpi ${state.outputs.export_dpi}`);
+    }
     const fmt =
       state.outputs.mbtiles && state.outputs.kmz
         ? "both"

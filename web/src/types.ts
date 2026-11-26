@@ -41,7 +41,7 @@ export type USOverlayKind =
 export type WaypointCategory = "waypoint" | "camp" | "water" | "hazard" | "lz";
 export type MBTilesFormat = "png" | "jpg";
 export type GarminProfile = "standard" | "modern";
-export type BasemapId = "opentopo" | "osm" | "satellite" | "offline";
+export type BasemapId = "vector" | "opentopo" | "osm" | "satellite" | "offline";
 export type PackDemTier =
   | "auto"
   | "srtm-1s"
@@ -98,6 +98,7 @@ export interface OutputOptions {
   gpkg_tiles: boolean;
   osmand_sqlitedb: boolean;
   field_bundle_zip: boolean;
+  export_dpi: number;
 }
 
 export interface WaypointInput {
@@ -418,6 +419,7 @@ export interface CreateJobPayload {
   orientation: Orientation;
   color_mode: ColorMode;
   units: Units;
+  dpi: number;
   title: string | null;
   date_iso?: string | null;
   dem_source: DemSourceKind;
@@ -483,6 +485,7 @@ export interface AppFormState {
   orientation: Orientation;
   color_mode: ColorMode;
   units: Units;
+  dpi: number;
   grid_cols: number;
   grid_rows: number;
   dem_source: DemSourceKind;
@@ -541,4 +544,187 @@ export interface AtlasGridOption {
   label: string;
   cols: number;
   rows: number;
+}
+
+export type AuthMode = "none" | "hosted";
+export type UserRole = "none" | "guest" | "friend" | "admin";
+export type AccountRole = "friend" | "admin";
+export type OutputKey =
+  | "pdf"
+  | "geopdf"
+  | "mbtiles"
+  | "kmz"
+  | "gpkg_tiles"
+  | "osmand_sqlitedb"
+  | "field_bundle_zip";
+
+export interface SessionUser {
+  user_id: string;
+  email: string;
+  display_name: string | null;
+  role: AccountRole;
+}
+
+export interface SessionCapabilities {
+  max_grid_cells: number;
+  max_grid_cols: number;
+  max_grid_rows: number;
+  strip_atlas_allowed: boolean;
+  max_strip_sheets: number;
+  allowed_outputs: string[];
+  packs_manage_allowed: boolean;
+  max_upload_bytes: number;
+  max_dpi?: number;
+  max_export_dpi?: number;
+  turnstile_required: boolean;
+  turnstile_sitekey: string | null;
+  google_oauth_enabled: boolean;
+}
+
+export interface SessionQuotas {
+  daily_renders_limit: number | null;
+  daily_renders_used: number;
+  daily_renders_remaining: number | null;
+  hourly_previews_limit: number | null;
+  hourly_previews_used: number;
+  hourly_previews_remaining: number | null;
+  public_renders_paused: boolean;
+  global_daily_public_limit: number | null;
+  global_daily_public_used: number;
+}
+
+export interface SessionResponse {
+  auth_mode: AuthMode;
+  authenticated: boolean;
+  user: SessionUser | null;
+  role: UserRole;
+  capabilities: SessionCapabilities;
+  quotas: SessionQuotas;
+  brand_name?: string;
+  brand_subtitle?: string;
+  brand_tagline?: string;
+}
+
+export interface LoginRequest {
+  email: string;
+  password: string;
+}
+
+export interface AcceptInviteRequest {
+  token: string;
+  email?: string;
+  password: string;
+  display_name?: string;
+}
+
+export interface AdminUsageSummary {
+  renders_today: number;
+  renders_7d: number;
+  previews_today: number;
+  active_queue_depth: number;
+  global_daily_public_used: number;
+  global_daily_public_limit: number | null;
+  public_renders_paused: boolean;
+  avg_elapsed_seconds: number | null;
+  max_peak_rss_mb: number | null;
+}
+
+export interface AdminUsageRoleRow {
+  role?: string;
+  renders_today?: number;
+  renders_7d?: number;
+  previews_today?: number;
+  [key: string]: number | string | undefined;
+}
+
+export interface AdminUsageEvent {
+  event_id?: number | string;
+  created_at: string;
+  event_type: string;
+  actor_role?: UserRole | string;
+  actor_id?: string | null;
+  job_id?: string | null;
+  role?: UserRole | string;
+  owner_id?: string | null;
+  endpoint?: string | null;
+  status_code?: number | null;
+  detail?: Record<string, unknown> | string | null;
+  elapsed_seconds?: number | null;
+  peak_rss_mb?: number | null;
+  [key: string]: unknown;
+}
+
+export interface AdminUsageResponse {
+  summary: AdminUsageSummary;
+  by_role: Record<string, AdminUsageRoleRow | number>;
+  recent_events: AdminUsageEvent[];
+}
+
+export interface AdminUserRecord {
+  user_id: string;
+  email: string;
+  display_name: string | null;
+  role: AccountRole;
+  disabled: boolean;
+  daily_render_limit: number | null;
+  hourly_preview_limit: number | null;
+  has_password?: boolean;
+  has_google?: boolean;
+  renders_today?: number;
+  created_at: string;
+  last_login_at?: string | null;
+}
+
+export interface AdminInviteRecord {
+  invite_id: string;
+  email: string | null;
+  role: AccountRole;
+  expires_at: string;
+  created_at?: string;
+  used_at?: string | null;
+  accepted_at?: string | null;
+  revoked_at?: string | null;
+  status?: "pending" | "used" | "revoked" | "expired";
+}
+
+export interface AdminUsersResponse {
+  users: AdminUserRecord[];
+  invites: AdminInviteRecord[];
+}
+
+export interface CreateInviteRequest {
+  email?: string | null;
+  role?: AccountRole;
+  expires_hours?: number;
+}
+
+export interface CreateInviteResponse {
+  invite_id: string;
+  token: string;
+  invite_path: string;
+  expires_at: string;
+}
+
+export interface RevokeInviteResponse {
+  revoked: boolean;
+  invite_id: string;
+}
+
+export interface UpdateUserRequest {
+  disabled?: boolean;
+  daily_render_limit?: number | null;
+  hourly_preview_limit?: number | null;
+  role?: AccountRole;
+}
+
+export interface UpdateUserResponse {
+  user: AdminUserRecord;
+}
+
+export interface AdminSettingsRequest {
+  public_renders_paused: boolean;
+}
+
+export interface AdminSettingsResponse {
+  public_renders_paused: boolean;
 }

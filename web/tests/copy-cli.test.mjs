@@ -2,7 +2,13 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
 
-import { buildCliCommand, createInitialFormState } from "../src/presets.ts";
+import {
+  BASEMAP_OPTIONS,
+  DPI_OPTIONS,
+  SCALE_OPTIONS,
+  buildCliCommand,
+  createInitialFormState,
+} from "../src/presets.ts";
 
 // Capture the tokens a POSIX shell actually hands to Docker.
 function dockerArgs(state) {
@@ -142,4 +148,36 @@ test("v1.4.0 themes, Canada overlays, RF links, tactical graphics, and new digit
   assert.equal(option(args, "--gpkg"), "/out/sheet_25k_a4_night-red.gpkg");
   assert.equal(option(args, "--osmand"), "/out/sheet_25k_a4_night-red.sqlitedb");
   assert.equal(option(args, "--field-bundle"), "/out/sheet_25k_a4_night-red_field_bundle.zip");
+});
+
+test("fine tactical scales (1:10k, 1:12.5k), high DPI options, and Vector HD basemap work cleanly", () => {
+  assert.ok(SCALE_OPTIONS.some((s) => s.value === 10000));
+  assert.ok(SCALE_OPTIONS.some((s) => s.value === 12500));
+  assert.deepEqual(
+    DPI_OPTIONS.map((d) => d.value),
+    [300, 450, 600]
+  );
+  assert.ok(BASEMAP_OPTIONS.some((b) => b.id === "vector"));
+
+  const state = createInitialFormState();
+  state.scale = 12500;
+  state.dpi = 600;
+  state.outputs.mbtiles = true;
+  state.outputs.export_dpi = 450;
+
+  const args = dockerArgs(state);
+  assert.equal(args[0], "render");
+  assert.equal(option(args, "--scale"), "12500");
+  assert.equal(option(args, "--dpi"), "600");
+  assert.equal(option(args, "--export-dpi"), "450");
+  assert.equal(option(args, "--output"), "/out/sheet_12_5k_a4_color.pdf");
+
+  // Digital-only export uses --dpi from outputs.export_dpi
+  state.outputs.pdf = false;
+  state.scale = 10000;
+  const expArgs = dockerArgs(state);
+  assert.equal(expArgs[0], "export");
+  assert.equal(option(expArgs, "--scale"), "10000");
+  assert.equal(option(expArgs, "--dpi"), "450");
+  assert.equal(option(expArgs, "--output"), "/out/sheet_10k_a4_color.mbtiles");
 });

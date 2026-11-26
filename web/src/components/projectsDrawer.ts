@@ -16,6 +16,7 @@ export interface ProjectsDrawerCallbacks {
     last_job_id: string | null;
   };
   onToast: (message: string, kind: "success" | "error" | "info") => void;
+  onApiError?: (err: unknown, context: "projects") => void;
 }
 
 function formatDateLabel(iso: string): string {
@@ -142,13 +143,19 @@ export class ProjectsDrawer {
     }
   }
 
+  clear(): void {
+    this.projects = [];
+    this.countEl.textContent = "0";
+    this.renderList();
+  }
+
   async refresh(): Promise<void> {
     try {
       this.projects = await fetchProjects();
       this.countEl.textContent = String(this.projects.length);
       this.renderList();
-    } catch {
-      // Keep last known projects cleanly
+    } catch (err) {
+      this.callbacks.onApiError?.(err, "projects");
     }
   }
 
@@ -182,6 +189,7 @@ export class ProjectsDrawer {
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Failed to save project";
       this.callbacks.onToast(msg, "error");
+      this.callbacks.onApiError?.(err, "projects");
     } finally {
       this.saving = false;
       this.saveBtn.disabled = false;
@@ -207,6 +215,7 @@ export class ProjectsDrawer {
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Failed to clone project";
       this.callbacks.onToast(msg, "error");
+      this.callbacks.onApiError?.(err, "projects");
     } finally {
       this.busyIds.delete(proj.project_id);
       this.renderList();
@@ -224,6 +233,7 @@ export class ProjectsDrawer {
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Failed to delete project";
       this.callbacks.onToast(msg, "error");
+      this.callbacks.onApiError?.(err, "projects");
     } finally {
       this.busyIds.delete(id);
       this.renderList();

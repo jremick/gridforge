@@ -38,7 +38,12 @@ const EXTERNAL_SOURCE_IDS = new Set([
   "osm-standard",
   "opentopomap",
   "esri-imagery",
+  "openmaptiles",
+  "ne2_shaded",
 ]);
+
+const OPENFREEMAP_STYLE_URL = "https://tiles.openfreemap.org/styles/liberty";
+const VECTOR_LAYER_PREFIX = "gf-ofm-";
 
 export interface GridForgeMapCallbacks {
   onCenterDrag: (lat: number, lon: number) => void;
@@ -52,6 +57,7 @@ export interface GridForgeMapCallbacks {
   onMapSectorFinish?: () => void;
   onCursorMove?: (lat: number, lon: number) => void;
   onExternalTileFailure?: () => void;
+  onVectorBasemapError?: () => void;
 }
 
 export interface GridForgeMapOptions {
@@ -708,6 +714,7 @@ function rfStatusColor(entry: RFLinkEntry): string {
 
 export class GridForgeMap {
   private readonly container: HTMLElement;
+  private readonly callbacks: GridForgeMapCallbacks;
   private readonly map: maplibregl.Map;
   private readonly marker: maplibregl.Marker;
   private isLoaded = false;
@@ -727,6 +734,26 @@ export class GridForgeMap {
   private pendingRuler: { lat: number; lon: number }[] | null = null;
   private pendingOfflineBasemap: BasemapInfoResponse | null = null;
 
+  private lastGrid: FeatureCollection = EMPTY_FC;
+  private lastStripRoute: FeatureCollection = EMPTY_FC;
+  private lastWaypoints: WaypointInput[] = [];
+  private lastViewsheds: ViewshedEntry[] = [];
+  private lastTactical: {
+    graphics: TacticalGraphic[];
+    sectorDraft: [number, number][];
+  } = { graphics: [], sectorDraft: [] };
+  private lastRFLinks: {
+    links: RFLinkEntry[];
+    pendingFrom: { lat: number; lon: number; label: string } | null;
+  } = { links: [], pendingFrom: null };
+  private lastRuler: { lat: number; lon: number }[] = [];
+  private lastOfflineBasemap: BasemapInfoResponse | null = null;
+
+  private vectorStyleCache: maplibregl.StyleSpecification | null = null;
+  private vectorStyleMerged = false;
+  private vectorLayerIds: string[] = [];
+  private vectorLoadInFlight: Promise<void> | null = null;
+
   private offlineBasemapReady = false;
   private offlineBasemapKey = "";
   private reportedExternalTileFail = false;
@@ -742,6 +769,7 @@ export class GridForgeMap {
     options?: GridForgeMapOptions
   ) {
     this.container = container;
+    this.callbacks = callbacks;
     const initLat = options?.initialLat ?? DEFAULT_CENTER_LAT;
     const initLon = options?.initialLon ?? DEFAULT_CENTER_LON;
     const initZoom = options?.initialZoom ?? DEFAULT_MAP_ZOOM;
@@ -850,7 +878,11 @@ export class GridForgeMap {
         this.attachOfflineBasemapLayer(this.pendingOfflineBasemap);
         this.pendingOfflineBasemap = null;
       }
-      this.applyBasemapVisibility();
+      if (this.currentBasemap === "vector" && !this.vectorStyleMerged) {
+        void this.ensureVectorBasemapLoaded();
+      } else {
+        this.applyBasemapVisibility();
+      }
       if (this.pendingFootprint || this.pendingGrid) {
         this.applyGeoJson(
           this.pendingFootprint ?? EMPTY_FC,
@@ -893,6 +925,7 @@ export class GridForgeMap {
   }
 
   enableOfflineBasemap(info: BasemapInfoResponse): void {
+    this.lastOfflineBasemap = info;
     if (!this.isLoaded) {
       this.pendingOfflineBasemap = info;
       return;
@@ -985,12 +1018,159 @@ export class GridForgeMap {
 
   setBasemap(basemap: BasemapId): void {
     this.currentBasemap = basemap;
-    if (this.isLoaded) {
-      this.applyBasemapVisibility();
+    if (!this.isLoaded) return;
+    if (basemap === "vector" && !this.vectorStyleMerged) {
+      void this.ensureVectorBasemapLoaded();
+      return;
     }
+    this.applyBasemapVisibility();
+  }
+
+  private async ensureVectorBasemapLoaded(): Promise<void> {
+    if (this.vectorStyleMerged) {
+      this.applyBasemapVisibility();
+      return;
+    }
+    if (this.vectorLoadInFlight) {
+      await this.vectorLoadInFlight;
+      return;
+    }
+
+    const loadPromise = (async () => {
+      try {
+        let vecStyle = this.vectorStyleCache;
+        if (!vecStyle) {
+          const resp = await fetch(OPENFREEMAP_STYLE_URL, {
+            headers: { Accept: "application/json" },
+          });
+          if (!resp.ok) {
+            throw new Error(`OpenFreeMap style HTTP ${resp.status}`);
+          }
+          const parsed = (await resp.json()) as Partial<maplibregl.StyleSpecification>;
+          if (
+            !parsed ||
+            typeof parsed !== "object" ||
+            !parsed.sources ||
+            !Array.isArray(parsed.layers)
+          ) {
+            throw new Error("Invalid OpenFreeMap style payload");
+          }
+          vecStyle = parsed as maplibregl.StyleSpecification;
+          this.vectorStyleCache = vecStyle;
+        }
+
+        const baseStyle = buildInitialStyle();
+        const showVectorNow = this.currentBasemap === "vector";
+        const vecLayerIds: string[] = [];
+        const prefixedVectorLayers: maplibregl.LayerSpecification[] =
+          vecStyle.layers.map((rawLayer) => {
+            const id = `${VECTOR_LAYER_PREFIX}${rawLayer.id}`;
+            vecLayerIds.push(id);
+            return {
+              ...rawLayer,
+              id,
+              layout: {
+                ...(rawLayer.layout ?? {}),
+                visibility: showVectorNow ? "visible" : "none",
+              },
+            } as maplibregl.LayerSpecification;
+          });
+
+        const bgLayer = baseStyle.layers[0];
+        const restBaseLayers = baseStyle.layers.slice(1);
+        const mergedLayers: maplibregl.LayerSpecification[] = [
+          ...(bgLayer ? [bgLayer] : []),
+          ...prefixedVectorLayers,
+          ...restBaseLayers,
+        ];
+
+        const mergedStyle: maplibregl.StyleSpecification = {
+          version: 8,
+          sources: {
+            ...vecStyle.sources,
+            ...baseStyle.sources,
+          },
+          layers: mergedLayers,
+        };
+        if (vecStyle.glyphs) {
+          mergedStyle.glyphs = vecStyle.glyphs;
+        }
+        if (vecStyle.sprite) {
+          mergedStyle.sprite = vecStyle.sprite;
+        }
+
+        this.vectorLayerIds = vecLayerIds;
+        this.isLoaded = false;
+        this.map.once("style.load", () => {
+          this.isLoaded = true;
+          this.vectorStyleMerged = true;
+          this.rehydrateOverlaysAndVisibility();
+        });
+        this.map.setStyle(mergedStyle);
+      } catch (err) {
+        console.warn("Vector HD basemap failed to load:", err);
+        if (this.currentBasemap === "vector") {
+          this.currentBasemap = this.offlineBasemapReady
+            ? "offline"
+            : "opentopo";
+          if (this.isLoaded) {
+            this.applyBasemapVisibility();
+          }
+          this.callbacks.onVectorBasemapError?.();
+        }
+      } finally {
+        this.vectorLoadInFlight = null;
+      }
+    })();
+
+    this.vectorLoadInFlight = loadPromise;
+    await loadPromise;
+  }
+
+  private rehydrateOverlaysAndVisibility(): void {
+    const offlineInfo = this.pendingOfflineBasemap ?? this.lastOfflineBasemap;
+    this.pendingOfflineBasemap = null;
+    if (offlineInfo) {
+      this.offlineBasemapKey = "";
+      this.attachOfflineBasemapLayer(offlineInfo);
+    }
+
+    const fp = this.pendingFootprint ?? this.currentFootprint ?? EMPTY_FC;
+    const grid = this.pendingGrid ?? this.lastGrid;
+    this.pendingFootprint = null;
+    this.pendingGrid = null;
+    this.applyGeoJson(fp, grid);
+
+    const stripRoute = this.pendingStripRoute ?? this.lastStripRoute;
+    this.pendingStripRoute = null;
+    this.applyStripRoute(stripRoute);
+
+    const wps = this.pendingWaypoints ?? this.lastWaypoints;
+    this.pendingWaypoints = null;
+    this.applyWaypoints(wps);
+
+    const vs = this.pendingViewsheds ?? this.lastViewsheds;
+    this.pendingViewsheds = null;
+    this.applyViewsheds(vs);
+
+    const tac = this.pendingTactical ?? this.lastTactical;
+    this.pendingTactical = null;
+    this.applyTacticalGraphics(tac.graphics, tac.sectorDraft);
+
+    const rf = this.pendingRFLinks ?? this.lastRFLinks;
+    this.pendingRFLinks = null;
+    this.applyRFLinks(rf.links, rf.pendingFrom);
+
+    const ruler = this.pendingRuler ?? this.lastRuler;
+    this.pendingRuler = null;
+    this.applyRuler(ruler);
+
+    this.applyBasemapVisibility();
   }
 
   private applyBasemapVisibility(): void {
+    const showVector =
+      this.currentBasemap === "vector" && this.vectorStyleMerged;
     const showOsm =
       this.currentBasemap === "osm" || this.currentBasemap === "opentopo";
     const showOpenTopo = this.currentBasemap === "opentopo";
@@ -998,21 +1178,37 @@ export class GridForgeMap {
     const showOffline =
       this.currentBasemap === "offline" && this.offlineBasemapReady;
 
-    this.map.setLayoutProperty(
-      "basemap-osm-underlay",
-      "visibility",
-      showOsm ? "visible" : "none"
-    );
-    this.map.setLayoutProperty(
-      "basemap-opentopo",
-      "visibility",
-      showOpenTopo ? "visible" : "none"
-    );
-    this.map.setLayoutProperty(
-      "basemap-satellite",
-      "visibility",
-      showSat ? "visible" : "none"
-    );
+    for (const vecId of this.vectorLayerIds) {
+      if (this.map.getLayer(vecId)) {
+        this.map.setLayoutProperty(
+          vecId,
+          "visibility",
+          showVector ? "visible" : "none"
+        );
+      }
+    }
+
+    if (this.map.getLayer("basemap-osm-underlay")) {
+      this.map.setLayoutProperty(
+        "basemap-osm-underlay",
+        "visibility",
+        showOsm ? "visible" : "none"
+      );
+    }
+    if (this.map.getLayer("basemap-opentopo")) {
+      this.map.setLayoutProperty(
+        "basemap-opentopo",
+        "visibility",
+        showOpenTopo ? "visible" : "none"
+      );
+    }
+    if (this.map.getLayer("basemap-satellite")) {
+      this.map.setLayoutProperty(
+        "basemap-satellite",
+        "visibility",
+        showSat ? "visible" : "none"
+      );
+    }
     if (this.map.getLayer("basemap-offline")) {
       this.map.setLayoutProperty(
         "basemap-offline",
@@ -1113,6 +1309,7 @@ export class GridForgeMap {
   ): void {
     this.currentFootprint = footprint;
     const gridData = showGridLines ? grid : EMPTY_FC;
+    this.lastGrid = gridData;
     if (!this.isLoaded) {
       this.pendingFootprint = footprint;
       this.pendingGrid = gridData;
@@ -1127,6 +1324,7 @@ export class GridForgeMap {
 
   updateStripRoute(routeGeoJson: FeatureCollection | null): void {
     const fc = routeGeoJson ?? EMPTY_FC;
+    this.lastStripRoute = fc;
     if (!this.isLoaded) {
       this.pendingStripRoute = fc;
       return;
@@ -1135,6 +1333,7 @@ export class GridForgeMap {
   }
 
   updateWaypoints(waypoints: WaypointInput[]): void {
+    this.lastWaypoints = [...waypoints];
     if (!this.isLoaded) {
       this.pendingWaypoints = [...waypoints];
       return;
@@ -1143,6 +1342,7 @@ export class GridForgeMap {
   }
 
   updateViewsheds(entries: ViewshedEntry[]): void {
+    this.lastViewsheds = [...entries];
     if (!this.isLoaded) {
       this.pendingViewsheds = [...entries];
       return;
@@ -1154,6 +1354,10 @@ export class GridForgeMap {
     graphics: TacticalGraphic[],
     sectorDraft: [number, number][] = []
   ): void {
+    this.lastTactical = {
+      graphics: [...graphics],
+      sectorDraft: [...sectorDraft],
+    };
     if (!this.isLoaded) {
       this.pendingTactical = {
         graphics: [...graphics],
@@ -1168,6 +1372,7 @@ export class GridForgeMap {
     links: RFLinkEntry[],
     pendingFrom: { lat: number; lon: number; label: string } | null = null
   ): void {
+    this.lastRFLinks = { links: [...links], pendingFrom };
     if (!this.isLoaded) {
       this.pendingRFLinks = { links: [...links], pendingFrom };
       return;
@@ -1176,6 +1381,7 @@ export class GridForgeMap {
   }
 
   updateRuler(points: { lat: number; lon: number }[]): void {
+    this.lastRuler = [...points];
     if (!this.isLoaded) {
       this.pendingRuler = [...points];
       return;

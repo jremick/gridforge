@@ -5,7 +5,9 @@ import {
   fetchPacks,
   startPackBuild,
 } from "../api";
+import { TrapFocusHelper } from "../modalFocus";
 import { escapeHtml, formatBytes, formatDuration } from "../presets";
+import { classifyApiError } from "../session";
 import type {
   PackBuildTask,
   PackDemTier,
@@ -20,6 +22,7 @@ export interface PacksModalCallbacks {
   onBasemapRefresh: () => void;
   onToast: (message: string, kind: "success" | "error" | "info") => void;
   getCurrentBBoxString: () => string | null;
+  onApiError?: (err: unknown) => void;
 }
 
 type ModalRegionTab = PackRegionGroup | "custom";
@@ -34,6 +37,7 @@ function formatLatDeg(lat: number): string {
 
 export class PacksModal {
   private readonly root: HTMLElement;
+  private readonly panelEl: HTMLElement;
   private readonly callbacks: PacksModalCallbacks;
   private readonly installedEl: HTMLElement;
   private readonly regionsEl: HTMLElement;
@@ -43,8 +47,11 @@ export class PacksModal {
   private readonly incDemCheck: HTMLInputElement;
   private readonly incOverlaysCheck: HTMLInputElement;
   private readonly incBasemapCheck: HTMLInputElement;
+  private readonly focusTrap: TrapFocusHelper;
 
   private isOpen = false;
+  private manageAllowed = true;
+  private tasksDeniedMessage: string | null = null;
   private activeTab: ModalRegionTab = "au_tactical";
   private packs: PackSummary[] = [];
   private regions: PackRegionPreset[] = [];
@@ -61,18 +68,18 @@ export class PacksModal {
     this.root.className = "gf-modal-backdrop hidden";
     this.root.setAttribute("role", "dialog");
     this.root.setAttribute("aria-modal", "true");
-    this.root.setAttribute("aria-label", "Offline Pack Manager");
+    this.root.setAttribute("aria-labelledby", "gf-packs-modal-title");
 
     this.root.innerHTML = `
       <div class="gf-modal-panel" data-role="modal-panel">
         <div class="gf-modal-header">
           <div class="gf-modal-title-group">
             <span class="gf-section-index">AIR-GAP</span>
-            <h2 class="gf-modal-title">Offline Pack Manager</h2>
+            <h2 class="gf-modal-title" id="gf-packs-modal-title">Offline Pack Manager</h2>
           </div>
           <div class="gf-drawer-actions">
-            <button type="button" class="gf-icon-btn" data-role="modal-refresh" title="Refresh packs &amp; tasks">↻</button>
-            <button type="button" class="gf-icon-btn" data-role="modal-close" title="Close (Esc)">×</button>
+            <button type="button" class="gf-icon-btn" data-role="modal-refresh" aria-label="Refresh packs and tasks" title="Refresh packs &amp; tasks">↻</button>
+            <button type="button" class="gf-icon-btn" data-role="modal-close" aria-label="Close dialog" title="Close (Esc)">×</button>
           </div>
         </div>
 
@@ -136,6 +143,7 @@ export class PacksModal {
       </div>
     `;
 
+    this.panelEl = this.q("[data-role='modal-panel']");
     this.installedEl = this.q("[data-role='installed-list']");
     this.regionsEl = this.q("[data-role='regions-list']");
     this.tasksEl = this.q("[data-role='pack-tasks']");
@@ -148,6 +156,7 @@ export class PacksModal {
     this.incBasemapCheck = this.q<HTMLInputElement>(
       "[data-role='pack-inc-basemap']"
     );
+    this.focusTrap = new TrapFocusHelper(this.panelEl);
 
     this.bindEvents();
   }
@@ -245,16 +254,34 @@ export class PacksModal {
     return this.isOpen;
   }
 
+  setManageAllowed(allowed: boolean): void {
+    this.manageAllowed = allowed;
+    if (!allowed && this.isOpen) {
+      this.close();
+    }
+  }
+
   open(): void {
+    if (!this.manageAllowed) {
+      this.callbacks.onToast(
+        "Offline Pack Manager is restricted to admins in hosted mode.",
+        "info"
+      );
+      return;
+    }
     this.isOpen = true;
+    this.tasksDeniedMessage = null;
     this.root.classList.remove("hidden");
+    this.focusTrap.activate(this.q("[data-role='modal-close']"));
     void this.refreshAll();
   }
 
   close(): void {
+    if (!this.isOpen) return;
     this.isOpen = false;
     this.root.classList.add("hidden");
     this.stopPolling();
+    this.focusTrap.deactivate();
   }
 
   private stopPolling(): void {
@@ -302,6 +329,13 @@ export class PacksModal {
   }
 
   private async refreshAll(): Promise<void> {
+    if (!this.manageAllowed) {
+      this.tasks = [];
+      this.tasksDeniedMessage = "Admin access required to manage offline packs.";
+      this.renderTasks();
+      return;
+    }
+
     const [packsRes, regionsRes, tasksRes] = await Promise.allSettled([
       fetchPacks(),
       this.regions.length > 0 ? Promise.resolve(this.regions) : fetchPackRegions(),
@@ -318,6 +352,13 @@ export class PacksModal {
     }
     if (tasksRes.status === "fulfilled") {
       this.tasks = tasksRes.value;
+      this.tasksDeniedMessage = null;
+    } else {
+      const classified = classifyApiError(tasksRes.reason);
+      if (classified.status === 401 || classified.status === 403) {
+        this.tasksDeniedMessage = "Admin access required for pack build tasks.";
+        this.callbacks.onApiError?.(tasksRes.reason);
+      }
     }
 
     this.renderInstalled();
@@ -391,6 +432,7 @@ export class PacksModal {
       const msg =
         err instanceof Error ? err.message : "Failed to start pack build";
       this.callbacks.onToast(msg, "error");
+      this.callbacks.onApiError?.(err);
     } finally {
       this.submittingRegion = null;
       this.renderRegions();
@@ -411,6 +453,7 @@ export class PacksModal {
       const msg =
         err instanceof Error ? err.message : "Failed to delete offline pack";
       this.callbacks.onToast(msg, "error");
+      this.callbacks.onApiError?.(err);
     } finally {
       this.deletingIds.delete(packId);
       this.renderInstalled();
@@ -418,6 +461,11 @@ export class PacksModal {
   }
 
   private renderTasks(): void {
+    if (this.tasksDeniedMessage) {
+      this.tasksEl.classList.remove("hidden");
+      this.tasksEl.innerHTML = `<div class="gf-form-error" role="alert">${escapeHtml(this.tasksDeniedMessage)}</div>`;
+      return;
+    }
     const visible = this.tasks.slice(0, 3);
     if (visible.length === 0) {
       this.tasksEl.classList.add("hidden");

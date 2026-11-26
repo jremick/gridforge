@@ -1,4 +1,4 @@
-import { fetchGeocode } from "../api";
+import { ApiError, fetchGeocode } from "../api";
 import {
   ATLAS_GRID_OPTIONS,
   AU_OVERLAY_OPTIONS,
@@ -8,6 +8,7 @@ import {
   COLOR_MODE_OPTIONS,
   DEM_SOURCE_OPTIONS,
   DENSITY_OPTIONS,
+  DPI_OPTIONS,
   HILLSHADE_OPTIONS,
   LOCATION_PRESETS,
   NZ_OVERLAY_OPTIONS,
@@ -22,6 +23,16 @@ import {
   isStripEligibleFile,
   looksLikeCoordOrMgrs,
 } from "../presets";
+import {
+  DEFAULT_MAX_UPLOAD_BYTES,
+  createDefaultNoneSession,
+  formatUploadLimitLabel,
+  getEffectiveMaxDpi,
+  getEffectiveMaxExportDpi,
+  isAtlasOptionAllowed,
+  isGuestRenderPaused,
+  isOutputAllowed,
+} from "../session";
 import { renderRFLinkSvg } from "./rfChart";
 import type {
   AUOverlayKind,
@@ -39,11 +50,13 @@ import type {
   MapInteractionMode,
   NZOverlayKind,
   Orientation,
+  OutputKey,
   PackSummary,
   PaperSize,
   PresetRegionTab,
   RouteMetricsResponse,
   RulerMetricsResponse,
+  SessionResponse,
   USOverlayKind,
   Units,
   WaypointCategory,
@@ -96,6 +109,8 @@ export interface SidebarCallbacks {
   onRefreshPacks: () => void;
   onSubmitJob: () => void;
   onCopyCli: () => void;
+  onApiError?: (err: unknown, source: "geocode") => void;
+  onOpenAuth?: () => void;
 }
 
 const GEOCODE_DEBOUNCE_MS = 300;
@@ -132,10 +147,12 @@ export class SidebarPanel {
   private paperSelect!: HTMLSelectElement;
   private atlasGridEl!: HTMLElement;
   private atlasSublabelEl!: HTMLElement;
+  private atlasTierHintEl!: HTMLElement;
   private foldMarksCheck!: HTMLInputElement;
   private sheetAtlasIndexCheck!: HTMLInputElement;
   private demSelect!: HTMLSelectElement;
   private packSelect!: HTMLSelectElement;
+  private managePacksBtn!: HTMLButtonElement;
   private stateAutoCheck!: HTMLInputElement;
   private contourSelect!: HTMLSelectElement;
   private hillshadeSelect!: HTMLSelectElement;
@@ -182,6 +199,7 @@ export class SidebarPanel {
 
   // Sticky Footer Outputs
   private outPdfCheck!: HTMLInputElement;
+  private outPdfDpiSelect!: HTMLSelectElement;
   private outGeoPdfCheck!: HTMLInputElement;
   private outMbtilesCheck!: HTMLInputElement;
   private outMbtilesFmt!: HTMLSelectElement;
@@ -191,6 +209,7 @@ export class SidebarPanel {
   private outOsmandCheck!: HTMLInputElement;
   private outBundleCheck!: HTMLInputElement;
   private outDigitalGridCheck!: HTMLInputElement;
+  private outExportDpiSelect!: HTMLSelectElement;
   private digitalGridRow!: HTMLElement;
   private suppPagesBoxEl!: HTMLElement;
   private outCalibrationCheck!: HTMLInputElement;
@@ -198,12 +217,17 @@ export class SidebarPanel {
   private outElevProfileCheck!: HTMLInputElement;
   private outAtlasIndexCheck!: HTMLInputElement;
   private outRfLinkCardCheck!: HTMLInputElement;
+  private turnstileSlotEl!: HTMLElement;
+  private quotaNoticeEl!: HTMLElement;
   private generateBtn!: HTMLButtonElement;
   private formErrorEl!: HTMLElement;
   private sheetPillEl!: HTMLElement;
   private overlayPillEl!: HTMLElement;
   private cartoPillEl!: HTMLElement;
 
+  private session: SessionResponse = createDefaultNoneSession();
+  private maxUploadBytes = DEFAULT_MAX_UPLOAD_BYTES;
+  private isSubmitting = false;
   private activePresetTab: PresetRegionTab = "nsw-vic";
   private activePresetId: string | null = "blue-mountains";
   private interactionMode: MapInteractionMode = "pan";
@@ -331,6 +355,10 @@ export class SidebarPanel {
       (h) => `<option value="${h.value}">${escapeHtml(h.label)}</option>`
     ).join("");
 
+    const dpiOptsHtml = DPI_OPTIONS.map(
+      (d) => `<option value="${d.value}">${escapeHtml(d.shortLabel)}</option>`
+    ).join("");
+
     const cartoTogglesHtml = CARTO_TOGGLES.map(
       (t) => `
         <label class="gf-toggle-chip">
@@ -445,6 +473,7 @@ export class SidebarPanel {
               <div class="gf-atlas-grid" data-role="atlas-grid">
                 ${atlasBtnsHtml}
               </div>
+              <div class="gf-tier-hint hidden" data-role="atlas-tier-hint"></div>
               <div class="gf-atlas-extras">
                 <label class="gf-toggle-chip" title="Draw 0.20 mm corner registration & fold/join marks for multi-sheet assembly">
                   <input type="checkbox" data-role="fold-marks" />
@@ -610,7 +639,7 @@ export class SidebarPanel {
               <div class="gf-dropzone" data-role="dropzone">
                 <label class="gf-dropzone-label" for="gf-overlay-file">
                   <span class="gf-dropzone-title" data-role="file-title">Drop or browse overlay file…</span>
-                  <span class="gf-dropzone-sub" data-role="file-sub">Waypoints, tracks, or polygons (max 25 MB)</span>
+                  <span class="gf-dropzone-sub" data-role="file-sub">Waypoints, tracks, or polygons (max ${escapeHtml(formatUploadLimitLabel(this.maxUploadBytes))})</span>
                 </label>
                 <input
                   id="gf-overlay-file"
@@ -776,12 +805,22 @@ export class SidebarPanel {
           <div class="gf-output-line">
             <label class="gf-output-check">
               <input type="checkbox" data-role="out-pdf" />
-              <span>Print PDF (300 DPI)</span>
+              <span>Print PDF</span>
             </label>
-            <label class="gf-inline-check" title="Embed geospatial reference tags in PDF">
-              <input type="checkbox" data-role="out-geopdf" />
-              <span>GeoPDF</span>
-            </label>
+            <div class="gf-output-inline">
+              <select
+                class="gf-mini-select"
+                data-role="out-pdf-dpi"
+                aria-label="Print PDF resolution (DPI)"
+                title="Print PDF resolution (300 DPI standard; 450/600 DPI ultra-sharp hillshade)"
+              >
+                ${dpiOptsHtml}
+              </select>
+              <label class="gf-inline-check" title="Embed geospatial reference tags in PDF">
+                <input type="checkbox" data-role="out-geopdf" />
+                <span>GeoPDF</span>
+              </label>
+            </div>
           </div>
 
           <div class="gf-supp-pages" data-role="supp-pages">
@@ -850,12 +889,27 @@ export class SidebarPanel {
             </label>
           </div>
 
-          <label class="gf-inline-check" data-role="digital-grid-row" style="padding: 1px 4px;">
-            <input type="checkbox" data-role="out-digital-grid" />
-            <span>Include MGRS Grid on Digital Exports</span>
-          </label>
+          <div class="gf-digital-opts-row" data-role="digital-grid-row">
+            <label class="gf-inline-check">
+              <input type="checkbox" data-role="out-digital-grid" />
+              <span>MGRS Grid on Digital</span>
+            </label>
+            <div class="gf-output-inline">
+              <span class="gf-mini-label">Tiles</span>
+              <select
+                class="gf-mini-select"
+                data-role="out-export-dpi"
+                aria-label="Digital export tile resolution (DPI)"
+                title="Digital export rasterization DPI (higher DPI generates sharper max zoom tiles)"
+              >
+                ${dpiOptsHtml}
+              </select>
+            </div>
+          </div>
         </div>
 
+        <div class="gf-turnstile-slot hidden" data-role="turnstile-slot"></div>
+        <div class="gf-quota-notice hidden" data-role="quota-notice" role="status"></div>
         <div class="gf-form-error hidden" data-role="form-error"></div>
 
         <div class="gf-footer-actions">
@@ -888,12 +942,14 @@ export class SidebarPanel {
     this.paperSelect = this.q<HTMLSelectElement>("#gf-paper-select");
     this.atlasGridEl = this.q("[data-role='atlas-grid']");
     this.atlasSublabelEl = this.q("[data-role='atlas-sublabel']");
+    this.atlasTierHintEl = this.q("[data-role='atlas-tier-hint']");
     this.foldMarksCheck = this.q<HTMLInputElement>("[data-role='fold-marks']");
     this.sheetAtlasIndexCheck = this.q<HTMLInputElement>(
       "[data-role='sheet-atlas-index']"
     );
     this.demSelect = this.q<HTMLSelectElement>("#gf-dem-select");
     this.packSelect = this.q<HTMLSelectElement>("#gf-pack-select");
+    this.managePacksBtn = this.q<HTMLButtonElement>("[data-role='manage-packs']");
     this.stateAutoCheck = this.q<HTMLInputElement>("[data-role='au-state-auto']");
     this.contourSelect = this.q<HTMLSelectElement>("#gf-contour-select");
     this.hillshadeSelect = this.q<HTMLSelectElement>("#gf-hillshade-select");
@@ -948,6 +1004,7 @@ export class SidebarPanel {
     this.rfLinksListEl = this.q("[data-role='rf-links-list']");
 
     this.outPdfCheck = this.q<HTMLInputElement>("[data-role='out-pdf']");
+    this.outPdfDpiSelect = this.q<HTMLSelectElement>("[data-role='out-pdf-dpi']");
     this.outGeoPdfCheck = this.q<HTMLInputElement>("[data-role='out-geopdf']");
     this.outMbtilesCheck = this.q<HTMLInputElement>("[data-role='out-mbtiles']");
     this.outMbtilesFmt = this.q<HTMLSelectElement>(
@@ -962,6 +1019,9 @@ export class SidebarPanel {
     this.outBundleCheck = this.q<HTMLInputElement>("[data-role='out-bundle']");
     this.outDigitalGridCheck = this.q<HTMLInputElement>(
       "[data-role='out-digital-grid']"
+    );
+    this.outExportDpiSelect = this.q<HTMLSelectElement>(
+      "[data-role='out-export-dpi']"
     );
     this.digitalGridRow = this.q("[data-role='digital-grid-row']");
     this.suppPagesBoxEl = this.q("[data-role='supp-pages']");
@@ -980,6 +1040,8 @@ export class SidebarPanel {
     this.outRfLinkCardCheck = this.q<HTMLInputElement>(
       "[data-role='out-rf-link-card']"
     );
+    this.turnstileSlotEl = this.q("[data-role='turnstile-slot']");
+    this.quotaNoticeEl = this.q("[data-role='quota-notice']");
     this.generateBtn = this.q<HTMLButtonElement>("[data-role='generate-btn']");
     this.formErrorEl = this.q("[data-role='form-error']");
     this.sheetPillEl = this.q("[data-role='sheet-pill']");
@@ -1063,10 +1125,18 @@ export class SidebarPanel {
           this.closeGeocodeMenu();
           this.callbacks.onPlaceNotFound(value);
         }
-      } catch {
+      } catch (err) {
         if (!controller.signal.aborted) {
-          this.closeGeocodeMenu();
-          this.callbacks.onPlaceNotFound(value);
+          if (
+            err instanceof ApiError &&
+            (err.status === 429 || err.status === 503)
+          ) {
+            this.showGeocodeStatus(err.message);
+            this.callbacks.onApiError?.(err, "geocode");
+          } else {
+            this.closeGeocodeMenu();
+            this.callbacks.onPlaceNotFound(value);
+          }
         }
       }
     };
@@ -1198,6 +1268,9 @@ export class SidebarPanel {
           if (this.state.stripPlan) return;
           const cols = Number(btn.dataset.atlasCols);
           const rows = Number(btn.dataset.atlasRows);
+          if (!isAtlasOptionAllowed(cols, rows, this.session.capabilities)) {
+            return;
+          }
           if (
             this.state.grid_cols === cols &&
             this.state.grid_rows === rows
@@ -1441,8 +1514,10 @@ export class SidebarPanel {
     });
 
     const handleFile = (file: File | null) => {
-      if (file && file.size > 25 * 1024 * 1024) {
-        this.setFormError("Overlay file exceeds 25 MB limit.");
+      if (file && file.size > this.maxUploadBytes) {
+        this.setFormError(
+          `Overlay file exceeds ${formatUploadLimitLabel(this.maxUploadBytes)} limit.`
+        );
         return;
       }
       this.setFormError(null);
@@ -1484,6 +1559,7 @@ export class SidebarPanel {
       this.setFormError(null);
       const action = btn.dataset.stripAction;
       if (action === "plan") {
+        if (!this.session.capabilities.strip_atlas_allowed) return;
         this.callbacks.onAutoStripPlan();
       } else if (action === "clear") {
         this.callbacks.onClearStripPlan();
@@ -1760,25 +1836,7 @@ export class SidebarPanel {
 
     // Outputs
     const syncOutputControls = () => {
-      const o = this.state.outputs;
-      const pdfOn = o.pdf;
-      this.outGeoPdfCheck.disabled = !pdfOn;
-      this.outCalibrationCheck.disabled = !pdfOn;
-      this.outRouteCardCheck.disabled = !pdfOn;
-      this.outElevProfileCheck.disabled = !pdfOn;
-      this.outAtlasIndexCheck.disabled = !pdfOn;
-      this.outRfLinkCardCheck.disabled = !pdfOn;
-      this.suppPagesBoxEl.style.opacity = pdfOn ? "1" : "0.45";
-      if (!pdfOn) {
-        o.geopdf = false;
-        this.outGeoPdfCheck.checked = false;
-      }
-      this.outMbtilesFmt.disabled = !o.mbtiles;
-      this.outGarminProfile.disabled = !o.kmz;
-      const anyDigital =
-        o.mbtiles || o.kmz || o.gpkg_tiles || o.osmand_sqlitedb;
-      this.outDigitalGridCheck.disabled = !anyDigital;
-      this.digitalGridRow.style.opacity = anyDigital ? "1" : "0.45";
+      this.syncOutputLockStates();
 
       if (!this.hasAnyOutputEnabled()) {
         this.setFormError(
@@ -1876,6 +1934,39 @@ export class SidebarPanel {
       this.callbacks.onStateChange();
     });
 
+    this.outPdfDpiSelect.addEventListener("change", () => {
+      const nextDpi = Number(this.outPdfDpiSelect.value);
+      const maxDpi = getEffectiveMaxDpi(this.session.capabilities);
+      if (Number.isFinite(nextDpi) && nextDpi <= maxDpi) {
+        this.state.dpi = nextDpi;
+        this.updateSectionPills();
+        this.setFormError(null);
+        this.callbacks.onStateChange();
+      } else {
+        this.outPdfDpiSelect.value = String(this.state.dpi);
+      }
+    });
+
+    this.outExportDpiSelect.addEventListener("change", () => {
+      const nextDpi = Number(this.outExportDpiSelect.value);
+      const maxDpi = getEffectiveMaxExportDpi(this.session.capabilities);
+      if (Number.isFinite(nextDpi) && nextDpi <= maxDpi) {
+        this.state.outputs.export_dpi = nextDpi;
+        this.setFormError(null);
+        this.callbacks.onStateChange();
+      } else {
+        this.outExportDpiSelect.value = String(this.state.outputs.export_dpi);
+      }
+    });
+
+    this.quotaNoticeEl.addEventListener("click", (e) => {
+      const target = e.target as HTMLElement | null;
+      const btn = target?.closest<HTMLButtonElement>("[data-action='open-auth']");
+      if (btn) {
+        this.callbacks.onOpenAuth?.();
+      }
+    });
+
     this.generateBtn.addEventListener("click", () => {
       if (!this.hasAnyOutputEnabled()) {
         this.setFormError(
@@ -1924,9 +2015,17 @@ export class SidebarPanel {
       } else {
         this.renderGeocodeResults();
       }
-    } catch {
+    } catch (err) {
       if (!controller.signal.aborted) {
-        this.closeGeocodeMenu();
+        if (
+          err instanceof ApiError &&
+          (err.status === 429 || err.status === 503)
+        ) {
+          this.showGeocodeStatus(err.message);
+          this.callbacks.onApiError?.(err, "geocode");
+        } else {
+          this.closeGeocodeMenu();
+        }
       }
     }
   }
@@ -2003,17 +2102,40 @@ export class SidebarPanel {
 
   private updateAtlasButtons(): void {
     const stripActive = this.state.stripPlan !== null;
+    const cap = this.session.capabilities;
     this.atlasGridEl.classList.toggle("disabled", stripActive);
     this.root
       .querySelectorAll<HTMLButtonElement>("[data-atlas-cols]")
       .forEach((btn) => {
-        btn.disabled = stripActive;
+        const cols = Number(btn.dataset.atlasCols);
+        const rows = Number(btn.dataset.atlasRows);
+        const tierAllowed = isAtlasOptionAllowed(cols, rows, cap);
+        btn.disabled = stripActive || !tierAllowed;
+        btn.classList.toggle("tier-locked", !tierAllowed);
+        if (!tierAllowed) {
+          btn.title = "Friend invite required for multi-sheet atlases";
+        } else {
+          btn.title =
+            cols * rows === 1
+              ? "Single sheet"
+              : `${cols * rows} edge-matched sheets`;
+        }
         const active =
           !stripActive &&
-          Number(btn.dataset.atlasCols) === this.state.grid_cols &&
-          Number(btn.dataset.atlasRows) === this.state.grid_rows;
+          cols === this.state.grid_cols &&
+          rows === this.state.grid_rows;
         btn.classList.toggle("active", active);
       });
+
+    if (this.session.auth_mode === "hosted" && cap.max_grid_cells <= 1) {
+      this.atlasTierHintEl.textContent =
+        "Multi-sheet atlases require an invited Friend account.";
+      this.atlasTierHintEl.classList.remove("hidden");
+    } else {
+      this.atlasTierHintEl.textContent = "";
+      this.atlasTierHintEl.classList.add("hidden");
+    }
+
     if (stripActive && this.state.stripPlan) {
       const count =
         this.state.stripPlan.sheet_count ?? this.state.stripPlan.sheets.length;
@@ -2056,7 +2178,7 @@ export class SidebarPanel {
       this.fileClearBtn.hidden = false;
     } else {
       this.fileTitleEl.textContent = "Drop or browse overlay file…";
-      this.fileSubEl.textContent = "Waypoints, tracks, or polygons (max 25 MB)";
+      this.fileSubEl.textContent = `Waypoints, tracks, or polygons (max ${formatUploadLimitLabel(this.maxUploadBytes)})`;
       this.fileClearBtn.hidden = true;
     }
     this.renderStripBar();
@@ -2081,6 +2203,18 @@ export class SidebarPanel {
           <span class="gf-strip-badge mono">Strip Atlas: ${count} sheet${count === 1 ? "" : "s"} · ${plan.route_distance_km.toFixed(1)} km</span>
           <button type="button" class="gf-mini-btn danger" data-strip-action="clear">Clear Strip</button>
         </div>
+      `;
+    } else if (!this.session.capabilities.strip_atlas_allowed) {
+      this.stripBarEl.innerHTML = `
+        <button
+          type="button"
+          class="gf-strip-btn tier-locked"
+          data-strip-action="plan"
+          disabled
+          title="Friend invite required for Auto-Fit Strip Atlas"
+        >
+          <span>Auto-Fit Strip Atlas (Friend invite required)</span>
+        </button>
       `;
     } else {
       this.stripBarEl.innerHTML = `
@@ -2506,15 +2640,20 @@ export class SidebarPanel {
   }
 
   private updateSectionPills(): void {
-    const scaleK = `1:${Math.round(this.state.scale / 1000)}k`;
+    const scaleVal =
+      this.state.scale % 1000 === 0
+        ? `${this.state.scale / 1000}k`
+        : `${Number((this.state.scale / 1000).toFixed(1))}k`;
+    const scaleK = `1:${scaleVal}`;
     const paperLbl = this.state.paper.toUpperCase();
     const orientShort = this.state.orientation === "landscape" ? "L" : "P";
+    const dpiSuffix = this.state.dpi > 300 ? ` · ${this.state.dpi}` : "";
     const stripSuffix = this.state.stripPlan
       ? ` · Strip ${this.state.stripPlan.sheet_count ?? this.state.stripPlan.sheets.length}sh`
       : this.state.grid_cols * this.state.grid_rows > 1
         ? ` · ${this.state.grid_cols}×${this.state.grid_rows}`
         : "";
-    this.sheetPillEl.textContent = `${scaleK} · ${paperLbl} ${orientShort}${stripSuffix}`;
+    this.sheetPillEl.textContent = `${scaleK} · ${paperLbl} ${orientShort}${dpiSuffix}${stripSuffix}`;
 
     const overlayCount =
       this.state.au_overlays.length +
@@ -2641,38 +2780,28 @@ export class SidebarPanel {
     this.rfBandSelect.value = bandMatch ? String(bandMatch.freq_mhz) : "custom";
 
     const o = this.state.outputs;
-    const pdfOn = o.pdf;
-    this.outPdfCheck.checked = pdfOn;
+    this.outPdfCheck.checked = o.pdf;
+    this.outPdfDpiSelect.value = String(this.state.dpi);
     this.outGeoPdfCheck.checked = o.geopdf;
-    this.outGeoPdfCheck.disabled = !pdfOn;
     this.outCalibrationCheck.checked = this.state.include_calibration_page;
-    this.outCalibrationCheck.disabled = !pdfOn;
     this.outRouteCardCheck.checked = this.state.include_route_card;
-    this.outRouteCardCheck.disabled = !pdfOn;
     this.wpRouteCardCheck.checked = this.state.include_route_card;
     this.outElevProfileCheck.checked = this.state.include_elevation_profile;
-    this.outElevProfileCheck.disabled = !pdfOn;
     this.outAtlasIndexCheck.checked = this.state.include_atlas_index;
-    this.outAtlasIndexCheck.disabled = !pdfOn;
     this.outRfLinkCardCheck.checked = this.state.include_rf_link_card;
-    this.outRfLinkCardCheck.disabled = !pdfOn;
     this.rfCardCheck.checked = this.state.include_rf_link_card;
-    this.suppPagesBoxEl.style.opacity = pdfOn ? "1" : "0.45";
 
     this.outMbtilesCheck.checked = o.mbtiles;
     this.outMbtilesFmt.value = o.mbtiles_format;
-    this.outMbtilesFmt.disabled = !o.mbtiles;
     this.outKmzCheck.checked = o.kmz;
     this.outGarminProfile.value = o.garmin_profile;
-    this.outGarminProfile.disabled = !o.kmz;
     this.outGpkgCheck.checked = o.gpkg_tiles;
     this.outOsmandCheck.checked = o.osmand_sqlitedb;
     this.outBundleCheck.checked = o.field_bundle_zip;
     this.outDigitalGridCheck.checked = o.include_grid_on_digital;
-    const anyDigital = o.mbtiles || o.kmz || o.gpkg_tiles || o.osmand_sqlitedb;
-    this.outDigitalGridCheck.disabled = !anyDigital;
-    this.digitalGridRow.style.opacity = anyDigital ? "1" : "0.45";
+    this.outExportDpiSelect.value = String(o.export_dpi);
 
+    this.syncOutputLockStates();
     this.syncFileDisplay();
     this.renderRulerBox();
     this.renderSectorDraftBar();
@@ -2683,6 +2812,180 @@ export class SidebarPanel {
     this.updateAtlasButtons();
     this.updatePresetButtons();
     this.updateSectionPills();
+  }
+
+  private syncOutputLockStates(): void {
+    const o = this.state.outputs;
+    const cap = this.session.capabilities;
+    const hosted = this.session.auth_mode === "hosted";
+
+    const applyTierLock = (
+      input: HTMLInputElement,
+      key: OutputKey,
+      defaultTitle: string
+    ): boolean => {
+      const allowed = isOutputAllowed(key, cap);
+      const wrap = input.closest<HTMLElement>(
+        ".gf-output-line, .gf-inline-check, .gf-output-chip"
+      );
+      if (wrap) {
+        wrap.classList.toggle("tier-locked", hosted && !allowed);
+        if (hosted && !allowed) {
+          wrap.title = "Friend invite required";
+        } else if (defaultTitle) {
+          wrap.title = defaultTitle;
+        } else {
+          wrap.removeAttribute("title");
+        }
+      }
+      return allowed;
+    };
+
+    const pdfAllowed = applyTierLock(this.outPdfCheck, "pdf", "");
+    const geopdfAllowed = applyTierLock(
+      this.outGeoPdfCheck,
+      "geopdf",
+      "Embed geospatial reference tags in PDF"
+    );
+    const mbtilesAllowed = applyTierLock(this.outMbtilesCheck, "mbtiles", "");
+    const kmzAllowed = applyTierLock(this.outKmzCheck, "kmz", "");
+    const gpkgAllowed = applyTierLock(
+      this.outGpkgCheck,
+      "gpkg_tiles",
+      "OGC GeoPackage Raster Tiles (.gpkg) for QGIS, AlpineQuest & Gaia"
+    );
+    const osmandAllowed = applyTierLock(
+      this.outOsmandCheck,
+      "osmand_sqlitedb",
+      "OsmAnd / Locus Map BigPlanet SQLite (.sqlitedb)"
+    );
+    const bundleAllowed = applyTierLock(
+      this.outBundleCheck,
+      "field_bundle_zip",
+      "Single Field Bundle (.zip) containing PDF, digital tiles, GPX 1.1 & README"
+    );
+
+    const pdfOn = o.pdf && pdfAllowed;
+    const maxDpi = getEffectiveMaxDpi(cap);
+    const maxExportDpi = getEffectiveMaxExportDpi(cap);
+    this.outPdfCheck.disabled = !pdfAllowed;
+    this.outPdfDpiSelect.disabled = !pdfOn;
+    for (const opt of Array.from(this.outPdfDpiSelect.options)) {
+      const val = Number(opt.value);
+      const locked = Number.isFinite(val) && val > maxDpi;
+      opt.disabled = locked;
+      const baseOpt = DPI_OPTIONS.find((d) => d.value === val);
+      opt.textContent = locked
+        ? `${baseOpt?.shortLabel ?? `${val} DPI`} (Sign in)`
+        : baseOpt?.shortLabel ?? `${val} DPI`;
+    }
+    this.outPdfDpiSelect.title =
+      hosted && maxDpi < 600
+        ? `Guest print resolution capped at ${maxDpi} DPI (sign in for 450/600 DPI)`
+        : "Print PDF resolution (300 DPI standard; 450/600 DPI ultra-sharp hillshade)";
+    this.outGeoPdfCheck.disabled = !pdfOn || !geopdfAllowed;
+    this.outCalibrationCheck.disabled = !pdfOn;
+    this.outRouteCardCheck.disabled = !pdfOn;
+    this.outElevProfileCheck.disabled = !pdfOn;
+    this.outAtlasIndexCheck.disabled = !pdfOn;
+    this.outRfLinkCardCheck.disabled = !pdfOn;
+    this.suppPagesBoxEl.style.opacity = pdfOn ? "1" : "0.45";
+    if (!pdfOn || !geopdfAllowed) {
+      o.geopdf = false;
+      this.outGeoPdfCheck.checked = false;
+    }
+
+    this.outMbtilesCheck.disabled = !mbtilesAllowed;
+    this.outMbtilesFmt.disabled = !mbtilesAllowed || !o.mbtiles;
+    this.outKmzCheck.disabled = !kmzAllowed;
+    this.outGarminProfile.disabled = !kmzAllowed || !o.kmz;
+    this.outGpkgCheck.disabled = !gpkgAllowed;
+    this.outOsmandCheck.disabled = !osmandAllowed;
+    this.outBundleCheck.disabled = !bundleAllowed;
+
+    const anyDigital =
+      o.mbtiles || o.kmz || o.gpkg_tiles || o.osmand_sqlitedb;
+    this.outDigitalGridCheck.disabled = !anyDigital;
+    this.outExportDpiSelect.disabled = !anyDigital;
+    for (const opt of Array.from(this.outExportDpiSelect.options)) {
+      const val = Number(opt.value);
+      const locked = Number.isFinite(val) && val > maxExportDpi;
+      opt.disabled = locked;
+      const baseOpt = DPI_OPTIONS.find((d) => d.value === val);
+      opt.textContent = locked
+        ? `${baseOpt?.shortLabel ?? `${val} DPI`} (Sign in)`
+        : baseOpt?.shortLabel ?? `${val} DPI`;
+    }
+    this.outExportDpiSelect.title =
+      hosted && maxExportDpi < 600
+        ? `Guest export resolution capped at ${maxExportDpi} DPI (sign in for 450/600 DPI)`
+        : "Digital export rasterization DPI (higher DPI generates sharper max zoom tiles)";
+    this.digitalGridRow.style.opacity = anyDigital ? "1" : "0.45";
+  }
+
+  applySession(session: SessionResponse): void {
+    this.session = session;
+    this.maxUploadBytes =
+      session.capabilities.max_upload_bytes || DEFAULT_MAX_UPLOAD_BYTES;
+    const hosted = session.auth_mode === "hosted";
+    this.managePacksBtn.hidden =
+      hosted && !session.capabilities.packs_manage_allowed;
+
+    this.syncFileDisplay();
+    this.updateAtlasButtons();
+    this.syncOutputLockStates();
+    this.syncQuotaNoticeAndGenerateBtn();
+  }
+
+  getTurnstileContainer(): HTMLElement {
+    return this.turnstileSlotEl;
+  }
+
+  private syncQuotaNoticeAndGenerateBtn(): void {
+    const hosted = this.session.auth_mode === "hosted";
+    const q = this.session.quotas;
+    const paused = isGuestRenderPaused(this.session);
+    const dailyExhausted =
+      hosted &&
+      q.daily_renders_remaining !== null &&
+      q.daily_renders_remaining <= 0;
+    const globalExhausted =
+      hosted &&
+      this.session.role === "guest" &&
+      q.global_daily_public_limit !== null &&
+      q.global_daily_public_used >= q.global_daily_public_limit;
+
+    let noticeHtml = "";
+    let blockedReason = "";
+
+    if (paused) {
+      noticeHtml =
+        "Public renders are temporarily paused by the administrator.";
+      blockedReason = noticeHtml;
+    } else if (dailyExhausted) {
+      if (this.session.role === "guest") {
+        noticeHtml = `Daily guest render quota reached (0/${q.daily_renders_limit} left). <button type="button" class="gf-link-btn" data-action="open-auth">Sign in</button> for higher limits.`;
+        blockedReason = "Daily guest render quota reached";
+      } else {
+        noticeHtml = `Daily render quota reached (0/${q.daily_renders_limit} left). Resets in 24h.`;
+        blockedReason = "Daily render quota reached";
+      }
+    } else if (globalExhausted) {
+      noticeHtml = `Global daily public render budget reached. <button type="button" class="gf-link-btn" data-action="open-auth">Sign in</button> or try again tomorrow.`;
+      blockedReason = "Global daily public render budget reached";
+    }
+
+    if (noticeHtml) {
+      this.quotaNoticeEl.innerHTML = noticeHtml;
+      this.quotaNoticeEl.classList.remove("hidden");
+    } else {
+      this.quotaNoticeEl.innerHTML = "";
+      this.quotaNoticeEl.classList.add("hidden");
+    }
+
+    this.generateBtn.disabled =
+      this.isSubmitting || paused || dailyExhausted || globalExhausted;
+    this.generateBtn.title = blockedReason;
   }
 
   setPlanningStrip(planning: boolean): void {
@@ -2759,10 +3062,11 @@ export class SidebarPanel {
   }
 
   setSubmitting(isSubmitting: boolean): void {
-    this.generateBtn.disabled = isSubmitting;
+    this.isSubmitting = isSubmitting;
     this.generateBtn.innerHTML = isSubmitting
       ? `<span>Submitting Job…</span>`
       : `<span>Generate Map Sheet</span>`;
+    this.syncQuotaNoticeAndGenerateBtn();
   }
 
   setFormError(message: string | null): void {

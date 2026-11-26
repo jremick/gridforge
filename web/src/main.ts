@@ -1,5 +1,6 @@
 import "./styles.css";
 import {
+  ApiError,
   cancelJob,
   deleteJob,
   fetchBasemapInfo,
@@ -10,10 +11,14 @@ import {
   fetchRFLinkProfile,
   fetchRouteMetrics,
   fetchRulerMetrics,
+  fetchSession,
   fetchStripPlan,
   fetchViewshedPreview,
+  logoutSession,
   submitJob,
 } from "./api";
+import { AdminModal } from "./components/adminModal";
+import { AuthModal } from "./components/authModal";
 import { JobsDrawer } from "./components/jobsDrawer";
 import { PacksModal } from "./components/packsModal";
 import { ProjectsDrawer } from "./components/projectsDrawer";
@@ -26,6 +31,7 @@ import {
   CA_OVERLAY_OPTIONS,
   COLOR_MODE_OPTIONS,
   DEM_SOURCE_OPTIONS,
+  DPI_OPTIONS,
   NZ_OVERLAY_OPTIONS,
   PAPER_OPTIONS,
   SCALE_OPTIONS,
@@ -36,6 +42,23 @@ import {
   formatCoords,
   parseLatLon,
 } from "./presets";
+import {
+  clampFormStateToCapabilities,
+  classifyApiError,
+  createDefaultNoneSession,
+  extractAuthErrorFromSearch,
+  extractInviteTokenFromSearch,
+  isGuestRenderPaused,
+} from "./session";
+import {
+  DEFAULT_SIDEBAR_WIDTH,
+  MIN_SIDEBAR_WIDTH,
+  clampSidebarWidth,
+  getMaxSidebarWidthForViewport,
+  loadSidebarPrefs,
+  saveSidebarPrefs,
+} from "./sidebarPrefs";
+import { TurnstileController } from "./turnstile";
 import type {
   AUOverlayKind,
   AppFormState,
@@ -56,6 +79,7 @@ import type {
   RFLinkSpec,
   RulerMetricsResponse,
   SavedProject,
+  SessionResponse,
   TacticalGraphic,
   USOverlayKind,
   Units,
@@ -72,6 +96,7 @@ const IDLE_JOBS_POLL_MS = 10000;
 const HEALTH_POLL_MS = 5000;
 
 const VALID_SCALES = new Set(SCALE_OPTIONS.map((s) => s.value));
+const VALID_DPIS = new Set(DPI_OPTIONS.map((d) => d.value));
 const VALID_PAPERS = new Set<string>(PAPER_OPTIONS.map((p) => p.value));
 const VALID_MODES = new Set<string>(COLOR_MODE_OPTIONS.map((m) => m.value));
 const VALID_DEMS = new Set<string>(DEM_SOURCE_OPTIONS.map((d) => d.value));
@@ -124,6 +149,16 @@ function hydrateStateFromUrl(state: AppFormState): {
   const unitsParam = params.get("units")?.toLowerCase();
   if (unitsParam === "metric" || unitsParam === "imperial") {
     state.units = unitsParam as Units;
+  }
+
+  const dpiParam = Number(params.get("dpi"));
+  if (VALID_DPIS.has(dpiParam)) {
+    state.dpi = dpiParam;
+  }
+
+  const exportDpiParam = Number(params.get("export_dpi"));
+  if (VALID_DPIS.has(exportDpiParam)) {
+    state.outputs.export_dpi = exportDpiParam;
   }
 
   const demParam = params.get("dem")?.toLowerCase();
@@ -246,6 +281,19 @@ function hydrateStateFromUrl(state: AppFormState): {
   return { hasCustomCenter, needsFlyToResolvedCenter };
 }
 
+type ApiErrorContext =
+  | "job"
+  | "viewshed"
+  | "rf"
+  | "geocode"
+  | "strip"
+  | "ruler"
+  | "packs"
+  | "projects"
+  | "jobs-poll"
+  | "admin"
+  | "general";
+
 class GridForgeApp {
   private readonly state = createInitialFormState();
   private readonly shellEl: HTMLElement;
@@ -254,18 +302,29 @@ class GridForgeApp {
   private readonly drawer: JobsDrawer;
   private readonly projectsDrawer: ProjectsDrawer;
   private readonly packsModal: PacksModal;
+  private readonly authModal: AuthModal;
+  private readonly adminModal: AdminModal;
+  private readonly turnstile: TurnstileController;
   private readonly map: GridForgeMap;
   private readonly basemapSwitcherEl: HTMLElement;
   private readonly offlineReadyBadgeEl: HTMLButtonElement;
+  private readonly globalStatusBannerEl: HTMLElement;
   private readonly footprintBannerEl: HTMLElement;
   private readonly mapHintEl: HTMLElement;
   private readonly mapHintTextEl: HTMLElement;
   private readonly cursorCoordsEl: HTMLElement;
   private readonly toastContainerEl: HTMLElement;
-  private readonly collapseBtnEl: HTMLButtonElement;
+  private readonly sidebarEl: HTMLElement;
+  private readonly sidebarResizerEl: HTMLElement;
   private readonly toolBarButtons: NodeListOf<HTMLButtonElement>;
 
+  private session: SessionResponse = createDefaultNoneSession();
+  private sessionRefreshInFlight: Promise<SessionResponse> | null = null;
+  private pendingInviteToken: string | null;
+  private pendingAuthError: string | null;
   private sidebarCollapsed = false;
+  private sidebarWidth = DEFAULT_SIDEBAR_WIDTH;
+  private sidebarPrefOwnerId: string | null = null;
   private drawerOpen = false;
   private projectsOpen = false;
   private interactionMode: MapInteractionMode = "pan";
@@ -294,6 +353,10 @@ class GridForgeApp {
   private rfLinkSeq = 1;
 
   constructor(root: HTMLElement) {
+    this.pendingInviteToken = extractInviteTokenFromSearch(
+      window.location.search
+    );
+    this.pendingAuthError = extractAuthErrorFromSearch(window.location.search);
     const urlHydration = hydrateStateFromUrl(this.state);
     this.initialFlyToResolved = urlHydration.needsFlyToResolvedCenter;
     this.viewshedSeq = this.state.viewsheds.length + 1;
@@ -304,15 +367,20 @@ class GridForgeApp {
         <main class="gf-workspace">
           <div class="gf-map-container" data-role="map"></div>
 
-          <button
-            type="button"
-            class="gf-sidebar-collapse-btn"
-            data-role="sidebar-toggle"
-            title="Toggle studio sidebar"
-            aria-label="Toggle studio sidebar"
-          >◂</button>
-
-          <aside data-role="sidebar"></aside>
+          <aside id="gf-studio-sidebar" data-role="sidebar"></aside>
+          <div
+            class="gf-sidebar-resizer"
+            data-role="sidebar-resizer"
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="Resize studio sidebar"
+            aria-controls="gf-studio-sidebar"
+            aria-valuemin="${MIN_SIDEBAR_WIDTH}"
+            aria-valuemax="560"
+            aria-valuenow="${DEFAULT_SIDEBAR_WIDTH}"
+            tabindex="0"
+            title="Drag to resize sidebar · Double-click to reset"
+          ></div>
 
           <div class="gf-map-toolbar">
             <div class="gf-toolbar-row">
@@ -346,6 +414,7 @@ class GridForgeApp {
             </div>
           </div>
 
+          <div class="gf-global-status-banner hidden" data-role="global-status-banner" role="status"></div>
           <div class="gf-footprint-banner hidden" data-role="footprint-banner"></div>
 
           <div class="gf-map-hint" data-role="map-hint">
@@ -357,6 +426,8 @@ class GridForgeApp {
           <aside data-role="projects-drawer"></aside>
         </main>
         <div data-role="packs-modal"></div>
+        <div data-role="auth-modal"></div>
+        <div data-role="admin-modal"></div>
         <div class="gf-toast-container" data-role="toasts"></div>
       </div>
     `;
@@ -367,23 +438,29 @@ class GridForgeApp {
       root,
       "[data-role='offline-ready-pill']"
     );
+    this.globalStatusBannerEl = this.q(
+      root,
+      "[data-role='global-status-banner']"
+    );
     this.footprintBannerEl = this.q(root, "[data-role='footprint-banner']");
     this.mapHintEl = this.q(root, "[data-role='map-hint']");
     this.mapHintTextEl = this.q(root, "[data-role='map-hint-text']");
     this.cursorCoordsEl = this.q(root, "[data-role='cursor-coords']");
     this.toastContainerEl = this.q(root, "[data-role='toasts']");
-    this.collapseBtnEl = this.q<HTMLButtonElement>(
-      root,
-      "[data-role='sidebar-toggle']"
-    );
+    this.sidebarEl = this.q(root, "[data-role='sidebar']");
+    this.sidebarResizerEl = this.q(root, "[data-role='sidebar-resizer']");
     this.toolBarButtons = root.querySelectorAll<HTMLButtonElement>(
       "[data-map-tool]"
     );
 
     this.telemetry = new TelemetryBar(this.q(root, "[data-role='topbar']"), {
+      onToggleSidebar: () => this.setSidebarCollapsed(!this.sidebarCollapsed),
       onToggleDrawer: () => this.setDrawerOpen(!this.drawerOpen),
       onToggleProjects: () => this.setProjectsOpen(!this.projectsOpen),
       onCopyMgrs: (mgrs) => this.copyText(mgrs, `Copied ${mgrs}`),
+      onOpenAuth: () => this.authModal.open(),
+      onSignOut: () => void this.handleSignOut(),
+      onOpenAdmin: () => this.adminModal.open(),
     });
 
     this.packsModal = new PacksModal(this.q(root, "[data-role='packs-modal']"), {
@@ -403,7 +480,33 @@ class GridForgeApp {
       },
       onToast: (msg, kind) => this.showToast(msg, kind),
       getCurrentBBoxString: () => this.map.getFootprintBBoxString(),
+      onApiError: (err) => {
+        this.handleApiError(err, "packs", "Offline pack request failed");
+      },
     });
+
+    this.authModal = new AuthModal(this.q(root, "[data-role='auth-modal']"), {
+      onSessionChanged: (nextSession) => {
+        this.applySession(nextSession);
+      },
+      onOpenAdmin: () => this.adminModal.open(),
+      onToast: (msg, kind) => this.showToast(msg, kind),
+    });
+
+    this.adminModal = new AdminModal(
+      this.q(root, "[data-role='admin-modal']"),
+      {
+        getCurrentUserId: () => this.session.user?.user_id ?? null,
+        onSettingsChanged: () => {
+          void this.refreshSession();
+        },
+        onCopyText: (text, label) => this.copyText(text, label),
+        onToast: (msg, kind) => this.showToast(msg, kind),
+        onApiError: (err) => {
+          this.handleApiError(err, "admin", "Admin request failed");
+        },
+      }
+    );
 
     this.projectsDrawer = new ProjectsDrawer(
       this.q(root, "[data-role='projects-drawer']"),
@@ -412,6 +515,9 @@ class GridForgeApp {
         onLoadProject: (proj) => this.loadProject(proj),
         getCurrentSnapshot: () => this.buildProjectSnapshot(),
         onToast: (msg, kind) => this.showToast(msg, kind),
+        onApiError: (err) => {
+          this.handleApiError(err, "projects", "Project request failed");
+        },
       }
     );
 
@@ -522,9 +628,27 @@ class GridForgeApp {
               : "Command copied. Run from the project directory. Results appear in ./out/."
           );
         },
+        onApiError: (err, source) => {
+          const msg = this.handleApiError(
+            err,
+            source,
+            "Place search temporarily unavailable"
+          );
+          this.showToast(msg, "error");
+        },
+        onOpenAuth: () => this.authModal.open(),
       },
       urlHydration.hasCustomCenter ? null : "blue-mountains"
     );
+
+    this.turnstile = new TurnstileController({
+      container: this.sidebar.getTurnstileContainer(),
+      onInteractiveNeeded: () => {
+        if (this.sidebarCollapsed) {
+          this.setSidebarCollapsed(false, { persist: false });
+        }
+      },
+    });
 
     this.drawer = new JobsDrawer(this.q(root, "[data-role='drawer']"), {
       onClose: () => this.setDrawerOpen(false),
@@ -570,6 +694,18 @@ class GridForgeApp {
         onExternalTileFailure: () => {
           this.offlineReadyBadgeEl.classList.remove("hidden");
         },
+        onVectorBasemapError: () => {
+          const fallback: BasemapId = this.basemapSwitcherEl.querySelector(
+            "[data-basemap='offline']"
+          )
+            ? "offline"
+            : "opentopo";
+          this.selectBasemap(fallback);
+          this.showToast(
+            "Vector HD tiles unavailable — switched back to raster basemap",
+            "info"
+          );
+        },
       },
       {
         initialLat: this.state.lat,
@@ -577,8 +713,9 @@ class GridForgeApp {
       }
     );
 
+    this.restoreSidebarPrefs(null);
     this.bindChromeEvents(root);
-    this.bootstrap();
+    void this.bootstrap();
   }
 
   private q<T extends HTMLElement = HTMLElement>(
@@ -590,12 +727,164 @@ class GridForgeApp {
     return el;
   }
 
-  private bindChromeEvents(root: HTMLElement): void {
-    this.collapseBtnEl.addEventListener("click", () => {
-      this.sidebarCollapsed = !this.sidebarCollapsed;
-      this.shellEl.classList.toggle("sidebar-collapsed", this.sidebarCollapsed);
-      this.collapseBtnEl.textContent = this.sidebarCollapsed ? "▸" : "◂";
+  private getEffectiveSidebarWidth(): number {
+    return clampSidebarWidth(this.sidebarWidth, window.innerWidth);
+  }
+
+  private applySidebarLayout(options: { resizeMap?: boolean } = {}): void {
+    const vw = window.innerWidth;
+    const effectiveWidth = clampSidebarWidth(this.sidebarWidth, vw);
+    const maxWidth = getMaxSidebarWidthForViewport(vw);
+
+    this.shellEl.style.setProperty("--sidebar-w", `${effectiveWidth}px`);
+    this.shellEl.classList.toggle("sidebar-collapsed", this.sidebarCollapsed);
+    this.sidebarEl.setAttribute("aria-hidden", String(this.sidebarCollapsed));
+    if ("inert" in this.sidebarEl) {
+      (this.sidebarEl as HTMLElement & { inert: boolean }).inert =
+        this.sidebarCollapsed;
+    }
+
+    this.sidebarResizerEl.setAttribute("aria-valuemin", String(MIN_SIDEBAR_WIDTH));
+    this.sidebarResizerEl.setAttribute("aria-valuemax", String(maxWidth));
+    this.sidebarResizerEl.setAttribute("aria-valuenow", String(effectiveWidth));
+    this.sidebarResizerEl.hidden = this.sidebarCollapsed;
+    this.telemetry.updateSidebarCollapsed(this.sidebarCollapsed);
+
+    if (options.resizeMap) {
       window.setTimeout(() => this.map.resize(), 240);
+    }
+  }
+
+  private restoreSidebarPrefs(userId: string | null): void {
+    this.sidebarPrefOwnerId = userId;
+    const prefs = loadSidebarPrefs(userId, window.innerWidth);
+    this.sidebarWidth = prefs.width;
+    this.sidebarCollapsed = prefs.collapsed;
+    this.applySidebarLayout({ resizeMap: false });
+  }
+
+  private persistSidebarPrefs(): void {
+    saveSidebarPrefs(
+      { width: this.sidebarWidth, collapsed: this.sidebarCollapsed },
+      this.sidebarPrefOwnerId,
+      window.innerWidth
+    );
+  }
+
+  private setSidebarCollapsed(
+    collapsed: boolean,
+    options: { persist?: boolean } = {}
+  ): void {
+    if (this.sidebarCollapsed === collapsed) return;
+    this.sidebarCollapsed = collapsed;
+    this.applySidebarLayout({ resizeMap: true });
+    if (options.persist !== false) {
+      this.persistSidebarPrefs();
+    }
+  }
+
+  private setSidebarWidth(
+    nextWidth: number,
+    options: { persist?: boolean; resizeMap?: boolean } = {}
+  ): void {
+    const clamped = clampSidebarWidth(nextWidth, window.innerWidth);
+    this.sidebarWidth = clamped;
+    this.applySidebarLayout({ resizeMap: Boolean(options.resizeMap) });
+    if (options.persist) {
+      this.persistSidebarPrefs();
+    }
+  }
+
+  private bindChromeEvents(root: HTMLElement): void {
+    let activePointerId: number | null = null;
+    let dragStartX = 0;
+    let dragStartWidth = this.sidebarWidth;
+
+    const finishDrag = (): void => {
+      if (activePointerId === null) return;
+      if (this.sidebarResizerEl.hasPointerCapture?.(activePointerId)) {
+        try {
+          this.sidebarResizerEl.releasePointerCapture(activePointerId);
+        } catch (err) {
+          console.debug("Pointer capture release skipped:", err);
+        }
+      }
+      activePointerId = null;
+      this.shellEl.classList.remove("is-resizing");
+      this.sidebarResizerEl.classList.remove("dragging");
+      this.persistSidebarPrefs();
+      this.map.resize();
+    };
+
+    this.sidebarResizerEl.addEventListener("pointerdown", (e) => {
+      if (e.button !== 0 || this.sidebarCollapsed) return;
+      e.preventDefault();
+      activePointerId = e.pointerId;
+      dragStartX = e.clientX;
+      dragStartWidth = this.getEffectiveSidebarWidth();
+      this.shellEl.classList.add("is-resizing");
+      this.sidebarResizerEl.classList.add("dragging");
+      try {
+        this.sidebarResizerEl.setPointerCapture?.(e.pointerId);
+      } catch (err) {
+        console.debug("Pointer capture unavailable:", err);
+      }
+    });
+
+    this.sidebarResizerEl.addEventListener("pointermove", (e) => {
+      if (activePointerId === null || e.pointerId !== activePointerId) return;
+      const delta = e.clientX - dragStartX;
+      this.setSidebarWidth(dragStartWidth + delta, {
+        persist: false,
+        resizeMap: false,
+      });
+    });
+
+    this.sidebarResizerEl.addEventListener("pointerup", (e) => {
+      if (activePointerId !== null && e.pointerId === activePointerId) {
+        finishDrag();
+      }
+    });
+
+    this.sidebarResizerEl.addEventListener("pointercancel", (e) => {
+      if (activePointerId !== null && e.pointerId === activePointerId) {
+        finishDrag();
+      }
+    });
+
+    this.sidebarResizerEl.addEventListener("dblclick", () => {
+      this.setSidebarWidth(DEFAULT_SIDEBAR_WIDTH, {
+        persist: true,
+        resizeMap: true,
+      });
+    });
+
+    this.sidebarResizerEl.addEventListener("keydown", (e) => {
+      if (this.sidebarCollapsed) return;
+      const step = e.shiftKey ? 48 : 16;
+      if (e.key === "ArrowLeft") {
+        e.preventDefault();
+        this.setSidebarWidth(this.getEffectiveSidebarWidth() - step, {
+          persist: true,
+          resizeMap: true,
+        });
+      } else if (e.key === "ArrowRight") {
+        e.preventDefault();
+        this.setSidebarWidth(this.getEffectiveSidebarWidth() + step, {
+          persist: true,
+          resizeMap: true,
+        });
+      } else if (e.key === "Home") {
+        e.preventDefault();
+        this.setSidebarWidth(DEFAULT_SIDEBAR_WIDTH, {
+          persist: true,
+          resizeMap: true,
+        });
+      }
+    });
+
+    window.addEventListener("resize", () => {
+      this.applySidebarLayout({ resizeMap: false });
     });
 
     this.basemapSwitcherEl.addEventListener("click", (e) => {
@@ -647,7 +936,11 @@ class GridForgeApp {
         Boolean(target?.isContentEditable);
 
       if (e.key === "Escape") {
-        if (this.packsModal.opened) {
+        if (this.adminModal.opened) {
+          this.adminModal.close();
+        } else if (this.authModal.opened) {
+          this.authModal.close();
+        } else if (this.packsModal.opened) {
           this.packsModal.close();
         } else if (this.interactionMode !== "pan") {
           this.setInteractionMode("pan");
@@ -659,7 +952,14 @@ class GridForgeApp {
         return;
       }
 
-      if (this.packsModal.opened || inInput) return;
+      if (
+        this.adminModal.opened ||
+        this.authModal.opened ||
+        this.packsModal.opened ||
+        inInput
+      ) {
+        return;
+      }
 
       if (e.key === "Enter" && this.interactionMode === "sector") {
         if (this.sectorDraft.length >= 3) {
@@ -672,9 +972,17 @@ class GridForgeApp {
       if (e.key === "/") {
         e.preventDefault();
         if (this.sidebarCollapsed) {
-          this.collapseBtnEl.click();
+          this.setSidebarCollapsed(false, { persist: false });
         }
         this.sidebar.focusCenterInput();
+      } else if (
+        e.key === "[" &&
+        !e.ctrlKey &&
+        !e.metaKey &&
+        !e.altKey
+      ) {
+        e.preventDefault();
+        this.setSidebarCollapsed(!this.sidebarCollapsed);
       } else if (
         (e.key === "f" || e.key === "F") &&
         !e.ctrlKey &&
@@ -796,30 +1104,276 @@ class GridForgeApp {
   }
 
   private fitSheetOnMap(): void {
-    this.map.fitFootprint(this.sidebarCollapsed ? 24 : 368);
+    this.map.fitFootprint(
+      this.sidebarCollapsed ? 24 : this.getEffectiveSidebarWidth()
+    );
   }
 
-  private bootstrap(): void {
+  private async bootstrap(): Promise<void> {
     this.requestFootprintImmediate({
       flyToResult: this.initialFlyToResolved,
       syncMarker: true,
       fitAfterLoad: this.state.grid_cols * this.state.grid_rows > 1,
     });
     void this.loadBasemapInfo(this.state.pack_id || null);
+
+    const session = await this.loadSession();
+    this.applySession(session, { isBootstrap: true });
+
+    const turnstileSyncPromise = this.turnstile
+      .syncSession(session)
+      .catch((err) => {
+        console.warn("Turnstile session sync skipped during bootstrap:", err);
+      });
+
     void this.loadHealth();
     void this.loadPacks(false);
     void this.pollJobsOnce();
 
-    if (this.state.viewsheds.length > 0) {
-      this.sidebar.openViewshedSection();
-      this.map.updateViewsheds(this.state.viewsheds);
-      for (const vs of this.state.viewsheds) {
-        void this.computeViewshedEntry(vs.id);
+    if (session.auth_mode === "hosted" && this.pendingInviteToken) {
+      const token = this.pendingInviteToken;
+      this.pendingInviteToken = null;
+      const bannerErr = this.pendingAuthError;
+      this.pendingAuthError = null;
+      if (!session.authenticated) {
+        this.authModal.open({
+          mode: "invite",
+          inviteToken: token,
+          bannerError: bannerErr,
+        });
+      }
+    } else if (this.pendingAuthError) {
+      const authErr = this.pendingAuthError;
+      this.pendingAuthError = null;
+      this.showToast(authErr, "error");
+      if (session.auth_mode === "hosted") {
+        this.authModal.open({
+          mode: "signin",
+          bannerError: authErr,
+        });
       }
     }
 
     window.setInterval(() => void this.loadHealth(), HEALTH_POLL_MS);
     window.setInterval(() => this.drawer.tickElapsed(), 1000);
+
+    if (this.state.viewsheds.length > 0) {
+      this.sidebar.openViewshedSection();
+      this.map.updateViewsheds(this.state.viewsheds);
+      if (session.capabilities.turnstile_required) {
+        await turnstileSyncPromise;
+        for (const vs of this.state.viewsheds) {
+          await this.computeViewshedEntry(vs.id);
+        }
+      } else {
+        for (const vs of this.state.viewsheds) {
+          void this.computeViewshedEntry(vs.id);
+        }
+      }
+    }
+  }
+
+  private async loadSession(): Promise<SessionResponse> {
+    if (this.sessionRefreshInFlight) {
+      return this.sessionRefreshInFlight;
+    }
+    let currentPromise: Promise<SessionResponse> | null = null;
+    currentPromise = (async (): Promise<SessionResponse> => {
+      try {
+        return await fetchSession();
+      } catch (err) {
+        if (err instanceof ApiError && err.status === 404) {
+          return createDefaultNoneSession();
+        }
+        console.warn("Failed to load session; keeping current session:", err);
+        return this.session;
+      } finally {
+        if (this.sessionRefreshInFlight === currentPromise) {
+          this.sessionRefreshInFlight = null;
+        }
+      }
+    })();
+    this.sessionRefreshInFlight = currentPromise;
+    return currentPromise;
+  }
+
+  private async refreshSession(): Promise<SessionResponse> {
+    const next = await this.loadSession();
+    this.applySession(next);
+    return next;
+  }
+
+  private applySession(
+    next: SessionResponse,
+    options: { isBootstrap?: boolean } = {}
+  ): void {
+    const prev = this.session;
+    const tenantChanged =
+      !options.isBootstrap &&
+      (prev.role !== next.role ||
+        (prev.user?.user_id ?? null) !== (next.user?.user_id ?? null));
+
+    this.session = next;
+    const nextPrefOwnerId = next.authenticated
+      ? (next.user?.user_id ?? null)
+      : null;
+    if (nextPrefOwnerId !== this.sidebarPrefOwnerId) {
+      this.restoreSidebarPrefs(nextPrefOwnerId);
+    }
+    this.telemetry.updateSession(next);
+    this.sidebar.applySession(next);
+    this.packsModal.setManageAllowed(next.capabilities.packs_manage_allowed);
+    this.authModal.setSession(next);
+    this.adminModal.syncPublicPaused(next.quotas.public_renders_paused);
+    this.syncGlobalStatusBanner(next);
+
+    if (!options.isBootstrap) {
+      void this.turnstile.syncSession(next);
+    }
+
+    if (next.auth_mode === "hosted") {
+      const prevGridCols = this.state.grid_cols;
+      const prevGridRows = this.state.grid_rows;
+      const prevPdf = this.state.outputs.pdf;
+      const clamped = clampFormStateToCapabilities(
+        this.state,
+        next.capabilities
+      );
+      if (clamped.changed) {
+        this.sidebar.syncControlsFromState();
+        this.syncUrlFromState();
+        const footprintChanged =
+          prevGridCols !== this.state.grid_cols ||
+          prevGridRows !== this.state.grid_rows ||
+          prevPdf !== this.state.outputs.pdf ||
+          clamped.resetItems.includes("atlas grid");
+        if (!options.isBootstrap || footprintChanged) {
+          this.requestFootprintImmediate({
+            flyToResult: options.isBootstrap ? this.initialFlyToResolved : false,
+            syncMarker: Boolean(options.isBootstrap),
+            fitAfterLoad: false,
+          });
+        }
+        if (!options.isBootstrap && clamped.resetItems.length > 0) {
+          this.showToast(
+            `Adjusted selections for your account tier (${clamped.resetItems.join(", ")})`,
+            "info"
+          );
+        }
+      }
+    }
+
+    if (next.role !== "admin" && this.adminModal.opened) {
+      this.adminModal.close();
+    }
+    if (!next.capabilities.packs_manage_allowed && this.packsModal.opened) {
+      this.packsModal.close();
+    }
+
+    if (tenantChanged) {
+      this.projectsDrawer.clear();
+      if (this.projectsOpen) {
+        void this.projectsDrawer.refresh();
+      }
+      void this.pollJobsOnce();
+    }
+  }
+
+  private syncGlobalStatusBanner(session: SessionResponse): void {
+    if (session.auth_mode !== "hosted") {
+      this.globalStatusBannerEl.classList.add("hidden");
+      this.globalStatusBannerEl.textContent = "";
+      return;
+    }
+
+    const q = session.quotas;
+    const globalExhausted =
+      session.role === "guest" &&
+      q.global_daily_public_limit !== null &&
+      q.global_daily_public_used >= q.global_daily_public_limit;
+
+    if (q.public_renders_paused && session.role === "admin") {
+      this.globalStatusBannerEl.textContent =
+        "Notice: Guest (public) renders are currently PAUSED (Friend and Admin renders remain active).";
+      this.globalStatusBannerEl.classList.remove("hidden");
+      return;
+    }
+
+    if (isGuestRenderPaused(session)) {
+      this.globalStatusBannerEl.textContent =
+        "Public renders are temporarily paused by the administrator.";
+      this.globalStatusBannerEl.classList.remove("hidden");
+      return;
+    }
+
+    if (globalExhausted) {
+      this.globalStatusBannerEl.textContent =
+        "Global daily public render budget reached. Sign in with an invited account or try again tomorrow.";
+      this.globalStatusBannerEl.classList.remove("hidden");
+      return;
+    }
+
+    this.globalStatusBannerEl.classList.add("hidden");
+    this.globalStatusBannerEl.textContent = "";
+  }
+
+  private async handleSignOut(): Promise<void> {
+    try {
+      const next = await logoutSession();
+      this.applySession(next);
+      this.showToast("Signed out", "info");
+    } catch (err) {
+      const msg = this.handleApiError(err, "general", "Failed to sign out");
+      this.showToast(msg, "error");
+    }
+  }
+
+  private handleApiError(
+    err: unknown,
+    context: ApiErrorContext,
+    fallbackMsg: string
+  ): string {
+    const info = classifyApiError(err);
+    const msg = info.message || fallbackMsg;
+
+    if (info.kind === "auth") {
+      const wasAuthenticated = this.session.authenticated;
+      void this.refreshSession();
+      if (context !== "jobs-poll" || wasAuthenticated) {
+        this.authModal.open({
+          mode: "signin",
+          bannerError: msg || "Please sign in to continue.",
+        });
+      }
+      return msg;
+    }
+
+    if (info.kind === "turnstile") {
+      this.turnstile.reset();
+      if (this.sidebarCollapsed) {
+        this.setSidebarCollapsed(false, { persist: false });
+      }
+      return `Security verification failed or expired (${msg}). Please try again.`;
+    }
+
+    if (info.kind === "forbidden") {
+      void this.refreshSession();
+      if (
+        this.session.auth_mode === "hosted" &&
+        this.session.role === "guest" &&
+        context !== "admin"
+      ) {
+        return `${msg} Sign in with an invited account for this feature.`;
+      }
+      return msg;
+    }
+
+    if (info.kind === "rate_limit" || info.kind === "service_unavailable") {
+      void this.refreshSession();
+      return msg;
+    }
+
+    return msg;
   }
 
   private async loadBasemapInfo(packId?: string | null): Promise<void> {
@@ -868,6 +1422,12 @@ class GridForgeApp {
     params.set("orientation", this.state.orientation);
     params.set("mode", this.state.color_mode);
     params.set("units", this.state.units);
+    if (this.state.dpi !== 300) {
+      params.set("dpi", String(this.state.dpi));
+    }
+    if (this.state.outputs.export_dpi !== 300) {
+      params.set("export_dpi", String(this.state.outputs.export_dpi));
+    }
     if (this.state.dem_source !== "auto") {
       params.set("dem", this.state.dem_source);
     }
@@ -982,6 +1542,7 @@ class GridForgeApp {
         orientation: this.state.orientation,
         color_mode: this.state.color_mode,
         units: this.state.units,
+        dpi: this.state.dpi,
         grid_cols: this.state.grid_cols,
         grid_rows: this.state.grid_rows,
         dem_source: this.state.dem_source,
@@ -1043,6 +1604,8 @@ class GridForgeApp {
     if (s.units === "metric" || s.units === "imperial") {
       this.state.units = s.units;
     }
+    this.state.dpi =
+      typeof s.dpi === "number" && VALID_DPIS.has(s.dpi) ? s.dpi : defaults.dpi;
     if (typeof s.grid_cols === "number" && s.grid_cols >= 1 && s.grid_cols <= 3) {
       this.state.grid_cols = s.grid_cols;
     }
@@ -1127,6 +1690,10 @@ class GridForgeApp {
     this.state.include_rf_link_card = Boolean(s.include_rf_link_card);
     this.state.show_fold_marks = Boolean(s.show_fold_marks);
 
+    if (this.session.auth_mode === "hosted") {
+      clampFormStateToCapabilities(this.state, this.session.capabilities);
+    }
+
     this.sidebar.setFormError(null);
     this.sidebar.syncControlsFromState(true);
     this.syncUrlFromState();
@@ -1147,15 +1714,30 @@ class GridForgeApp {
     } else {
       this.sidebar.setRouteMetrics(null);
     }
-    for (const vs of this.state.viewsheds) {
-      void this.computeViewshedEntry(vs.id);
-    }
-    for (const rf of this.state.rfLinks) {
-      void this.computeRFLinkEntry(rf.id);
-    }
-
     this.setProjectsOpen(false);
     this.showToast(`Loaded project "${project.name}"`, "success");
+
+    if (this.turnstile.isActive()) {
+      const viewshedsToRun = [...this.state.viewsheds];
+      const rfLinksToRun = [...this.state.rfLinks];
+      void (async () => {
+        for (const vs of viewshedsToRun) {
+          if (!this.state.viewsheds.some((e) => e.id === vs.id)) break;
+          await this.computeViewshedEntry(vs.id);
+        }
+        for (const rf of rfLinksToRun) {
+          if (!this.state.rfLinks.some((e) => e.id === rf.id)) break;
+          await this.computeRFLinkEntry(rf.id);
+        }
+      })();
+    } else {
+      for (const vs of this.state.viewsheds) {
+        void this.computeViewshedEntry(vs.id);
+      }
+      for (const rf of this.state.rfLinks) {
+        void this.computeRFLinkEntry(rf.id);
+      }
+    }
   }
 
   // ---------- Strip Atlas Planner ----------
@@ -1222,8 +1804,11 @@ class GridForgeApp {
       }
     } catch (err) {
       if (controller.signal.aborted) return;
-      const msg =
-        err instanceof Error ? err.message : "Failed to plan strip atlas";
+      const msg = this.handleApiError(
+        err,
+        "strip",
+        "Failed to plan strip atlas"
+      );
       this.setFootprintError(msg);
       this.showToast(msg, "error");
     } finally {
@@ -1274,12 +1859,29 @@ class GridForgeApp {
     this.rulerAbort = controller;
     this.sidebar.setRulerState(this.rulerPoints, this.rulerMetrics, true);
 
+    let usedTurnstile = false;
     try {
+      const packId = this.state.pack_id || null;
+      const isHostedGuest =
+        this.session.auth_mode === "hosted" && this.session.role === "guest";
+      // Keep guest ruler measurements unlimited (pure geodesic) unless an offline pack is selected.
+      const demSourceToSend =
+        isHostedGuest && !packId ? null : this.state.dem_source;
+      const needsTurnstile =
+        this.turnstile.isActive() &&
+        (demSourceToSend !== null || packId !== null);
+      const turnstileToken = needsTurnstile
+        ? await this.turnstile.acquireToken()
+        : null;
+      usedTurnstile = needsTurnstile && Boolean(turnstileToken);
+      if (controller.signal.aborted) return;
+
       const res = await fetchRulerMetrics(
         this.rulerPoints,
-        this.state.dem_source,
-        this.state.pack_id || null,
-        controller.signal
+        demSourceToSend,
+        packId,
+        controller.signal,
+        turnstileToken
       );
       if (controller.signal.aborted) return;
       this.rulerMetrics = res;
@@ -1287,9 +1889,16 @@ class GridForgeApp {
     } catch (err) {
       if (controller.signal.aborted) return;
       this.sidebar.setRulerState(this.rulerPoints, this.rulerMetrics, false);
-      const msg =
-        err instanceof Error ? err.message : "Failed to compute ruler metrics";
+      const msg = this.handleApiError(
+        err,
+        "ruler",
+        "Failed to compute ruler metrics"
+      );
       this.showToast(msg, "error");
+    } finally {
+      if (usedTurnstile) {
+        this.turnstile.reset();
+      }
     }
   }
 
@@ -1514,12 +2123,21 @@ class GridForgeApp {
     this.sidebar.renderRFLinksList();
     this.map.updateRFLinks(this.state.rfLinks, this.rfPendingFrom);
 
+    let usedTurnstile = false;
     try {
+      const needsTurnstile = this.turnstile.isActive();
+      const turnstileToken = needsTurnstile
+        ? await this.turnstile.acquireToken()
+        : null;
+      usedTurnstile = needsTurnstile && Boolean(turnstileToken);
+      if (controller.signal.aborted) return;
+
       const profile = await fetchRFLinkProfile(
         entry.spec,
         this.state.dem_source,
         this.state.pack_id || null,
-        controller.signal
+        controller.signal,
+        turnstileToken
       );
       if (controller.signal.aborted) return;
 
@@ -1528,10 +2146,12 @@ class GridForgeApp {
       );
       this.sidebar.renderRFLinksList();
       this.map.updateRFLinks(this.state.rfLinks, this.rfPendingFrom);
+      if (this.session.auth_mode === "hosted") {
+        void this.refreshSession();
+      }
     } catch (err) {
       if (controller.signal.aborted) return;
-      const msg =
-        err instanceof Error ? err.message : "RF link profile failed";
+      const msg = this.handleApiError(err, "rf", "RF link profile failed");
       this.state.rfLinks = this.state.rfLinks.map((e) =>
         e.id === id ? { ...e, loading: false, error: msg } : e
       );
@@ -1539,6 +2159,9 @@ class GridForgeApp {
       this.map.updateRFLinks(this.state.rfLinks, this.rfPendingFrom);
       this.showToast(`RF link error: ${msg}`, "error");
     } finally {
+      if (usedTurnstile) {
+        this.turnstile.reset();
+      }
       if (this.rfLinkAborts.get(id) === controller) {
         this.rfLinkAborts.delete(id);
       }
@@ -1629,12 +2252,21 @@ class GridForgeApp {
     );
     this.sidebar.renderViewshedsList();
 
+    let usedTurnstile = false;
     try {
+      const needsTurnstile = this.turnstile.isActive();
+      const turnstileToken = needsTurnstile
+        ? await this.turnstile.acquireToken()
+        : null;
+      usedTurnstile = needsTurnstile && Boolean(turnstileToken);
+      if (controller.signal.aborted) return;
+
       const preview = await fetchViewshedPreview(
         entry.observer,
         this.state.dem_source,
         this.state.pack_id || null,
-        controller.signal
+        controller.signal,
+        turnstileToken
       );
       if (controller.signal.aborted) return;
 
@@ -1643,16 +2275,25 @@ class GridForgeApp {
       );
       this.sidebar.renderViewshedsList();
       this.map.updateViewsheds(this.state.viewsheds);
+      if (this.session.auth_mode === "hosted") {
+        void this.refreshSession();
+      }
     } catch (err) {
       if (controller.signal.aborted) return;
-      const msg =
-        err instanceof Error ? err.message : "Viewshed computation failed";
+      const msg = this.handleApiError(
+        err,
+        "viewshed",
+        "Viewshed computation failed"
+      );
       this.state.viewsheds = this.state.viewsheds.map((e) =>
         e.id === id ? { ...e, loading: false, error: msg } : e
       );
       this.sidebar.renderViewshedsList();
       this.showToast(`Viewshed error: ${msg}`, "error");
     } finally {
+      if (usedTurnstile) {
+        this.turnstile.reset();
+      }
       if (this.viewshedAborts.get(id) === controller) {
         this.viewshedAborts.delete(id);
       }
@@ -1950,8 +2591,10 @@ class GridForgeApp {
       this.jobs = jobs;
       this.drawer.setJobs(jobs);
       this.updateQueueBadge();
-    } catch {
-      // Keep last known jobs silently while backend restarts or offline
+    } catch (err) {
+      if (err instanceof ApiError && (err.status === 401 || err.status === 503)) {
+        this.handleApiError(err, "jobs-poll", "Failed to load jobs");
+      }
     } finally {
       this.scheduleNextJobsPoll();
     }
@@ -1977,6 +2620,7 @@ class GridForgeApp {
       orientation: this.state.orientation,
       color_mode: this.state.color_mode,
       units: this.state.units,
+      dpi: this.state.dpi,
       title: this.state.title.trim() || null,
       dem_source: this.state.dem_source,
       pack_id: this.state.pack_id || null,
@@ -2019,10 +2663,21 @@ class GridForgeApp {
   private async handleSubmitJob(): Promise<void> {
     this.sidebar.setSubmitting(true);
     this.sidebar.setFormError(null);
+    let usedTurnstile = false;
 
     try {
+      const needsTurnstile = this.turnstile.isActive();
+      const turnstileToken = needsTurnstile
+        ? await this.turnstile.acquireToken()
+        : null;
+      usedTurnstile = needsTurnstile && Boolean(turnstileToken);
+
       const payload = this.buildJobPayload();
-      const job = await submitJob(payload, this.state.overlayFile);
+      const job = await submitJob(
+        payload,
+        this.state.overlayFile,
+        turnstileToken
+      );
       this.jobs = [job, ...this.jobs.filter((j) => j.job_id !== job.job_id)];
       this.drawer.setJobs(this.jobs);
       this.setDrawerOpen(true);
@@ -2031,13 +2686,22 @@ class GridForgeApp {
         "success"
       );
       void this.loadHealth();
+      if (this.session.auth_mode === "hosted") {
+        void this.refreshSession();
+      }
       this.scheduleNextJobsPoll();
     } catch (err) {
-      const msg =
-        err instanceof Error ? err.message : "Failed to submit render job";
+      const msg = this.handleApiError(
+        err,
+        "job",
+        "Failed to submit render job"
+      );
       this.sidebar.setFormError(msg);
       this.showToast(msg, "error");
     } finally {
+      if (usedTurnstile) {
+        this.turnstile.reset();
+      }
       this.sidebar.setSubmitting(false);
     }
   }
@@ -2051,7 +2715,7 @@ class GridForgeApp {
       this.showToast(`Cancelled job #${jobId.slice(0, 8)}`, "info");
     } catch (err) {
       this.drawer.clearBusy(jobId);
-      const msg = err instanceof Error ? err.message : "Failed to cancel job";
+      const msg = this.handleApiError(err, "general", "Failed to cancel job");
       this.showToast(msg, "error");
     }
   }
@@ -2065,7 +2729,7 @@ class GridForgeApp {
       this.showToast(`Deleted job #${jobId.slice(0, 8)}`, "info");
     } catch (err) {
       this.drawer.clearBusy(jobId);
-      const msg = err instanceof Error ? err.message : "Failed to delete job";
+      const msg = this.handleApiError(err, "general", "Failed to delete job");
       this.showToast(msg, "error");
     }
   }
