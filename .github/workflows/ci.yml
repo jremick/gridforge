@@ -38,6 +38,10 @@ jobs:
       - name: Run Copy CLI unit tests
         run: npm test
 
+      - name: Run release & README hygiene preflight
+        working-directory: .
+        run: python3 scripts/release_preflight.py
+
       - name: Typecheck and build SPA
         run: npm run build
 
