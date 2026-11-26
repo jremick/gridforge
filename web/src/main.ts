@@ -15,7 +15,7 @@ import { SidebarPanel } from "./components/sidebar";
 import { TelemetryBar } from "./components/telemetry";
 import { GridForgeMap } from "./map";
 import {
-  AU_OVERLAY_OPTIONS,
+  ALL_AU_OVERLAY_KINDS,
   BASEMAP_OPTIONS,
   DEM_SOURCE_OPTIONS,
   PAPER_OPTIONS,
@@ -54,7 +54,7 @@ const HEALTH_POLL_MS = 5000;
 const VALID_SCALES = new Set(SCALE_OPTIONS.map((s) => s.value));
 const VALID_PAPERS = new Set<string>(PAPER_OPTIONS.map((p) => p.value));
 const VALID_DEMS = new Set<string>(DEM_SOURCE_OPTIONS.map((d) => d.value));
-const VALID_AU_OV = new Set<string>(AU_OVERLAY_OPTIONS.map((o) => o.value));
+const VALID_AU_OV = new Set<string>(ALL_AU_OVERLAY_KINDS);
 const VALID_US_OV = new Set<string>(US_OVERLAY_OPTIONS.map((o) => o.value));
 
 function hydrateStateFromUrl(state: AppFormState): {

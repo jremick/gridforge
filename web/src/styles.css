@@ -646,6 +646,7 @@ button {
   display: flex;
   align-items: center;
   gap: 8px;
+  min-width: 0;
 }
 
 .gf-section-index {
@@ -656,6 +657,7 @@ button {
   background: var(--accent-amber-soft);
   border-radius: 3px;
   padding: 1px 5px;
+  flex-shrink: 0;
 }
 
 .gf-section-title {
@@ -664,12 +666,17 @@ button {
   letter-spacing: 0.04em;
   text-transform: uppercase;
   color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .gf-section-meta {
   display: flex;
   align-items: center;
   gap: 6px;
+  flex-shrink: 0;
+  white-space: nowrap;
 }
 
 .gf-section-pill {
@@ -680,6 +687,8 @@ button {
   background: var(--bg-elevated);
   color: var(--accent-cyan);
   border: 1px solid var(--border-subtle);
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .gf-chevron {
@@ -1023,6 +1032,56 @@ details[open] > .gf-section-summary .gf-chevron {
   letter-spacing: 0.07em;
   color: var(--accent-cyan);
   margin-top: 2px;
+}
+
+.gf-state-trails-box {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 4px 5px 6px;
+  border-radius: var(--radius-md);
+  background: rgba(15, 20, 25, 0.72);
+  border: 1px solid var(--border-subtle);
+}
+
+.gf-state-auto-row {
+  background: transparent;
+  padding: 3px 4px;
+}
+
+.gf-state-chip-bar {
+  display: grid;
+  grid-template-columns: repeat(8, 1fr);
+  gap: 3px;
+  padding: 0 3px;
+}
+
+.gf-state-chip {
+  height: 22px;
+  padding: 0;
+  border-radius: 3px;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-panel);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  display: grid;
+  place-items: center;
+  transition: all 0.13s ease;
+}
+
+.gf-state-chip:hover {
+  border-color: var(--accent-amber);
+  color: var(--text-primary);
+  background: var(--bg-elevated);
+}
+
+.gf-state-chip.active {
+  background: var(--accent-amber);
+  border-color: var(--accent-amber);
+  color: #0f1419;
 }
 
 .gf-check-row {

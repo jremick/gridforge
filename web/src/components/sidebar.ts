@@ -2,6 +2,7 @@ import { fetchGeocode } from "../api";
 import {
   ATLAS_GRID_OPTIONS,
   AU_OVERLAY_OPTIONS,
+  AU_STATE_TRAIL_CHIPS,
   CARTO_TOGGLES,
   DEM_SOURCE_OPTIONS,
   DENSITY_OPTIONS,
@@ -18,6 +19,7 @@ import {
 } from "../presets";
 import type {
   AUOverlayKind,
+  AUStateTrailKind,
   AppFormState,
   ColorMode,
   DemSourceKind,
@@ -65,6 +67,10 @@ const CATEGORY_COLOR_MAP: Record<WaypointCategory, string> = Object.fromEntries(
   WAYPOINT_CATEGORY_OPTIONS.map((o) => [o.value, o.color])
 ) as Record<WaypointCategory, string>;
 
+const STATE_TRAIL_CHIP_SET = new Set<AUOverlayKind>(
+  AU_STATE_TRAIL_CHIPS.map((c) => c.value)
+);
+
 export class SidebarPanel {
   private readonly root: HTMLElement;
   private readonly state: AppFormState;
@@ -80,6 +86,7 @@ export class SidebarPanel {
   private atlasSublabelEl!: HTMLElement;
   private demSelect!: HTMLSelectElement;
   private packSelect!: HTMLSelectElement;
+  private stateAutoCheck!: HTMLInputElement;
   private contourSelect!: HTMLSelectElement;
   private hillshadeSelect!: HTMLSelectElement;
   private labelDensitySelect!: HTMLSelectElement;
@@ -167,6 +174,11 @@ export class SidebarPanel {
 
     const demOptsHtml = DEM_SOURCE_OPTIONS.map(
       (d) => `<option value="${d.value}">${escapeHtml(d.label)}</option>`
+    ).join("");
+
+    const stateChipsHtml = AU_STATE_TRAIL_CHIPS.map(
+      (c) =>
+        `<button type="button" class="gf-state-chip" data-au-state-chip="${c.value}" aria-pressed="false" title="Pin ${escapeHtml(c.name)} trails, huts &amp; trigs">${escapeHtml(c.label)}</button>`
     ).join("");
 
     const auOverlaysHtml = AU_OVERLAY_OPTIONS.map(
@@ -363,7 +375,19 @@ export class SidebarPanel {
             </div>
 
             <div class="gf-overlay-group">
-              <span class="gf-overlay-heading">Australia State &amp; National Overlays (CC BY 4.0)</span>
+              <span class="gf-overlay-heading">Australia Overlays (CC BY 4.0)</span>
+              <div class="gf-state-trails-box">
+                <label class="gf-check-row gf-state-auto-row">
+                  <input type="checkbox" data-role="au-state-auto" />
+                  <span class="gf-check-text">
+                    <span class="gf-check-title">State Fire Trails, Huts &amp; Trigs (Auto — All 8 States)</span>
+                    <span class="gf-check-hint">Auto-detects NSW, VIC, TAS, QLD, WA, SA, NT, ACT (incl. cross-border)</span>
+                  </span>
+                </label>
+                <div class="gf-state-chip-bar" role="group" aria-label="Override specific Australian states">
+                  ${stateChipsHtml}
+                </div>
+              </div>
               ${auOverlaysHtml}
             </div>
 
@@ -577,6 +601,7 @@ export class SidebarPanel {
     this.atlasSublabelEl = this.q("[data-role='atlas-sublabel']");
     this.demSelect = this.q<HTMLSelectElement>("#gf-dem-select");
     this.packSelect = this.q<HTMLSelectElement>("#gf-pack-select");
+    this.stateAutoCheck = this.q<HTMLInputElement>("[data-role='au-state-auto']");
     this.contourSelect = this.q<HTMLSelectElement>("#gf-contour-select");
     this.hillshadeSelect = this.q<HTMLSelectElement>("#gf-hillshade-select");
     this.labelDensitySelect = this.q<HTMLSelectElement>("#gf-label-select");
@@ -833,6 +858,37 @@ export class SidebarPanel {
     this.q("[data-role='refresh-packs']").addEventListener("click", () => {
       this.callbacks.onRefreshPacks();
     });
+
+    this.stateAutoCheck.addEventListener("change", () => {
+      const others = this.state.au_overlays.filter(
+        (k) => k !== "au-state-trails" && !STATE_TRAIL_CHIP_SET.has(k)
+      );
+      this.state.au_overlays = this.stateAutoCheck.checked
+        ? ["au-state-trails", ...others]
+        : others;
+      this.syncStateTrailControls();
+      this.updateSectionPills();
+      this.callbacks.onStateChange();
+    });
+
+    this.root
+      .querySelectorAll<HTMLButtonElement>("[data-au-state-chip]")
+      .forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const kind = btn.dataset.auStateChip as AUStateTrailKind;
+          const withoutAuto = this.state.au_overlays.filter(
+            (k) => k !== "au-state-trails"
+          );
+          if (withoutAuto.includes(kind)) {
+            this.state.au_overlays = withoutAuto.filter((k) => k !== kind);
+          } else {
+            this.state.au_overlays = [...withoutAuto, kind];
+          }
+          this.syncStateTrailControls();
+          this.updateSectionPills();
+          this.callbacks.onStateChange();
+        });
+      });
 
     this.root
       .querySelectorAll<HTMLInputElement>("[data-au-overlay]")
@@ -1246,6 +1302,19 @@ export class SidebarPanel {
     }
   }
 
+  private syncStateTrailControls(): void {
+    const autoOn = this.state.au_overlays.includes("au-state-trails");
+    this.stateAutoCheck.checked = autoOn;
+    this.root
+      .querySelectorAll<HTMLButtonElement>("[data-au-state-chip]")
+      .forEach((btn) => {
+        const kind = btn.dataset.auStateChip as AUStateTrailKind;
+        const pinned = !autoOn && this.state.au_overlays.includes(kind);
+        btn.classList.toggle("active", pinned);
+        btn.setAttribute("aria-pressed", String(pinned));
+      });
+  }
+
   private updatePresetButtons(): void {
     this.root
       .querySelectorAll<HTMLButtonElement>("[data-preset]")
@@ -1457,6 +1526,8 @@ export class SidebarPanel {
     this.setSegmentedValue("units", this.state.units);
     this.demSelect.value = this.state.dem_source;
     this.packSelect.value = this.state.pack_id;
+
+    this.syncStateTrailControls();
 
     this.root
       .querySelectorAll<HTMLInputElement>("[data-au-overlay]")

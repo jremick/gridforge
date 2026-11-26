@@ -7,9 +7,19 @@ export type Units = "metric" | "imperial";
 export type DensityLevel = "low" | "normal" | "high";
 export type HillshadeStrength = "off" | "light" | "normal" | "strong";
 export type DemSourceKind = "auto" | "au-elvis" | "glo30" | "usgs3dep";
-export type AUOverlayKind =
+export type AUStateTrailKind =
   | "au-nsw-trails"
   | "au-vic-trails"
+  | "au-tas-trails"
+  | "au-qld-trails"
+  | "au-wa-trails"
+  | "au-sa-trails"
+  | "au-nt-trails"
+  | "au-act-trails";
+
+export type AUOverlayKind =
+  | "au-state-trails"
+  | AUStateTrailKind
   | "au-hydro"
   | "au-parks"
   | "au-infra"

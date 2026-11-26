@@ -1,5 +1,6 @@
 import type {
   AUOverlayKind,
+  AUStateTrailKind,
   AppFormState,
   AtlasGridOption,
   BasemapId,
@@ -169,21 +170,26 @@ export const DEM_SOURCE_OPTIONS: readonly {
   { value: "usgs3dep", label: "USGS 3DEP 1m / 10m (NAVD88)" },
 ];
 
+export const AU_STATE_TRAIL_CHIPS: readonly {
+  value: AUStateTrailKind;
+  label: string;
+  name: string;
+}[] = [
+  { value: "au-nsw-trails", label: "NSW", name: "New South Wales" },
+  { value: "au-vic-trails", label: "VIC", name: "Victoria" },
+  { value: "au-tas-trails", label: "TAS", name: "Tasmania" },
+  { value: "au-qld-trails", label: "QLD", name: "Queensland" },
+  { value: "au-wa-trails", label: "WA", name: "Western Australia" },
+  { value: "au-sa-trails", label: "SA", name: "South Australia" },
+  { value: "au-nt-trails", label: "NT", name: "Northern Territory" },
+  { value: "au-act-trails", label: "ACT", name: "Australian Capital Territory" },
+];
+
 export const AU_OVERLAY_OPTIONS: readonly {
   value: AUOverlayKind;
   label: string;
   hint: string;
 }[] = [
-  {
-    value: "au-nsw-trails",
-    label: "NSW Fire Trails, Huts & Trigs",
-    hint: "Spatial Services fire trails, 4WD, tracks & trigs",
-  },
-  {
-    value: "au-vic-trails",
-    label: "VIC Vicmap Trails & Huts",
-    hint: "DEECA 4WD fire tracks, alpine huts & camps",
-  },
   {
     value: "au-hydro",
     label: "GA Hydrology (Bores/Streams)",
@@ -204,6 +210,12 @@ export const AU_OVERLAY_OPTIONS: readonly {
     label: "GA Airfields & Homesteads",
     hint: "Regional strips, runways & stations",
   },
+];
+
+export const ALL_AU_OVERLAY_KINDS: readonly AUOverlayKind[] = [
+  "au-state-trails",
+  ...AU_STATE_TRAIL_CHIPS.map((c) => c.value),
+  ...AU_OVERLAY_OPTIONS.map((o) => o.value),
 ];
 
 export const US_OVERLAY_OPTIONS: readonly {
