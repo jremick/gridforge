@@ -7,6 +7,7 @@ memory stays safely below the 3 GB worker container limit on 16 GB hosts.
 from __future__ import annotations
 
 import argparse
+import inspect
 import logging
 import os
 import re
@@ -23,8 +24,11 @@ from typing import Any
 from pyproj import Transformer
 
 from gridforge.config import ColorMode, DeclinationInfo, SheetLayout, SheetSpec
+from gridforge.export.bundle import export_field_bundle_zip
+from gridforge.export.gpkg_tiles import export_gpkg_tiles
 from gridforge.export.kmz import export_garmin_kmz
 from gridforge.export.mbtiles import export_mbtiles
+from gridforge.export.osmand import export_osmand_sqlitedb
 from gridforge.export.raster import render_collarless_geotiff
 from gridforge.geo.crs import compute_atlas_layouts, compute_sheet_layout, parse_center
 from gridforge.geo.strip_atlas import (
@@ -40,11 +44,12 @@ from gridforge.geo.supplements import (
     render_atlas_index_pdf,
     render_calibration_pdf,
     render_elevation_profile_pdf,
+    render_rf_link_card_pdf,
     render_route_card_pdf,
 )
 from gridforge.geo.waypoints import compute_route_metrics
 from gridforge.packs.builder import discover_packs, resolve_pack_directory
-from gridforge.pipeline import runner
+from gridforge.pipeline import runner, terrain as terrain_mod
 from gridforge.render.pyqgis_worker import PyQGISRenderer
 from gridforge.sources.overlay_user import UserOverlaySource
 from gridforge.web import db
@@ -91,12 +96,16 @@ def _build_spec_from_request(req: CreateJobRequest) -> SheetSpec:
         us_overlays=req.us_overlays,
         au_overlays=req.au_overlays,
         nz_overlays=req.nz_overlays,
+        ca_overlays=req.ca_overlays,
         waypoints=req.waypoints,
         viewsheds=req.viewsheds,
+        rf_links=req.rf_links,
+        tactical_graphics=req.tactical_graphics,
         include_calibration_page=req.include_calibration_page,
         include_route_card=req.include_route_card,
         include_elevation_profile=req.include_elevation_profile,
         include_atlas_index=req.include_atlas_index,
+        include_rf_link_card=req.include_rf_link_card,
         show_fold_marks=req.show_fold_marks,
     )
 
@@ -221,7 +230,27 @@ def _assemble_supplemental_pages(
         )
         back_pages.append(card_pdf)
 
-    # 3. Optional 100 mm Scale Calibration & MGRS Romer page
+    # 3. Optional RF / Line-of-Sight Link Budget & Fresnel Card page
+    if req.include_rf_link_card and req.rf_links and dem_paths:
+        compute_rf_fn = getattr(terrain_mod, "compute_rf_link_profile", None)
+        if compute_rf_fn is not None:
+            sig = inspect.signature(compute_rf_fn)
+            rf_kwargs: dict[str, Any] = {}
+            if "date_iso" in sig.parameters and spec.date_iso is not None:
+                rf_kwargs["date_iso"] = spec.date_iso
+            rf_profiles = [
+                compute_rf_fn(dem_paths[0], link, anchor_layout.utm_epsg, **rf_kwargs)
+                for link in req.rf_links
+            ]
+            rf_pdf = render_rf_link_card_pdf(
+                rf_profiles,
+                anchor_layout,
+                supp_dir / "rf_link_card.pdf",
+                bw=bw,
+            )
+            back_pages.append(rf_pdf)
+
+    # 4. Optional 100 mm Scale Calibration & MGRS Romer page
     if req.include_calibration_page:
         cal_pdf = render_calibration_pdf(
             anchor_layout.page_width_mm,
@@ -295,7 +324,12 @@ def process_single_job(
             or (req.include_route_card and len(req.waypoints) > 0)
             or req.include_elevation_profile
             or (req.include_atlas_index and (is_strip or total_sheets > 1))
+            or (req.include_rf_link_card and len(req.rf_links) > 0)
         )
+        wants_digital_raster = bool(
+            outputs.mbtiles or outputs.kmz or outputs.gpkg_tiles or outputs.osmand_sqlitedb
+        )
+        wants_any_export = bool(wants_digital_raster or outputs.field_bundle_zip)
 
         if not is_strip and total_sheets == 1:
             _report_stage("fetching_data", 15)
@@ -443,7 +477,7 @@ def process_single_job(
             collected_dem_paths: list[Path] = []
             anchor_layout: SheetLayout | None = None
             anchor_declination: DeclinationInfo | None = None
-            pdf_budget_pct = 72 if (outputs.mbtiles or outputs.kmz) else 88
+            pdf_budget_pct = 72 if wants_any_export else 88
 
             if outputs.pdf:
                 for idx, (sheet_id, sheet_spec) in enumerate(atlas_sheets, start=1):
@@ -526,7 +560,7 @@ def process_single_job(
                 )
 
             anchor_workspace = None
-            if outputs.mbtiles or outputs.kmz:
+            if wants_any_export:
                 if _is_cancelled(db_path, job_id):
                     return db.get_job(db_path, job_id)
                 _report_stage("preparing_center_sheet_export", 74)
@@ -539,13 +573,23 @@ def process_single_job(
                     spec, center_work, **prep_kwargs
                 )
 
-        if outputs.mbtiles or outputs.kmz:
+        if wants_any_export:
             assert anchor_workspace is not None
             eff_dpi = outputs.export_dpi or spec.dpi
             eff_grid = outputs.include_grid_on_digital
             shared_tif: Path | None = None
 
-            if outputs.mbtiles and outputs.kmz:
+            raster_export_count = sum(
+                1
+                for flag in (
+                    outputs.mbtiles,
+                    outputs.kmz,
+                    outputs.gpkg_tiles,
+                    outputs.osmand_sqlitedb,
+                )
+                if flag
+            )
+            if raster_export_count >= 2:
                 _report_stage("rendering_digital_raster", 76)
                 shared_tif = render_collarless_geotiff(
                     anchor_workspace,
@@ -557,7 +601,7 @@ def process_single_job(
             if outputs.mbtiles:
                 if _is_cancelled(db_path, job_id):
                     return db.get_job(db_path, job_id)
-                _report_stage("exporting_mbtiles", 82)
+                _report_stage("exporting_mbtiles", 80)
                 mbt_name = f"{stem}.mbtiles"
                 mbt_path = artifacts_dir / mbt_name
                 export_mbtiles(
@@ -580,7 +624,7 @@ def process_single_job(
             if outputs.kmz:
                 if _is_cancelled(db_path, job_id):
                     return db.get_job(db_path, job_id)
-                _report_stage("exporting_kmz", 92)
+                _report_stage("exporting_kmz", 84)
                 kmz_name = f"{stem}.kmz"
                 kmz_path = artifacts_dir / kmz_name
                 export_garmin_kmz(
@@ -598,6 +642,77 @@ def process_single_job(
                         filename=kmz_name,
                         size_bytes=kmz_path.stat().st_size,
                         download_url=f"/api/jobs/{job_id}/artifacts/{kmz_name}",
+                    )
+                )
+
+            if outputs.gpkg_tiles:
+                if _is_cancelled(db_path, job_id):
+                    return db.get_job(db_path, job_id)
+                _report_stage("exporting_gpkg_tiles", 88)
+                gpkg_name = f"{stem}.gpkg"
+                gpkg_path = artifacts_dir / gpkg_name
+                export_gpkg_tiles(
+                    anchor_workspace,
+                    gpkg_path,
+                    tile_format=outputs.mbtiles_format,
+                    dpi=eff_dpi,
+                    include_grid=eff_grid,
+                    collarless_tif=shared_tif,
+                )
+                artifacts.append(
+                    JobArtifact(
+                        kind="gpkg",
+                        filename=gpkg_name,
+                        size_bytes=gpkg_path.stat().st_size,
+                        download_url=f"/api/jobs/{job_id}/artifacts/{gpkg_name}",
+                    )
+                )
+
+            if outputs.osmand_sqlitedb:
+                if _is_cancelled(db_path, job_id):
+                    return db.get_job(db_path, job_id)
+                _report_stage("exporting_osmand_sqlitedb", 92)
+                osm_name = f"{stem}.sqlitedb"
+                osm_path = artifacts_dir / osm_name
+                export_osmand_sqlitedb(
+                    anchor_workspace,
+                    osm_path,
+                    tile_format=outputs.mbtiles_format,
+                    dpi=eff_dpi,
+                    include_grid=eff_grid,
+                    collarless_tif=shared_tif,
+                )
+                artifacts.append(
+                    JobArtifact(
+                        kind="sqlitedb",
+                        filename=osm_name,
+                        size_bytes=osm_path.stat().st_size,
+                        download_url=f"/api/jobs/{job_id}/artifacts/{osm_name}",
+                    )
+                )
+
+            if outputs.field_bundle_zip:
+                if _is_cancelled(db_path, job_id):
+                    return db.get_job(db_path, job_id)
+                _report_stage("exporting_field_bundle", 96)
+                zip_name = f"{stem}_field_bundle.zip"
+                zip_path = artifacts_dir / zip_name
+                bundled_paths = [
+                    artifacts_dir / a.filename
+                    for a in artifacts
+                    if (artifacts_dir / a.filename).is_file()
+                ]
+                export_field_bundle_zip(
+                    anchor_workspace,
+                    zip_path,
+                    artifacts=bundled_paths,
+                )
+                artifacts.append(
+                    JobArtifact(
+                        kind="zip",
+                        filename=zip_name,
+                        size_bytes=zip_path.stat().st_size,
+                        download_url=f"/api/jobs/{job_id}/artifacts/{zip_name}",
                     )
                 )
 

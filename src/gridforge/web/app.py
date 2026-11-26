@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import re
+import subprocess
 import time
 import uuid
 from collections import OrderedDict
@@ -37,9 +38,10 @@ from gridforge.geo.strip_atlas import (
     parse_route_geojson,
     plan_strip_atlas,
 )
+from gridforge.geo.tactical import RulerMetricsResponse
 from gridforge.geo.waypoints import compute_route_metrics
 from gridforge.packs.builder import discover_packs
-from gridforge.web import db
+from gridforge.web import db, projects as projects_store
 from gridforge.web.access import SameOriginWritesMiddleware
 from gridforge.web.basemap import BasemapInfoResponse, MBTilesBasemapStore
 from gridforge.web.pack_tasks import (
@@ -50,6 +52,12 @@ from gridforge.web.pack_tasks import (
     PackTaskRecord,
     PackTasksListResponse,
     get_pack_regions_response,
+)
+from gridforge.web.projects import (
+    ProjectCreateRequest,
+    ProjectRecord,
+    ProjectsListResponse,
+    ProjectUpdateRequest,
 )
 from gridforge.web.schemas import (
     CreateJobRequest,
@@ -62,14 +70,21 @@ from gridforge.web.schemas import (
     JobsListResponse,
     PacksResponse,
     PackSummary,
+    RFLinkProfileRequest,
+    RFLinkProfileResponse,
     RouteMetricsRequest,
     RouteMetricsResponse,
+    RulerMetricsRequest,
     StripPlanRequest,
     StripPlanResponse,
     ViewshedPreviewRequest,
     ViewshedPreviewResponse,
 )
-from gridforge.web.viewshed import compute_viewshed_preview
+from gridforge.web.viewshed import (
+    compute_rf_link_preview,
+    compute_ruler_preview,
+    compute_viewshed_preview,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +105,9 @@ _MEDIA_TYPES: dict[str, str] = {
     ".pdf": "application/pdf",
     ".mbtiles": "application/vnd.sqlite3",
     ".kmz": "application/vnd.google-earth.kmz",
+    ".gpkg": "application/geopackage+sqlite3",
+    ".sqlitedb": "application/vnd.sqlite3",
+    ".zip": "application/zip",
 }
 
 
@@ -505,17 +523,33 @@ def create_app(
         )
 
     @application.get("/api/basemap/info", response_model=BasemapInfoResponse)
-    def api_basemap_info() -> BasemapInfoResponse:
-        return basemap_store.get_info()
+    def api_basemap_info(pack_id: str | None = Query(default=None)) -> BasemapInfoResponse:
+        if pack_id is not None and not _PACK_ID_RE.match(pack_id):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid pack_id '{pack_id}'.",
+            )
+        return basemap_store.get_info(pack_id=pack_id)
 
     @application.get("/api/basemap/{z}/{x}/{y}.{ext}")
-    def api_basemap_tile(z: int, x: int, y: int, ext: str) -> Response:
+    def api_basemap_tile(
+        z: int,
+        x: int,
+        y: int,
+        ext: str,
+        pack_id: str | None = Query(default=None),
+    ) -> Response:
         if ext.lower() not in {"png", "jpg", "jpeg", "webp"}:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Unsupported basemap tile extension '.{ext}'.",
             )
-        result = basemap_store.get_tile(z, x, y, requested_ext=ext)
+        if pack_id is not None and not _PACK_ID_RE.match(pack_id):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid pack_id '{pack_id}'.",
+            )
+        result = basemap_store.get_tile(z, x, y, requested_ext=ext, pack_id=pack_id)
         if result is None:
             return Response(status_code=status.HTTP_204_NO_CONTENT)
         tile_bytes, media_type = result
@@ -539,6 +573,9 @@ def create_app(
                 size_bytes=m.size_bytes,
                 has_dem=m.dem_path is not None,
                 has_osm=m.osm_pbf_path is not None,
+                has_basemap=bool(
+                    m.basemap_path or basemap_store._resolve_pack_basemap(m.pack_id) is not None
+                ),
                 overlays=sorted(m.overlays.keys()),
             )
             for m in manifests
@@ -616,6 +653,101 @@ def create_app(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"Viewshed preview failed: {exc}",
             ) from exc
+
+    @application.post("/api/rf-link-profile", response_model=RFLinkProfileResponse)
+    def api_rf_link_profile(req: RFLinkProfileRequest) -> RFLinkProfileResponse:
+        if req.pack_id is not None:
+            if not _PACK_ID_RE.match(req.pack_id):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid pack_id '{req.pack_id}'.",
+                )
+            installed_ids = {p.pack_id for p in discover_packs(resolved_packs_dir)}
+            if req.pack_id not in installed_ids:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Offline pack '{req.pack_id}' is not installed.",
+                )
+        try:
+            return compute_rf_link_preview(
+                req,
+                packs_dir=resolved_packs_dir,
+                pack_dir_finder=pack_manager.find_pack_dir,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=_HTTP_422, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception("RF link profile failed: %s", exc)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"RF link profile failed: {exc}",
+            ) from exc
+
+    @application.post("/api/ruler-metrics", response_model=RulerMetricsResponse)
+    def api_ruler_metrics(req: RulerMetricsRequest) -> RulerMetricsResponse:
+        if req.pack_id is not None:
+            if not _PACK_ID_RE.match(req.pack_id):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid pack_id '{req.pack_id}'.",
+                )
+            installed_ids = {p.pack_id for p in discover_packs(resolved_packs_dir)}
+            if req.pack_id not in installed_ids:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Offline pack '{req.pack_id}' is not installed.",
+                )
+        try:
+            return compute_ruler_preview(
+                req,
+                packs_dir=resolved_packs_dir,
+                pack_dir_finder=pack_manager.find_pack_dir,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=_HTTP_422, detail=str(exc)) from exc
+
+    @application.get("/api/projects", response_model=ProjectsListResponse)
+    def api_list_projects(limit: int = Query(default=100, ge=1, le=500)) -> ProjectsListResponse:
+        return ProjectsListResponse(projects=projects_store.list_projects(db_path, limit=limit))
+
+    @application.post(
+        "/api/projects",
+        response_model=ProjectRecord,
+        status_code=status.HTTP_201_CREATED,
+    )
+    def api_create_project(req: ProjectCreateRequest) -> ProjectRecord:
+        if req.last_job_id is not None and not _JOB_ID_RE.match(req.last_job_id):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid last_job_id.")
+        return projects_store.create_project(db_path, req)
+
+    @application.get("/api/projects/{project_id}", response_model=ProjectRecord)
+    def api_get_project(project_id: str) -> ProjectRecord:
+        if not projects_store.is_valid_project_id(project_id):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid project_id.")
+        record = projects_store.get_project(db_path, project_id)
+        if record is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found.")
+        return record
+
+    @application.patch("/api/projects/{project_id}", response_model=ProjectRecord)
+    def api_update_project(project_id: str, req: ProjectUpdateRequest) -> ProjectRecord:
+        if not projects_store.is_valid_project_id(project_id):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid project_id.")
+        if req.last_job_id is not None and not _JOB_ID_RE.match(req.last_job_id):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid last_job_id.")
+        record = projects_store.update_project(db_path, project_id, req)
+        if record is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found.")
+        return record
+
+    @application.delete("/api/projects/{project_id}")
+    def api_delete_project(project_id: str) -> dict[str, Any]:
+        if not projects_store.is_valid_project_id(project_id):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid project_id.")
+        deleted = projects_store.delete_project(db_path, project_id)
+        if not deleted:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found.")
+        return {"deleted": True, "id": project_id, "project_id": project_id}
 
     @application.get("/api/geocode", response_model=GeocodeResponse)
     def api_geocode(
@@ -766,12 +898,16 @@ def create_app(
                 us_overlays=job_req.us_overlays,
                 au_overlays=job_req.au_overlays,
                 nz_overlays=job_req.nz_overlays,
+                ca_overlays=job_req.ca_overlays,
                 waypoints=job_req.waypoints,
                 viewsheds=job_req.viewsheds,
+                rf_links=job_req.rf_links,
+                tactical_graphics=job_req.tactical_graphics,
                 include_calibration_page=job_req.include_calibration_page,
                 include_route_card=job_req.include_route_card,
                 include_elevation_profile=job_req.include_elevation_profile,
                 include_atlas_index=job_req.include_atlas_index,
+                include_rf_link_card=job_req.include_rf_link_card,
                 show_fold_marks=job_req.show_fold_marks,
             )
             anchor = compute_sheet_layout(spec)
@@ -940,6 +1076,69 @@ def create_app(
             path=candidate,
             media_type=media_type,
             filename=candidate.name,
+        )
+
+    @application.get("/api/jobs/{job_id}/thumbnail.png")
+    def api_job_thumbnail(job_id: str) -> FileResponse:
+        if not _JOB_ID_RE.match(job_id):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid job_id.")
+        record = db.get_job(db_path, job_id)
+        if record is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found.")
+
+        job_root = (resolved_data_dir / job_id).resolve()
+        if not job_root.is_relative_to(resolved_data_dir):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid job_id.")
+
+        thumb_path = (job_root / "thumbnail.png").resolve()
+        if not thumb_path.is_file():
+            artifacts_dir = (job_root / "artifacts").resolve()
+            pdf_candidates = [
+                artifacts_dir / a.filename for a in record.artifacts if a.kind == "pdf"
+            ]
+            if not pdf_candidates and artifacts_dir.is_dir():
+                pdf_candidates = sorted(artifacts_dir.glob("*.pdf"))
+            source_pdf = next((p.resolve() for p in pdf_candidates if p.is_file()), None)
+            if source_pdf is None or not source_pdf.is_relative_to(artifacts_dir):
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="No PDF artifact available for thumbnail.",
+                )
+
+            job_root.mkdir(parents=True, exist_ok=True)
+            tmp_prefix = job_root / f".thumb_{uuid.uuid4().hex[:8]}"
+            proc = subprocess.run(
+                [
+                    "pdftoppm",
+                    "-png",
+                    "-f",
+                    "1",
+                    "-l",
+                    "1",
+                    "-scale-to",
+                    "480",
+                    "-singlefile",
+                    str(source_pdf),
+                    str(tmp_prefix),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            rendered_png = tmp_prefix.with_suffix(".png")
+            if proc.returncode != 0 or not rendered_png.is_file():
+                rendered_png.unlink(missing_ok=True)
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Failed to rasterize PDF thumbnail.",
+                )
+            rendered_png.replace(thumb_path)
+
+        return FileResponse(
+            path=thumb_path,
+            media_type="image/png",
+            headers={"Cache-Control": "public, max-age=3600"},
         )
 
     # Mount built SPA frontend if present; otherwise expose clean JSON root for headless/API mode.

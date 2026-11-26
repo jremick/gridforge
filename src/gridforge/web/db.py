@@ -114,6 +114,19 @@ def init_db(db_path: Path) -> None:
                 pid INTEGER,
                 active_job_id TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS projects (
+                project_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                state_json TEXT NOT NULL,
+                last_job_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_projects_updated
+                ON projects (updated_at DESC);
             """
         )
         # Lightweight additive migration for existing SQLite databases created pre-atlas.

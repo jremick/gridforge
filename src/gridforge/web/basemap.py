@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sqlite3
 from pathlib import Path
 from typing import Literal
@@ -11,9 +12,12 @@ from urllib.parse import quote
 
 from pydantic import BaseModel
 
+from gridforge.packs.builder import load_pack_manifest, resolve_pack_directory
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_CONTAINER_BASEMAP_PATH = Path("/data/basemap.mbtiles")
+_PACK_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 
 _FORMAT_TO_MEDIA_TYPE: dict[str, str] = {
     "png": "image/png",
@@ -34,6 +38,7 @@ class BasemapInfoResponse(BaseModel):
     bounds: list[float] | None = None
     attribution: str | None = None
     tile_url: str | None = None
+    pack_id: str | None = None
 
 
 def _normalize_format(raw: str | None) -> Literal["png", "jpg"]:
@@ -103,31 +108,93 @@ class MBTilesBasemapStore:
         self._explicit_path = Path(explicit_path).resolve() if explicit_path is not None else None
         self._allow_default_data_path = allow_default_data_path
 
-    def resolve_mbtiles_path(self) -> Path | None:
-        """Resolve the active local ``.mbtiles`` file, or ``None`` if unavailable."""
+    def _resolve_pack_basemap(self, pack_id: str) -> Path | None:
+        """Resolve ``<pack_dir>/basemap.mbtiles`` (or manifest ``basemap_path``) safely under ``packs_dir``."""
+        if not pack_id or not _PACK_ID_RE.match(pack_id) or not self._packs_dir.is_dir():
+            return None
+        try:
+            pack_dir = resolve_pack_directory(self._packs_dir, pack_id)
+        except FileNotFoundError:
+            return None
+        if not pack_dir.is_relative_to(self._packs_dir):
+            return None
+
+        try:
+            manifest = load_pack_manifest(pack_dir)
+            if manifest.basemap_path:
+                cand = (pack_dir / manifest.basemap_path).resolve()
+                if cand.is_relative_to(pack_dir) and cand.is_file():
+                    return cand
+        except Exception:
+            pass
+
+        default_bm = (pack_dir / "basemap.mbtiles").resolve()
+        if default_bm.is_relative_to(pack_dir) and default_bm.is_file():
+            return default_bm
+        return None
+
+    def _discover_first_pack_basemap(self) -> tuple[Path, str] | None:
+        """Return the first installed pack's bundled ``basemap.mbtiles``, if any."""
+        if not self._packs_dir.is_dir():
+            return None
+        for child in sorted(self._packs_dir.iterdir()):
+            if not child.is_dir() or not (child / "pack.json").is_file():
+                continue
+            resolved = child.resolve()
+            if not resolved.is_relative_to(self._packs_dir):
+                continue
+            try:
+                manifest = load_pack_manifest(resolved)
+            except Exception:
+                continue
+            if manifest.basemap_path:
+                cand = (resolved / manifest.basemap_path).resolve()
+                if cand.is_relative_to(resolved) and cand.is_file():
+                    return (cand, manifest.pack_id)
+            fallback = (resolved / "basemap.mbtiles").resolve()
+            if fallback.is_relative_to(resolved) and fallback.is_file():
+                return (fallback, manifest.pack_id)
+        return None
+
+    def resolve_mbtiles_path(self, pack_id: str | None = None) -> Path | None:
+        """Resolve the active local ``.mbtiles`` file (optionally preferring ``pack_id``)."""
+        resolved = self._resolve_with_source(pack_id=pack_id)
+        return resolved[0] if resolved is not None else None
+
+    def _resolve_with_source(self, pack_id: str | None = None) -> tuple[Path, str | None] | None:
+        if pack_id:
+            pack_bm = self._resolve_pack_basemap(pack_id)
+            if pack_bm is not None:
+                return (pack_bm, pack_id)
+
         if self._explicit_path is not None:
-            return self._explicit_path if self._explicit_path.is_file() else None
+            return (self._explicit_path, None) if self._explicit_path.is_file() else None
 
         env_raw = os.environ.get("GRIDFORGE_BASEMAP_MBTILES", "").strip()
         if env_raw:
             env_path = Path(env_raw).expanduser().resolve()
             if env_path.is_file():
-                return env_path
+                return (env_path, None)
 
         pack_candidate = self._packs_dir / "basemap.mbtiles"
         if pack_candidate.is_file():
-            return pack_candidate
+            return (pack_candidate, None)
 
         if self._allow_default_data_path and DEFAULT_CONTAINER_BASEMAP_PATH.is_file():
-            return DEFAULT_CONTAINER_BASEMAP_PATH
+            return (DEFAULT_CONTAINER_BASEMAP_PATH, None)
+
+        discovered = self._discover_first_pack_basemap()
+        if discovered is not None:
+            return discovered
 
         return None
 
-    def get_info(self) -> BasemapInfoResponse:
+    def get_info(self, *, pack_id: str | None = None) -> BasemapInfoResponse:
         """Read MBTiles ``metadata`` and zoom extents; returns ``available=False`` when absent."""
-        path = self.resolve_mbtiles_path()
-        if path is None:
+        resolved = self._resolve_with_source(pack_id=pack_id)
+        if resolved is None:
             return BasemapInfoResponse(available=False)
+        path, resolved_pack_id = resolved
 
         conn: sqlite3.Connection | None = None
         try:
@@ -171,6 +238,7 @@ class MBTilesBasemapStore:
             name = meta.get("name") or path.stem
             attribution = meta.get("attribution") or "Offline MBTiles Basemap"
             bounds = _parse_bounds(meta.get("bounds"))
+            qs = f"?pack_id={quote(resolved_pack_id)}" if resolved_pack_id else ""
 
             return BasemapInfoResponse(
                 available=True,
@@ -180,7 +248,8 @@ class MBTilesBasemapStore:
                 maxzoom=max(0, maxzoom if maxzoom is not None else 0),
                 bounds=bounds,
                 attribution=attribution,
-                tile_url=f"/api/basemap/{{z}}/{{x}}/{{y}}.{fmt}",
+                tile_url=f"/api/basemap/{{z}}/{{x}}/{{y}}.{fmt}{qs}",
+                pack_id=resolved_pack_id,
             )
         except Exception as exc:
             logger.warning("Failed reading MBTiles basemap '%s': %s", path, exc)
@@ -189,7 +258,15 @@ class MBTilesBasemapStore:
             if conn is not None:
                 conn.close()
 
-    def get_tile(self, z: int, x: int, y: int, *, requested_ext: str | None = None) -> tuple[bytes, str] | None:
+    def get_tile(
+        self,
+        z: int,
+        x: int,
+        y: int,
+        *,
+        requested_ext: str | None = None,
+        pack_id: str | None = None,
+    ) -> tuple[bytes, str] | None:
         """Fetch one XYZ tile, converting XYZ ``y`` to MBTiles TMS ``tms_y = (2**z - 1) - y``."""
         if z < 0 or z > 22:
             return None
@@ -197,7 +274,7 @@ class MBTilesBasemapStore:
         if x < 0 or x >= max_coord or y < 0 or y >= max_coord:
             return None
 
-        path = self.resolve_mbtiles_path()
+        path = self.resolve_mbtiles_path(pack_id=pack_id)
         if path is None:
             return None
 

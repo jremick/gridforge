@@ -11,6 +11,7 @@ from gridforge.config import (
     VALID_SCALES,
     AUOverlayKind,
     BBox,
+    CAOverlayKind,
     CartoOptions,
     ColorMode,
     DeclinationInfo,
@@ -20,12 +21,15 @@ from gridforge.config import (
     NZOverlayKind,
     Orientation,
     PaperSize,
+    RFLinkSpec,
+    TacticalGraphic,
     Units,
     USOverlayKind,
     ViewshedObserver,
     WaypointInput,
 )
 from gridforge.geo.strip_atlas import StripAtlasPlan
+from gridforge.geo.tactical import RulerMetricsResponse, RulerSegment
 from gridforge.geo.waypoints import RouteMetrics
 from gridforge.web.basemap import BasemapInfoResponse
 from gridforge.web.pack_tasks import (
@@ -34,6 +38,12 @@ from gridforge.web.pack_tasks import (
     PackRegionSummary,
     PackTaskRecord,
     PackTasksListResponse,
+)
+from gridforge.web.projects import (
+    ProjectCreateRequest,
+    ProjectRecord,
+    ProjectsListResponse,
+    ProjectUpdateRequest,
 )
 
 
@@ -50,7 +60,7 @@ class JobStatus(str, Enum):
 class JobArtifact(BaseModel):
     """Downloadable output file produced by a completed render/export job."""
 
-    kind: Literal["pdf", "mbtiles", "kmz"]
+    kind: Literal["pdf", "mbtiles", "kmz", "gpkg", "sqlitedb", "zip"]
     filename: str
     size_bytes: int
     download_url: str
@@ -217,6 +227,82 @@ class ViewshedPreviewResponse(BaseModel):
     range_ring_geojson: dict[str, Any]
 
 
+class RFLinkProfileRequest(RFLinkSpec):
+    """Request payload for ``POST /api/rf-link-profile`` point-to-point Fresnel analysis."""
+
+    dem_source: DemSourceKind = DemSourceKind.AUTO
+    pack_id: str | None = None
+    date_iso: str | None = None
+
+
+class RFLinkSample(BaseModel):
+    """Single sample station along a curved-Earth RF link profile."""
+
+    dist_km: float
+    terrain_m: float
+    los_m: float
+    fresnel_lo_m: float
+    fresnel_hi_m: float
+    fresnel60_lo_m: float
+    clearance_m: float
+
+
+class RFLinkProfileResponse(BaseModel):
+    """Point-to-point RF Fresnel zone & terrain clearance response."""
+
+    status: Literal["CLEAR", "MARGINAL", "OBSTRUCTED"]
+    distance_km: float
+    freq_mhz: float
+    fspl_db: float
+    min_clearance_m: float
+    min_fresnel_pct: float
+    los_clear: bool
+    fresnel_60pct_clear: bool
+    bearing_true_deg: float
+    bearing_grid_deg: float
+    bearing_mag_deg: float
+    bearing_mils: float
+    from_elev_m: float
+    to_elev_m: float
+    from_mgrs: str
+    to_mgrs: str
+    from_label: str = "OBS1"
+    to_label: str = "OBS2"
+    from_height_m: float = 2.0
+    to_height_m: float = 2.0
+    samples: list[RFLinkSample] = Field(default_factory=list)
+
+
+class RulerPoint(BaseModel):
+    """Single ``(lat, lon)`` point on a ruler measurement path."""
+
+    lat: float = Field(..., ge=-80.0, le=84.0)
+    lon: float = Field(..., ge=-180.0, le=180.0)
+
+
+class RulerMetricsRequest(BaseModel):
+    """Request payload for ``POST /api/ruler-metrics``."""
+
+    points: list[RulerPoint] = Field(..., min_length=2)
+    dem_source: DemSourceKind | None = None
+    pack_id: str | None = None
+    date_iso: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_tuple_points(cls, data: Any) -> Any:
+        if isinstance(data, dict) and isinstance(data.get("points"), list):
+            norm = []
+            for pt in data["points"]:
+                if isinstance(pt, (list, tuple)) and len(pt) >= 2:
+                    norm.append({"lat": float(pt[0]), "lon": float(pt[1])})
+                else:
+                    norm.append(pt)
+            data = dict(data)
+            data["points"] = norm
+        return data
+
+
 class OutputOptions(BaseModel):
     """Requested print and offline digital export outputs for a job."""
 
@@ -225,6 +311,9 @@ class OutputOptions(BaseModel):
     mbtiles: bool = False
     mbtiles_format: MBTilesFormat = MBTilesFormat.PNG
     kmz: bool = False
+    gpkg_tiles: bool = False
+    osmand_sqlitedb: bool = False
+    field_bundle_zip: bool = False
     garmin_profile: GarminProfile = GarminProfile.STANDARD
     max_tiles: int | None = Field(default=None, ge=1, le=500)
     include_grid_on_digital: bool = True
@@ -233,6 +322,7 @@ class OutputOptions(BaseModel):
     include_route_card: bool = False
     include_elevation_profile: bool = False
     include_atlas_index: bool = False
+    include_rf_link_card: bool = False
 
     @model_validator(mode="before")
     @classmethod
@@ -245,8 +335,17 @@ class OutputOptions(BaseModel):
 
     @model_validator(mode="after")
     def _require_at_least_one_output(self) -> OutputOptions:
-        if not (self.pdf or self.mbtiles or self.kmz):
-            raise ValueError("At least one output format (pdf, mbtiles, or kmz) must be enabled.")
+        if not (
+            self.pdf
+            or self.mbtiles
+            or self.kmz
+            or self.gpkg_tiles
+            or self.osmand_sqlitedb
+            or self.field_bundle_zip
+        ):
+            raise ValueError(
+                "At least one output format (pdf, mbtiles, kmz, gpkg_tiles, osmand_sqlitedb, or field_bundle_zip) must be enabled."
+            )
         return self
 
 
@@ -269,17 +368,21 @@ class CreateJobRequest(BaseModel):
     us_overlays: list[USOverlayKind] = Field(default_factory=list)
     au_overlays: list[AUOverlayKind] = Field(default_factory=list)
     nz_overlays: list[NZOverlayKind] = Field(default_factory=list)
+    ca_overlays: list[CAOverlayKind] = Field(default_factory=list)
     carto: CartoOptions = Field(default_factory=CartoOptions)
     outputs: OutputOptions = Field(default_factory=OutputOptions)
     grid_cols: int = Field(default=1, ge=1, le=3)
     grid_rows: int = Field(default=1, ge=1, le=3)
     waypoints: list[WaypointInput] = Field(default_factory=list)
     viewsheds: list[ViewshedObserver] = Field(default_factory=list)
+    rf_links: list[RFLinkSpec] = Field(default_factory=list)
+    tactical_graphics: list[TacticalGraphic] = Field(default_factory=list)
     strip_sheets: list[StripSheetInput] = Field(default_factory=list)
     include_calibration_page: bool = False
     include_route_card: bool = False
     include_elevation_profile: bool = False
     include_atlas_index: bool = False
+    include_rf_link_card: bool = False
     show_fold_marks: bool = False
 
     @field_validator("scale")
@@ -305,6 +408,9 @@ class CreateJobRequest(BaseModel):
         self.include_atlas_index = (
             self.include_atlas_index or self.outputs.include_atlas_index
         )
+        self.include_rf_link_card = (
+            self.include_rf_link_card or self.outputs.include_rf_link_card
+        )
         if not self.center and self.strip_sheets:
             s0 = self.strip_sheets[0]
             self.center = f"{s0.center_lat:.6f}, {s0.center_lon:.6f}"
@@ -327,6 +433,7 @@ class PackSummary(BaseModel):
     size_bytes: int
     has_dem: bool = True
     has_osm: bool = True
+    has_basemap: bool = False
     overlays: list[str] = Field(default_factory=list)
 
 

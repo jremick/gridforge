@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import queue
 import re
@@ -17,8 +18,9 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 from gridforge.config import BBox, PackManifest
+from gridforge.packs import catalog as packs_catalog
 from gridforge.packs.builder import build_offline_pack, load_pack_manifest
-from gridforge.packs.catalog import RegionPreset, list_regions, resolve_region
+from gridforge.packs.catalog import RegionPreset, resolve_region
 
 logger = logging.getLogger(__name__)
 
@@ -36,11 +38,12 @@ def _slugify(raw: str) -> str:
 
 
 class PackRegionSummary(BaseModel):
-    """Curated Australian region preset exposed by ``GET /api/packs/regions``."""
+    """Curated regional pack preset exposed by ``GET /api/packs/regions``."""
 
     id: str
     region_id: str
     name: str
+    group: Literal["au_tactical", "au_state", "nz", "na", "custom"]
     kind: Literal["state", "tactical", "custom"]
     category: Literal["state", "tactical", "custom"]
     bbox_wgs84: BBox
@@ -63,7 +66,8 @@ class PackBuildRequest(BaseModel):
     include_osm: bool = True
     include_dem: bool = True
     include_overlays: bool = True
-    dem_tier: Literal["srtm-1s", "glo30", "au-elvis"] = "srtm-1s"
+    include_basemap: bool = True
+    dem_tier: Literal["auto", "srtm-1s", "glo30", "au-elvis", "nz-linz", "usgs3dep", "ca-hrdem"] = "srtm-1s"
 
 
 class PackTaskRecord(BaseModel):
@@ -91,21 +95,56 @@ class PackTasksListResponse(BaseModel):
     tasks: list[PackTaskRecord] = Field(default_factory=list)
 
 
+def _infer_region_group(preset: Any) -> Literal["au_tactical", "au_state", "nz", "na", "custom"]:
+    explicit = getattr(preset, "group", None)
+    if explicit in ("au_tactical", "au_state", "nz", "na", "custom"):
+        return explicit
+    cat = getattr(preset, "category", "tactical")
+    if cat == "state":
+        return "au_state"
+    if cat == "tactical":
+        return "au_tactical"
+    return "custom"
+
+
+def _load_all_regions() -> list[Any]:
+    try:
+        from gridforge.packs import regions as packs_regions  # type: ignore[import-not-found]
+
+        if hasattr(packs_regions, "list_regions"):
+            return list(packs_regions.list_regions())
+    except Exception:
+        pass
+    return list(packs_catalog.list_regions())
+
+
+def _resolve_any_region(region_or_bbox: str) -> Any:
+    try:
+        from gridforge.packs import regions as packs_regions  # type: ignore[import-not-found]
+
+        if hasattr(packs_regions, "resolve_region"):
+            return packs_regions.resolve_region(region_or_bbox)
+    except Exception:
+        pass
+    return resolve_region(region_or_bbox)
+
+
 def get_pack_regions_response() -> PackRegionsResponse:
-    """Build the curated 15-region Australia catalog payload."""
+    """Build the curated grouped regional pack catalog payload (AU, NZ, NA)."""
     items = [
         PackRegionSummary(
             id=r.region_id,
             region_id=r.region_id,
             name=r.name,
-            kind=r.category,
-            category=r.category,
+            group=_infer_region_group(r),
+            kind=r.category if r.category in ("state", "tactical", "custom") else "tactical",
+            category=r.category if r.category in ("state", "tactical", "custom") else "tactical",
             bbox_wgs84=r.bbox_wgs84,
             utm_zones=list(r.utm_zones),
-            description=r.description,
-            estimated_size_hint=r.estimated_size_hint,
+            description=getattr(r, "description", "") or "",
+            estimated_size_hint=getattr(r, "estimated_size_hint", "") or "",
         )
-        for r in list_regions()
+        for r in _load_all_regions()
     ]
     return PackRegionsResponse(regions=items)
 
@@ -155,7 +194,7 @@ class PackTaskManager:
 
     def enqueue_build(self, req: PackBuildRequest) -> PackTaskRecord:
         """Validate region/bbox and enqueue a single-concurrency pack build task."""
-        preset = resolve_region(req.region_or_bbox)
+        preset = _resolve_any_region(req.region_or_bbox)
         slug, out_dir = self._resolve_target_dir(preset, req.name)
 
         task_id = uuid.uuid4().hex[:16]
@@ -207,14 +246,22 @@ class PackTaskManager:
                     )
 
                 self._packs_dir.mkdir(parents=True, exist_ok=True)
+                build_kwargs: dict[str, Any] = {
+                    "name": req.name,
+                    "include_osm": req.include_osm,
+                    "include_dem": req.include_dem,
+                    "include_overlays": req.include_overlays,
+                    "dem_tier": req.dem_tier,
+                }
+                sig = inspect.signature(self._builder)
+                if "include_basemap" in sig.parameters or any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                ):
+                    build_kwargs["include_basemap"] = req.include_basemap
                 manifest = self._builder(
                     req.region_or_bbox,
                     out_dir,
-                    name=req.name,
-                    include_osm=req.include_osm,
-                    include_dem=req.include_dem,
-                    include_overlays=req.include_overlays,
-                    dem_tier=req.dem_tier,
+                    **build_kwargs,
                 )
                 elapsed = round(time.perf_counter() - t0, 3)
                 with self._lock:

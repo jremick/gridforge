@@ -214,6 +214,34 @@ def render_atlas_index_pdf(
     return _spawn_supplement_worker("atlas-index", payload, output_pdf)
 
 
+def render_rf_link_card_pdf(
+    profiles: Sequence[dict[str, Any] | BaseModel],
+    layout: SheetLayout,
+    output_pdf: Path,
+    *,
+    bw: bool = False,
+) -> Path:
+    """Render an exact-mm pure-vector RF / Line-of-Sight Link Budget & Fresnel Profile Card."""
+    if not profiles:
+        raise ValueError("render_rf_link_card_pdf() requires at least one RF link profile.")
+
+    serialized: list[dict[str, Any]] = []
+    for p in profiles:
+        if isinstance(p, BaseModel):
+            serialized.append(json.loads(p.model_dump_json()))
+        elif isinstance(p, dict):
+            serialized.append(dict(p))
+        else:
+            raise TypeError(f"Unsupported RF link profile entry: {type(p)!r}")
+
+    payload = {
+        "profiles": serialized,
+        "layout": json.loads(layout.model_dump_json()),
+        "bw": bool(bw),
+    }
+    return _spawn_supplement_worker("rf-link-card", payload, output_pdf)
+
+
 # ---------------------------------------------------------------------------
 # Subprocess-only PyQt5 QPdfWriter vector drawing implementations
 # ---------------------------------------------------------------------------
@@ -1763,6 +1791,482 @@ def _render_atlas_index_in_process(spec: dict[str, Any], output_pdf: Path) -> No
         painter.end()
 
 
+def _render_rf_link_card_in_process(spec: dict[str, Any], output_pdf: Path) -> None:
+    from PyQt5.QtCore import QPointF, QRectF, Qt
+    from PyQt5.QtGui import QColor, QFontMetricsF, QPainter, QPolygonF
+
+    profiles: list[dict[str, Any]] = list(spec.get("profiles") or [])
+    layout = SheetLayout.model_validate(spec["layout"])
+    bw = bool(spec.get("bw", False))
+
+    page_w = layout.page_width_mm
+    page_h = layout.page_height_mm
+    is_imp = layout.spec.units == Units.IMPERIAL
+    dist_factor = KM_TO_MILES if is_imp else 1.0
+    elev_factor = METERS_TO_FEET if is_imp else 1.0
+    dist_unit = "mi" if is_imp else "km"
+    elev_unit = "ft" if is_imp else "m"
+
+    ink = "#000000" if bw else "#111820"
+    muted = "#333333" if bw else "#4B5563"
+    stripe = "#F2F2F2" if bw else "#F5F7FA"
+    border = "#222222" if bw else "#94A3B8"
+    terrain_fill = "#DCDCDC" if bw else "#D6E2D0"
+    terrain_stroke = "#111111" if bw else "#3A5F3E"
+    fresnel_fill = QColor(180, 180, 180, 75) if bw else QColor(14, 165, 233, 48)
+    fresnel_stroke = "#444444" if bw else "#0284C7"
+    f60_stroke = "#666666" if bw else "#D97706"
+
+    status_colors: dict[str, str] = {
+        "CLEAR": "#111111" if bw else "#15803D",
+        "MARGINAL": "#333333" if bw else "#B45309",
+        "OBSTRUCTED": "#000000" if bw else "#B91C1C",
+    }
+
+    writer = _setup_pdf_writer(output_pdf, page_w, page_h)
+    painter = QPainter()
+    if not painter.begin(writer):
+        raise RuntimeError(f"Failed to start QPainter for '{output_pdf}'.")
+
+    try:
+        margin = 12.0
+        inner_w = page_w - 2.0 * margin
+        title = layout.spec.title or f"SHEET {layout.gzd}"
+
+        # Outer page border
+        painter.setPen(_make_pen(ink, 0.35))
+        painter.drawRect(QRectF(_px(margin), _px(margin), _px(inner_w), _px(page_h - 2.0 * margin)))
+
+        # Header banner
+        painter.fillRect(QRectF(_px(margin), _px(margin), _px(inner_w), _px(12.0)), QColor(ink))
+        _draw_text_box(
+            painter,
+            margin + 4.0,
+            margin + 1.0,
+            inner_w - 8.0,
+            10.0,
+            f"RF / LINE-OF-SIGHT LINK PROFILE & FRESNEL CARD  —  {title.upper()}",
+            pt=9.2,
+            bold=True,
+            color_hex="#FFFFFF",
+        )
+
+        primary = profiles[0]
+        p_status = str(primary.get("status") or "CLEAR").upper()
+        st_col = status_colors.get(p_status, ink)
+        from_lbl = str(primary.get("from_label") or "OBS1")
+        to_lbl = str(primary.get("to_label") or "OBS2")
+        from_mgrs = str(primary.get("from_mgrs") or "—")
+        to_mgrs = str(primary.get("to_mgrs") or "—")
+        from_elev = float(primary.get("from_elev_m") or 0.0) * elev_factor
+        to_elev = float(primary.get("to_elev_m") or 0.0) * elev_factor
+        from_h = float(primary.get("from_height_m") or 2.0)
+        to_h = float(primary.get("to_height_m") or 2.0)
+        dist_km = float(primary.get("distance_km") or 0.0)
+        freq_mhz = float(primary.get("freq_mhz") or 915.0)
+        fspl_db = float(primary.get("fspl_db") or 0.0)
+        min_clr_m = float(primary.get("min_clearance_m") or 0.0)
+        min_f1_pct = float(primary.get("min_fresnel_pct") or 0.0)
+        b_true = float(primary.get("bearing_true_deg") or 0.0)
+        b_grid = float(primary.get("bearing_grid_deg") or 0.0)
+        b_mag = float(primary.get("bearing_mag_deg") or 0.0)
+        b_mils = float(primary.get("bearing_mils") or 0.0)
+
+        # Endpoint telemetry bar + status badge
+        bar_y = margin + 14.0
+        bar_h = 12.0
+        badge_w = 32.0
+        bar_x = margin + 2.0
+        bar_w = inner_w - 4.0
+        painter.fillRect(QRectF(_px(bar_x), _px(bar_y), _px(bar_w), _px(bar_h)), QColor(stripe))
+        painter.setPen(_make_pen(border, 0.2))
+        painter.drawRect(QRectF(_px(bar_x), _px(bar_y), _px(bar_w), _px(bar_h)))
+
+        painter.fillRect(
+            QRectF(_px(bar_x + bar_w - badge_w), _px(bar_y), _px(badge_w), _px(bar_h)),
+            QColor(st_col),
+        )
+        _draw_text_box(
+            painter,
+            bar_x + bar_w - badge_w + 1.0,
+            bar_y + 1.0,
+            badge_w - 2.0,
+            bar_h - 2.0,
+            p_status,
+            pt=8.2,
+            bold=True,
+            align="center",
+            color_hex="#FFFFFF",
+        )
+        _draw_text_box(
+            painter,
+            bar_x + 3.0,
+            bar_y + 1.0,
+            bar_w - badge_w - 5.0,
+            5.0,
+            f"A: {from_lbl} ({from_mgrs})  ·  {round(from_elev):,} {elev_unit} + {from_h:g} m AGL",
+            pt=6.8,
+            bold=True,
+            mono=True,
+            color_hex=ink,
+        )
+        _draw_text_box(
+            painter,
+            bar_x + 3.0,
+            bar_y + 6.2,
+            bar_w - badge_w - 5.0,
+            5.0,
+            f"B: {to_lbl} ({to_mgrs})  ·  {round(to_elev):,} {elev_unit} + {to_h:g} m AGL",
+            pt=6.8,
+            bold=True,
+            mono=True,
+            color_hex=muted,
+        )
+
+        # 4 Key RF Metric Cards
+        cards_y = bar_y + bar_h + 3.0
+        card_h = 15.5
+        gap = 2.8
+        card_w = (bar_w - 3.0 * gap) / 4.0
+        cards = [
+            ("DISTANCE & BAND", f"{dist_km * dist_factor:.2f} {dist_unit} @ {freq_mhz:g} MHz"),
+            ("FREE-SPACE LOSS", f"{fspl_db:.1f} dB"),
+            (
+                "MIN CLEARANCE (F1)",
+                f"{min_clr_m * elev_factor:+.1f} {elev_unit} ({min_f1_pct:.0f}% F1)",
+            ),
+            (
+                "MAG AZ / MILS",
+                f"{b_mag:05.1f}°M ({int(round(b_mils)):04d}m) | {b_grid:05.1f}°G",
+            ),
+        ]
+        for idx, (lbl, val) in enumerate(cards):
+            cx = bar_x + idx * (card_w + gap)
+            painter.fillRect(QRectF(_px(cx), _px(cards_y), _px(card_w), _px(card_h)), QColor(stripe))
+            painter.setPen(_make_pen(border, 0.2))
+            painter.drawRect(QRectF(_px(cx), _px(cards_y), _px(card_w), _px(card_h)))
+            _draw_text_box(
+                painter, cx + 2.0, cards_y + 1.4, card_w - 4.0, 4.2, lbl, pt=5.8, bold=True, color_hex=muted
+            )
+            _draw_text_box(
+                painter,
+                cx + 2.0,
+                cards_y + 6.5,
+                card_w - 4.0,
+                7.2,
+                val,
+                pt=8.0 if len(val) <= 18 else 6.8,
+                bold=True,
+                color_hex=ink,
+            )
+
+        # Pure-vector Fresnel Zone & Terrain Elevation Profile Chart
+        chart_x = margin + 17.0
+        chart_y = cards_y + card_h + 8.5
+        chart_w = inner_w - 23.0
+        is_landscape = page_w > page_h
+        chart_h = 74.0 if not is_landscape else 52.0
+
+        # Split chart title cleanly across full bar_x..bar_x+bar_w so bearings never clip on portrait sheets
+        left_title_w = bar_w * 0.46
+        right_title_w = bar_w - left_title_w - 2.0
+        _draw_text_box(
+            painter,
+            bar_x,
+            chart_y - 5.2,
+            left_title_w,
+            4.5,
+            "CURVED-EARTH (k=4/3) TERRAIN & 1ST FRESNEL PROFILE",
+            pt=6.2,
+            bold=True,
+            color_hex=ink,
+        )
+        right_raw = (
+            f"{from_lbl} → {to_lbl}  "
+            f"({b_true:05.1f}°T · {b_grid:05.1f}°G · {b_mag:05.1f}°M)"
+        )
+        right_font = _make_font(6.0, bold=False)
+        right_elided = QFontMetricsF(right_font).elidedText(
+            right_raw, Qt.ElideRight, _px(right_title_w)
+        )
+        _draw_text_box(
+            painter,
+            bar_x + left_title_w + 2.0,
+            chart_y - 5.2,
+            right_title_w,
+            4.5,
+            right_elided,
+            pt=6.0,
+            bold=False,
+            align="right",
+            color_hex=muted,
+        )
+
+        samples: list[dict[str, Any]] = list(primary.get("samples") or [])
+        if samples:
+            xs_d = [float(s.get("dist_km", 0.0)) * dist_factor for s in samples]
+            terr = [float(s.get("terrain_m", 0.0)) * elev_factor for s in samples]
+            los = [float(s.get("los_m", 0.0)) * elev_factor for s in samples]
+            f_lo = [float(s.get("fresnel_lo_m", s.get("los_m", 0.0))) * elev_factor for s in samples]
+            f_hi = [float(s.get("fresnel_hi_m", s.get("los_m", 0.0))) * elev_factor for s in samples]
+            f60_lo = [float(s.get("fresnel60_lo_m", s.get("los_m", 0.0))) * elev_factor for s in samples]
+            clrs = [float(s.get("clearance_m", 0.0)) for s in samples]
+        else:
+            xs_d = [0.0, max(dist_km * dist_factor, 0.01)]
+            terr = [from_elev, to_elev]
+            los = [from_elev + from_h * elev_factor, to_elev + to_h * elev_factor]
+            f_lo, f_hi, f60_lo = list(los), list(los), list(los)
+            clrs = [min_clr_m, min_clr_m]
+
+        max_d = max(xs_d[-1] if xs_d else 1.0, 0.01)
+        all_y = terr + los + f_lo + f_hi
+        min_y = min(all_y) if all_y else 0.0
+        max_y = max(all_y) if all_y else 100.0
+        y_span = max(max_y - min_y, 20.0)
+        y_min = math.floor((min_y - y_span * 0.14) / 10.0) * 10.0
+        y_max = math.ceil((max_y + y_span * 0.18) / 10.0) * 10.0
+        if y_max <= y_min:
+            y_max = y_min + 20.0
+
+        def _cx(d: float) -> float:
+            return chart_x + (d / max_d) * chart_w
+
+        def _cy(e: float) -> float:
+            return chart_y + chart_h - ((e - y_min) / (y_max - y_min)) * chart_h
+
+        # Gridlines & axes
+        for i in range(5):
+            ev = y_min + (y_max - y_min) * i / 4.0
+            yy = _cy(ev)
+            painter.setPen(_make_pen("#D0D7DE", 0.15))
+            painter.drawLine(QPointF(_px(chart_x), _px(yy)), QPointF(_px(chart_x + chart_w), _px(yy)))
+            _draw_text_box(
+                painter,
+                margin + 1.0,
+                yy - 2.0,
+                14.5,
+                4.0,
+                f"{round(ev):,} {elev_unit}",
+                pt=5.6,
+                align="right",
+                color_hex=muted,
+            )
+
+        for i in range(6):
+            dv = max_d * i / 5.0
+            xx = _cx(dv)
+            painter.setPen(_make_pen("#D0D7DE", 0.12, dashed=True))
+            painter.drawLine(QPointF(_px(xx), _px(chart_y)), QPointF(_px(xx), _px(chart_y + chart_h)))
+            _draw_text_box(
+                painter,
+                xx - 8.5,
+                chart_y + chart_h + 1.2,
+                17.0,
+                4.0,
+                f"{dv:.1f} {dist_unit}",
+                pt=5.8,
+                align="center",
+                color_hex=muted,
+            )
+
+        painter.save()
+        painter.setClipRect(QRectF(_px(chart_x), _px(chart_y), _px(chart_w), _px(chart_h)))
+
+        # 1. Terrain fill + stroke
+        t_poly = QPolygonF()
+        t_poly.append(QPointF(_px(_cx(xs_d[0])), _px(chart_y + chart_h)))
+        for d, e in zip(xs_d, terr):
+            t_poly.append(QPointF(_px(_cx(d)), _px(_cy(e))))
+        t_poly.append(QPointF(_px(_cx(xs_d[-1])), _px(chart_y + chart_h)))
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(terrain_fill))
+        painter.drawPolygon(t_poly)
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(_make_pen(terrain_stroke, 0.45))
+        for i in range(len(xs_d) - 1):
+            painter.drawLine(
+                QPointF(_px(_cx(xs_d[i])), _px(_cy(terr[i]))),
+                QPointF(_px(_cx(xs_d[i + 1])), _px(_cy(terr[i + 1]))),
+            )
+
+        # 2. Outer 1st Fresnel zone envelope
+        f_poly = QPolygonF()
+        for d, e in zip(xs_d, f_hi):
+            f_poly.append(QPointF(_px(_cx(d)), _px(_cy(e))))
+        for d, e in zip(reversed(xs_d), reversed(f_lo)):
+            f_poly.append(QPointF(_px(_cx(d)), _px(_cy(e))))
+        painter.setPen(_make_pen(fresnel_stroke, 0.22, dashed=True))
+        painter.setBrush(fresnel_fill)
+        painter.drawPolygon(f_poly)
+        painter.setBrush(Qt.NoBrush)
+
+        # 3. Inner 60% Fresnel clearance curve
+        painter.setPen(_make_pen(f60_stroke, 0.28, dashed=True))
+        for i in range(len(xs_d) - 1):
+            painter.drawLine(
+                QPointF(_px(_cx(xs_d[i])), _px(_cy(f60_lo[i]))),
+                QPointF(_px(_cx(xs_d[i + 1])), _px(_cy(f60_lo[i + 1]))),
+            )
+
+        # 4. Direct LOS line
+        painter.setPen(_make_pen(st_col, 0.55))
+        for i in range(len(xs_d) - 1):
+            painter.drawLine(
+                QPointF(_px(_cx(xs_d[i])), _px(_cy(los[i]))),
+                QPointF(_px(_cx(xs_d[i + 1])), _px(_cy(los[i + 1]))),
+            )
+
+        # 5. Worst clearance marker (interior points preferred)
+        if len(xs_d) >= 3:
+            worst_i = min(range(1, len(xs_d) - 1), key=lambda k: clrs[k])
+            wx = _cx(xs_d[worst_i])
+            wy = _cy(terr[worst_i])
+            painter.setPen(_make_pen(st_col, 0.28))
+            painter.setBrush(QColor(st_col))
+            painter.drawEllipse(QPointF(_px(wx), _px(wy)), _px(1.1), _px(1.1))
+            painter.setBrush(Qt.NoBrush)
+            _draw_text_box(
+                painter,
+                max(chart_x + 1.0, min(chart_x + chart_w - 34.0, wx - 17.0)),
+                max(chart_y + 1.0, min(chart_y + chart_h - 5.0, wy - 5.5)),
+                34.0,
+                4.2,
+                f"MIN {clrs[worst_i] * elev_factor:+.1f} {elev_unit}",
+                pt=5.8,
+                bold=True,
+                align="center",
+                color_hex=st_col,
+            )
+
+        # Compact legend pill inside top-right of chart
+        leg_w, leg_h = 74.0, 6.2
+        leg_x = chart_x + chart_w - leg_w - 2.0
+        leg_y = chart_y + 1.8
+        painter.fillRect(
+            QRectF(_px(leg_x), _px(leg_y), _px(leg_w), _px(leg_h)),
+            QColor(255, 255, 255, 230),
+        )
+        painter.setPen(_make_pen(border, 0.16))
+        painter.drawRect(QRectF(_px(leg_x), _px(leg_y), _px(leg_w), _px(leg_h)))
+        lx = leg_x + 2.5
+        for col_hex, label_txt, is_dash in (
+            (terrain_stroke, "Terrain", False),
+            (st_col, "LOS", False),
+            (fresnel_stroke, "1st F1", True),
+            (f60_stroke, "60% F1", True),
+        ):
+            painter.setPen(_make_pen(col_hex, 0.48, dashed=is_dash))
+            painter.drawLine(
+                QPointF(_px(lx), _px(leg_y + leg_h * 0.5)),
+                QPointF(_px(lx + 4.5), _px(leg_y + leg_h * 0.5)),
+            )
+            _draw_text_box(
+                painter, lx + 5.2, leg_y + 0.8, 12.8, 4.6, label_txt, pt=5.0, bold=True, color_hex=ink
+            )
+            lx += 17.6
+
+        painter.restore()
+        painter.setPen(_make_pen(ink, 0.30))
+        painter.drawRect(QRectF(_px(chart_x), _px(chart_y), _px(chart_w), _px(chart_h)))
+
+        # Link Summary Table below chart
+        tbl_x = bar_x
+        tbl_w = bar_w
+        tbl_y = chart_y + chart_h + 11.5
+        _draw_text_box(
+            painter,
+            tbl_x,
+            tbl_y - 5.0,
+            tbl_w,
+            4.5,
+            f"RF LINK SUMMARY TABLE ({len(profiles)} {'LINK' if len(profiles) == 1 else 'LINKS'})",
+            pt=7.0,
+            bold=True,
+            color_hex=ink,
+        )
+        cols = [
+            ("LINK", 0.30, "left"),
+            ("FREQ", 0.095, "right"),
+            (f"DIST ({dist_unit})", 0.085, "right"),
+            ("FSPL (dB)", 0.095, "right"),
+            (f"MIN CLR ({elev_unit})", 0.105, "right"),
+            ("F1 %", 0.065, "right"),
+            ("MAG AZ / MILS", 0.145, "right"),
+            ("STATUS", 0.11, "center"),
+        ]
+        row_h = 6.8
+        painter.fillRect(QRectF(_px(tbl_x), _px(tbl_y), _px(tbl_w), _px(row_h)), QColor(ink))
+        cx = tbl_x
+        for hdr, frac, align in cols:
+            cw = tbl_w * frac
+            _draw_text_box(
+                painter, cx + 1.0, tbl_y, cw - 2.0, row_h, hdr, pt=5.9, bold=True, color_hex="#FFFFFF", align=align
+            )
+            cx += cw
+
+        cur_y = tbl_y + row_h
+        usable_bottom = page_h - margin - 10.0
+        link_col_w = tbl_w * cols[0][1] - 2.0
+        link_font = _make_font(5.9, bold=True)
+        link_fm = QFontMetricsF(link_font)
+        for row_idx, pr in enumerate(profiles):
+            if cur_y + row_h > usable_bottom:
+                break
+            if row_idx % 2 == 1:
+                painter.fillRect(QRectF(_px(tbl_x), _px(cur_y), _px(tbl_w), _px(row_h)), QColor(stripe))
+            r_status = str(pr.get("status") or "CLEAR").upper()
+            r_col = status_colors.get(r_status, ink)
+            raw_link_name = f"{pr.get('from_label', 'OBS1')} → {pr.get('to_label', 'OBS2')}"
+            r_name = link_fm.elidedText(raw_link_name, Qt.ElideRight, _px(link_col_w))
+            vals = [
+                (r_name, True, False, ink),
+                (f"{float(pr.get('freq_mhz', 915.0)):g} MHz", False, True, ink),
+                (f"{float(pr.get('distance_km', 0.0)) * dist_factor:.2f}", False, True, ink),
+                (f"{float(pr.get('fspl_db', 0.0)):.1f}", False, True, ink),
+                (f"{float(pr.get('min_clearance_m', 0.0)) * elev_factor:+.1f}", True, True, ink),
+                (f"{float(pr.get('min_fresnel_pct', 0.0)):.0f}%", False, True, ink),
+                (
+                    f"{float(pr.get('bearing_mag_deg', 0.0)):05.1f}° / {int(round(float(pr.get('bearing_mils', 0.0)))):04d}",
+                    False,
+                    True,
+                    ink,
+                ),
+                (r_status, True, True, r_col),
+            ]
+            cx = tbl_x
+            for (txt, is_b, is_m, col_h), (_, frac, align) in zip(vals, cols):
+                cw = tbl_w * frac
+                _draw_text_box(
+                    painter, cx + 1.0, cur_y, cw - 2.0, row_h, txt, pt=5.9, bold=is_b, mono=is_m, color_hex=col_h, align=align
+                )
+                cx += cw
+            painter.setPen(_make_pen(border, 0.15))
+            painter.drawLine(
+                QPointF(_px(tbl_x), _px(cur_y + row_h)),
+                QPointF(_px(tbl_x + tbl_w), _px(cur_y + row_h)),
+            )
+            cur_y += row_h
+
+        painter.setPen(_make_pen(ink, 0.25))
+        painter.drawRect(QRectF(_px(tbl_x), _px(tbl_y), _px(tbl_w), _px(cur_y - tbl_y)))
+
+        # Footer
+        _draw_text_box(
+            painter,
+            margin + 4.0,
+            page_h - margin - 6.0,
+            inner_w - 8.0,
+            5.0,
+            f"GridForge RF / Line-of-Sight Link Card  |  k = 4/3 Effective Earth Radius  |  "
+            f"WMM2025 Magnetic Bearings  |  EPSG:{layout.utm_epsg}",
+            pt=6.1,
+            align="center",
+            color_hex=muted,
+        )
+    finally:
+        painter.end()
+
+
 def _set_exact_mediabox_mm(pdf_path: Path, page_width_mm: float, page_height_mm: float) -> None:
     """Set exact floating-point PDF MediaBox dimensions in points (Qt5 QPdfWriter rounds to int pts)."""
     from pypdf import PdfReader
@@ -1788,7 +2292,10 @@ def _set_exact_mediabox_mm(pdf_path: Path, page_width_mm: float, page_height_mm:
 
 def _worker_main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="GridForge supplemental vector PDF generator")
-    parser.add_argument("mode", choices=["calibration", "route-card", "elevation-profile", "atlas-index"])
+    parser.add_argument(
+        "mode",
+        choices=["calibration", "route-card", "elevation-profile", "atlas-index", "rf-link-card"],
+    )
     parser.add_argument("spec_json", type=Path)
     parser.add_argument("output_pdf", type=Path)
     args = parser.parse_args(argv)
@@ -1819,6 +2326,13 @@ def _worker_main(argv: list[str] | None = None) -> int:
         elif args.mode == "atlas-index":
             _render_atlas_index_in_process(spec, args.output_pdf)
             _set_exact_mediabox_mm(args.output_pdf, spec["page_width_mm"], spec["page_height_mm"])
+        elif args.mode == "rf-link-card":
+            _render_rf_link_card_in_process(spec, args.output_pdf)
+            _set_exact_mediabox_mm(
+                args.output_pdf,
+                spec["layout"]["page_width_mm"],
+                spec["layout"]["page_height_mm"],
+            )
     finally:
         qt_app.quit()
         del qt_app
