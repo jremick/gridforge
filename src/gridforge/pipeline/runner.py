@@ -22,6 +22,7 @@ from gridforge.config import (
     GarminProfile,
     JobWorkspace,
     MBTilesFormat,
+    NZOverlayKind,
     Orientation,
     PackManifest,
     PaperSize,
@@ -30,6 +31,7 @@ from gridforge.config import (
     SheetSpec,
     Units,
     USOverlayKind,
+    ViewshedObserver,
     WaypointInput,
 )
 from gridforge.export.kmz import export_garmin_kmz
@@ -73,7 +75,7 @@ from gridforge.sources.overlays_us import build_us_overlay_sources
 logger = logging.getLogger(__name__)
 
 ProgressCallback = Callable[[str, int], None]
-OverlayOverrideKey = str | USOverlayKind | AUOverlayKind
+OverlayOverrideKey = str | USOverlayKind | AUOverlayKind | NZOverlayKind
 
 
 def _report_progress(callback: ProgressCallback | None, stage: str, pct: int) -> None:
@@ -94,6 +96,10 @@ def _resolve_elevation_source(
         return USGS3DEPSource()
     if spec.dem_source == DemSourceKind.AU_ELVIS:
         return AUElvisDEMSource()
+    if spec.dem_source == DemSourceKind.NZ_LINZ:
+        from gridforge.sources.dem_nz_linz import NZLinzDEMSource
+
+        return NZLinzDEMSource()
     if spec.dem_source == DemSourceKind.GLO30:
         return CopernicusGLO30Source()
     return AutoDEMSource()
@@ -116,9 +122,9 @@ def _resolve_pack_sources(
     regional_overlay_overrides: Mapping[OverlayOverrideKey, Path | str] | None,
 ) -> tuple[
     PackManifest,
-    ElevationSource | None,
+    ElevationSource,
     bool,
-    VectorSource | None,
+    VectorSource,
     dict[str, Path],
     list[USOverlayKind],
     list[AUOverlayKind],
@@ -139,7 +145,12 @@ def _resolve_pack_sources(
 
     pack_used_dem = False
     resolved_elev = elevation_source
-    if resolved_elev is None and manifest.dem_path:
+    if resolved_elev is None:
+        if not manifest.dem_path:
+            raise ValueError(
+                f"Offline pack '{manifest.pack_id}' has no DEM. "
+                "Choose a pack with elevation data or supply --offline-dem."
+            )
         dem_file = (resolved_pack_dir / manifest.dem_path).resolve()
         if not dem_file.exists():
             raise FileNotFoundError(
@@ -149,7 +160,12 @@ def _resolve_pack_sources(
         pack_used_dem = True
 
     resolved_vec = vector_source
-    if resolved_vec is None and manifest.osm_pbf_path:
+    if resolved_vec is None:
+        if not manifest.osm_pbf_path:
+            raise ValueError(
+                f"Offline pack '{manifest.pack_id}' has no OSM data. "
+                "Choose a pack with OSM data or supply --offline-pbf."
+            )
         pbf_file = (resolved_pack_dir / manifest.osm_pbf_path).resolve()
         if not pbf_file.is_file():
             raise FileNotFoundError(
@@ -182,7 +198,7 @@ def _resolve_pack_sources(
         for raw_key, raw_path in regional_overlay_overrides.items():
             norm_key = (
                 raw_key.value
-                if isinstance(raw_key, (USOverlayKind, AUOverlayKind))
+                if isinstance(raw_key, (USOverlayKind, AUOverlayKind, NZOverlayKind))
                 else str(raw_key).lower().replace("_", "-")
             )
             merged_overrides[norm_key] = Path(raw_path).expanduser().resolve()
@@ -286,30 +302,38 @@ def _fetch_regional_overlays(
     *,
     us_kinds_override: Sequence[USOverlayKind] | None = None,
     au_kinds_override: Sequence[AUOverlayKind] | None = None,
+    nz_kinds_override: Sequence[NZOverlayKind] | None = None,
 ) -> tuple[dict[str, Path], list[str]]:
-    """Fetch opt-in US and Australia regional overlays, retaining non-empty GeoPackages."""
+    """Fetch opt-in US, Australia, and New Zealand regional overlays, retaining non-empty GeoPackages."""
     us_kinds = list(spec.us_overlays) if us_kinds_override is None else list(us_kinds_override)
     au_kinds = list(spec.au_overlays) if au_kinds_override is None else list(au_kinds_override)
+    nz_kinds = list(spec.nz_overlays) if nz_kinds_override is None else list(nz_kinds_override)
 
-    if not us_kinds and not au_kinds:
+    if not us_kinds and not au_kinds and not nz_kinds:
         return {}, []
 
     us_overrides: dict[str | USOverlayKind, Path | str] = {}
     au_overrides: dict[str | AUOverlayKind, Path | str] = {}
+    nz_overrides: dict[str | NZOverlayKind, Path | str] = {}
     if local_overrides:
         us_values = {k.value for k in USOverlayKind}
         au_values = {k.value for k in AUOverlayKind}
+        nz_values = {k.value for k in NZOverlayKind}
         for raw_key, raw_path in local_overrides.items():
             if isinstance(raw_key, USOverlayKind):
                 us_overrides[raw_key] = raw_path
             elif isinstance(raw_key, AUOverlayKind):
                 au_overrides[raw_key] = raw_path
+            elif isinstance(raw_key, NZOverlayKind):
+                nz_overrides[raw_key] = raw_path
             else:
                 norm = str(raw_key).lower().replace("_", "-")
                 if norm in us_values:
                     us_overrides[norm] = raw_path
                 elif norm in au_values:
                     au_overrides[norm] = raw_path
+                elif norm in nz_values:
+                    nz_overrides[norm] = raw_path
 
     overlay_dir = job_dir / "regional_overlays"
     overlay_dir.mkdir(parents=True, exist_ok=True)
@@ -319,6 +343,10 @@ def _fetch_regional_overlays(
         sources.update(build_us_overlay_sources(us_kinds, local_overrides=us_overrides or None))
     if au_kinds:
         sources.update(build_au_overlay_sources(au_kinds, local_overrides=au_overrides or None))
+    if nz_kinds:
+        from gridforge.sources.overlays_nz import build_nz_overlay_sources
+
+        sources.update(build_nz_overlay_sources(nz_kinds, local_overrides=nz_overrides or None))
 
     resolved_paths: dict[str, Path] = {}
     attributions: list[str] = []
@@ -375,9 +403,9 @@ def prepare_job_workspace(
     if pack_dir is not None:
         (
             pack_manifest,
-            elevation_source,
+            elev_src,
             pack_used_dem,
-            vector_source,
+            vec_src,
             effective_overrides,
             us_kinds_override,
             au_kinds_override,
@@ -389,9 +417,9 @@ def prepare_job_workspace(
             vector_source=vector_source,
             regional_overlay_overrides=regional_overlay_overrides,
         )
-
-    elev_src = _resolve_elevation_source(spec, elevation_source)
-    vec_src: VectorSource = vector_source or OverpassOSMSource()
+    else:
+        elev_src = _resolve_elevation_source(spec, elevation_source)
+        vec_src = vector_source or OverpassOSMSource()
 
     logger.info(
         "Preparing GridForge workspace: EPSG:%s (%s) scale=1:%s paper=%s %s mode=%s dem=%s%s",
@@ -433,9 +461,22 @@ def prepare_job_workspace(
     _report_progress(progress_callback, "normalizing_osm", 24)
     osm_gpkg = normalize_osm_to_gpkg(osm_raw_path, layout, resolved_dir / "osm.gpkg")
 
-    # 3. Build UTM DEM, multi-directional hillshade, and density-aware elevation contours
+    # 3. Build UTM DEM, multi-directional hillshade, contours, slope shading, and optional RF viewshed
     _report_progress(progress_callback, "terrain", 32)
     terrain = build_terrain_products(dem_raw_path, layout, resolved_dir)
+
+    viewshed_tif: Path | None = getattr(terrain, "viewshed_tif", None)
+    viewshed_observers_gpkg: Path | None = getattr(terrain, "viewshed_observers_gpkg", None)
+    if spec.viewsheds and (viewshed_tif is None or viewshed_observers_gpkg is None):
+        from gridforge.pipeline.terrain import build_viewshed_products
+
+        viewshed_tif, viewshed_observers_gpkg = build_viewshed_products(
+            terrain.dem_utm_tif,
+            list(spec.viewsheds),
+            layout.utm_epsg,
+            spec.color_mode,
+            resolved_dir,
+        )
 
     # 4. Generate MGRS 1 km / 100 km grid & neatline ticks
     _report_progress(progress_callback, "mgrs_grid", 40)
@@ -476,6 +517,12 @@ def prepare_job_workspace(
             resolved_dir / "waypoints.gpkg",
         )
 
+    nz_kinds_override: list[NZOverlayKind] | None = None
+    if pack_manifest is not None:
+        nz_kinds_override = [
+            k for k in spec.nz_overlays if effective_overrides and k.value in effective_overrides
+        ]
+
     regional_overlays, regional_attributions = _fetch_regional_overlays(
         spec,
         layout,
@@ -483,6 +530,7 @@ def prepare_job_workspace(
         local_overrides=effective_overrides,
         us_kinds_override=us_kinds_override,
         au_kinds_override=au_kinds_override,
+        nz_kinds_override=nz_kinds_override,
     )
 
     # 7. Assemble mandatory attributions (deduplicated, preserving order)
@@ -519,6 +567,8 @@ def prepare_job_workspace(
         regional_overlays=regional_overlays,
         slope_tif=terrain.slope_tif,
         waypoints_gpkg=waypoints_gpkg,
+        viewshed_tif=viewshed_tif,
+        viewshed_observers_gpkg=viewshed_observers_gpkg,
     )
 
 
@@ -580,6 +630,16 @@ def _run_workspace_exports(
     return results
 
 
+def _overlay_source_paths(source: OverlaySource) -> list[Path]:
+    """Return resolved file paths wrapped by a user or custom overlay source."""
+    raw_paths = (
+        source.paths
+        if isinstance(source, UserOverlaySource)
+        else [getattr(source, "path", None)]
+    )
+    return [Path(p).expanduser().resolve() for p in raw_paths if p is not None]
+
+
 def _infer_route_file_from_overlays(
     overlay_path: Path | str | None,
     overlay_sources: Sequence[OverlaySource] | None,
@@ -590,10 +650,8 @@ def _infer_route_file_from_overlays(
         if candidate.is_file():
             return candidate
     if overlay_sources:
-        for src in overlay_sources:
-            src_path = getattr(src, "path", None)
-            if src_path is not None:
-                cand = Path(src_path).expanduser().resolve()
+        for source in overlay_sources:
+            for cand in _overlay_source_paths(source):
                 if cand.is_file() and cand.suffix.lower() in (".gpx", ".geojson", ".json"):
                     return cand
     return None
@@ -610,21 +668,24 @@ def _assemble_pdf_with_supplements(
     strip_plan: StripAtlasPlan | None,
     job_dir: Path,
     output_pdf: Path,
+    overlap_pct: float = 0.0,
 ) -> Path:
-    """Assemble ``[Elevation Profile?] + Map Sheet(s) + [Route Card?] + [100 mm Calibration?]``."""
+    """Assemble ``[Atlas Index?] + [Elevation Profile?] + Map Sheet(s) + [Route Card?] + [100 mm Calibration?]``."""
     bw = spec.color_mode == ColorMode.BW
     supp_dir = job_dir / "supplements"
     supp_dir.mkdir(parents=True, exist_ok=True)
     front_pages: list[Path] = []
     back_pages: list[Path] = []
 
+    parsed_route_lonlat: list[tuple[float, float]] | None = None
+    if route_file is not None and route_file.is_file():
+        try:
+            parsed_route_lonlat = parse_route_file(route_file)
+        except Exception as exc:
+            logger.warning("Could not parse '%s' as route (%s)", route_file, exc)
+
     if spec.include_elevation_profile and dem_paths:
-        route_lonlat: list[tuple[float, float]] | None = None
-        if route_file is not None and route_file.is_file():
-            try:
-                route_lonlat = parse_route_file(route_file)
-            except Exception as exc:
-                logger.warning("Could not parse '%s' as route for elevation profile (%s)", route_file, exc)
+        route_lonlat = parsed_route_lonlat
         if route_lonlat is None and len(spec.waypoints) >= 2:
             route_lonlat = [(w.lon, w.lat) for w in spec.waypoints]
         if route_lonlat is None and strip_plan is not None and len(strip_plan.sheets) >= 2:
@@ -640,6 +701,48 @@ def _assemble_pdf_with_supplements(
                 bw=bw,
             )
             front_pages.append(elev_pdf)
+
+    if spec.include_atlas_index and strip_plan is not None and strip_plan.sheets:
+        from pyproj import Transformer
+
+        from gridforge.geo.supplements import AtlasIndexSheet, render_atlas_index_pdf
+
+        first_sheet_page = 2 + len(front_pages)
+        index_sheets = [
+            AtlasIndexSheet(
+                sheet_id=sh.sheet_id,
+                page_number=first_sheet_page + idx_s,
+                center_lat=sh.center_lat,
+                center_lon=sh.center_lon,
+                center_mgrs_10m=sh.center_mgrs_10m,
+                utm_bbox=sh.utm_bbox,
+            )
+            for idx_s, sh in enumerate(strip_plan.sheets)
+        ]
+        route_utm: list[tuple[float, float]] | None = None
+        if parsed_route_lonlat and len(parsed_route_lonlat) >= 2:
+            to_utm = Transformer.from_crs(
+                "EPSG:4326", f"EPSG:{strip_plan.utm_epsg}", always_xy=True
+            )
+            rxs, rys = to_utm.transform(
+                [p[0] for p in parsed_route_lonlat],
+                [p[1] for p in parsed_route_lonlat],
+            )
+            route_utm = [(float(x), float(y)) for x, y in zip(rxs, rys)]
+
+        idx_pdf = render_atlas_index_pdf(
+            index_sheets,
+            page_width_mm=anchor_layout.page_width_mm,
+            page_height_mm=anchor_layout.page_height_mm,
+            scale=spec.scale,
+            utm_epsg=strip_plan.utm_epsg,
+            title=(spec.title or "GRIDFORGE STRIP ATLAS"),
+            overlap_pct=overlap_pct,
+            route_utm=route_utm,
+            output_pdf=supp_dir / "atlas_index.pdf",
+            bw=bw,
+        )
+        front_pages.insert(0, idx_pdf)
 
     if spec.include_route_card and spec.waypoints:
         dem_for_wp = dem_paths[0] if dem_paths else None
@@ -704,11 +807,7 @@ def run_render_job(
     combined_overlays: list[OverlaySource] = list(overlay_sources or [])
     if overlay_path is not None:
         resolved_ov = Path(overlay_path).expanduser().resolve()
-        existing_paths = {
-            Path(getattr(s, "path")).expanduser().resolve()
-            for s in combined_overlays
-            if getattr(s, "path", None) is not None
-        }
+        existing_paths = {p for s in combined_overlays for p in _overlay_source_paths(s)}
         if resolved_ov not in existing_paths:
             combined_overlays.insert(0, UserOverlaySource(resolved_ov))
 
@@ -804,11 +903,15 @@ def run_strip_atlas_job(
     dem_source: DemSourceKind = DemSourceKind.AUTO,
     us_overlays: Sequence[USOverlayKind] | None = None,
     au_overlays: Sequence[AUOverlayKind] | None = None,
+    nz_overlays: Sequence[NZOverlayKind] | None = None,
     carto: CartoOptions | None = None,
     waypoints: Sequence[WaypointInput] | None = None,
+    viewsheds: Sequence[ViewshedObserver] | None = None,
     include_calibration_page: bool = False,
     include_route_card: bool = False,
     include_elevation_profile: bool = True,
+    include_atlas_index: bool = False,
+    show_fold_marks: bool = False,
     overlap_pct: float = 10.0,
     max_sheets: int = 12,
     elevation_source: ElevationSource | None = None,
@@ -840,8 +943,7 @@ def run_strip_atlas_job(
 
     combined_overlays: list[OverlaySource] = [UserOverlaySource(resolved_route)]
     for src in overlay_sources or []:
-        src_path = getattr(src, "path", None)
-        if src_path is not None and Path(src_path).expanduser().resolve() == resolved_route:
+        if _overlay_source_paths(src) == [resolved_route]:
             continue
         combined_overlays.append(src)
 
@@ -849,8 +951,10 @@ def run_strip_atlas_job(
     total_sheets = len(strip_plan.sheets)
     eff_carto = carto if carto is not None else CartoOptions()
     eff_waypoints = list(waypoints or [])
+    eff_viewsheds = list(viewsheds or [])
     eff_us = list(dict.fromkeys(us_overlays or []))
     eff_au = list(dict.fromkeys(au_overlays or []))
+    eff_nz = list(dict.fromkeys(nz_overlays or []))
 
     owns_temp_dir = work_dir is None
     if work_dir is not None:
@@ -897,10 +1001,14 @@ def run_strip_atlas_job(
                 dem_source=dem_source,
                 us_overlays=eff_us,
                 au_overlays=eff_au,
+                nz_overlays=eff_nz,
                 waypoints=eff_waypoints,
+                viewsheds=eff_viewsheds,
                 include_calibration_page=include_calibration_page,
                 include_route_card=include_route_card,
                 include_elevation_profile=include_elevation_profile,
+                include_atlas_index=include_atlas_index,
+                show_fold_marks=show_fold_marks,
             )
             if anchor_spec is None:
                 anchor_spec = sheet_spec.model_copy(update={"title": base_title})
@@ -945,6 +1053,7 @@ def run_strip_atlas_job(
             strip_plan=strip_plan,
             job_dir=job_dir,
             output_pdf=output_pdf_path,
+            overlap_pct=overlap_pct,
         )
 
         _report_progress(progress_callback, "done", 100)

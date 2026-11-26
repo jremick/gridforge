@@ -15,6 +15,7 @@ from gridforge.config import (
     ColorMode,
     GridTick,
     JobWorkspace,
+    NZOverlayKind,
     SheetLayout,
 )
 from gridforge.render.styles import DEFAULT_FONT_FAMILY, map_background_hex
@@ -23,6 +24,10 @@ _AU_STATE_TRAIL_KEYS: frozenset[str] = frozenset(
     {k.value for k in AU_STATE_TRAIL_OVERLAY_KINDS}
     | {k.value.replace("-", "_") for k in AU_STATE_TRAIL_OVERLAY_KINDS}
 )
+_NZ_TRAIL_KEYS: frozenset[str] = frozenset(
+    {NZOverlayKind.NZ_DOC_TRAILS.value, NZOverlayKind.NZ_DOC_TRAILS.value.replace("-", "_")}
+)
+_ALL_TRAIL_OVERLAY_KEYS: frozenset[str] = _AU_STATE_TRAIL_KEYS | _NZ_TRAIL_KEYS
 
 # Per-scale metric & imperial scale bar parameters calibrated to fit cleanly in ~40 mm width.
 # Format: (units_per_segment, segments_left, segments_right, unit_label, subdivision_count)
@@ -632,12 +637,19 @@ def _render_compact_map_key(
     has_au_hydro = ("au-hydro" in regional) or ("au_hydro" in regional)
     has_au_aviation = ("au-aviation" in regional) or ("au_aviation" in regional)
     has_au_state_trails = any(k in regional for k in _AU_STATE_TRAIL_KEYS)
+    has_nz_trails = any(k in regional for k in _NZ_TRAIL_KEYS)
+    has_state_or_nz_trails = has_au_state_trails or has_nz_trails
     has_slope = bool(
         workspace is not None
         and workspace.slope_tif is not None
         and workspace.slope_tif.is_file()
         and carto is not None
         and carto.show_slope_shading
+    )
+    has_viewshed = bool(
+        workspace is not None
+        and workspace.viewshed_tif is not None
+        and workspace.viewshed_tif.is_file()
     )
     has_waypoints = bool(
         workspace is not None
@@ -649,25 +661,25 @@ def _render_compact_map_key(
     has_au_row = (has_au_parks or has_au_hydro or has_au_aviation) and not has_us_row
 
     # Keep total rows cleanly readable (<= 11 rows inside 31.8 mm box height)
-    dynamic_count = (
-        int(has_us_row or has_au_row)
-        + int(has_au_state_trails)
-        + int(has_slope)
-        + int(has_waypoints)
-    )
-    if 8 + int(has_infra) + dynamic_count > 11:
+    def _count_rows() -> int:
+        return (
+            8
+            + int(has_infra)
+            + int(has_us_row or has_au_row)
+            + int(has_state_or_nz_trails)
+            + int(has_slope)
+            + int(has_viewshed)
+            + int(has_waypoints)
+        )
+
+    if _count_rows() > 11:
         has_infra = False
-    if 8 + int(has_infra) + dynamic_count > 11 and has_au_row and has_au_state_trails:
+    if _count_rows() > 11 and has_au_row and has_state_or_nz_trails:
+        has_au_row = False
+    if _count_rows() > 11 and has_au_row:
         has_au_row = False
 
-    extra_rows = (
-        int(has_infra)
-        + int(has_us_row or has_au_row)
-        + int(has_au_state_trails)
-        + int(has_slope)
-        + int(has_waypoints)
-    )
-    total_rows = 8 + extra_rows
+    total_rows = _count_rows()
     meta_y = y_mm + h_mm - 4.7
     meta_divider_y = meta_y - 0.35
     row_y0 = y_mm + 4.55
@@ -828,8 +840,8 @@ def _render_compact_map_key(
             au_tag = "Bore / Waterpt"
         _add_label(print_layout, au_tag, lbl_x, ry - 1.15, lbl_w, 2.3, size_pt=lbl_pt, valign="center")
 
-    # Row: NSW / VIC State Fire Trails, Huts & Trigs
-    if has_au_state_trails:
+    # Row: Pan-Australia State Fire Trails or New Zealand DOC Tracks / Huts / Trigs
+    if has_state_or_nz_trails:
         ry = _ry(idx); idx += 1
         _add_line(
             print_layout,
@@ -842,7 +854,8 @@ def _render_compact_map_key(
             dash_vector=[1.4, 0.65] if is_color else [1.5, 0.55, 0.5, 0.55],
         )
         _add_triangle(print_layout, sx1 + 4.5, ry - 0.68, 1.35, fill_hex="#7A3E1D" if is_color else "#111111")
-        _add_label(print_layout, "Fire Trl / Hut / Trig", lbl_x, ry - 1.15, lbl_w, 2.3, size_pt=lbl_pt, valign="center")
+        tr_lbl = "Fire Trl / Hut / Trig" if has_au_state_trails else "Tracks / Huts / Trigs"
+        _add_label(print_layout, tr_lbl, lbl_x, ry - 1.15, lbl_w, 2.3, size_pt=lbl_pt, valign="center")
 
     # Row: Slope-Angle Shading (Avalanche >30 deg)
     if has_slope:
@@ -865,6 +878,31 @@ def _render_compact_map_key(
                 stroke_mm=0.08,
             )
         _add_label(print_layout, "Slope 30/35/45°+", lbl_x, ry - 1.15, lbl_w, 2.3, size_pt=lbl_pt, valign="center")
+
+    # Row: RF / Line-of-Sight Viewshed Coverage
+    if has_viewshed:
+        ry = _ry(idx); idx += 1
+        _add_rect(
+            print_layout,
+            sx1,
+            ry - 0.55,
+            4.0,
+            1.10,
+            fill_hex="#6BE6BF" if is_color else "#B8B8B8",
+            stroke_hex="#00897B" if is_color else "#222222",
+            stroke_mm=0.16,
+        )
+        _add_rect(
+            print_layout,
+            sx1 + 4.7,
+            ry - 0.55,
+            1.10,
+            1.10,
+            fill_hex="#00695C" if is_color else "#000000",
+            stroke_hex="#111111",
+            stroke_mm=0.14,
+        )
+        _add_label(print_layout, "LOS / RF Viewshed", lbl_x, ry - 1.05, lbl_w, 2.1, size_pt=lbl_pt, valign="center")
 
     # Row: Custom Tactical Waypoints & Route Legs
     if has_waypoints:
@@ -936,6 +974,68 @@ def _format_attribution_footer(attributions: list[str]) -> str:
     if "GridForge" not in joined:
         ordered.append("Rendered by GridForge (GPL-3.0)")
     return " | ".join(ordered)
+
+
+def _render_fold_marks(print_layout: Any, layout: SheetLayout) -> None:
+    """Draw exact 4.0 mm corner crop & midpoint fold/join registration hairlines outside the neatline."""
+    ox1 = layout.frame_x_mm - 0.8
+    oy1 = layout.frame_y_mm - 0.8
+    ox2 = layout.frame_x_mm + layout.frame_width_mm + 0.8
+    oy2 = layout.frame_y_mm + layout.frame_height_mm + 0.8
+    gap = 1.4
+    arm = 4.0
+    mark_c = "#222222"
+    w_mm = 0.20
+
+    # Four L-shaped corner registration crop marks (strictly clear of header, collar, and MGRS ticks)
+    corners = (
+        (ox1, oy1, -1.0, -1.0),
+        (ox2, oy1, 1.0, -1.0),
+        (ox1, oy2, -1.0, 1.0),
+        (ox2, oy2, 1.0, 1.0),
+    )
+    for cx, cy, dx, dy in corners:
+        hx1 = max(1.0, min(layout.page_width_mm - 1.0, cx + dx * gap))
+        hx2 = max(1.0, min(layout.page_width_mm - 1.0, cx + dx * (gap + arm)))
+        vy1 = max(1.0, min(layout.page_height_mm - 1.0, cy + dy * gap))
+        vy2 = max(1.0, min(layout.page_height_mm - 1.0, cy + dy * (gap + arm)))
+        _add_line(print_layout, hx1, cy, hx2, cy, color_hex=mark_c, width_mm=w_mm)
+        _add_line(print_layout, cx, vy1, cx, vy2, color_hex=mark_c, width_mm=w_mm)
+
+    # Subtle margin midpoint fold/join micro-ticks on left, right, and bottom paper edges
+    mid_y = layout.frame_y_mm + layout.frame_height_mm / 2.0
+    mid_x = layout.frame_x_mm + layout.frame_width_mm / 2.0
+    _add_line(print_layout, 1.0, mid_y, 4.2, mid_y, color_hex="#555555", width_mm=0.18)
+    _add_line(
+        print_layout,
+        layout.page_width_mm - 4.2,
+        mid_y,
+        layout.page_width_mm - 1.0,
+        mid_y,
+        color_hex="#555555",
+        width_mm=0.18,
+    )
+    _add_line(
+        print_layout,
+        mid_x,
+        layout.page_height_mm - 1.6,
+        mid_x,
+        layout.page_height_mm - 0.3,
+        color_hex="#555555",
+        width_mm=0.18,
+    )
+    _add_label(
+        print_layout,
+        "FOLD / JOIN",
+        0.8,
+        mid_y + 0.4,
+        10.2,
+        2.0,
+        size_pt=3.6,
+        color_hex="#666666",
+        halign="left",
+        valign="top",
+    )
 
 
 def _split_base_and_vector_layers(ordered_layers: list[Any]) -> tuple[list[Any], list[Any]]:
@@ -1095,6 +1195,10 @@ def build_print_layout(
         stroke_hex="#1A1A1A",
         stroke_mm=0.20,
     )
+
+    # Optional edge-overlap corner crop & margin fold/join registration marks for multi-sheet atlases
+    if spec.show_fold_marks:
+        _render_fold_marks(print_layout, layout)
 
     # 3. Top Header Band (y = 1.4 .. 7.6 mm, strictly above top tick labels)
     fx = layout.frame_x_mm

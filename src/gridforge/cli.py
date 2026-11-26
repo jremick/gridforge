@@ -5,6 +5,7 @@ from __future__ import annotations
 from enum import Enum
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Literal, Optional, cast
 
@@ -21,16 +22,19 @@ from gridforge.config import (
     GarminProfile,
     HillshadeStrength,
     MBTilesFormat,
+    NZOverlayKind,
     Orientation,
     PaperSize,
     SheetSpec,
     Units,
     USOverlayKind,
+    ViewshedObserver,
     WaypointCategory,
     WaypointInput,
 )
 from gridforge.geo.crs import compute_sheet_layout, parse_center
 from gridforge.geo.declination import compute_declination
+from gridforge.packs.builder import resolve_pack_directory
 from gridforge.pipeline.runner import run_export_job, run_render_job, run_strip_atlas_job
 from gridforge.sources.base import ElevationSource, OverlaySource, VectorSource
 from gridforge.sources.dem_local import LocalDEMSource
@@ -75,11 +79,24 @@ def _configure_logging(verbose: bool) -> None:
     )
 
 
+def _cli_pack(path: Path | None, pack_id: str | None) -> Path | None:
+    """Resolve mutually exclusive ``--pack`` directory or installed ``--pack-id``."""
+    if path is not None and pack_id is not None:
+        raise typer.BadParameter("Choose either --pack or --pack-id.")
+    if pack_id is None:
+        return path
+    packs_root = os.environ.get("GRIDFORGE_PACKS_DIR", "/data/packs")
+    try:
+        return resolve_pack_directory(packs_root, pack_id)
+    except FileNotFoundError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--pack-id") from exc
+
+
 def _parse_waypoints(raw_waypoints: list[str] | None) -> list[WaypointInput]:
     """Parse repeatable ``--waypoint 'Label,lat,lon[,category[,notes]]'`` CLI strings."""
     parsed: list[WaypointInput] = []
     for raw in raw_waypoints or []:
-        parts = [p.strip() for p in raw.split(",")]
+        parts = [p.strip() for p in raw.split(",", maxsplit=4)]
         if len(parts) < 3:
             raise typer.BadParameter(
                 f"Invalid --waypoint '{raw}'. Expected 'Label,lat,lon[,category[,notes]]'."
@@ -105,11 +122,51 @@ def _parse_waypoints(raw_waypoints: list[str] | None) -> list[WaypointInput]:
                     f"Invalid waypoint category '{parts[3]}' in '{raw}'. Choose: {allowed}."
                 ) from exc
 
-        notes = ",".join(parts[4:]).strip() or None if len(parts) >= 5 else None
+        notes = parts[4] if len(parts) == 5 and parts[4] else None
         try:
             parsed.append(WaypointInput(label=label, lat=lat, lon=lon, category=cat, notes=notes))
         except Exception as exc:
             raise typer.BadParameter(f"Invalid waypoint '{raw}': {exc}") from exc
+    return parsed
+
+
+def _parse_viewsheds(raw_viewsheds: list[str] | None) -> list[ViewshedObserver]:
+    """Parse repeatable ``--viewshed 'lat,lon[,obs_m[,tgt_m[,max_km[,label]]]]'`` CLI strings."""
+    parsed: list[ViewshedObserver] = []
+    for idx, raw in enumerate(raw_viewsheds or [], start=1):
+        parts = [p.strip() for p in raw.split(",", maxsplit=5)]
+        if len(parts) < 2:
+            raise typer.BadParameter(
+                f"Invalid --viewshed '{raw}'. Expected 'lat,lon[,obs_m[,tgt_m[,max_km[,label]]]]'."
+            )
+        try:
+            lat = float(parts[0])
+            lon = float(parts[1])
+            obs_m = float(parts[2]) if len(parts) >= 3 and parts[2] else 2.0
+            tgt_m = float(parts[3]) if len(parts) >= 4 and parts[3] else 1.5
+            max_km = float(parts[4]) if len(parts) >= 5 and parts[4] else 10.0
+        except ValueError as exc:
+            raise typer.BadParameter(
+                f"Invalid numeric field in --viewshed '{raw}'. Expected 'lat,lon[,obs_m[,tgt_m[,max_km[,label]]]]'."
+            ) from exc
+
+        label = parts[5] if len(parts) == 6 else ""
+        if not label:
+            label = f"Observer {idx}"
+
+        try:
+            parsed.append(
+                ViewshedObserver(
+                    label=label,
+                    lat=lat,
+                    lon=lon,
+                    observer_height_m=obs_m,
+                    target_height_m=tgt_m,
+                    max_distance_m=max_km * 1000.0,
+                )
+            )
+        except Exception as exc:
+            raise typer.BadParameter(f"Invalid --viewshed '{raw}': {exc}") from exc
     return parsed
 
 
@@ -128,10 +185,14 @@ def _build_spec(
     dem_source: DemSourceKind = DemSourceKind.AUTO,
     us_overlays: list[USOverlayKind] | None = None,
     au_overlays: list[AUOverlayKind] | None = None,
+    nz_overlays: list[NZOverlayKind] | None = None,
     waypoints: list[WaypointInput] | None = None,
+    viewsheds: list[ViewshedObserver] | None = None,
     include_calibration_page: bool = False,
     include_route_card: bool = False,
     include_elevation_profile: bool = False,
+    include_atlas_index: bool = False,
+    show_fold_marks: bool = False,
     carto: CartoOptions | None = None,
 ) -> SheetSpec:
     if scale not in VALID_SCALES:
@@ -159,10 +220,14 @@ def _build_spec(
         dem_source=dem_source,
         us_overlays=list(dict.fromkeys(us_overlays or [])),
         au_overlays=list(dict.fromkeys(au_overlays or [])),
+        nz_overlays=list(dict.fromkeys(nz_overlays or [])),
         waypoints=list(waypoints or []),
+        viewsheds=list(viewsheds or []),
         include_calibration_page=include_calibration_page,
         include_route_card=include_route_card,
         include_elevation_profile=include_elevation_profile,
+        include_atlas_index=include_atlas_index,
+        show_fold_marks=show_fold_marks,
         carto=carto if carto is not None else CartoOptions(),
     )
 
@@ -249,7 +314,7 @@ def render_cmd(
         DemSourceKind.AUTO,
         "--dem-source",
         case_sensitive=False,
-        help="Elevation source selection (auto, glo30, usgs3dep, au-elvis).",
+        help="Elevation source selection (auto, glo30, usgs3dep, au-elvis, nz-linz).",
     ),
     us_overlay: Optional[list[USOverlayKind]] = typer.Option(
         None,
@@ -267,10 +332,21 @@ def render_cmd(
             "au-tas-trails, au-qld-trails, au-wa-trails, au-sa-trails, au-nt-trails, au-act-trails); repeatable."
         ),
     ),
+    nz_overlay: Optional[list[NZOverlayKind]] = typer.Option(
+        None,
+        "--nz-overlay",
+        case_sensitive=False,
+        help="Optional New Zealand CC BY 4.0 overlay (nz-doc-trails); repeatable.",
+    ),
     pack: Optional[Path] = typer.Option(
         None,
         "--pack",
         help="Path to an air-gapped offline regional pack directory containing pack.json.",
+    ),
+    pack_id: Optional[str] = typer.Option(
+        None,
+        "--pack-id",
+        help="Installed offline regional pack ID resolved under GRIDFORGE_PACKS_DIR (default /data/packs).",
     ),
     contour_density: DensityLevel = typer.Option(
         DensityLevel.NORMAL,
@@ -295,6 +371,11 @@ def render_cmd(
     power: bool = typer.Option(True, "--power/--no-power", help="Show power lines, towers, and substations."),
     pipelines: bool = typer.Option(True, "--pipelines/--no-pipelines", help="Show pipelines."),
     grid: bool = typer.Option(True, "--grid/--no-grid", help="Show MGRS 1 km grid & neatline ticks."),
+    export_grid: bool = typer.Option(
+        True,
+        "--export-grid/--no-export-grid",
+        help="Include the enabled print grid in accompanying digital exports.",
+    ),
     river_arrows: bool = typer.Option(
         True,
         "--river-arrows/--no-river-arrows",
@@ -310,6 +391,11 @@ def render_cmd(
         "--waypoint",
         help='Add a numbered tactical waypoint as "Label,lat,lon[,category]" (waypoint|camp|water|hazard|lz); repeatable.',
     ),
+    viewshed: Optional[list[str]] = typer.Option(
+        None,
+        "--viewshed",
+        help='Add an RF/LOS viewshed observer as "lat,lon[,obs_m[,tgt_m[,max_km[,label]]]]"; repeatable.',
+    ),
     calibration_page: bool = typer.Option(
         False,
         "--calibration-page/--no-calibration-page",
@@ -324,6 +410,16 @@ def render_cmd(
         False,
         "--elevation-profile/--no-elevation-profile",
         help="Prepend a Route Overview & DEM Elevation Profile page (from --strip-route, --overlay, or --waypoint).",
+    ),
+    atlas_index: bool = typer.Option(
+        False,
+        "--atlas-index/--no-atlas-index",
+        help="Prepend a vector Atlas Overview & Sheet Index cover page for multi-sheet / strip atlases.",
+    ),
+    fold_marks: bool = typer.Option(
+        False,
+        "--fold-marks/--no-fold-marks",
+        help="Draw 4.0 mm corner crop & margin fold/join registration marks outside the neatline.",
     ),
     mbtiles: Optional[Path] = typer.Option(
         None,
@@ -414,10 +510,12 @@ def render_cmd(
         show_slope_shading=slope_shading,
     )
     parsed_waypoints = _parse_waypoints(waypoint)
+    parsed_viewsheds = _parse_viewsheds(viewshed)
 
     elev_src: ElevationSource | None = LocalDEMSource(offline_dem) if offline_dem is not None else None
     vec_src: VectorSource | None = LocalPBFSource(offline_pbf) if offline_pbf is not None else None
     overlay_srcs: list[OverlaySource] = [UserOverlaySource(p) for p in (overlay or [])]
+    pack_dir = _cli_pack(pack, pack_id)
 
     if strip_route is not None:
         if scale not in VALID_SCALES:
@@ -438,16 +536,20 @@ def render_cmd(
             dem_source=dem_source,
             us_overlays=us_overlay,
             au_overlays=au_overlay,
+            nz_overlays=nz_overlay,
             carto=carto,
             waypoints=parsed_waypoints,
+            viewsheds=parsed_viewsheds,
             include_calibration_page=calibration_page,
             include_route_card=route_card,
             include_elevation_profile=elevation_profile,
+            include_atlas_index=atlas_index,
+            show_fold_marks=fold_marks,
             overlap_pct=overlap_pct,
             elevation_source=elev_src,
             vector_source=vec_src,
             overlay_sources=overlay_srcs or None,
-            pack_dir=pack,
+            pack_dir=pack_dir,
             keep_workspace=keep_workspace,
             work_dir=work_dir,
         )
@@ -467,10 +569,14 @@ def render_cmd(
             dem_source=dem_source,
             us_overlays=us_overlay,
             au_overlays=au_overlay,
+            nz_overlays=nz_overlay,
             waypoints=parsed_waypoints,
+            viewsheds=parsed_viewsheds,
             include_calibration_page=calibration_page,
             include_route_card=route_card,
             include_elevation_profile=elevation_profile,
+            include_atlas_index=atlas_index,
+            show_fold_marks=fold_marks,
             carto=carto,
         )
         result = run_render_job(
@@ -479,7 +585,7 @@ def render_cmd(
             elevation_source=elev_src,
             vector_source=vec_src,
             overlay_sources=overlay_srcs or None,
-            pack_dir=pack,
+            pack_dir=pack_dir,
             keep_workspace=keep_workspace,
             work_dir=work_dir,
             mbtiles_out=mbtiles,
@@ -487,7 +593,7 @@ def render_cmd(
             mbtiles_format=mbtiles_format,
             garmin_profile=garmin_profile,
             max_tiles=max_tiles,
-            export_include_grid=grid,
+            export_include_grid=grid and export_grid,
             export_dpi=dpi,
         )
 
@@ -586,7 +692,7 @@ def export_cmd(
         DemSourceKind.AUTO,
         "--dem-source",
         case_sensitive=False,
-        help="Elevation source selection (auto, glo30, usgs3dep, au-elvis).",
+        help="Elevation source selection (auto, glo30, usgs3dep, au-elvis, nz-linz).",
     ),
     us_overlay: Optional[list[USOverlayKind]] = typer.Option(
         None,
@@ -604,10 +710,21 @@ def export_cmd(
             "au-tas-trails, au-qld-trails, au-wa-trails, au-sa-trails, au-nt-trails, au-act-trails); repeatable."
         ),
     ),
+    nz_overlay: Optional[list[NZOverlayKind]] = typer.Option(
+        None,
+        "--nz-overlay",
+        case_sensitive=False,
+        help="Optional New Zealand CC BY 4.0 overlay (nz-doc-trails); repeatable.",
+    ),
     pack: Optional[Path] = typer.Option(
         None,
         "--pack",
         help="Path to an air-gapped offline regional pack directory containing pack.json.",
+    ),
+    pack_id: Optional[str] = typer.Option(
+        None,
+        "--pack-id",
+        help="Installed offline regional pack ID resolved under GRIDFORGE_PACKS_DIR (default /data/packs).",
     ),
     contour_density: DensityLevel = typer.Option(
         DensityLevel.NORMAL,
@@ -647,6 +764,11 @@ def export_cmd(
         "--waypoint",
         help='Add a numbered tactical waypoint as "Label,lat,lon[,category]" (waypoint|camp|water|hazard|lz); repeatable.',
     ),
+    viewshed: Optional[list[str]] = typer.Option(
+        None,
+        "--viewshed",
+        help='Add an RF/LOS viewshed observer as "lat,lon[,obs_m[,tgt_m[,max_km[,label]]]]"; repeatable.',
+    ),
     offline_dem: Optional[Path] = typer.Option(None, "--offline-dem", help="Local GeoTIFF/VRT or directory of DEMs."),
     offline_pbf: Optional[Path] = typer.Option(None, "--offline-pbf", help="Local .osm.pbf or .osm XML file."),
     overlay: Optional[list[Path]] = typer.Option(None, "--overlay", help="Optional user overlay (.geojson, .gpx, .csv)."),
@@ -684,13 +806,16 @@ def export_cmd(
         dem_source=dem_source,
         us_overlays=us_overlay,
         au_overlays=au_overlay,
+        nz_overlays=nz_overlay,
         waypoints=_parse_waypoints(waypoint),
+        viewsheds=_parse_viewsheds(viewshed),
         carto=carto,
     )
 
     elev_src: ElevationSource | None = LocalDEMSource(offline_dem) if offline_dem is not None else None
     vec_src: VectorSource | None = LocalPBFSource(offline_pbf) if offline_pbf is not None else None
     overlay_srcs: list[OverlaySource] = [UserOverlaySource(p) for p in (overlay or [])]
+    pack_dir = _cli_pack(pack, pack_id)
 
     results = run_export_job(
         spec,
@@ -699,7 +824,7 @@ def export_cmd(
         elevation_source=elev_src,
         vector_source=vec_src,
         overlay_sources=overlay_srcs or None,
-        pack_dir=pack,
+        pack_dir=pack_dir,
         mbtiles_format=mbtiles_format,
         garmin_profile=garmin_profile,
         max_tiles=max_tiles,
@@ -1076,7 +1201,7 @@ def pack_inspect_cmd(
 @app.command("serve")
 def serve_cmd(
     host: str = typer.Option(
-        "0.0.0.0",
+        "127.0.0.1",
         "--host",
         help="Bind interface for the GridForge self-hosted web server.",
     ),

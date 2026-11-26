@@ -27,6 +27,7 @@ from gridforge.config import (
     DensityLevel,
     HillshadeStrength,
     JobWorkspace,
+    NZOverlayKind,
     Units,
 )
 
@@ -36,6 +37,7 @@ logger = logging.getLogger(__name__)
 STYLE_ROLES: tuple[str, ...] = (
     "landcover",
     "hillshade",
+    "viewshed",
     "slope_shading",
     "fema_flood",
     "au_protected_areas",
@@ -70,6 +72,8 @@ STYLE_ROLES: tuple[str, ...] = (
     "overlay_points",
     "waypoint_route",
     "waypoint_points",
+    "viewshed_rings",
+    "viewshed_observers",
 )
 
 DEFAULT_FONT_FAMILY = "Liberation Sans"
@@ -99,6 +103,7 @@ _LABELED_ROLES: frozenset[str] = frozenset(
         "us_towers",
         "mgrs_square_labels",
         "waypoint_points",
+        "viewshed_observers",
     }
 )
 _NATIVE_QML_MARKER = "gridforge-pyqgis-exported"
@@ -1187,6 +1192,60 @@ def _build_slope_shading_style(
         shader.setRasterShaderFunction(ramp)
         renderer = QgsSingleBandPseudoColorRenderer(layer.dataProvider(), 1, shader)
         renderer.setOpacity(0.42 if is_color else 0.35)
+        layer.setRenderer(renderer)
+
+    layer.setBlendMode(QPainter.CompositionMode_SourceOver)
+    if layer.resampleFilter() is not None:
+        layer.resampleFilter().setZoomedInResampler(QgsBilinearRasterResampler())
+        layer.resampleFilter().setZoomedOutResampler(QgsBilinearRasterResampler())
+
+
+def _build_viewshed_style(
+    layer: Any,
+    color_mode: ColorMode,
+) -> None:
+    """Style RF / line-of-sight viewshed coverage raster on the lower raster stack.
+
+    Supports both 4-band RGBA Byte GeoTIFFs (from ``terrain.build_viewshed_products``)
+    and 1-band binary visibility rasters (0/255), keeping ``BlendNormal`` at 0.52 Color /
+    0.55 B&W opacity right above ``hillshade.tif`` so all upper-stack vectors remain pure.
+    """
+    from qgis.core import (
+        QgsBilinearRasterResampler,
+        QgsColorRampShader,
+        QgsMultiBandColorRenderer,
+        QgsRasterShader,
+        QgsSingleBandPseudoColorRenderer,
+    )
+    from qgis.PyQt.QtGui import QColor, QPainter
+
+    is_color = color_mode == ColorMode.COLOR
+    band_count = layer.bandCount() if hasattr(layer, "bandCount") else 4
+
+    if band_count >= 3:
+        renderer = QgsMultiBandColorRenderer(layer.dataProvider(), 1, 2, 3)
+        if band_count >= 4:
+            renderer.setAlphaBand(4)
+        renderer.setOpacity(0.52 if is_color else 0.55)
+        layer.setRenderer(renderer)
+    else:
+        shader = QgsRasterShader()
+        ramp = QgsColorRampShader()
+        ramp.setColorRampType(QgsColorRampShader.Discrete)
+        if is_color:
+            items = [
+                QgsColorRampShader.ColorRampItem(0.5, QColor(0, 0, 0, 0), "Shadowed"),
+                QgsColorRampShader.ColorRampItem(255.0, QColor(0, 212, 146, 170), "Visible"),
+            ]
+        else:
+            items = [
+                QgsColorRampShader.ColorRampItem(0.5, QColor(0, 0, 0, 0), "Shadowed"),
+                QgsColorRampShader.ColorRampItem(255.0, QColor(80, 80, 80, 145), "Visible"),
+            ]
+        ramp.setColorRampItemList(items)
+        shader.setRasterShaderFunction(ramp)
+        renderer = QgsSingleBandPseudoColorRenderer(layer.dataProvider(), 1, shader)
+        renderer.setOpacity(0.52 if is_color else 0.55)
         layer.setRenderer(renderer)
 
     layer.setBlendMode(QPainter.CompositionMode_SourceOver)
@@ -3660,6 +3719,92 @@ def _build_waypoint_points_style(
     layer.setLabelsEnabled(True)
 
 
+def _build_viewshed_rings_style(
+    layer: Any,
+    color_mode: ColorMode,
+    *,
+    scale: int = 25000,
+) -> None:
+    """Style RF / LOS viewshed max-range boundary rings."""
+    from qgis.core import QgsSingleSymbolRenderer
+
+    wf = scale_width_factor(scale)
+    is_color = color_mode == ColorMode.COLOR
+    sym = _halo_dashed_line_symbol(
+        "#00897B" if is_color else "#222222",
+        0.38 * wf,
+        [2.6, 1.4],
+        halo_hex="#FFFFFF",
+        halo_width_mm=0.72 * wf,
+        halo_alpha=185,
+        render_pass=28,
+    )
+    layer.setRenderer(QgsSingleSymbolRenderer(sym))
+    layer.setLabelsEnabled(False)
+
+
+def _build_viewshed_observers_style(
+    layer: Any,
+    color_mode: ColorMode,
+    *,
+    units: Units = Units.METRIC,
+    scale: int = 25000,
+    icons_root: Path | None = None,
+) -> None:
+    """Style RF / LOS observer beacon pins with AGL antenna height callouts."""
+    from qgis.core import QgsPalLayerSettings, QgsSingleSymbolRenderer, QgsVectorLayerSimpleLabeling
+
+    wf = scale_width_factor(scale)
+    fd = scale_font_delta(scale)
+    is_color = color_mode == ColorMode.COLOR
+    fill_c = "#00695C" if is_color else "#000000"
+    outline_c = "#004D40" if is_color else "#000000"
+
+    sym = _svg_marker_symbol(
+        "observer",
+        3.3 * wf,
+        fill_hex=fill_c,
+        outline_hex=outline_c,
+        icons_root=icons_root,
+    )
+    layer.setRenderer(QgsSingleSymbolRenderer(sym))
+
+    if units == Units.IMPERIAL:
+        h_fmt = "to_int(round(to_real(\"observer_height_m\") * 3.28084)) || ' ft AGL'"
+    else:
+        h_fmt = (
+            "CASE WHEN abs(to_real(\"observer_height_m\") - round(to_real(\"observer_height_m\"))) < 0.05 "
+            "THEN to_int(round(to_real(\"observer_height_m\"))) "
+            "ELSE round(to_real(\"observer_height_m\"), 1) END || ' m AGL'"
+        )
+
+    lbl_expr = (
+        "CASE "
+        "WHEN \"label\" IS NOT NULL AND length(trim(\"label\")) > 0 AND \"observer_height_m\" IS NOT NULL "
+        f"THEN trim(\"label\") || ' (' || {h_fmt} || ')' "
+        "WHEN \"label\" IS NOT NULL AND length(trim(\"label\")) > 0 THEN trim(\"label\") "
+        f"WHEN \"observer_height_m\" IS NOT NULL THEN 'Observer (' || {h_fmt} || ')' "
+        "ELSE 'Observer' END"
+    )
+    pal = QgsPalLayerSettings()
+    pal.fieldName = lbl_expr
+    pal.isExpression = True
+    pal.priority = 10
+    _configure_point_pal(pal, over_point=False, dist_mm=2.2)
+    pal.setFormat(
+        _make_text_format(
+            6.3 + fd,
+            "#004D40" if is_color else "#000000",
+            bold=True,
+            halo_hex="#FFFFFF",
+            halo_mm=0.85,
+            halo_opacity=0.98,
+        )
+    )
+    layer.setLabeling(QgsVectorLayerSimpleLabeling(pal))
+    layer.setLabelsEnabled(True)
+
+
 def apply_programmatic_style(
     layer: Any,
     role: str,
@@ -3677,6 +3822,8 @@ def apply_programmatic_style(
         _build_landcover_style(layer, color_mode, carto=opts, icons_root=icons_root)
     elif role == "hillshade":
         _build_hillshade_style(layer, color_mode, carto=opts)
+    elif role == "viewshed":
+        _build_viewshed_style(layer, color_mode)
     elif role == "slope_shading":
         _build_slope_shading_style(layer, color_mode)
     elif role == "fema_flood":
@@ -3741,6 +3888,10 @@ def apply_programmatic_style(
         _build_waypoint_route_style(layer, color_mode, scale=scale)
     elif role == "waypoint_points":
         _build_waypoint_points_style(layer, color_mode, scale=scale)
+    elif role == "viewshed_rings":
+        _build_viewshed_rings_style(layer, color_mode, scale=scale)
+    elif role == "viewshed_observers":
+        _build_viewshed_observers_style(layer, color_mode, units=units, scale=scale, icons_root=icons_root)
     else:
         raise ValueError(f"Unknown GridForge style role: {role!r}")
 
@@ -3760,7 +3911,7 @@ def _can_use_cached_qml(
         return False
     if carto != _DEFAULT_CARTO:
         return False
-    if units == Units.IMPERIAL and role in ("points", "us_towers", "au_state_pois"):
+    if units == Units.IMPERIAL and role in ("points", "us_towers", "au_state_pois", "viewshed_observers"):
         return False
     return True
 
@@ -3805,6 +3956,8 @@ def apply_layer_style(
                     _build_hillshade_style(layer, color_mode, carto=opts)
                 elif role == "slope_shading":
                     _build_slope_shading_style(layer, color_mode)
+                elif role == "viewshed":
+                    _build_viewshed_style(layer, color_mode)
                 return True
             logger.warning(
                 "QML style %s incomplete (ok=%s, renderer=%s, labeling=%s, msg=%s); "
@@ -3976,7 +4129,8 @@ def populate_project_layers(
 
     au_state_trail_entries: list[tuple[str, Path, set[str]]] = []
     seen_state_paths: set[Path] = set()
-    for st_kind in AU_STATE_TRAIL_OVERLAY_KINDS:
+    unified_trail_kinds = (*AU_STATE_TRAIL_OVERLAY_KINDS, NZOverlayKind.NZ_DOC_TRAILS)
+    for st_kind in unified_trail_kinds:
         raw_st = regional.get(st_kind.value) or regional.get(st_kind.value.replace("-", "_"))
         if raw_st is None:
             continue
@@ -3987,11 +4141,12 @@ def populate_project_layers(
         seen_state_paths.add(resolved_st)
         st_layers = set(_list_gpkg_layers(st_path))
         if st_layers:
-            label_prefix = (
-                "AU State"
-                if st_kind.value == "au-state-trails"
-                else st_kind.value.split("-")[1].upper()
-            )
+            if st_kind.value == "au-state-trails":
+                label_prefix = "AU State"
+            elif st_kind.value == "nz-doc-trails":
+                label_prefix = "NZ DOC"
+            else:
+                label_prefix = st_kind.value.split("-")[1].upper()
             au_state_trail_entries.append((label_prefix, st_path, st_layers))
 
     fema_layers = set(_list_gpkg_layers(fema_path)) if fema_path else set()
@@ -4004,6 +4159,12 @@ def populate_project_layers(
     au_aviation_layers = set(_list_gpkg_layers(au_aviation_path)) if au_aviation_path else set()
     waypoints_path = workspace.waypoints_gpkg if (workspace.waypoints_gpkg and workspace.waypoints_gpkg.is_file()) else None
     waypoints_layers = set(_list_gpkg_layers(waypoints_path)) if waypoints_path else set()
+    vs_obs_path = (
+        workspace.viewshed_observers_gpkg
+        if (workspace.viewshed_observers_gpkg and workspace.viewshed_observers_gpkg.is_file())
+        else None
+    )
+    vs_obs_layers = set(_list_gpkg_layers(vs_obs_path)) if vs_obs_path else set()
 
     ordered_top_to_bottom: list[Any] = []
 
@@ -4011,7 +4172,7 @@ def populate_project_layers(
         if layer is not None:
             ordered_top_to_bottom.append(layer)
 
-    # 0. Tactical Custom Waypoints & Route Legs on very top (highest visibility)
+    # 0. Tactical Custom Waypoints & RF/LOS Viewshed Observers on very top (highest visibility)
     if waypoints_path:
         if "waypoint_points" in waypoints_layers:
             _push(
@@ -4023,6 +4184,30 @@ def populate_project_layers(
             _push(
                 _load_vector_layer(
                     project, waypoints_path, "waypoint_route", "Waypoint Route", role="waypoint_route", workspace=workspace
+                )
+            )
+
+    if vs_obs_path:
+        if "viewshed_observers" in vs_obs_layers:
+            _push(
+                _load_vector_layer(
+                    project,
+                    vs_obs_path,
+                    "viewshed_observers",
+                    "LOS / RF Observers",
+                    role="viewshed_observers",
+                    workspace=workspace,
+                )
+            )
+        if "viewshed_rings" in vs_obs_layers:
+            _push(
+                _load_vector_layer(
+                    project,
+                    vs_obs_path,
+                    "viewshed_rings",
+                    "LOS / RF Max Range",
+                    role="viewshed_rings",
+                    workspace=workspace,
                 )
             )
 
@@ -4152,7 +4337,7 @@ def populate_project_layers(
     if au_parks_path and "au_protected_areas" in au_parks_layers:
         _push(_load_vector_layer(project, au_parks_path, "au_protected_areas", "AU Protected Areas", role="au_protected_areas", workspace=workspace))
 
-    # 10.5. Slope-Angle Avalanche Shading (bottom raster stack right above hillshade; vectors stay pure!)
+    # 10.5. Slope-Angle Avalanche Shading (bottom raster stack right above viewshed & hillshade; vectors stay pure!)
     if carto.show_slope_shading and workspace.slope_tif is not None and workspace.slope_tif.is_file():
         slope_layer = QgsRasterLayer(str(workspace.slope_tif), "Slope Shading")
         if slope_layer.isValid():
@@ -4166,6 +4351,21 @@ def populate_project_layers(
             )
             project.addMapLayer(slope_layer, False)
             ordered_top_to_bottom.append(slope_layer)
+
+    # 10.75. RF / Line-of-Sight Viewshed Coverage (bottom raster stack right above hillshade, below slope!)
+    if workspace.viewshed_tif is not None and workspace.viewshed_tif.is_file():
+        vs_layer = QgsRasterLayer(str(workspace.viewshed_tif), "LOS Viewshed")
+        if vs_layer.isValid():
+            apply_layer_style(
+                vs_layer,
+                "viewshed",
+                spec.color_mode,
+                units=spec.units,
+                scale=spec.scale,
+                carto=carto,
+            )
+            project.addMapLayer(vs_layer, False)
+            ordered_top_to_bottom.append(vs_layer)
 
     # 11. Multi-directional Hillshade (Multiply blend over landcover + background; omitted if OFF)
     if carto.hillshade_strength != HillshadeStrength.OFF and workspace.hillshade_tif.is_file():
@@ -4351,6 +4551,15 @@ def export_qml_styles(styles_root: Path | None = None) -> list[Path]:
             "&field=category:string&field=mgrs_10m:string&field=elev_m:double",
             "waypoint_points",
         ),
+        "viewshed_rings": (
+            "LineString?crs=EPSG:32756&field=label:string&field=max_distance_m:double",
+            "viewshed_rings",
+        ),
+        "viewshed_observers": (
+            "Point?crs=EPSG:32756&field=label:string&field=observer_height_m:double"
+            "&field=target_height_m:double&field=max_distance_m:double&field=elev_m:double",
+            "viewshed_observers",
+        ),
     }
 
     with tempfile.TemporaryDirectory(prefix="gridforge_qml_") as tmpdir:
@@ -4370,6 +4579,14 @@ def export_qml_styles(styles_root: Path | None = None) -> list[Path]:
             sds.GetRasterBand(b_idx).Fill(val)
         sds.FlushCache()
         sds = None
+
+        dummy_vs_tif = Path(tmpdir) / "dummy_viewshed_rgba.tif"
+        vds = drv.Create(str(dummy_vs_tif), 4, 4, 4, gdal.GDT_Byte)
+        vds.SetGeoTransform((250000.0, 10.0, 0.0, 6265000.0, 0.0, -10.0))
+        for b_idx, val in ((1, 0), (2, 212), (3, 146), (4, 130)):
+            vds.GetRasterBand(b_idx).Fill(val)
+        vds.FlushCache()
+        vds = None
 
         def _tag_native_qml(path: Path) -> None:
             text = path.read_text(encoding="utf-8")
@@ -4394,6 +4611,15 @@ def export_qml_styles(styles_root: Path | None = None) -> list[Path]:
                 raise RuntimeError(f"Failed to export {hs_qml}: {msg}")
             _tag_native_qml(hs_qml)
             written.append(hs_qml)
+
+            vlayer_vs = QgsRasterLayer(str(dummy_vs_tif), "viewshed")
+            apply_programmatic_style(vlayer_vs, "viewshed", mode)
+            vs_qml = mode_dir / "viewshed.qml"
+            msg, ok = vlayer_vs.saveNamedStyle(str(vs_qml))
+            if not ok:
+                raise RuntimeError(f"Failed to export {vs_qml}: {msg}")
+            _tag_native_qml(vs_qml)
+            written.append(vs_qml)
 
             slayer = QgsRasterLayer(str(dummy_slope_tif), "slope_shading")
             apply_programmatic_style(slayer, "slope_shading", mode)
