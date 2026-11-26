@@ -2,26 +2,35 @@
 
 from __future__ import annotations
 
+import html as html_lib
+import json
 import logging
 import math
 import os
 import re
+import secrets
+import shutil
 import subprocess
 import time
 import uuid
 from collections import OrderedDict
 from collections.abc import Callable
+from contextlib import aclosing
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import anyio
 import httpx
 import mgrs
 from fastapi import FastAPI, HTTPException, Query, Request, Response, status
+from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 from pyproj import Transformer
+from starlette.formparsers import MultiPartException, MultiPartParser
 
 from gridforge import __version__
 from gridforge.config import BBox, Orientation, PaperSize, SheetSpec, Units
@@ -42,8 +51,25 @@ from gridforge.geo.tactical import RulerMetricsResponse
 from gridforge.geo.waypoints import compute_route_metrics
 from gridforge.packs.builder import discover_packs
 from gridforge.web import db, projects as projects_store
-from gridforge.web.access import SameOriginWritesMiddleware
+from gridforge.web.access import SameOriginWritesMiddleware, get_client_ip
+from gridforge.web.auth import (
+    OAUTH_STATE_COOKIE_NAME,
+    AuthConfig,
+    AuthContext,
+    AuthManager,
+    sha256_hex,
+)
 from gridforge.web.basemap import BasemapInfoResponse, MBTilesBasemapStore
+from gridforge.web.limits import (
+    LimitsConfig,
+    enforce_and_create_job,
+    enforce_and_record_auth_attempt,
+    enforce_and_record_geocode_miss,
+    enforce_and_record_preview,
+    enforce_pre_upload_job_limits,
+    get_capabilities,
+    validate_job_capabilities,
+)
 from gridforge.web.pack_tasks import (
     _TASK_ID_RE,
     PackBuildRequest,
@@ -60,6 +86,18 @@ from gridforge.web.projects import (
     ProjectUpdateRequest,
 )
 from gridforge.web.schemas import (
+    AcceptInviteRequest,
+    AdminInviteRecord,
+    AdminSettingsRequest,
+    AdminSettingsResponse,
+    AdminUsageEvent,
+    AdminUsageResponse,
+    AdminUsageSummary,
+    AdminUserRecord,
+    AdminUsersResponse,
+    AuthSessionResponse,
+    CreateInviteRequest,
+    CreateInviteResponse,
     CreateJobRequest,
     FootprintRequest,
     FootprintResponse,
@@ -68,8 +106,10 @@ from gridforge.web.schemas import (
     HealthResponse,
     JobRecord,
     JobsListResponse,
+    LoginRequest,
     PacksResponse,
     PackSummary,
+    RevokeInviteResponse,
     RFLinkProfileRequest,
     RFLinkProfileResponse,
     RouteMetricsRequest,
@@ -77,6 +117,8 @@ from gridforge.web.schemas import (
     RulerMetricsRequest,
     StripPlanRequest,
     StripPlanResponse,
+    UpdateUserRequest,
+    UpdateUserResponse,
     ViewshedPreviewRequest,
     ViewshedPreviewResponse,
 )
@@ -89,6 +131,7 @@ from gridforge.web.viewshed import (
 logger = logging.getLogger(__name__)
 
 _HTTP_422: int = getattr(status, "HTTP_422_UNPROCESSABLE_CONTENT", 422)
+_HTTP_413: int = getattr(status, "HTTP_413_CONTENT_TOO_LARGE", 413)
 MAX_UPLOAD_BYTES: int = 25 * 1024 * 1024  # 25 MiB
 ALLOWED_OVERLAY_EXTS: frozenset[str] = frozenset({".geojson", ".json", ".gpx", ".csv"})
 _JOB_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{8,64}$")
@@ -111,7 +154,12 @@ _MEDIA_TYPES: dict[str, str] = {
 }
 
 
-def _search_nominatim(query: str, limit: int = 5) -> list[GeocodeResult]:
+def _search_nominatim(
+    query: str,
+    limit: int = 5,
+    *,
+    on_cache_miss: Callable[[], None] | None = None,
+) -> list[GeocodeResult]:
     """Search OSM Nominatim with in-memory LRU/TTL cache and graceful offline fallback."""
     cleaned = query.strip()
     if len(cleaned) < 2:
@@ -126,6 +174,9 @@ def _search_nominatim(query: str, limit: int = 5) -> list[GeocodeResult]:
             _geocode_cache.move_to_end(cache_key)
             return list(items)
         _geocode_cache.pop(cache_key, None)
+
+    if on_cache_miss is not None:
+        on_cache_miss()
 
     url = os.environ.get("GRIDFORGE_NOMINATIM_URL", NOMINATIM_URL).strip()
     try:
@@ -185,6 +236,111 @@ def _split_mgrs(raw: str) -> tuple[str, str, str]:
     if not match:
         raise ValueError(f"Unexpected MGRS string: '{raw}'")
     return (f"{int(match.group(1))}{match.group(2)}", match.group(3), match.group(4))
+
+
+def _parse_content_length(request: Request) -> int | None:
+    raw = request.headers.get("content-length")
+    if raw is None:
+        return None
+    cleaned = raw.strip()
+    if not cleaned:
+        return None
+    try:
+        val = int(cleaned)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid Content-Length header.",
+        ) from exc
+    if val < 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid Content-Length header.",
+        )
+    return val
+
+
+class _OversizeUploadError(Exception):
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail)
+        self.detail = detail
+
+
+class _BoundedMultiPartParser(MultiPartParser):
+    def __init__(
+        self,
+        headers: Any,
+        stream: Any,
+        *,
+        max_file_bytes: int,
+        oversize_detail: str,
+        max_files: int | float = 1000,
+        max_fields: int | float = 1000,
+        max_part_size: int = 1024 * 1024,
+    ) -> None:
+        super().__init__(
+            headers,
+            stream,
+            max_files=max_files,
+            max_fields=max_fields,
+            max_part_size=max_part_size,
+        )
+        self._max_file_bytes = max_file_bytes
+        self._oversize_detail = oversize_detail
+        self._total_file_bytes = 0
+
+    def on_part_data(self, data: bytes, start: int, end: int) -> None:
+        if self._current_part.file is not None:
+            self._total_file_bytes += end - start
+            if self._total_file_bytes > self._max_file_bytes:
+                raise _OversizeUploadError(self._oversize_detail)
+        super().on_part_data(data, start, end)
+
+
+def _make_bounded_request(
+    request: Request,
+    *,
+    max_body_bytes: int,
+    detail: str,
+) -> Request:
+    orig_receive = request.receive
+    received_bytes = 0
+
+    async def bounded_receive() -> dict[str, Any]:
+        nonlocal received_bytes
+        message = await orig_receive()
+        if message.get("type") == "http.request":
+            chunk = message.get("body") or b""
+            received_bytes += len(chunk)
+            if received_bytes > max_body_bytes:
+                raise HTTPException(status_code=_HTTP_413, detail=detail)
+        return message
+
+    return Request(request.scope, bounded_receive)
+
+
+async def _parse_bounded_multipart_form(
+    bounded_request: Request,
+    *,
+    max_file_bytes: int,
+    detail: str,
+) -> Any:
+    try:
+        async with aclosing(bounded_request.stream()) as stream:
+            parser = _BoundedMultiPartParser(
+                bounded_request.headers,
+                stream,
+                max_file_bytes=max_file_bytes,
+                oversize_detail=detail,
+            )
+            return await parser.parse()
+    except _OversizeUploadError as exc:
+        raise HTTPException(status_code=_HTTP_413, detail=exc.detail) from exc
+    except MultiPartException as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=exc.message,
+        ) from exc
 
 
 def _sanitize_upload_filename(raw_name: str | None) -> str:
@@ -445,6 +601,21 @@ def _resolve_default_data_dir() -> Path:
     return Path("/tmp/gridforge-data/jobs")
 
 
+def _resolve_default_samples_dir() -> Path | None:
+    env_samples = os.environ.get("GRIDFORGE_SAMPLES_DIR", "").strip()
+    if env_samples:
+        p = Path(env_samples).resolve()
+        return p if p.is_dir() else None
+    for candidate in (
+        Path("/app/samples"),
+        Path("/data/samples"),
+        Path(__file__).resolve().parents[3] / "samples",
+    ):
+        if candidate.is_dir():
+            return candidate.resolve()
+    return None
+
+
 def create_app(
     *,
     data_dir: Path | str | None = None,
@@ -477,6 +648,12 @@ def create_app(
     db_path = resolved_data_dir / "gridforge_jobs.sqlite3"
     db.init_db(db_path)
 
+    auth_config = AuthConfig.from_env()
+    limits_config = LimitsConfig.from_env(auth_mode=auth_config.auth_mode)
+    auth_manager = AuthManager(db_path=db_path, config=auth_config)
+    if auth_config.auth_mode == "hosted":
+        auth_manager.bootstrap_admin()
+
     basemap_store = MBTilesBasemapStore(
         packs_dir=resolved_packs_dir,
         explicit_path=basemap_mbtiles,
@@ -488,9 +665,14 @@ def create_app(
     )
 
     application = FastAPI(
-        title="GridForge Map Studio API",
+        title=f"{auth_config.brand_name} Map Studio API",
         version=__version__,
-        description="Self-hosted military-style MGRS topographic map generator & offline pack studio.",
+        description=(
+            f"{auth_config.brand_name} — true-scale local UTM MGRS topographic map generator & print studio "
+            "(powered by open-source GridForge)."
+            if auth_config.brand_name.lower() != "gridforge"
+            else "Self-hosted military-style MGRS topographic map generator & offline pack studio."
+        ),
     )
     application.add_middleware(SameOriginWritesMiddleware)
     allowed_hosts = ["localhost", "127.0.0.1", "[::1]"]
@@ -507,6 +689,27 @@ def create_app(
     application.state.web_dist_dir = resolved_web_dist
     application.state.basemap_store = basemap_store
     application.state.pack_manager = pack_manager
+    application.state.auth_config = auth_config
+    application.state.limits_config = limits_config
+    application.state.auth_manager = auth_manager
+
+    def _caps_for(ctx: AuthContext):
+        return get_capabilities(
+            ctx.role,
+            limits_config,
+            turnstile_sitekey=auth_config.turnstile_site_key,
+            turnstile_configured=auth_config.turnstile_configured,
+            google_oauth_enabled=auth_config.google_oauth_enabled,
+        )
+
+    def _require_admin(request: Request) -> AuthContext:
+        ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=False)
+        if auth_config.auth_mode != "hosted" or ctx.role != "admin":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Admin privileges required.",
+            )
+        return ctx
 
     @application.get("/api/health", response_model=HealthResponse)
     def api_health() -> HealthResponse:
@@ -521,6 +724,310 @@ def create_app(
             memory_budget_mb=resolved_mem_mb,
             packs_count=len(packs),
         )
+
+    @application.get("/api/auth/session", response_model=AuthSessionResponse)
+    def api_auth_session(request: Request, response: Response) -> AuthSessionResponse:
+        ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=True)
+        payload = auth_manager.build_session_response(ctx, limits_config)
+        auth_manager.apply_auth_cookies(response, ctx, request)
+        return payload
+
+    @application.post("/api/auth/login", response_model=AuthSessionResponse)
+    def api_auth_login(
+        req: LoginRequest,
+        request: Request,
+        response: Response,
+    ) -> AuthSessionResponse:
+        client_ip = get_client_ip(request)
+        if auth_config.auth_mode == "hosted":
+            enforce_and_record_auth_attempt(
+                db_path,
+                event_type="auth_login",
+                client_ip=client_ip,
+                cfg=limits_config,
+            )
+        user, raw_session_token = auth_manager.authenticate_password(req.email, req.password)
+        auth_manager.set_session_cookie(response, raw_session_token, request)
+        role_val = "admin" if user["role"] == "admin" else "friend"
+        ctx = AuthContext(
+            auth_mode="hosted",
+            role=role_val,
+            authenticated=True,
+            owner_id=str(user["user_id"]),
+            user=user,
+            client_ip=client_ip,
+        )
+        return auth_manager.build_session_response(ctx, limits_config)
+
+    @application.post("/api/auth/logout", response_model=AuthSessionResponse)
+    def api_auth_logout(request: Request, response: Response) -> AuthSessionResponse:
+        ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=False)
+        auth_manager.logout_session(ctx)
+        auth_manager.delete_session_cookie(response, request)
+        if auth_config.auth_mode == "none":
+            next_ctx = AuthContext(
+                auth_mode="none",
+                role="none",
+                authenticated=False,
+                owner_id="local",
+                user=None,
+                client_ip=ctx.client_ip,
+            )
+        else:
+            existing_guest_id = auth_manager._parse_guest_cookie(
+                request.cookies.get("gf_guest")
+            )
+            new_guest_cookie: str | None = None
+            if existing_guest_id is None:
+                existing_guest_id, new_guest_cookie = auth_manager._mint_guest_cookie()
+            next_ctx = AuthContext(
+                auth_mode="hosted",
+                role="guest",
+                authenticated=False,
+                owner_id=f"guest:{existing_guest_id}",
+                user=None,
+                client_ip=ctx.client_ip,
+                new_guest_cookie_value=new_guest_cookie,
+            )
+            auth_manager.apply_auth_cookies(response, next_ctx, request)
+        return auth_manager.build_session_response(next_ctx, limits_config)
+
+    @application.post("/api/auth/register")
+    def api_auth_register() -> None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Public signup is disabled; an admin invite is required.",
+        )
+
+    @application.post("/api/auth/accept-invite", response_model=AuthSessionResponse)
+    def api_auth_accept_invite(
+        req: AcceptInviteRequest,
+        request: Request,
+        response: Response,
+    ) -> AuthSessionResponse:
+        client_ip = get_client_ip(request)
+        if auth_config.auth_mode == "hosted":
+            enforce_and_record_auth_attempt(
+                db_path,
+                event_type="auth_accept_invite",
+                client_ip=client_ip,
+                cfg=limits_config,
+            )
+        user, raw_session_token = auth_manager.accept_invite(req)
+        auth_manager.set_session_cookie(response, raw_session_token, request)
+        role_val = "admin" if user["role"] == "admin" else "friend"
+        ctx = AuthContext(
+            auth_mode="hosted",
+            role=role_val,
+            authenticated=True,
+            owner_id=str(user["user_id"]),
+            user=user,
+            client_ip=client_ip,
+        )
+        return auth_manager.build_session_response(ctx, limits_config)
+
+    @application.get("/api/auth/google/start", include_in_schema=False)
+    def api_google_start(
+        request: Request,
+        invite_token: str | None = Query(default=None),
+    ) -> RedirectResponse:
+        auth_url, signed_state = auth_manager.build_google_oauth_start(
+            request, invite_token=invite_token
+        )
+        resp = RedirectResponse(url=auth_url, status_code=status.HTTP_302_FOUND)
+        resp.set_cookie(
+            key=OAUTH_STATE_COOKIE_NAME,
+            value=signed_state,
+            max_age=600,
+            path="/",
+            httponly=True,
+            samesite="lax",
+            secure=auth_manager._cookie_is_secure(request),
+        )
+        return resp
+
+    @application.get("/api/auth/google/callback", name="api_google_callback", include_in_schema=False)
+    def api_google_callback(
+        request: Request,
+        code: str | None = Query(default=None),
+        state: str | None = Query(default=None),
+        error: str | None = Query(default=None),
+    ) -> Response:
+        secure = auth_manager._cookie_is_secure(request)
+        try:
+            _, raw_session_token = auth_manager.handle_google_oauth_callback(
+                request, code=code, state=state, error=error
+            )
+        except HTTPException as exc:
+            err_resp = JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+            err_resp.delete_cookie(
+                key=OAUTH_STATE_COOKIE_NAME,
+                path="/",
+                httponly=True,
+                samesite="lax",
+                secure=secure,
+            )
+            return err_resp
+
+        resp = RedirectResponse(url="/", status_code=status.HTTP_302_FOUND)
+        resp.delete_cookie(
+            key=OAUTH_STATE_COOKIE_NAME,
+            path="/",
+            httponly=True,
+            samesite="lax",
+            secure=secure,
+        )
+        auth_manager.set_session_cookie(resp, raw_session_token, request)
+        return resp
+
+    @application.get("/api/admin/usage", response_model=AdminUsageResponse)
+    def api_admin_usage(request: Request) -> AdminUsageResponse:
+        _require_admin(request)
+        report = db.get_admin_usage_report(
+            db_path,
+            global_daily_public_limit=limits_config.global_daily_public_renders,
+        )
+        return AdminUsageResponse(
+            summary=AdminUsageSummary(**report["summary"]),
+            by_role=report["by_role"],
+            recent_events=[AdminUsageEvent(**ev) for ev in report["recent_events"]],
+        )
+
+    @application.get("/api/admin/users", response_model=AdminUsersResponse)
+    def api_admin_users(request: Request) -> AdminUsersResponse:
+        _require_admin(request)
+        users = [
+            AdminUserRecord(
+                user_id=u["user_id"],
+                email=u["email"],
+                display_name=u["display_name"],
+                role=u["role"],
+                disabled=bool(u["disabled"]),
+                daily_render_limit=u["daily_render_limit"],
+                hourly_preview_limit=u["hourly_preview_limit"],
+                has_password=bool(u.get("password_hash")),
+                has_google=bool(u.get("google_sub")),
+                created_at=u["created_at"],
+                last_login_at=u.get("last_login_at"),
+            )
+            for u in db.list_users(db_path)
+        ]
+        invites = [
+            AdminInviteRecord(
+                invite_id=inv["invite_id"],
+                email=inv["email"],
+                role=inv["role"],
+                created_by=inv["created_by"],
+                created_at=inv["created_at"],
+                expires_at=inv["expires_at"],
+                used_at=inv["used_at"],
+                used_by_user_id=inv["used_by_user_id"],
+                revoked_at=inv["revoked_at"],
+                status=inv["status"],
+            )
+            for inv in db.list_invites(db_path)
+        ]
+        return AdminUsersResponse(users=users, invites=invites)
+
+    @application.post(
+        "/api/admin/invites",
+        response_model=CreateInviteResponse,
+        status_code=status.HTTP_201_CREATED,
+    )
+    def api_admin_create_invite(
+        req: CreateInviteRequest,
+        request: Request,
+    ) -> CreateInviteResponse:
+        ctx = _require_admin(request)
+        raw_token = secrets.token_urlsafe(24)
+        invite_id = f"inv_{uuid.uuid4().hex[:12]}"
+        expires_at = db._dt_to_iso(
+            datetime.now(timezone.utc) + timedelta(hours=req.expires_hours)
+        )
+        db.create_invite(
+            db_path,
+            invite_id=invite_id,
+            token_hash=sha256_hex(raw_token),
+            email=req.email,
+            role=req.role,
+            created_by=ctx.owner_id,
+            expires_at=expires_at,
+        )
+        return CreateInviteResponse(
+            invite_id=invite_id,
+            token=raw_token,
+            invite_path=f"/?invite={raw_token}",
+            expires_at=expires_at,
+        )
+
+    @application.delete("/api/admin/invites/{invite_id}", response_model=RevokeInviteResponse)
+    def api_admin_revoke_invite(invite_id: str, request: Request) -> RevokeInviteResponse:
+        _require_admin(request)
+        if not _JOB_ID_RE.match(invite_id):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid invite_id.")
+        revoked = db.revoke_invite(db_path, invite_id)
+        if not revoked:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invite not found.")
+        return RevokeInviteResponse(revoked=True, invite_id=invite_id)
+
+    @application.patch("/api/admin/users/{user_id}", response_model=UpdateUserResponse)
+    def api_admin_update_user(
+        user_id: str,
+        req: UpdateUserRequest,
+        request: Request,
+    ) -> UpdateUserResponse:
+        ctx = _require_admin(request)
+        if not _JOB_ID_RE.match(user_id):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid user_id.")
+        fields = req.model_fields_set
+        if user_id == ctx.owner_id and (
+            ("disabled" in fields and req.disabled is True)
+            or ("role" in fields and req.role is not None and req.role != "admin")
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Administrators cannot disable or demote their own account.",
+            )
+        updated = db.update_user(
+            db_path,
+            user_id,
+            disabled=req.disabled,
+            set_disabled=("disabled" in fields and req.disabled is not None),
+            daily_render_limit=req.daily_render_limit,
+            set_daily_render_limit=("daily_render_limit" in fields),
+            hourly_preview_limit=req.hourly_preview_limit,
+            set_hourly_preview_limit=("hourly_preview_limit" in fields),
+            role=req.role,
+            set_role=("role" in fields and req.role is not None),
+        )
+        if updated is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
+        if updated.get("disabled"):
+            db.delete_sessions_for_user(db_path, user_id)
+        return UpdateUserResponse(
+            user=AdminUserRecord(
+                user_id=updated["user_id"],
+                email=updated["email"],
+                display_name=updated["display_name"],
+                role=updated["role"],
+                disabled=bool(updated["disabled"]),
+                daily_render_limit=updated["daily_render_limit"],
+                hourly_preview_limit=updated["hourly_preview_limit"],
+                has_password=bool(updated.get("password_hash")),
+                has_google=bool(updated.get("google_sub")),
+                created_at=updated["created_at"],
+                last_login_at=updated.get("last_login_at"),
+            )
+        )
+
+    @application.post("/api/admin/settings", response_model=AdminSettingsResponse)
+    def api_admin_settings(
+        req: AdminSettingsRequest,
+        request: Request,
+    ) -> AdminSettingsResponse:
+        _require_admin(request)
+        db.set_setting(db_path, "public_renders_paused", bool(req.public_renders_paused))
+        return AdminSettingsResponse(public_renders_paused=bool(req.public_renders_paused))
 
     @application.get("/api/basemap/info", response_model=BasemapInfoResponse)
     def api_basemap_info(pack_id: str | None = Query(default=None)) -> BasemapInfoResponse:
@@ -591,18 +1098,36 @@ def create_app(
         response_model=PackTaskRecord,
         status_code=status.HTTP_202_ACCEPTED,
     )
-    def api_build_pack(req: PackBuildRequest) -> PackTaskRecord:
+    def api_build_pack(req: PackBuildRequest, request: Request) -> PackTaskRecord:
+        ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=False)
+        if auth_config.auth_mode == "hosted" and ctx.role != "admin":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Admin role required to manage offline packs.",
+            )
         try:
             return pack_manager.enqueue_build(req)
         except ValueError as exc:
             raise HTTPException(status_code=_HTTP_422, detail=str(exc)) from exc
 
     @application.get("/api/packs/tasks", response_model=PackTasksListResponse)
-    def api_list_pack_tasks() -> PackTasksListResponse:
+    def api_list_pack_tasks(request: Request) -> PackTasksListResponse:
+        ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=False)
+        if auth_config.auth_mode == "hosted" and ctx.role != "admin":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Admin role required to manage offline packs.",
+            )
         return PackTasksListResponse(tasks=pack_manager.list_tasks())
 
     @application.get("/api/packs/tasks/{task_id}", response_model=PackTaskRecord)
-    def api_get_pack_task(task_id: str) -> PackTaskRecord:
+    def api_get_pack_task(task_id: str, request: Request) -> PackTaskRecord:
+        ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=False)
+        if auth_config.auth_mode == "hosted" and ctx.role != "admin":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Admin role required to manage offline packs.",
+            )
         if not _TASK_ID_RE.match(task_id):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid task_id.")
         record = pack_manager.get_task(task_id)
@@ -611,7 +1136,13 @@ def create_app(
         return record
 
     @application.delete("/api/packs/{pack_id}")
-    def api_delete_pack(pack_id: str) -> dict[str, Any]:
+    def api_delete_pack(pack_id: str, request: Request) -> dict[str, Any]:
+        ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=False)
+        if auth_config.auth_mode == "hosted" and ctx.role != "admin":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Admin role required to manage offline packs.",
+            )
         try:
             deleted = pack_manager.delete_pack(pack_id)
         except ValueError as exc:
@@ -626,7 +1157,17 @@ def create_app(
         return {"deleted": True, "pack_id": pack_id}
 
     @application.post("/api/viewshed-preview", response_model=ViewshedPreviewResponse)
-    def api_viewshed_preview(req: ViewshedPreviewRequest) -> ViewshedPreviewResponse:
+    def api_viewshed_preview(
+        req: ViewshedPreviewRequest,
+        request: Request,
+        response: Response,
+    ) -> ViewshedPreviewResponse:
+        ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=True)
+        auth_manager.apply_auth_cookies(response, ctx, request)
+        if auth_config.auth_mode == "hosted":
+            auth_manager.verify_turnstile_if_required(
+                request, ctx, body_token=req.turnstile_token
+            )
         if req.pack_id is not None:
             if not _PACK_ID_RE.match(req.pack_id):
                 raise HTTPException(
@@ -639,6 +1180,17 @@ def create_app(
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail=f"Offline pack '{req.pack_id}' is not installed.",
                 )
+        if auth_config.auth_mode == "hosted":
+            enforce_and_record_preview(
+                db_path,
+                role=ctx.role,
+                owner_id=ctx.owner_id,
+                client_ip=ctx.client_ip,
+                user_dict=ctx.user,
+                cfg=limits_config,
+                event_type="viewshed_preview",
+                detail={"pack_id": req.pack_id},
+            )
         try:
             return compute_viewshed_preview(
                 req,
@@ -655,7 +1207,17 @@ def create_app(
             ) from exc
 
     @application.post("/api/rf-link-profile", response_model=RFLinkProfileResponse)
-    def api_rf_link_profile(req: RFLinkProfileRequest) -> RFLinkProfileResponse:
+    def api_rf_link_profile(
+        req: RFLinkProfileRequest,
+        request: Request,
+        response: Response,
+    ) -> RFLinkProfileResponse:
+        ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=True)
+        auth_manager.apply_auth_cookies(response, ctx, request)
+        if auth_config.auth_mode == "hosted":
+            auth_manager.verify_turnstile_if_required(
+                request, ctx, body_token=req.turnstile_token
+            )
         if req.pack_id is not None:
             if not _PACK_ID_RE.match(req.pack_id):
                 raise HTTPException(
@@ -668,6 +1230,17 @@ def create_app(
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail=f"Offline pack '{req.pack_id}' is not installed.",
                 )
+        if auth_config.auth_mode == "hosted":
+            enforce_and_record_preview(
+                db_path,
+                role=ctx.role,
+                owner_id=ctx.owner_id,
+                client_ip=ctx.client_ip,
+                user_dict=ctx.user,
+                cfg=limits_config,
+                event_type="rf_link_profile",
+                detail={"pack_id": req.pack_id},
+            )
         try:
             return compute_rf_link_preview(
                 req,
@@ -684,7 +1257,19 @@ def create_app(
             ) from exc
 
     @application.post("/api/ruler-metrics", response_model=RulerMetricsResponse)
-    def api_ruler_metrics(req: RulerMetricsRequest) -> RulerMetricsResponse:
+    def api_ruler_metrics(
+        req: RulerMetricsRequest,
+        request: Request,
+        response: Response,
+    ) -> RulerMetricsResponse:
+        wants_dem = req.dem_source is not None or req.pack_id is not None
+        ctx: AuthContext | None = None
+        if wants_dem and auth_config.auth_mode == "hosted":
+            ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=True)
+            auth_manager.apply_auth_cookies(response, ctx, request)
+            auth_manager.verify_turnstile_if_required(
+                request, ctx, body_token=req.turnstile_token
+            )
         if req.pack_id is not None:
             if not _PACK_ID_RE.match(req.pack_id):
                 raise HTTPException(
@@ -697,6 +1282,21 @@ def create_app(
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail=f"Offline pack '{req.pack_id}' is not installed.",
                 )
+        if wants_dem and auth_config.auth_mode == "hosted":
+            assert ctx is not None
+            enforce_and_record_preview(
+                db_path,
+                role=ctx.role,
+                owner_id=ctx.owner_id,
+                client_ip=ctx.client_ip,
+                user_dict=ctx.user,
+                cfg=limits_config,
+                event_type="ruler_metrics",
+                detail={
+                    "dem_source": req.dem_source.value if req.dem_source is not None else None,
+                    "pack_id": req.pack_id,
+                },
+            )
         try:
             return compute_ruler_preview(
                 req,
@@ -707,43 +1307,116 @@ def create_app(
             raise HTTPException(status_code=_HTTP_422, detail=str(exc)) from exc
 
     @application.get("/api/projects", response_model=ProjectsListResponse)
-    def api_list_projects(limit: int = Query(default=100, ge=1, le=500)) -> ProjectsListResponse:
-        return ProjectsListResponse(projects=projects_store.list_projects(db_path, limit=limit))
+    def api_list_projects(
+        request: Request,
+        response: Response,
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> ProjectsListResponse:
+        ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=True)
+        auth_manager.apply_auth_cookies(response, ctx, request)
+        owner_filter = ctx.owner_id if auth_config.auth_mode == "hosted" else None
+        return ProjectsListResponse(
+            projects=projects_store.list_projects(db_path, limit=limit, owner_id=owner_filter)
+        )
 
     @application.post(
         "/api/projects",
         response_model=ProjectRecord,
         status_code=status.HTTP_201_CREATED,
     )
-    def api_create_project(req: ProjectCreateRequest) -> ProjectRecord:
-        if req.last_job_id is not None and not _JOB_ID_RE.match(req.last_job_id):
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid last_job_id.")
-        return projects_store.create_project(db_path, req)
+    def api_create_project(
+        req: ProjectCreateRequest,
+        request: Request,
+        response: Response,
+    ) -> ProjectRecord:
+        ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=True)
+        auth_manager.apply_auth_cookies(response, ctx, request)
+        if req.last_job_id is not None:
+            if not _JOB_ID_RE.match(req.last_job_id):
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid last_job_id.")
+            if auth_config.auth_mode == "hosted":
+                linked = db.get_job(db_path, req.last_job_id)
+                if linked is not None and linked.owner_id != ctx.owner_id:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="Cannot link a job owned by another account.",
+                    )
+        return projects_store.create_project(
+            db_path, req, owner_id=ctx.owner_id, owner_role=ctx.role
+        )
 
     @application.get("/api/projects/{project_id}", response_model=ProjectRecord)
-    def api_get_project(project_id: str) -> ProjectRecord:
+    def api_get_project(
+        project_id: str,
+        request: Request,
+        response: Response,
+    ) -> ProjectRecord:
+        ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=True)
+        auth_manager.apply_auth_cookies(response, ctx, request)
         if not projects_store.is_valid_project_id(project_id):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid project_id.")
         record = projects_store.get_project(db_path, project_id)
         if record is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found.")
+        if auth_config.auth_mode == "hosted" and record.owner_id != ctx.owner_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have permission to access this project.",
+            )
         return record
 
     @application.patch("/api/projects/{project_id}", response_model=ProjectRecord)
-    def api_update_project(project_id: str, req: ProjectUpdateRequest) -> ProjectRecord:
+    def api_update_project(
+        project_id: str,
+        req: ProjectUpdateRequest,
+        request: Request,
+        response: Response,
+    ) -> ProjectRecord:
+        ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=True)
+        auth_manager.apply_auth_cookies(response, ctx, request)
         if not projects_store.is_valid_project_id(project_id):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid project_id.")
-        if req.last_job_id is not None and not _JOB_ID_RE.match(req.last_job_id):
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid last_job_id.")
+        if req.last_job_id is not None:
+            if not _JOB_ID_RE.match(req.last_job_id):
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid last_job_id.")
+            if auth_config.auth_mode == "hosted":
+                linked = db.get_job(db_path, req.last_job_id)
+                if linked is not None and linked.owner_id != ctx.owner_id:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="Cannot link a job owned by another account.",
+                    )
+        existing = projects_store.get_project(db_path, project_id)
+        if existing is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found.")
+        if auth_config.auth_mode == "hosted" and existing.owner_id != ctx.owner_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have permission to modify this project.",
+            )
         record = projects_store.update_project(db_path, project_id, req)
         if record is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found.")
         return record
 
     @application.delete("/api/projects/{project_id}")
-    def api_delete_project(project_id: str) -> dict[str, Any]:
+    def api_delete_project(
+        project_id: str,
+        request: Request,
+        response: Response,
+    ) -> dict[str, Any]:
+        ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=True)
+        auth_manager.apply_auth_cookies(response, ctx, request)
         if not projects_store.is_valid_project_id(project_id):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid project_id.")
+        existing = projects_store.get_project(db_path, project_id)
+        if existing is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found.")
+        if auth_config.auth_mode == "hosted" and existing.owner_id != ctx.owner_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have permission to delete this project.",
+            )
         deleted = projects_store.delete_project(db_path, project_id)
         if not deleted:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found.")
@@ -751,65 +1424,125 @@ def create_app(
 
     @application.get("/api/geocode", response_model=GeocodeResponse)
     def api_geocode(
+        request: Request,
         q: str = Query(default="", max_length=200),
         limit: int = Query(default=5, ge=1, le=10),
     ) -> GeocodeResponse:
-        return GeocodeResponse(results=_search_nominatim(q, limit=limit))
+        ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=False)
+        on_miss = (
+            lambda: enforce_and_record_geocode_miss(
+                db_path,
+                role=ctx.role,
+                owner_id=ctx.owner_id,
+                client_ip=ctx.client_ip,
+                cfg=limits_config,
+                query=q,
+            )
+        ) if auth_config.auth_mode == "hosted" else None
+        return GeocodeResponse(results=_search_nominatim(q, limit=limit, on_cache_miss=on_miss))
 
     @application.post("/api/footprint", response_model=FootprintResponse)
     def api_footprint(req: FootprintRequest) -> FootprintResponse:
         return _build_footprint_preview(req)
 
     @application.post("/api/strip-plan", response_model=StripPlanResponse)
-    async def api_strip_plan(request: Request) -> StripPlanResponse:
-        content_type = request.headers.get("content-type", "").lower()
-        if "multipart/form-data" in content_type:
-            form = await request.form()
-            route_file = form.get("route_file")
-            if route_file is None or not hasattr(route_file, "read"):
-                raise HTTPException(
-                    status_code=_HTTP_422,
-                    detail="Multipart /api/strip-plan requires a 'route_file' (.gpx or .geojson) upload.",
-                )
-            chunks: list[bytes] = []
-            total = 0
-            while True:
-                chunk = await route_file.read(65536)
-                if not chunk:
-                    break
-                total += len(chunk)
-                if total > MAX_UPLOAD_BYTES:
-                    raise HTTPException(
-                        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                        detail=f"Route file exceeds maximum size of {MAX_UPLOAD_BYTES // (1024 * 1024)} MB.",
-                    )
-                chunks.append(chunk)
-            raw_bytes = b"".join(chunks)
-            filename = str(getattr(route_file, "filename", None) or "route.geojson")
+    async def api_strip_plan(request: Request, response: Response) -> StripPlanResponse:
+        ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=True)
+        auth_manager.apply_auth_cookies(response, ctx, request)
+        caps = _caps_for(ctx)
+        if auth_config.auth_mode == "hosted" and not caps.strip_atlas_allowed:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Strip atlas planning requires an invited Friend or Admin account.",
+            )
 
+        content_type = request.headers.get("content-type", "").lower()
+        is_multipart = "multipart/form-data" in content_type
+        content_length = _parse_content_length(request)
+        max_body_bytes = caps.max_upload_bytes + (64 * 1024 if is_multipart else 0)
+        oversize_detail = (
+            f"Route file exceeds maximum size of "
+            f"{max(1, caps.max_upload_bytes // (1024 * 1024))} MB."
+        )
+        if content_length is not None and content_length > max_body_bytes:
+            raise HTTPException(
+                status_code=_HTTP_413,
+                detail=oversize_detail,
+            )
+
+        bounded_request = _make_bounded_request(
+            request,
+            max_body_bytes=max_body_bytes,
+            detail=oversize_detail,
+        )
+
+        if is_multipart:
+            form = await _parse_bounded_multipart_form(
+                bounded_request,
+                max_file_bytes=caps.max_upload_bytes,
+                detail=oversize_detail,
+            )
             try:
-                scale = int(form.get("scale", 25000))
-                paper = PaperSize(str(form.get("paper", "a4")).lower())
-                orientation = Orientation(str(form.get("orientation", "portrait")).lower())
-                units = Units(str(form.get("units", "metric")).lower())
-                overlap_pct = float(form.get("overlap_pct", 10.0))
-                max_sheets = int(form.get("max_sheets", 12))
-                route_lonlat = parse_route_bytes(raw_bytes, filename)
-                return plan_strip_atlas(
-                    route_lonlat,
-                    scale=scale,
-                    paper=paper,
-                    orientation=orientation,
-                    units=units,
-                    overlap_pct=overlap_pct,
-                    max_sheets=max_sheets,
-                )
-            except (ValueError, ValidationError) as exc:
-                raise HTTPException(status_code=_HTTP_422, detail=str(exc)) from exc
+                route_file = form.get("route_file")
+                if route_file is None or not hasattr(route_file, "read"):
+                    raise HTTPException(
+                        status_code=_HTTP_422,
+                        detail="Multipart /api/strip-plan requires a 'route_file' (.gpx or .geojson) upload.",
+                    )
+                max_bytes = caps.max_upload_bytes
+                chunks: list[bytes] = []
+                total = 0
+                while True:
+                    chunk = await route_file.read(65536)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise HTTPException(
+                            status_code=_HTTP_413,
+                            detail=f"Route file exceeds maximum size of {max(1, max_bytes // (1024 * 1024))} MB.",
+                        )
+                    chunks.append(chunk)
+                raw_bytes = b"".join(chunks)
+                filename = str(getattr(route_file, "filename", None) or "route.geojson")
+
+                try:
+                    scale = int(form.get("scale", 25000))
+                    paper = PaperSize(str(form.get("paper", "a4")).lower())
+                    orientation = Orientation(str(form.get("orientation", "portrait")).lower())
+                    units = Units(str(form.get("units", "metric")).lower())
+                    overlap_pct = float(form.get("overlap_pct", 10.0))
+                    max_sheets = int(form.get("max_sheets", 12))
+                    if auth_config.auth_mode == "hosted" and max_sheets > caps.max_strip_sheets:
+                        raise HTTPException(
+                            status_code=status.HTTP_403_FORBIDDEN,
+                            detail=f"Requested strip sheet count ({max_sheets}) exceeds your limit ({caps.max_strip_sheets}).",
+                        )
+                    route_lonlat = parse_route_bytes(raw_bytes, filename)
+                    return plan_strip_atlas(
+                        route_lonlat,
+                        scale=scale,
+                        paper=paper,
+                        orientation=orientation,
+                        units=units,
+                        overlap_pct=overlap_pct,
+                        max_sheets=max_sheets,
+                    )
+                except HTTPException:
+                    raise
+                except (ValueError, ValidationError) as exc:
+                    raise HTTPException(status_code=_HTTP_422, detail=str(exc)) from exc
+            finally:
+                await form.close()
 
         try:
-            raw_body = await request.body()
+            raw_body = await bounded_request.body()
             plan_req = StripPlanRequest.model_validate_json(raw_body)
+            if auth_config.auth_mode == "hosted" and plan_req.max_sheets > caps.max_strip_sheets:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Requested strip sheet count ({plan_req.max_sheets}) exceeds your limit ({caps.max_strip_sheets}).",
+                )
             route_lonlat = parse_route_geojson(plan_req.route_geojson)
             return plan_strip_atlas(
                 route_lonlat,
@@ -820,6 +1553,8 @@ def create_app(
                 overlap_pct=plan_req.overlap_pct,
                 max_sheets=plan_req.max_sheets,
             )
+        except HTTPException:
+            raise
         except (ValueError, ValidationError) as exc:
             raise HTTPException(status_code=_HTTP_422, detail=str(exc)) from exc
 
@@ -839,192 +1574,339 @@ def create_app(
         response_model=JobRecord,
         status_code=status.HTTP_202_ACCEPTED,
     )
-    async def api_create_job(request: Request) -> JobRecord:
-        content_type = request.headers.get("content-type", "").lower()
-        upload_file = None
+    async def api_create_job(request: Request, response: Response) -> JobRecord:
+        ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=True)
+        auth_manager.apply_auth_cookies(response, ctx, request)
+        caps = _caps_for(ctx)
 
-        if (
+        content_type = request.headers.get("content-type", "").lower()
+        is_form = (
             "multipart/form-data" in content_type
             or "application/x-www-form-urlencoded" in content_type
-        ):
-            form = await request.form()
-            raw_payload = form.get("payload")
-            if raw_payload is None or not isinstance(raw_payload, str):
-                raise HTTPException(
-                    status_code=_HTTP_422,
-                    detail="Form request must include a JSON string 'payload' field.",
-                )
-            try:
-                job_req = CreateJobRequest.model_validate_json(raw_payload)
-            except ValidationError as exc:
-                raise HTTPException(
-                    status_code=_HTTP_422,
-                    detail=exc.errors(),
-                ) from exc
-            maybe_file = form.get("overlay_file")
-            if maybe_file is not None and hasattr(maybe_file, "read"):
-                # Ignore empty browser file input fields with no filename
-                if getattr(maybe_file, "filename", ""):
-                    upload_file = maybe_file
-        else:
-            try:
-                raw_body = await request.body()
-                job_req = CreateJobRequest.model_validate_json(raw_body)
-            except ValidationError as exc:
-                raise HTTPException(
-                    status_code=_HTTP_422,
-                    detail=exc.errors(),
-                ) from exc
-
-        assert job_req.center is not None
-        try:
-            lat, lon, canonical_mgrs = parse_center(job_req.center)
-            # Validate full SheetSpec bounds and atlas projection early before enqueueing.
-            spec = SheetSpec(
-                center_lat=lat,
-                center_lon=lon,
-                center_mgrs=canonical_mgrs,
-                scale=job_req.scale,
-                paper=job_req.paper,
-                orientation=job_req.orientation,
-                color_mode=job_req.color_mode,
-                units=job_req.units,
-                title=job_req.title,
-                date_iso=job_req.date_iso,
-                geopdf=job_req.outputs.geopdf,
-                dpi=job_req.dpi,
-                carto=job_req.carto,
-                dem_source=job_req.dem_source,
-                us_overlays=job_req.us_overlays,
-                au_overlays=job_req.au_overlays,
-                nz_overlays=job_req.nz_overlays,
-                ca_overlays=job_req.ca_overlays,
-                waypoints=job_req.waypoints,
-                viewsheds=job_req.viewsheds,
-                rf_links=job_req.rf_links,
-                tactical_graphics=job_req.tactical_graphics,
-                include_calibration_page=job_req.include_calibration_page,
-                include_route_card=job_req.include_route_card,
-                include_elevation_profile=job_req.include_elevation_profile,
-                include_atlas_index=job_req.include_atlas_index,
-                include_rf_link_card=job_req.include_rf_link_card,
-                show_fold_marks=job_req.show_fold_marks,
+        )
+        content_length = _parse_content_length(request)
+        max_body_bytes = (
+            caps.max_upload_bytes + 512 * 1024
+            if is_form
+            else max(256 * 1024, caps.max_upload_bytes)
+        )
+        oversize_detail = (
+            f"Overlay file exceeds maximum size of "
+            f"{max(1, caps.max_upload_bytes // (1024 * 1024))} MB."
+        )
+        if content_length is not None and content_length > max_body_bytes:
+            raise HTTPException(
+                status_code=_HTTP_413,
+                detail=oversize_detail,
             )
-            anchor = compute_sheet_layout(spec)
-            if job_req.outputs.pdf and not job_req.strip_sheets and job_req.grid_cols * job_req.grid_rows > 1:
-                compute_atlas_layouts(anchor, job_req.grid_cols, job_req.grid_rows)
-            elif job_req.outputs.pdf and job_req.strip_sheets:
-                for sh in job_req.strip_sheets:
-                    compute_sheet_layout(
-                        spec.model_copy(
-                            update={
-                                "center_lat": float(sh.center_lat),
-                                "center_lon": float(sh.center_lon),
-                                "center_mgrs": None,
-                            }
+
+        header_turnstile_tok = (request.headers.get("x-turnstile-token") or "").strip()
+        needs_guest_turnstile = (
+            auth_config.auth_mode == "hosted"
+            and ctx.role == "guest"
+            and auth_config.turnstile_configured
+        )
+        turnstile_verified = False
+
+        if needs_guest_turnstile:
+            if header_turnstile_tok:
+                await anyio.to_thread.run_sync(
+                    lambda: auth_manager.verify_turnstile_if_required(
+                        request, ctx, body_token=None
+                    )
+                )
+                turnstile_verified = True
+            elif is_form and (content_length is None or content_length > 512 * 1024):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Human verification (Turnstile) is required.",
+                )
+
+        pre_upload_limits_checked = False
+        if not needs_guest_turnstile or turnstile_verified:
+            enforce_pre_upload_job_limits(
+                db_path,
+                role=ctx.role,
+                owner_id=ctx.owner_id,
+                client_ip=ctx.client_ip,
+                user_dict=ctx.user,
+                cfg=limits_config,
+            )
+            pre_upload_limits_checked = True
+
+        bounded_request = _make_bounded_request(
+            request,
+            max_body_bytes=max_body_bytes,
+            detail=oversize_detail,
+        )
+
+        form = None
+        upload_file = None
+        form_turnstile_token: str | None = None
+
+        try:
+            if is_form:
+                if "multipart/form-data" in content_type:
+                    form = await _parse_bounded_multipart_form(
+                        bounded_request,
+                        max_file_bytes=caps.max_upload_bytes,
+                        detail=oversize_detail,
+                    )
+                else:
+                    form = await bounded_request.form()
+                raw_payload = form.get("payload")
+                if raw_payload is None or not isinstance(raw_payload, str):
+                    raise HTTPException(
+                        status_code=_HTTP_422,
+                        detail="Form request must include a JSON string 'payload' field.",
+                    )
+                try:
+                    job_req = CreateJobRequest.model_validate_json(raw_payload)
+                except ValidationError as exc:
+                    raise HTTPException(
+                        status_code=_HTTP_422,
+                        detail=jsonable_encoder(exc.errors()),
+                    ) from exc
+                raw_ft = form.get("turnstile_token")
+                if isinstance(raw_ft, str) and raw_ft.strip():
+                    form_turnstile_token = raw_ft.strip()
+                maybe_file = form.get("overlay_file")
+                if maybe_file is not None and hasattr(maybe_file, "read"):
+                    # Ignore empty browser file input fields with no filename
+                    if getattr(maybe_file, "filename", ""):
+                        upload_file = maybe_file
+            else:
+                try:
+                    raw_body = await bounded_request.body()
+                    job_req = CreateJobRequest.model_validate_json(raw_body)
+                except ValidationError as exc:
+                    raise HTTPException(
+                        status_code=_HTTP_422,
+                        detail=jsonable_encoder(exc.errors()),
+                    ) from exc
+
+            if auth_config.auth_mode == "hosted":
+                if not turnstile_verified:
+                    turnstile_tok = job_req.turnstile_token or form_turnstile_token
+                    await anyio.to_thread.run_sync(
+                        lambda: auth_manager.verify_turnstile_if_required(
+                            request, ctx, body_token=turnstile_tok
                         )
                     )
-        except (ValueError, ValidationError) as exc:
-            raise HTTPException(
-                status_code=_HTTP_422,
-                detail=str(exc),
-            ) from exc
+                validate_job_capabilities(ctx.role, job_req, caps)
+                if not pre_upload_limits_checked:
+                    enforce_pre_upload_job_limits(
+                        db_path,
+                        role=ctx.role,
+                        owner_id=ctx.owner_id,
+                        client_ip=ctx.client_ip,
+                        user_dict=ctx.user,
+                        cfg=limits_config,
+                    )
 
-        if job_req.pack_id is not None:
-            if not _PACK_ID_RE.match(job_req.pack_id):
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Invalid pack_id '{job_req.pack_id}'.",
-                )
-            installed_ids = {p.pack_id for p in discover_packs(resolved_packs_dir)}
-            if job_req.pack_id not in installed_ids:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail=f"Offline pack '{job_req.pack_id}' is not installed.",
-                )
-
-        # Compute 10 m MGRS label for job card display
-        c_gzd, c_sq, c_digits = _split_mgrs(
-            _decode_mgrs(mgrs.MGRS().toMGRS(lat, lon, MGRSPrecision=4))
-        )
-        center_mgrs_10m = f"{c_gzd} {c_sq} {c_digits[:4]} {c_digits[4:]}"
-
-        job_id = uuid.uuid4().hex[:16]
-        saved_overlay: Path | None = None
-
-        if upload_file is not None:
-            safe_name = _sanitize_upload_filename(getattr(upload_file, "filename", None))
-            upload_dir = resolved_data_dir / job_id / "uploads"
-            upload_dir.mkdir(parents=True, exist_ok=True)
-            dest = (upload_dir / safe_name).resolve()
-            if not dest.is_relative_to(upload_dir.resolve()):
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Invalid overlay filename.",
-                )
-
-            written = 0
+            assert job_req.center is not None
             try:
-                with dest.open("wb") as fh:
-                    while True:
-                        chunk = await upload_file.read(65536)
-                        if not chunk:
-                            break
-                        written += len(chunk)
-                        if written > MAX_UPLOAD_BYTES:
-                            raise HTTPException(
-                                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                                detail=f"Overlay file exceeds maximum size of {MAX_UPLOAD_BYTES // (1024 * 1024)} MB.",
+                lat, lon, canonical_mgrs = parse_center(job_req.center)
+                # Validate full SheetSpec bounds and atlas projection early before enqueueing.
+                spec = SheetSpec(
+                    center_lat=lat,
+                    center_lon=lon,
+                    center_mgrs=canonical_mgrs,
+                    scale=job_req.scale,
+                    paper=job_req.paper,
+                    orientation=job_req.orientation,
+                    color_mode=job_req.color_mode,
+                    units=job_req.units,
+                    title=job_req.title,
+                    date_iso=job_req.date_iso,
+                    geopdf=job_req.outputs.geopdf,
+                    dpi=job_req.dpi,
+                    carto=job_req.carto,
+                    dem_source=job_req.dem_source,
+                    us_overlays=job_req.us_overlays,
+                    au_overlays=job_req.au_overlays,
+                    nz_overlays=job_req.nz_overlays,
+                    ca_overlays=job_req.ca_overlays,
+                    waypoints=job_req.waypoints,
+                    viewsheds=job_req.viewsheds,
+                    rf_links=job_req.rf_links,
+                    tactical_graphics=job_req.tactical_graphics,
+                    include_calibration_page=job_req.include_calibration_page,
+                    include_route_card=job_req.include_route_card,
+                    include_elevation_profile=job_req.include_elevation_profile,
+                    include_atlas_index=job_req.include_atlas_index,
+                    include_rf_link_card=job_req.include_rf_link_card,
+                    show_fold_marks=job_req.show_fold_marks,
+                )
+                anchor = compute_sheet_layout(spec)
+                if job_req.outputs.pdf and not job_req.strip_sheets and job_req.grid_cols * job_req.grid_rows > 1:
+                    compute_atlas_layouts(anchor, job_req.grid_cols, job_req.grid_rows)
+                elif job_req.outputs.pdf and job_req.strip_sheets:
+                    for sh in job_req.strip_sheets:
+                        compute_sheet_layout(
+                            spec.model_copy(
+                                update={
+                                    "center_lat": float(sh.center_lat),
+                                    "center_lon": float(sh.center_lon),
+                                    "center_mgrs": None,
+                                }
                             )
-                        fh.write(chunk)
-            except Exception:
-                if dest.exists():
-                    dest.unlink()
-                raise
-            saved_overlay = dest
+                        )
+            except (ValueError, ValidationError) as exc:
+                raise HTTPException(
+                    status_code=_HTTP_422,
+                    detail=str(exc),
+                ) from exc
 
-        return db.create_job(
-            db_path,
-            job_id=job_id,
-            title=job_req.title,
-            center=job_req.center,
-            center_mgrs=center_mgrs_10m,
-            scale=job_req.scale,
-            paper=job_req.paper,
-            orientation=job_req.orientation,
-            color_mode=job_req.color_mode,
-            grid_cols=job_req.grid_cols,
-            grid_rows=job_req.grid_rows,
-            request_json=job_req.model_dump_json(),
-            overlay_path=saved_overlay,
-        )
+            if job_req.pack_id is not None:
+                if not _PACK_ID_RE.match(job_req.pack_id):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Invalid pack_id '{job_req.pack_id}'.",
+                    )
+                installed_ids = {p.pack_id for p in discover_packs(resolved_packs_dir)}
+                if job_req.pack_id not in installed_ids:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail=f"Offline pack '{job_req.pack_id}' is not installed.",
+                    )
+
+            # Compute 10 m MGRS label for job card display
+            c_gzd, c_sq, c_digits = _split_mgrs(
+                _decode_mgrs(mgrs.MGRS().toMGRS(lat, lon, MGRSPrecision=4))
+            )
+            center_mgrs_10m = f"{c_gzd} {c_sq} {c_digits[:4]} {c_digits[4:]}"
+
+            job_id = uuid.uuid4().hex[:16]
+            saved_overlay: Path | None = None
+
+            if upload_file is not None:
+                safe_name = _sanitize_upload_filename(getattr(upload_file, "filename", None))
+                staging_root = resolved_data_dir / f".tmp_upload_{job_id}"
+                staging_upload_dir = staging_root / "uploads"
+                staging_upload_dir.mkdir(parents=True, exist_ok=True)
+                staging_dest = (staging_upload_dir / safe_name).resolve()
+                if not staging_dest.is_relative_to(staging_upload_dir.resolve()):
+                    shutil.rmtree(staging_root, ignore_errors=True)
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Invalid overlay filename.",
+                    )
+
+                max_bytes = caps.max_upload_bytes
+                written = 0
+                try:
+                    with staging_dest.open("wb") as fh:
+                        while True:
+                            chunk = await upload_file.read(65536)
+                            if not chunk:
+                                break
+                            written += len(chunk)
+                            if written > max_bytes:
+                                raise HTTPException(
+                                    status_code=_HTTP_413,
+                                    detail=f"Overlay file exceeds maximum size of {max(1, max_bytes // (1024 * 1024))} MB.",
+                                )
+                            fh.write(chunk)
+                    final_job_dir = resolved_data_dir / job_id
+                    staging_root.rename(final_job_dir)
+                    saved_overlay = (final_job_dir / "uploads" / safe_name).resolve()
+                except Exception:
+                    if staging_dest.exists():
+                        staging_dest.unlink()
+                    shutil.rmtree(staging_root, ignore_errors=True)
+                    shutil.rmtree(resolved_data_dir / job_id, ignore_errors=True)
+                    raise
+
+            try:
+                return enforce_and_create_job(
+                    db_path,
+                    role=ctx.role,
+                    owner_id=ctx.owner_id,
+                    client_ip=ctx.client_ip,
+                    user_dict=ctx.user,
+                    cfg=limits_config,
+                    job_id=job_id,
+                    title=job_req.title,
+                    center=job_req.center,
+                    center_mgrs=center_mgrs_10m,
+                    scale=job_req.scale,
+                    paper=job_req.paper,
+                    orientation=job_req.orientation,
+                    color_mode=job_req.color_mode,
+                    grid_cols=job_req.grid_cols,
+                    grid_rows=job_req.grid_rows,
+                    request_json=job_req.model_dump_json(),
+                    overlay_path=saved_overlay,
+                )
+            except Exception:
+                if saved_overlay is not None:
+                    shutil.rmtree(resolved_data_dir / job_id, ignore_errors=True)
+                raise
+        finally:
+            if form is not None:
+                await form.close()
 
     @application.get("/api/jobs", response_model=JobsListResponse)
-    def api_list_jobs(limit: int = Query(default=50, ge=1, le=200)) -> JobsListResponse:
-        return JobsListResponse(jobs=db.list_jobs(db_path, limit=limit))
+    def api_list_jobs(
+        request: Request,
+        response: Response,
+        limit: int = Query(default=50, ge=1, le=200),
+    ) -> JobsListResponse:
+        ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=True)
+        auth_manager.apply_auth_cookies(response, ctx, request)
+        owner_filter = ctx.owner_id if auth_config.auth_mode == "hosted" else None
+        return JobsListResponse(jobs=db.list_jobs(db_path, limit=limit, owner_id=owner_filter))
 
     @application.get("/api/jobs/{job_id}", response_model=JobRecord)
-    def api_get_job(job_id: str) -> JobRecord:
+    def api_get_job(job_id: str, request: Request, response: Response) -> JobRecord:
+        ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=True)
+        auth_manager.apply_auth_cookies(response, ctx, request)
         if not _JOB_ID_RE.match(job_id):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid job_id.")
         record = db.get_job(db_path, job_id)
         if record is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found.")
+        if auth_config.auth_mode == "hosted" and record.owner_id != ctx.owner_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have permission to access this job.",
+            )
         return record
 
     @application.post("/api/jobs/{job_id}/cancel", response_model=JobRecord)
-    def api_cancel_job(job_id: str) -> JobRecord:
+    def api_cancel_job(job_id: str, request: Request, response: Response) -> JobRecord:
+        ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=True)
+        auth_manager.apply_auth_cookies(response, ctx, request)
         if not _JOB_ID_RE.match(job_id):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid job_id.")
+        existing = db.get_job(db_path, job_id)
+        if existing is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found.")
+        if auth_config.auth_mode == "hosted" and existing.owner_id != ctx.owner_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have permission to cancel this job.",
+            )
         record = db.cancel_job(db_path, job_id)
         if record is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found.")
         return record
 
     @application.delete("/api/jobs/{job_id}")
-    def api_delete_job(job_id: str) -> dict[str, Any]:
+    def api_delete_job(job_id: str, request: Request, response: Response) -> dict[str, Any]:
+        ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=True)
+        auth_manager.apply_auth_cookies(response, ctx, request)
         if not _JOB_ID_RE.match(job_id):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid job_id.")
+        existing = db.get_job(db_path, job_id)
+        if existing is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found.")
+        if auth_config.auth_mode == "hosted" and existing.owner_id != ctx.owner_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have permission to delete this job.",
+            )
         deleted = db.delete_job(db_path, job_id, data_dir=resolved_data_dir)
         if not deleted:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found.")
@@ -1034,8 +1916,12 @@ def create_app(
     def api_download_artifact(
         job_id: str,
         filename: str,
+        request: Request,
+        response: Response,
         inline: bool = Query(default=False),
     ) -> FileResponse:
+        ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=True)
+        auth_manager.apply_auth_cookies(response, ctx, request)
         if not _JOB_ID_RE.match(job_id):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid job_id.")
         # Strictly reject path separators, null bytes, and parent directory references.
@@ -1052,6 +1938,16 @@ def create_app(
                 detail="Invalid artifact filename.",
             )
 
+        if auth_config.auth_mode == "hosted":
+            record = db.get_job(db_path, job_id)
+            if record is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found.")
+            if record.owner_id != ctx.owner_id:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="You do not have permission to download this artifact.",
+                )
+
         artifacts_dir = (resolved_data_dir / job_id / "artifacts").resolve()
         candidate = (artifacts_dir / filename).resolve()
         if not candidate.is_relative_to(artifacts_dir):
@@ -1066,25 +1962,41 @@ def create_app(
             )
 
         media_type = _MEDIA_TYPES.get(candidate.suffix.lower(), "application/octet-stream")
+        headers: dict[str, str] = {}
+        if auth_config.auth_mode == "hosted":
+            headers["Cache-Control"] = "private, no-store"
         if inline:
+            headers["Content-Disposition"] = f'inline; filename="{candidate.name}"'
             return FileResponse(
                 path=candidate,
                 media_type=media_type,
-                headers={"Content-Disposition": f'inline; filename="{candidate.name}"'},
+                headers=headers,
             )
         return FileResponse(
             path=candidate,
             media_type=media_type,
             filename=candidate.name,
+            headers=headers or None,
         )
 
     @application.get("/api/jobs/{job_id}/thumbnail.png")
-    def api_job_thumbnail(job_id: str) -> FileResponse:
+    def api_job_thumbnail(
+        job_id: str,
+        request: Request,
+        response: Response,
+    ) -> FileResponse:
+        ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=True)
+        auth_manager.apply_auth_cookies(response, ctx, request)
         if not _JOB_ID_RE.match(job_id):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid job_id.")
         record = db.get_job(db_path, job_id)
         if record is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found.")
+        if auth_config.auth_mode == "hosted" and record.owner_id != ctx.owner_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have permission to access this thumbnail.",
+            )
 
         job_root = (resolved_data_dir / job_id).resolve()
         if not job_root.is_relative_to(resolved_data_dir):
@@ -1129,16 +2041,59 @@ def create_app(
             rendered_png = tmp_prefix.with_suffix(".png")
             if proc.returncode != 0 or not rendered_png.is_file():
                 rendered_png.unlink(missing_ok=True)
+                if db.get_job(db_path, job_id) is None:
+                    shutil.rmtree(job_root, ignore_errors=True)
+                    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found.")
                 raise HTTPException(
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                     detail="Failed to rasterize PDF thumbnail.",
                 )
+            if db.get_job(db_path, job_id) is None:
+                rendered_png.unlink(missing_ok=True)
+                shutil.rmtree(job_root, ignore_errors=True)
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found.")
             rendered_png.replace(thumb_path)
 
+        cache_header = (
+            "private, max-age=3600"
+            if auth_config.auth_mode == "hosted"
+            else "public, max-age=3600"
+        )
         return FileResponse(
             path=thumb_path,
             media_type="image/png",
-            headers={"Cache-Control": "public, max-age=3600"},
+            headers={"Cache-Control": cache_header},
+        )
+
+    @application.get("/samples/{filename}", include_in_schema=False)
+    def serve_sample_pdf(filename: str) -> FileResponse:
+        if (
+            not filename
+            or "\x00" in filename
+            or "/" in filename
+            or "\\" in filename
+            or ".." in filename
+            or Path(filename).name != filename
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid sample filename.",
+            )
+        samples_dir = _resolve_default_samples_dir()
+        if samples_dir is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sample not found.")
+        candidate = (samples_dir / filename).resolve()
+        if not candidate.is_relative_to(samples_dir) or not candidate.is_file():
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sample not found.")
+        media_type = (
+            "application/pdf"
+            if candidate.suffix.lower() == ".pdf"
+            else "application/octet-stream"
+        )
+        return FileResponse(
+            path=candidate,
+            media_type=media_type,
+            headers={"Cache-Control": "public, max-age=604800"},
         )
 
     # Mount built SPA frontend if present; otherwise expose clean JSON root for headless/API mode.
@@ -1148,13 +2103,63 @@ def create_app(
         if assets_dir.is_dir():
             application.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
 
+        def _render_branded_index_html() -> str:
+            raw_html = index_html.read_text(encoding="utf-8")
+            brand_name = auth_config.brand_name
+            brand_subtitle = auth_config.brand_subtitle
+            brand_tagline = auth_config.brand_tagline
+            full_title = f"{brand_name} — {brand_tagline}"
+            esc_title = html_lib.escape(full_title, quote=True)
+            esc_name = html_lib.escape(brand_name, quote=True)
+
+            rendered = re.sub(
+                r"<title>.*?</title>",
+                lambda _m: f"<title>{esc_title}</title>",
+                raw_html,
+                count=1,
+                flags=re.DOTALL,
+            )
+            rendered = re.sub(
+                r'(<meta\s+property="og:title"\s+content=")[^"]*(")',
+                lambda m: f"{m.group(1)}{esc_title}{m.group(2)}",
+                rendered,
+                count=1,
+            )
+            rendered = re.sub(
+                r'(<meta\s+name="description"\s+content=")GridForge([^"]*")',
+                lambda m: f"{m.group(1)}{esc_name}{m.group(2)}",
+                rendered,
+                count=1,
+            )
+
+            brand_json = (
+                json.dumps(
+                    {
+                        "name": brand_name,
+                        "subtitle": brand_subtitle,
+                        "tagline": brand_tagline,
+                    },
+                    separators=(",", ":"),
+                )
+                .replace("<", "\\u003c")
+                .replace(">", "\\u003e")
+                .replace("&", "\\u0026")
+            )
+            brand_script = f"<script>window.__GF_BRAND__={brand_json};</script>"
+            if "</head>" in rendered:
+                rendered = rendered.replace("</head>", f"    {brand_script}\n  </head>", 1)
+            return rendered
+
         @application.get("/", include_in_schema=False)
-        def serve_spa_root() -> FileResponse:
-            return FileResponse(path=index_html, media_type="text/html")
+        def serve_spa_root() -> HTMLResponse:
+            return HTMLResponse(
+                content=_render_branded_index_html(),
+                headers={"Cache-Control": "no-cache"},
+            )
 
         @application.get("/{full_path:path}", include_in_schema=False)
-        def serve_spa_fallback(full_path: str) -> FileResponse:
-            if full_path.startswith("api/"):
+        def serve_spa_fallback(full_path: str) -> Response:
+            if full_path.startswith("api/") or full_path == "samples" or full_path.startswith("samples/"):
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found.")
             candidate = (resolved_web_dist / full_path).resolve()
             if (
@@ -1163,7 +2168,10 @@ def create_app(
                 and candidate.is_file()
             ):
                 return FileResponse(path=candidate)
-            return FileResponse(path=index_html, media_type="text/html")
+            return HTMLResponse(
+                content=_render_branded_index_html(),
+                headers={"Cache-Control": "no-cache"},
+            )
     else:
 
         @application.get("/", include_in_schema=False)

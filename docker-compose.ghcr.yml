@@ -14,7 +14,7 @@
 services:
   web:
     image: ${GRIDFORGE_IMAGE:-ghcr.io/jremick/gridforge:latest}
-    command: ["uvicorn", "gridforge.web.app:app", "--host", "0.0.0.0", "--port", "8080"]
+    command: ["uvicorn", "gridforge.web.app:app", "--host", "0.0.0.0", "--port", "8080", "--proxy-headers"]
     ports:
       - "127.0.0.1:${GRIDFORGE_PORT:-8080}:8080"
     environment:
@@ -23,6 +23,10 @@ services:
       - GRIDFORGE_WEB_DIST=/app/web/dist
       - GRIDFORGE_ALLOWED_HOSTS=${GRIDFORGE_ALLOWED_HOSTS:-}
       - FORWARDED_ALLOW_IPS=${FORWARDED_ALLOW_IPS:-127.0.0.1}
+      - GRIDFORGE_AUTH_MODE=${GRIDFORGE_AUTH_MODE:-none}
+      - GRIDFORGE_TRUST_CF_CONNECTING_IP=${GRIDFORGE_TRUST_CF_CONNECTING_IP:-false}
+      - GRIDFORGE_SESSION_SECRET=${GRIDFORGE_SESSION_SECRET:-}
+      - GRIDFORGE_SAMPLES_DIR=${GRIDFORGE_SAMPLES_DIR:-}
       - GDAL_CACHEMAX=192
       - OMP_THREAD_LIMIT=1
       # Uncomment for air-gapped offline Studio basemap tiles:
@@ -51,6 +55,11 @@ services:
       - GRIDFORGE_PACKS_DIR=/data/packs
       - GRIDFORGE_CACHE_DIR=/tmp/gridforge-cache
       - GRIDFORGE_WORKER_CONCURRENCY=1
+      - GRIDFORGE_AUTH_MODE=${GRIDFORGE_AUTH_MODE:-none}
+      - GRIDFORGE_PRUNE_INTERVAL_SECONDS=${GRIDFORGE_PRUNE_INTERVAL_SECONDS:-900}
+      - GRIDFORGE_GUEST_TTL_HOURS=${GRIDFORGE_GUEST_TTL_HOURS:-24}
+      - GRIDFORGE_FRIEND_TTL_HOURS=${GRIDFORGE_FRIEND_TTL_HOURS:-336}
+      - GRIDFORGE_CACHE_MAX_BYTES=${GRIDFORGE_CACHE_MAX_BYTES:-2147483648}
       - GDAL_CACHEMAX=192
       - OMP_THREAD_LIMIT=1
       - OVERPASS_URL=${OVERPASS_URL:-https://overpass-api.de/api/interpreter}
@@ -61,6 +70,32 @@ services:
     # Single-concurrency worker with strict memory guardrails for 16 GB hosts
     mem_limit: 3g
     memswap_limit: 3584m
+    restart: unless-stopped
+
+  studio:
+    profiles: ["single"]
+    image: ${GRIDFORGE_IMAGE:-ghcr.io/jremick/gridforge:latest}
+    ports:
+      - "127.0.0.1:${GRIDFORGE_PORT:-8080}:8080"
+    environment:
+      - QT_QPA_PLATFORM=offscreen
+      - GRIDFORGE_VOLUME_ROOT=/data
+      - GRIDFORGE_ALLOWED_HOSTS=${GRIDFORGE_ALLOWED_HOSTS:-}
+      - FORWARDED_ALLOW_IPS=${FORWARDED_ALLOW_IPS:-}
+      - GRIDFORGE_AUTH_MODE=${GRIDFORGE_AUTH_MODE:-none}
+      - GRIDFORGE_TRUST_CF_CONNECTING_IP=${GRIDFORGE_TRUST_CF_CONNECTING_IP:-false}
+      - GRIDFORGE_SESSION_SECRET=${GRIDFORGE_SESSION_SECRET:-}
+      - GRIDFORGE_SAMPLES_DIR=${GRIDFORGE_SAMPLES_DIR:-}
+      - GRIDFORGE_PRUNE_INTERVAL_SECONDS=${GRIDFORGE_PRUNE_INTERVAL_SECONDS:-900}
+      - GRIDFORGE_GUEST_TTL_HOURS=${GRIDFORGE_GUEST_TTL_HOURS:-24}
+      - GRIDFORGE_FRIEND_TTL_HOURS=${GRIDFORGE_FRIEND_TTL_HOURS:-336}
+      - GRIDFORGE_CACHE_MAX_BYTES=${GRIDFORGE_CACHE_MAX_BYTES:-2147483648}
+      - GDAL_CACHEMAX=192
+      - OMP_THREAD_LIMIT=1
+      - OVERPASS_URL=${OVERPASS_URL:-https://overpass-api.de/api/interpreter}
+    volumes:
+      - gridforge-single-data:/data
+    mem_limit: 3g
     restart: unless-stopped
 
   cli:
@@ -83,3 +118,4 @@ services:
 volumes:
   gridforge-data:
   gridforge-cache:
+  gridforge-single-data:

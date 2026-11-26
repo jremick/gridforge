@@ -52,7 +52,7 @@ from gridforge.packs.builder import discover_packs, resolve_pack_directory
 from gridforge.pipeline import runner, terrain as terrain_mod
 from gridforge.render.pyqgis_worker import PyQGISRenderer
 from gridforge.sources.overlay_user import UserOverlaySource
-from gridforge.web import db
+from gridforge.web import cache_prune, db
 from gridforge.web.schemas import CreateJobRequest, JobArtifact, JobRecord, JobStatus
 
 logger = logging.getLogger(__name__)
@@ -71,7 +71,7 @@ def _peak_rss_mb() -> float:
 def _artifact_stem(req: CreateJobRequest, center_mgrs: str | None) -> str:
     raw_base = req.title or center_mgrs or "gridforge_map"
     base = re.sub(r"[^a-zA-Z0-9]+", "_", raw_base.lower()).strip("_")[:48] or "gridforge_map"
-    scale_k = f"{req.scale // 1000}k"
+    scale_k = f"{req.scale // 1000}k" if req.scale % 1000 == 0 else f"{req.scale / 1000:g}k"
     return f"{base}_{scale_k}_{req.paper.value}_{req.color_mode.value}"
 
 
@@ -303,6 +303,9 @@ def process_single_job(
     """Execute one claimed job end-to-end (single sheet or multi-sheet UTM atlas)."""
     t0 = time.perf_counter()
     job_id = claimed.record.job_id
+    if db.get_job(db_path, job_id) is None:
+        shutil.rmtree(data_dir / job_id, ignore_errors=True)
+        return None
     artifacts_dir = data_dir / job_id / "artifacts"
     artifacts_dir.mkdir(parents=True, exist_ok=True)
     tmp_work_dir = Path(tempfile.mkdtemp(prefix=f"gf_worker_{job_id}_")).resolve()
@@ -717,31 +720,181 @@ def process_single_job(
                 )
 
         if _is_cancelled(db_path, job_id):
-            return db.get_job(db_path, job_id)
+            rec = db.get_job(db_path, job_id)
+            if rec is None:
+                shutil.rmtree(data_dir / job_id, ignore_errors=True)
+            return rec
 
         elapsed = time.perf_counter() - t0
         rss_mb = _peak_rss_mb()
-        return db.complete_job(
+        completed = db.complete_job(
             db_path,
             job_id,
             artifacts=artifacts,
             elapsed_seconds=elapsed,
             peak_rss_mb=rss_mb,
         )
+        if completed is None:
+            shutil.rmtree(data_dir / job_id, ignore_errors=True)
+        return completed
     except Exception as exc:
         elapsed = time.perf_counter() - t0
         rss_mb = _peak_rss_mb()
         logger.exception("Job %s failed after %.2fs: %s", job_id, elapsed, exc)
-        return db.fail_job(
+        failed = db.fail_job(
             db_path,
             job_id,
             error=str(exc),
             elapsed_seconds=elapsed,
             peak_rss_mb=rss_mb,
         )
+        if failed is None:
+            shutil.rmtree(data_dir / job_id, ignore_errors=True)
+        return failed
     finally:
+        if db.get_job(db_path, job_id) is None:
+            shutil.rmtree(data_dir / job_id, ignore_errors=True)
         shutil.rmtree(tmp_work_dir, ignore_errors=True)
         db.touch_heartbeat(db_path, worker_id=worker_id, pid=os.getpid(), active_job_id=None)
+
+
+DEFAULT_PRUNE_INTERVAL_SECONDS = 900.0
+DEFAULT_GUEST_TTL_HOURS = 24.0
+DEFAULT_FRIEND_TTL_HOURS = 336.0
+DEFAULT_CACHE_MAX_BYTES = 2 * 1024 * 1024 * 1024
+DEFAULT_CACHE_DIR = "/tmp/gridforge-cache"
+_CACHE_DISABLE_TOKENS = frozenset({"none", "unlimited", "off"})
+
+
+def _env_nonempty(name: str, default: str) -> str:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    stripped = raw.strip()
+    return stripped or default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    return float(raw.strip())
+
+
+def _resolve_auth_mode(explicit: str | None = None) -> str:
+    raw = explicit if explicit is not None else os.environ.get("GRIDFORGE_AUTH_MODE", "none")
+    mode = raw.strip().lower() or "none"
+    if mode not in {"none", "hosted"}:
+        raise ValueError(f"Invalid GRIDFORGE_AUTH_MODE={mode!r}. Expected 'none' or 'hosted'.")
+    return mode
+
+
+def _parse_cache_max_bytes(raw: str | int) -> int | None:
+    if isinstance(raw, int):
+        return raw
+    cleaned = raw.strip().lower()
+    if not cleaned:
+        return DEFAULT_CACHE_MAX_BYTES
+    if cleaned in _CACHE_DISABLE_TOKENS:
+        return None
+    return int(cleaned)
+
+
+def _resolve_cache_max_bytes_from_env() -> int | None:
+    raw = os.environ.get("GRIDFORGE_CACHE_MAX_BYTES")
+    if raw is None or not raw.strip():
+        return DEFAULT_CACHE_MAX_BYTES
+    return _parse_cache_max_bytes(raw)
+
+
+def run_pruning_pass(
+    db_path: Path,
+    *,
+    data_dir: Path,
+    cache_dir: Path | None = None,
+    max_job_age_hours: float = 24.0,
+    guest_ttl_hours: float | None = None,
+    friend_ttl_hours: float | None = None,
+    cache_max_bytes: int | None = None,
+    auth_mode: str | None = None,
+) -> dict[str, Any]:
+    """Run one TTL database/artifact pruning pass and bounded LRU cache trim."""
+    resolved_auth_mode = _resolve_auth_mode(auth_mode)
+    use_role_ttl = (
+        resolved_auth_mode == "hosted"
+        or guest_ttl_hours is not None
+        or friend_ttl_hours is not None
+    )
+
+    eff_guest_ttl = (
+        guest_ttl_hours
+        if guest_ttl_hours is not None
+        else _env_float("GRIDFORGE_GUEST_TTL_HOURS", DEFAULT_GUEST_TTL_HOURS)
+    )
+    eff_friend_ttl = (
+        friend_ttl_hours
+        if friend_ttl_hours is not None
+        else _env_float("GRIDFORGE_FRIEND_TTL_HOURS", DEFAULT_FRIEND_TTL_HOURS)
+    )
+
+    if use_role_ttl:
+        pruned_jobs = db.prune_expired_jobs(
+            db_path,
+            data_dir=data_dir,
+            guest_ttl_hours=eff_guest_ttl,
+            friend_ttl_hours=eff_friend_ttl,
+        )
+    else:
+        pruned_jobs = db.prune_expired_jobs(
+            db_path,
+            data_dir=data_dir,
+            max_age_hours=max_job_age_hours,
+        )
+
+    auth_pruned = db.prune_expired_projects_and_auth(
+        db_path,
+        guest_ttl_hours=eff_guest_ttl,
+        friend_ttl_hours=eff_friend_ttl,
+    )
+
+    cache_result: cache_prune.CachePruneResult | None = None
+    if cache_dir is not None and cache_max_bytes is not None:
+        cache_result = cache_prune.trim_cache_dir(cache_dir, cache_max_bytes)
+
+    deleted_cache_files = cache_result.deleted_files if cache_result is not None else 0
+    deleted_cache_bytes = cache_result.deleted_bytes if cache_result is not None else 0
+    removed_cache_dirs = cache_result.removed_dirs if cache_result is not None else 0
+
+    if (
+        pruned_jobs
+        or auth_pruned["projects"]
+        or auth_pruned["sessions"]
+        or auth_pruned["invites"]
+        or deleted_cache_files
+        or removed_cache_dirs
+    ):
+        logger.info(
+            "Pruned jobs=%d projects=%d sessions=%d invites=%d cache_files=%d cache_bytes=%d cache_dirs=%d",
+            pruned_jobs,
+            auth_pruned["projects"],
+            auth_pruned["sessions"],
+            auth_pruned["invites"],
+            deleted_cache_files,
+            deleted_cache_bytes,
+            removed_cache_dirs,
+        )
+
+    return {
+        "jobs": pruned_jobs,
+        "projects": auth_pruned["projects"],
+        "sessions": auth_pruned["sessions"],
+        "invites": auth_pruned["invites"],
+        "cache_deleted_files": deleted_cache_files,
+        "cache_deleted_bytes": deleted_cache_bytes,
+        "cache_removed_dirs": removed_cache_dirs,
+        "cache_bytes_after": cache_result.total_bytes_after if cache_result is not None else 0,
+        "cache": cache_result,
+    }
 
 
 def run_worker_loop(
@@ -751,9 +904,15 @@ def run_worker_loop(
     worker_id: str = "worker-1",
     poll_seconds: float = 1.0,
     heartbeat_seconds: float = 5.0,
-    prune_interval_seconds: float = 900.0,
+    prune_interval_seconds: float | None = None,
     max_job_age_hours: float = 24.0,
     once: bool = False,
+    cache_dir: Path | None = None,
+    guest_ttl_hours: float | None = None,
+    friend_ttl_hours: float | None = None,
+    cache_max_bytes: int | None = None,
+    auth_mode: str | None = None,
+    disable_cache_prune: bool = False,
 ) -> None:
     """Run the single-concurrency SQLite worker loop with graceful shutdown."""
     db_path = data_dir / "gridforge_jobs.sqlite3"
@@ -763,59 +922,101 @@ def run_worker_loop(
     if orphaned:
         logger.warning("Reset %d orphaned running job(s) on startup", orphaned)
 
+    resolved_prune_interval = max(
+        0.0,
+        float(prune_interval_seconds)
+        if prune_interval_seconds is not None
+        else _env_float("GRIDFORGE_PRUNE_INTERVAL_SECONDS", DEFAULT_PRUNE_INTERVAL_SECONDS),
+    )
+    if cache_dir is not None:
+        resolved_cache_dir: Path | None = cache_dir
+    else:
+        env_cache_dir = os.environ.get("GRIDFORGE_CACHE_DIR", "").strip()
+        resolved_cache_dir = Path(env_cache_dir).resolve() if env_cache_dir else None
+
+    if disable_cache_prune:
+        resolved_cache_max_bytes: int | None = None
+    elif cache_max_bytes is not None:
+        resolved_cache_max_bytes = cache_max_bytes
+    elif resolved_cache_dir is not None:
+        resolved_cache_max_bytes = _resolve_cache_max_bytes_from_env()
+    else:
+        resolved_cache_max_bytes = None
+
     stop_event = threading.Event()
 
     def _handle_signal(signum: int, _frame: Any) -> None:
         logger.info("Received signal %s; shutting down GridForge worker cleanly...", signum)
         stop_event.set()
 
-    signal.signal(signal.SIGTERM, _handle_signal)
-    signal.signal(signal.SIGINT, _handle_signal)
+    on_main_thread = threading.current_thread() is threading.main_thread()
+    prev_term = prev_int = None
+    if on_main_thread:
+        prev_term = signal.getsignal(signal.SIGTERM)
+        prev_int = signal.getsignal(signal.SIGINT)
+        signal.signal(signal.SIGTERM, _handle_signal)
+        signal.signal(signal.SIGINT, _handle_signal)
 
-    last_heartbeat = 0.0
-    last_prune = 0.0
+    last_heartbeat: float | None = None
+    last_prune: float | None = None
     packs_count = len(discover_packs(packs_dir))
     logger.info(
-        "GridForge worker '%s' started (pid=%d, data_dir=%s, packs_dir=%s, packs=%d, concurrency=1)",
+        "GridForge worker '%s' started (pid=%d, data_dir=%s, packs_dir=%s, cache_dir=%s, packs=%d, concurrency=1)",
         worker_id,
         os.getpid(),
         data_dir,
         packs_dir,
+        resolved_cache_dir,
         packs_count,
     )
 
-    while not stop_event.is_set():
-        now = time.monotonic()
-        if now - last_heartbeat >= heartbeat_seconds:
-            db.touch_heartbeat(db_path, worker_id=worker_id, pid=os.getpid(), active_job_id=None)
-            last_heartbeat = now
+    try:
+        while not stop_event.is_set():
+            now = time.monotonic()
+            if last_heartbeat is None or (now - last_heartbeat >= heartbeat_seconds):
+                db.touch_heartbeat(db_path, worker_id=worker_id, pid=os.getpid(), active_job_id=None)
+                last_heartbeat = now
 
-        if now - last_prune >= prune_interval_seconds:
-            pruned = db.prune_expired_jobs(
-                db_path, data_dir=data_dir, max_age_hours=max_job_age_hours
-            )
-            if pruned:
-                logger.info("Pruned %d expired job(s) older than %.1fh", pruned, max_job_age_hours)
-            last_prune = now
+            if last_prune is None or (now - last_prune >= resolved_prune_interval):
+                try:
+                    run_pruning_pass(
+                        db_path,
+                        data_dir=data_dir,
+                        cache_dir=resolved_cache_dir,
+                        max_job_age_hours=max_job_age_hours,
+                        guest_ttl_hours=guest_ttl_hours,
+                        friend_ttl_hours=friend_ttl_hours,
+                        cache_max_bytes=resolved_cache_max_bytes,
+                        auth_mode=auth_mode,
+                    )
+                except Exception as exc:
+                    logger.exception("Periodic pruning pass failed: %s", exc)
+                last_prune = now
 
-        claimed = db.claim_next_job(db_path)
-        if claimed is not None:
-            logger.info("Claimed job %s (scale=1:%d, paper=%s)", claimed.record.job_id, claimed.record.scale, claimed.record.paper.value)
-            process_single_job(
-                claimed,
-                db_path=db_path,
-                data_dir=data_dir,
-                packs_dir=packs_dir,
-                worker_id=worker_id,
-            )
-            last_heartbeat = time.monotonic()
+            claimed = db.claim_next_job(db_path)
+            if claimed is not None:
+                logger.info("Claimed job %s (scale=1:%d, paper=%s)", claimed.record.job_id, claimed.record.scale, claimed.record.paper.value)
+                process_single_job(
+                    claimed,
+                    db_path=db_path,
+                    data_dir=data_dir,
+                    packs_dir=packs_dir,
+                    worker_id=worker_id,
+                )
+                last_heartbeat = time.monotonic()
+                if once:
+                    break
+                continue
+
             if once:
                 break
-            continue
-
-        if once:
-            break
-        stop_event.wait(timeout=poll_seconds)
+            stop_event.wait(timeout=poll_seconds)
+    finally:
+        if on_main_thread:
+            if prev_term is not None:
+                signal.signal(signal.SIGTERM, prev_term)
+            if prev_int is not None:
+                signal.signal(signal.SIGINT, prev_int)
 
     logger.info("GridForge worker '%s' exited cleanly.", worker_id)
 
@@ -828,33 +1029,84 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="GridForge Phase 4 single-concurrency map worker")
     parser.add_argument(
         "--data-dir",
-        type=Path,
-        default=Path(os.environ.get("GRIDFORGE_DATA_DIR", "/data/jobs")),
+        type=str,
+        default=None,
     )
     parser.add_argument(
         "--packs-dir",
-        type=Path,
-        default=Path(os.environ.get("GRIDFORGE_PACKS_DIR", "/data/packs")),
+        type=str,
+        default=None,
+    )
+    parser.add_argument(
+        "--cache-dir",
+        type=str,
+        default=None,
     )
     parser.add_argument(
         "--worker-id",
         type=str,
-        default=os.environ.get("GRIDFORGE_WORKER_ID", "worker-1"),
+        default=None,
     )
     parser.add_argument(
         "--max-age-hours",
         type=float,
-        default=float(os.environ.get("GRIDFORGE_JOB_TTL_HOURS", "24")),
+        default=_env_float("GRIDFORGE_JOB_TTL_HOURS", 24.0),
+    )
+    parser.add_argument(
+        "--prune-interval-seconds",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--guest-ttl-hours",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--friend-ttl-hours",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--cache-max-bytes",
+        type=str,
+        default=None,
     )
     parser.add_argument("--once", action="store_true", help="Process at most one job and exit.")
     args = parser.parse_args(argv)
 
+    raw_data_dir = args.data_dir.strip() if args.data_dir is not None else ""
+    resolved_data_dir = Path(raw_data_dir or _env_nonempty("GRIDFORGE_DATA_DIR", "/data/jobs")).resolve()
+
+    raw_packs_dir = args.packs_dir.strip() if args.packs_dir is not None else ""
+    resolved_packs_dir = Path(raw_packs_dir or _env_nonempty("GRIDFORGE_PACKS_DIR", "/data/packs")).resolve()
+
+    if args.cache_dir is None:
+        resolved_cache_dir: Path | None = Path(_env_nonempty("GRIDFORGE_CACHE_DIR", DEFAULT_CACHE_DIR)).resolve()
+    else:
+        raw_cache_dir = args.cache_dir.strip()
+        resolved_cache_dir = Path(raw_cache_dir).resolve() if raw_cache_dir else None
+
+    raw_worker_id = args.worker_id.strip() if args.worker_id is not None else ""
+    resolved_worker_id = raw_worker_id or _env_nonempty("GRIDFORGE_WORKER_ID", "worker-1")
+
+    if args.cache_max_bytes is not None:
+        eff_cache_max_bytes = _parse_cache_max_bytes(args.cache_max_bytes)
+    else:
+        eff_cache_max_bytes = _resolve_cache_max_bytes_from_env()
+
     run_worker_loop(
-        data_dir=args.data_dir.resolve(),
-        packs_dir=args.packs_dir.resolve(),
-        worker_id=args.worker_id,
+        data_dir=resolved_data_dir,
+        packs_dir=resolved_packs_dir,
+        worker_id=resolved_worker_id,
+        prune_interval_seconds=args.prune_interval_seconds,
         max_job_age_hours=args.max_age_hours,
         once=args.once,
+        cache_dir=resolved_cache_dir,
+        guest_ttl_hours=args.guest_ttl_hours,
+        friend_ttl_hours=args.friend_ttl_hours,
+        cache_max_bytes=eff_cache_max_bytes,
+        disable_cache_prune=(eff_cache_max_bytes is None or resolved_cache_dir is None),
     )
     return 0
 

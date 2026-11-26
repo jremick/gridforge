@@ -82,6 +82,8 @@ class JobRecord(BaseModel):
     color_mode: ColorMode
     grid_cols: int = 1
     grid_rows: int = 1
+    owner_id: str = "local"
+    owner_role: str = "none"
     created_at: str
     started_at: str | None = None
     finished_at: str | None = None
@@ -213,6 +215,7 @@ class ViewshedPreviewRequest(BaseModel):
     observer: ViewshedObserver
     dem_source: DemSourceKind = DemSourceKind.AUTO
     pack_id: str | None = None
+    turnstile_token: str | None = Field(default=None, exclude=True)
 
 
 class ViewshedPreviewResponse(BaseModel):
@@ -233,6 +236,7 @@ class RFLinkProfileRequest(RFLinkSpec):
     dem_source: DemSourceKind = DemSourceKind.AUTO
     pack_id: str | None = None
     date_iso: str | None = None
+    turnstile_token: str | None = Field(default=None, exclude=True)
 
 
 class RFLinkSample(BaseModel):
@@ -287,6 +291,7 @@ class RulerMetricsRequest(BaseModel):
     dem_source: DemSourceKind | None = None
     pack_id: str | None = None
     date_iso: str | None = None
+    turnstile_token: str | None = Field(default=None, exclude=True)
 
     @model_validator(mode="before")
     @classmethod
@@ -384,6 +389,7 @@ class CreateJobRequest(BaseModel):
     include_atlas_index: bool = False
     include_rf_link_card: bool = False
     show_fold_marks: bool = False
+    turnstile_token: str | None = Field(default=None, exclude=True)
 
     @field_validator("scale")
     @classmethod
@@ -452,3 +458,205 @@ class HealthResponse(BaseModel):
     worker_last_seen: str | None = None
     memory_budget_mb: int = 3072
     packs_count: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Opt-in Hosted Authentication, Session & Admin Contracts
+# ---------------------------------------------------------------------------
+
+AuthRole = Literal["none", "guest", "friend", "admin"]
+
+
+class AuthUserSummary(BaseModel):
+    """Authenticated user summary returned inside ``GET /api/auth/session``."""
+
+    user_id: str
+    email: str
+    display_name: str = ""
+    role: Literal["friend", "admin"]
+
+
+class AuthCapabilities(BaseModel):
+    """Effective per-role feature caps and client flags."""
+
+    max_grid_cells: int
+    max_grid_cols: int
+    max_grid_rows: int
+    strip_atlas_allowed: bool
+    max_strip_sheets: int
+    allowed_outputs: list[str]
+    packs_manage_allowed: bool
+    max_upload_bytes: int
+    max_dpi: int = 600
+    max_export_dpi: int = 600
+    turnstile_required: bool
+    turnstile_sitekey: str | None = None
+    google_oauth_enabled: bool = False
+
+
+class AuthQuotas(BaseModel):
+    """Live quota usage and global public render budget snapshot."""
+
+    daily_renders_limit: int | None = None
+    daily_renders_used: int = 0
+    daily_renders_remaining: int | None = None
+    hourly_previews_limit: int | None = None
+    hourly_previews_used: int = 0
+    hourly_previews_remaining: int | None = None
+    public_renders_paused: bool = False
+    global_daily_public_limit: int | None = None
+    global_daily_public_used: int = 0
+
+
+class AuthSessionResponse(BaseModel):
+    """Response envelope for ``GET /api/auth/session`` and auth mutations."""
+
+    auth_mode: Literal["none", "hosted"]
+    authenticated: bool
+    user: AuthUserSummary | None = None
+    role: AuthRole
+    capabilities: AuthCapabilities
+    quotas: AuthQuotas
+    brand_name: str = "GridForge"
+    brand_subtitle: str = "Studio"
+    brand_tagline: str = "Tactical Topographic Print Studio"
+
+
+class LoginRequest(BaseModel):
+    """Request payload for ``POST /api/auth/login``."""
+
+    email: str = Field(..., min_length=3, max_length=254)
+    password: str = Field(..., min_length=1, max_length=256)
+
+
+class AcceptInviteRequest(BaseModel):
+    """Request payload for ``POST /api/auth/accept-invite``."""
+
+    token: str = Field(..., min_length=8, max_length=256)
+    email: str | None = Field(default=None, min_length=3, max_length=254)
+    password: str = Field(..., min_length=8, max_length=256)
+    display_name: str | None = Field(default=None, max_length=120)
+
+
+class AdminUsageSummary(BaseModel):
+    """Aggregate usage & telemetry metrics for ``GET /api/admin/usage``."""
+
+    renders_today: int = 0
+    renders_7d: int = 0
+    previews_today: int = 0
+    active_queue_depth: int = 0
+    global_daily_public_used: int = 0
+    global_daily_public_limit: int | None = None
+    public_renders_paused: bool = False
+    avg_elapsed_seconds: float | None = None
+    max_peak_rss_mb: float | None = None
+
+
+class AdminUsageEvent(BaseModel):
+    """Recent metered event returned inside ``GET /api/admin/usage``."""
+
+    event_id: int
+    event_type: str
+    actor_id: str
+    actor_role: str
+    client_ip: str = ""
+    job_id: str | None = None
+    detail: dict[str, Any] = Field(default_factory=dict)
+    created_at: str
+
+
+class AdminUsageResponse(BaseModel):
+    """Response envelope for ``GET /api/admin/usage``."""
+
+    summary: AdminUsageSummary
+    by_role: dict[str, dict[str, int]] = Field(default_factory=dict)
+    recent_events: list[AdminUsageEvent] = Field(default_factory=list)
+
+
+class AdminUserRecord(BaseModel):
+    """User account summary returned inside ``GET /api/admin/users``."""
+
+    user_id: str
+    email: str
+    display_name: str = ""
+    role: Literal["friend", "admin"]
+    disabled: bool = False
+    daily_render_limit: int | None = None
+    hourly_preview_limit: int | None = None
+    has_password: bool = False
+    has_google: bool = False
+    created_at: str
+    last_login_at: str | None = None
+
+
+class AdminInviteRecord(BaseModel):
+    """Invite record summary returned inside ``GET /api/admin/users``."""
+
+    invite_id: str
+    email: str | None = None
+    role: Literal["friend", "admin"]
+    created_by: str | None = None
+    created_at: str
+    expires_at: str
+    used_at: str | None = None
+    used_by_user_id: str | None = None
+    revoked_at: str | None = None
+    status: Literal["pending", "used", "revoked", "expired"]
+
+
+class AdminUsersResponse(BaseModel):
+    """Response envelope for ``GET /api/admin/users``."""
+
+    users: list[AdminUserRecord] = Field(default_factory=list)
+    invites: list[AdminInviteRecord] = Field(default_factory=list)
+
+
+class CreateInviteRequest(BaseModel):
+    """Request payload for ``POST /api/admin/invites``."""
+
+    email: str | None = Field(default=None, max_length=254)
+    role: Literal["friend", "admin"] = "friend"
+    expires_hours: int = Field(default=168, ge=1, le=8760)
+
+
+class CreateInviteResponse(BaseModel):
+    """Response payload for ``POST /api/admin/invites``."""
+
+    invite_id: str
+    token: str
+    invite_path: str
+    expires_at: str
+
+
+class RevokeInviteResponse(BaseModel):
+    """Response payload for ``DELETE /api/admin/invites/{invite_id}``."""
+
+    revoked: bool = True
+    invite_id: str
+
+
+class UpdateUserRequest(BaseModel):
+    """Request payload for ``PATCH /api/admin/users/{user_id}``."""
+
+    disabled: bool | None = None
+    daily_render_limit: int | None = Field(default=None, ge=0, le=10000)
+    hourly_preview_limit: int | None = Field(default=None, ge=0, le=10000)
+    role: Literal["friend", "admin"] | None = None
+
+
+class UpdateUserResponse(BaseModel):
+    """Response payload for ``PATCH /api/admin/users/{user_id}``."""
+
+    user: AdminUserRecord
+
+
+class AdminSettingsRequest(BaseModel):
+    """Request payload for ``POST /api/admin/settings``."""
+
+    public_renders_paused: bool
+
+
+class AdminSettingsResponse(BaseModel):
+    """Response payload for ``POST /api/admin/settings``."""
+
+    public_renders_paused: bool

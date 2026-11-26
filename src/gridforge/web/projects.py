@@ -58,6 +58,8 @@ class ProjectRecord(BaseModel):
     state: dict[str, Any] = Field(default_factory=dict)
     last_job_id: str | None = None
     thumbnail_url: str | None = None
+    owner_id: str = "local"
+    owner_role: str = "none"
     created_at: str
     updated_at: str
 
@@ -84,6 +86,9 @@ def _row_to_project(row: sqlite3.Row) -> ProjectRecord:
     last_job_id = str(row["last_job_id"]) if row["last_job_id"] else None
     thumb_url = f"/api/jobs/{last_job_id}/thumbnail.png" if last_job_id else None
     desc_text = str(row["description"] or "")
+    keys = set(row.keys())
+    owner_id = str(row["owner_id"]) if "owner_id" in keys and row["owner_id"] else "local"
+    owner_role = str(row["owner_role"]) if "owner_role" in keys and row["owner_role"] else "none"
     return ProjectRecord(
         id=pid,
         project_id=pid,
@@ -93,19 +98,33 @@ def _row_to_project(row: sqlite3.Row) -> ProjectRecord:
         state=state,
         last_job_id=last_job_id,
         thumbnail_url=thumb_url,
+        owner_id=owner_id,
+        owner_role=owner_role,
         created_at=str(row["created_at"]),
         updated_at=str(row["updated_at"]),
     )
 
 
-def list_projects(db_path: Path, *, limit: int = 100) -> list[ProjectRecord]:
+def list_projects(
+    db_path: Path,
+    *,
+    limit: int = 100,
+    owner_id: str | None = None,
+) -> list[ProjectRecord]:
     """List saved trip projects ordered most recently updated first."""
     conn = db._connect(db_path)
     try:
-        rows = conn.execute(
-            "SELECT * FROM projects ORDER BY updated_at DESC, rowid DESC LIMIT ?",
-            (max(1, min(500, limit)),),
-        ).fetchall()
+        clamped = max(1, min(500, limit))
+        if owner_id is not None:
+            rows = conn.execute(
+                "SELECT * FROM projects WHERE owner_id = ? ORDER BY updated_at DESC, rowid DESC LIMIT ?",
+                (owner_id, clamped),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM projects ORDER BY updated_at DESC, rowid DESC LIMIT ?",
+                (clamped,),
+            ).fetchall()
         return [_row_to_project(r) for r in rows]
     finally:
         conn.close()
@@ -124,7 +143,13 @@ def get_project(db_path: Path, project_id: str) -> ProjectRecord | None:
         conn.close()
 
 
-def create_project(db_path: Path, req: ProjectCreateRequest) -> ProjectRecord:
+def create_project(
+    db_path: Path,
+    req: ProjectCreateRequest,
+    *,
+    owner_id: str = "local",
+    owner_role: str = "none",
+) -> ProjectRecord:
     """Persist a new saved trip project and return its record."""
     project_id = uuid.uuid4().hex[:16]
     now = db._utc_now_iso()
@@ -135,8 +160,9 @@ def create_project(db_path: Path, req: ProjectCreateRequest) -> ProjectRecord:
         conn.execute(
             """
             INSERT INTO projects (
-                project_id, name, description, state_json, last_job_id, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                project_id, name, description, state_json, last_job_id,
+                owner_id, owner_role, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 project_id,
@@ -144,6 +170,8 @@ def create_project(db_path: Path, req: ProjectCreateRequest) -> ProjectRecord:
                 (req.description or "").strip(),
                 state_json,
                 req.last_job_id,
+                owner_id,
+                owner_role,
                 now,
                 now,
             ),

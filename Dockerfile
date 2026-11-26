@@ -70,14 +70,11 @@ ENV QT_QPA_PLATFORM=offscreen \
     VSI_CACHE_SIZE=67108864 \
     GDAL_HTTP_MAX_RETRY=3 \
     GDAL_HTTP_RETRY_DELAY=2 \
-    GRIDFORGE_CACHE_DIR=/tmp/gridforge-cache \
-    GRIDFORGE_DATA_DIR=/data/jobs \
-    GRIDFORGE_PACKS_DIR=/data/packs \
     GRIDFORGE_WEB_DIST=/app/web/dist \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app/src
 
-RUN mkdir -p /tmp/runtime-root /tmp/gridforge-cache /data/jobs /data/packs \
+RUN mkdir -p /tmp/runtime-root /tmp/gridforge-cache /data/jobs /data/packs /data/cache /data/samples \
     && chmod 700 /tmp/runtime-root
 
 WORKDIR /app
@@ -93,4 +90,7 @@ RUN pip install --no-cache-dir --no-deps --no-build-isolation -e .
 
 EXPOSE 8080
 
-CMD ["gridforge", "--help"]
+HEALTHCHECK --interval=15s --timeout=5s --start-period=15s --retries=3 \
+    CMD curl -fsS "http://127.0.0.1:${PORT:-8080}/api/health" || exit 1
+
+CMD ["python3", "-m", "gridforge.web.entrypoint"]
