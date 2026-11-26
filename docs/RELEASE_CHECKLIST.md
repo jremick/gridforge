@@ -18,32 +18,37 @@ Keep `README.md` structured as a **product landing page** (not a reverse-chronol
 
 - **Hero & Quickstart Above the Fold:** Keep `docs/images/banner.png`, live GitHub Actions badges (`CI` + `GHCR Multi-Arch`), dynamic `GitHub Release` badge, and the 30-second `docker compose -f docker-compose.ghcr.yml up -d` Quickstart at the top.
 - **Fresh Showcase Visuals:**
-  - If new cartographic themes, overlays, regions, or supplement pages shipped, generate a crisp 4-panel banner (`docs/images/vXY-showcase.jpg`, `<= 600 KB`) from real 300 DPI renders and visually inspect it.
+  - If new cartographic themes, overlays, regions, or supplement pages shipped, generate a crisp 4-panel showcase banner under `docs/images/` (like `docs/images/v14-showcase.jpg`, `<= 600 KB`) from real 300–600 DPI renders and visually inspect it.
   - If Studio UI changed meaningfully, update the Studio screenshot (`<= 300 KB`) and/or regenerate the animated Studio walkthrough GIF (`docs/images/studio-demo.gif`, `<= 2.5 MB`).
-- **Keep Capability Tables & Metrics Current:** Update the top comparison table, test counts, idle RAM measurement, data attributions table, and downloadable 300 DPI sample PDF links to match the new release tag.
+- **Keep Capability Tables, Docs & Metrics Current:** Update the top comparison table, test counts, idle RAM measurement, data attributions table, deployment/env-var guides (e.g., `deploy/hosted-mode.md` whenever new env vars or runtime modes ship), and downloadable sample PDF links to match the new release tag.
+- **Showcase Headline Features in Sample PDFs:** Update `scripts/render_release_samples.sh` whenever major new scales, DPI tiers, themes, or regions ship so visitors can inspect real vector outputs from the new release.
 - **Use Published Images in User Examples:** Use `ghcr.io/jremick/gridforge:latest` in all Quickstart and CLI Cookbook examples (reserve `gridforge:dev` strictly for local development/testing sections).
 
-## 3. Automated Verification & Release Preflight
+## 3. Automated Verification, CI Mount Parity & Release Preflight
 
-Run all four gates before tagging:
+Run all five gates before tagging:
 
 ```bash
-# 1. Release & marketing hygiene gate (version parity, README links/badges/images)
+# 1. Confirm latest GitHub Actions CI run on main is 100% green and .github/workflows/ci.yml
+#    mounts every repo path read by tests/unit, tests/integration, and tests/e2e
+gh run list --branch main --limit 3
+
+# 2. Release & marketing hygiene gate (version parity, README links/badges/images)
 python3 scripts/release_preflight.py --tag vX.Y.Z
 
-# 2. Frontend unit tests & production bundle
+# 3. Frontend unit tests & production bundle
 npm --prefix web test && npm --prefix web run build
 
-# 3. Full offline PyQGIS test suite inside the rebuilt image
+# 4. Full offline PyQGIS test suite inside the rebuilt image
 docker build -t gridforge:dev .
-docker run --rm -v "$(pwd):/app" gridforge:dev pytest -q tests/unit tests/integration
+docker run --rm -v "$(pwd):/app" gridforge:dev pytest -q tests/unit tests/integration tests/e2e
 
-# 4. Live multi-region E2E renders & visual inspection at 150-300 DPI
+# 5. Live multi-region E2E renders & visual inspection (verifies live Overpass/DEM/overlay feeds)
 docker run --rm -e GRIDFORGE_RUN_LIVE=1 -v "$(pwd):/app" gridforge:dev \
   pytest -q tests/integration -m live
 ```
 
-Verify live Studio UI at `http://127.0.0.1:8080` (`0` console errors, `0 px` topbar clipping at `1440×900`, idle `web + worker < 200 MiB` RAM).
+Verify live Studio UI (`0` console errors, `0 px` topbar clipping at `1440×900`, idle `web + worker < 200 MiB` RAM) and run a repo-privacy scan over tracked files and comments (zero local paths, personal emails, secrets, cloud account/project IDs, or machine-specific hostnames; public noreply commit author).
 
 ## 4. Commit, Tag & Push
 

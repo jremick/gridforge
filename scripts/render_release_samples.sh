@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Render verified 300 DPI sample PDFs across North America, Australia, and New Zealand
+# Render verified 300–600 DPI sample PDFs across North America, Australia, and New Zealand
 # and optionally attach them to a GitHub Release as downloadable showcase assets.
 #
 # Usage:
-#   ./scripts/render_release_samples.sh [--image ghcr.io/jremick/gridforge:latest] [--out-dir /tmp/gridforge-samples] [--upload v1.4.0]
+#   ./scripts/render_release_samples.sh [--image ghcr.io/jremick/gridforge:latest] [--out-dir /tmp/gridforge-samples] [--upload v1.5.0]
 set -euo pipefail
 
 IMAGE="ghcr.io/jremick/gridforge:latest"
@@ -21,13 +21,13 @@ done
 
 mkdir -p "${OUT_DIR}"
 
-echo "Rendering 4 verified 300 DPI sample PDFs using ${IMAGE} into ${OUT_DIR}..."
+echo "Rendering 5 verified sample PDFs (300–600 DPI) using ${IMAGE} into ${OUT_DIR}..."
 # Stream rendered PDFs out via stdout tar so this works identically on both local
-# Docker daemons and remote Docker contexts (e.g. ssh://gcp-dev).
+# Docker daemons and remote Docker contexts (e.g. ssh://<remote-host>).
 docker run --rm "${IMAGE}" bash -ceu '
   mkdir -p /tmp/samples
 
-  echo "[1/4] US Yosemite Valley CA — 1:24,000 Letter Alpine Winter..." >&2
+  echo "[1/5] US Yosemite Valley CA — 1:24,000 Letter Alpine Winter..." >&2
   gridforge render \
     --center "37.745,-119.593" --scale 24000 --paper letter --units imperial \
     --mode alpine --dem-source usgs3dep \
@@ -35,14 +35,14 @@ docker run --rm "${IMAGE}" bash -ceu '
     --title "YOSEMITE VALLEY — ALPINE CA" \
     --output /tmp/samples/sample-yosemite-alpine-24k-letter.pdf >&2
 
-  echo "[2/4] Canada Banff AB — 1:25,000 A4 Night-Red (Red-Headlamp Safe)..." >&2
+  echo "[2/5] Canada Banff AB — 1:25,000 A4 Night-Red (Red-Headlamp Safe)..." >&2
   gridforge render \
     --center "51.178,-115.571" --scale 25000 --paper a4 --mode night-red \
     --dem-source ca-hrdem --ca-overlay ca-canvec-trails \
     --title "BANFF — SULPHUR MTN AB" \
     --output /tmp/samples/sample-banff-night-red-25k-a4.pdf >&2
 
-  echo "[3/4] Australia Mt Kosciuszko NSW — RF Viewshed + 915 MHz Fresnel Link Card + Tactical..." >&2
+  echo "[3/5] Australia Mt Kosciuszko NSW — RF Viewshed + 915 MHz Fresnel Link Card + Tactical..." >&2
   gridforge render \
     --center "-36.456,148.263" --scale 25000 --paper a4 --mode color \
     --dem-source au-elvis --au-overlay au-nsw-trails \
@@ -55,12 +55,20 @@ docker run --rm "${IMAGE}" bash -ceu '
     --title "MT KOSCIUSZKO — RF LINK & TACTICAL" \
     --output /tmp/samples/sample-kosciuszko-rf-tactical-25k-a4.pdf >&2
 
-  echo "[4/4] New Zealand Tongariro — 1:25,000 A4 LINZ 1m LiDAR + DOC Tracks..." >&2
+  echo "[4/5] New Zealand Tongariro — 1:25,000 A4 LINZ 1m LiDAR + DOC Tracks..." >&2
   gridforge render \
     --center "-39.133,175.642" --scale 25000 --paper a4 --mode color \
     --dem-source nz-linz --nz-overlay nz-doc-trails --slope-shading \
     --title "TONGARIRO ALPINE CROSSING — NZ" \
     --output /tmp/samples/sample-tongariro-nz-1m-lidar-25k-a4.pdf >&2
+
+  echo "[5/5] US Boulder Flatirons CO — 1:10,000 600 DPI True 1m LiDAR + 5ft High-Density Contours..." >&2
+  gridforge render \
+    --center "39.992,-105.291" --scale 10000 --paper letter --units imperial \
+    --mode color --dpi 600 --contour-density high --dem-source usgs3dep \
+    --us-overlay us-trails --us-overlay us-public-lands \
+    --title "BOULDER FLATIRONS — 1:10K 600 DPI" \
+    --output /tmp/samples/sample-boulder-flatirons-10k-600dpi-letter.pdf >&2
 
   ls -lh /tmp/samples/*.pdf >&2
   tar -C /tmp/samples -cf - .
@@ -78,6 +86,7 @@ if [ -n "${UPLOAD_TAG}" ]; then
     "${OUT_DIR}/sample-banff-night-red-25k-a4.pdf" \
     "${OUT_DIR}/sample-kosciuszko-rf-tactical-25k-a4.pdf" \
     "${OUT_DIR}/sample-tongariro-nz-1m-lidar-25k-a4.pdf" \
+    "${OUT_DIR}/sample-boulder-flatirons-10k-600dpi-letter.pdf" \
     --clobber
   echo "Sample PDFs attached cleanly to release ${UPLOAD_TAG}!"
 fi

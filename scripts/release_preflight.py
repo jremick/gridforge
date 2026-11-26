@@ -136,9 +136,65 @@ def check_release(tag: str | None = None) -> list[str]:
             "use 'ghcr.io/jremick/gridforge:latest' outside development/testing sections."
         )
 
-    # Ensure docs/RELEASE_CHECKLIST.md exists
+    # Ensure docs/RELEASE_CHECKLIST.md and deploy/hosted-mode.md exist
     if not (ROOT / "docs/RELEASE_CHECKLIST.md").exists():
         errors.append("Missing docs/RELEASE_CHECKLIST.md")
+    if not (ROOT / "deploy/hosted-mode.md").exists():
+        errors.append("Missing deploy/hosted-mode.md")
+
+    # Verify README sample PDF links match the target release tag and render_release_samples.sh
+    sample_links = re.findall(
+        r"/releases/download/(v[0-9]+\.[0-9]+\.[0-9]+)/(sample-[A-Za-z0-9_.-]+\.pdf)",
+        readme,
+    )
+    if not sample_links:
+        errors.append("README.md has no downloadable sample PDF release links")
+    samples_script_path = ROOT / "scripts/render_release_samples.sh"
+    samples_script = samples_script_path.read_text(encoding="utf-8") if samples_script_path.exists() else ""
+    for link_tag, filename in sample_links:
+        if tag and link_tag != tag:
+            errors.append(
+                f"README.md sample PDF link '{filename}' points to {link_tag} instead of {tag}"
+            )
+        if filename not in samples_script:
+            errors.append(
+                f"README.md links to '{filename}', which is not rendered/uploaded by scripts/render_release_samples.sh"
+            )
+
+    # Verify CI mounts the entire tests/ tree (so tests/e2e/ stays in parity with local pytest)
+    ci_path = ROOT / ".github/workflows/ci.yml"
+    if ci_path.exists():
+        ci_text = ci_path.read_text(encoding="utf-8")
+        if "tests/unit" in ci_text and "tests/e2e" not in ci_text and ":/app/tests" not in ci_text:
+            errors.append(
+                ".github/workflows/ci.yml appears to omit tests/e2e; mount the full tests/ directory."
+            )
+
+    # Lightweight repository privacy hygiene check across docs, workflows, scripts, and AGENTS.md
+    privacy_patterns = [
+        ("macOS home path", re.compile(r"/" + "Users/[A-Za-z0-9._-]+/")),
+        ("Linux home path", re.compile(r"/" + "home/[A-Za-z0-9._-]+/")),
+        ("Windows user path", re.compile(r"C:\\\\" + r"Users\\[A-Za-z0-9._-]+\\")),
+    ]
+    scan_paths = [
+        ROOT / "AGENTS.md",
+        ROOT / "README.md",
+        ROOT / "CHANGELOG.md",
+        ROOT / "CONTRIBUTING.md",
+        *(ROOT / "docs").glob("*.md"),
+        *(ROOT / "deploy").glob("*.md"),
+        *(ROOT / ".github/workflows").glob("*.yml"),
+        *(ROOT / "scripts").glob("*.sh"),
+        *(ROOT / "scripts").glob("*.py"),
+    ]
+    for path in scan_paths:
+        if not path.is_file() or path.resolve() == Path(__file__).resolve():
+            continue
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        rel = path.relative_to(ROOT)
+        for label, pattern in privacy_patterns:
+            if pattern.search(text):
+                errors.append(f"Privacy check failed ({label}) in {rel}")
 
     return errors
 

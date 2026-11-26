@@ -5,6 +5,29 @@ All notable changes to **GridForge** are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] - 2026-11-27
+
+High-resolution cartography, public hosted multi-tenant deployment, and Studio UX upgrade release adding `1:10,000` / `1:12,500` scales, `300` / `450` / `600 DPI` print and digital tile controls, true `1.0 m` LiDAR terrain & `2 m` / `5 ft` contours, richer OSM backcountry micro-features across all four themes, a zero-key **Vector HD** (OpenFreeMap) Studio basemap, a resizable/collapsible sidebar & redesigned header, and opt-in public hosted mode (`GRIDFORGE_AUTH_MODE=hosted`, powering [GridMaps](https://gridmaps.net)).
+
+### Added
+
+- **Higher Print & Digital Export Resolution (`300` / `450` / `600 DPI`, `--export-dpi`):**
+  - Exposed inline **Print PDF DPI** and **Digital Export Tiles DPI** selectors in Studio (`web/src/components/sidebar.ts`), wired through URL permalinks, Saved Projects, Copy CLI (`--dpi`, `--export-dpi`), and backend job execution (`src/gridforge/cli.py`, `src/gridforge/web/worker.py`).
+  - Added role-aware DPI caps (`GRIDFORGE_GUEST_MAX_DPI=300`, `GRIDFORGE_FRIEND_MAX_DPI=600`) in `src/gridforge/web/limits.py` and `web/src/session.ts`.
+- **Finer Tactical Scales (`1:10,000`, `1:12,500`), True `1.0 m` LiDAR Terrain & `2 m` / `5 ft` Contours:**
+  - Expanded `VALID_SCALES` to `(10000, 12500, 15000, 24000, 25000, 48000, 50000)` with calibrated metric/imperial collar scale bars (`src/gridforge/render/layout.py`) and 100 mm Calibration Romer scale notes (`src/gridforge/geo/supplements.py`).
+  - Preserved true **`1.0 m` LiDAR** terrain on `<= 1:15,000` sheets with a `4096 px` memory safety cap (`src/gridforge/pipeline/terrain.py`), unlocked **`2 m` / `5 ft`** high-density contours on high-resolution DEMs (`<= 10 m`), and upgraded Queensland `QldDem` fetching (`src/gridforge/sources/dem_au_elvis.py`) to `1.0 m` (`qld-1m-lidar`) within verified `4096 × 2048 px` ImageServer limits.
+- **Richer OSM Backcountry Cartography Across All 4 Themes:**
+  - Expanded `config/osmconf.ini`, `src/gridforge/pipeline/normalize.py`, and `src/gridforge/sources/osm_overpass.py` (`v4:` cache key) to capture cliffs/escarpments, waterfalls/rapids, natural springs, stream fords, cave entrances, survey points/trigs, cairns/rock outcrops, gates/stiles/cattle grids, walls/fences, and historic ruins/forts.
+  - Styled all new backcountry features plus distinct `highway=steps` and rough `tracktype=grade4|grade5` 4WD tracks across `color`, `bw`, `night-red` (preserving `R <= 61` red-headlamp legibility), and `alpine`, regenerating `transport.qml` and `points.qml` across all 4 themes.
+- **Retina Interactive Studio Basemap (`Vector HD`), Redesigned Header & Resizable Sidebar:**
+  - Added a lazy-loaded, zero-API-key **Vector HD** basemap powered by **OpenFreeMap Liberty** (`web/src/map.ts`) preserving all 18 GeoJSON overlays and instant toggling with OpenTopoMap, OSM Standard, Esri Imagery, and Offline MBTiles.
+  - Redesigned the Studio header (`web/src/components/telemetry.ts`) with zero mid-character telemetry clipping and an accessible monogram account dropdown menu, and added a persistent, drag-resizable (`300px` min), hide/show sidebar (`[` hotkey, `web/src/sidebarPrefs.ts`).
+- **Opt-In Hosted Multi-Tenant Mode (`GRIDFORGE_AUTH_MODE=hosted`), Custom Branding & Single-Container Deployment:**
+  - Added SQLite-backed `Guest` / invite-only `Friend` / `Admin` roles (`src/gridforge/web/{auth,limits,cache_prune,entrypoint}.py`), email/password + Google OAuth, Cloudflare Turnstile bot protection, strict per-owner job/project isolation, Admin usage dashboard & public-render kill switch, role-aware artifact TTL + LRU cache pruning, configurable SSR/collar branding (`GRIDFORGE_BRAND_NAME`, `GRIDFORGE_BRAND_SUBTITLE`, `GRIDFORGE_BRAND_TAGLINE`), single-container Railway config (`railway.toml`), and a dedicated deployment guide ([`deploy/hosted-mode.md`](deploy/hosted-mode.md)) while preserving zero-login `127.0.0.1` local defaults (`GRIDFORGE_AUTH_MODE=none`).
+- **Automated Verification (`534` offline pytest + `35` frontend tests):**
+  - Added hosted E2E suites (`tests/e2e/`) and unit tests (`tests/unit/test_auth_and_limits.py`, `test_container_entrypoint.py`, `test_db_tenancy.py`, `test_worker_pruning.py`, plus `web/tests/*.test.mjs`) and mounted repo configs + `web/src` in `.github/workflows/ci.yml` so all 534 offline backend tests run in CI.
+
 ## [1.4.0] - 2026-11-26
 
 Major tactical communications, multi-theme cartography, North America backcountry coverage, offline basemap, and field-device export release shipping four cartographic themes (`172` native QGIS 3.40 `.qml` styles), curved-Earth RF Fresnel Link Cards, tactical range rings & sectors, GeoPackage / OsmAnd / Field Bundle `.zip` exports, Saved Trip Projects, turnkey pure-GDAL offline basemaps across 29 global regions, and full US & Canada backcountry open-data sources.

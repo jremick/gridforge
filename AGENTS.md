@@ -11,10 +11,10 @@ Welcome to **GridForge** (`jremick/gridforge`, GPL-3.0). Keep these core invaria
 - **Local-First Security:** Keep Compose/CLI/Vite defaults on `127.0.0.1` with `SameOriginWritesMiddleware` + `TrustedHostMiddleware` protecting all mutating endpoints.
 
 ## Release & Marketability Workflow
-Every `vX.Y.Z` release **must** follow [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md), including:
+Every `vX.Y.Z` release **must** follow [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md) and the `.agents/skills/gridforge-release/SKILL.md` runbook, including:
 1. Keeping [README.md](README.md) structured as a crisp product landing page (hero banner, live badges, 30-second GHCR quickstart above the fold, up-to-date comparison table, visuals, and downloadable sample PDF links).
-2. Passing `python3 scripts/release_preflight.py --tag vX.Y.Z` alongside offline pytest and `npm --prefix web test`.
-3. Attaching verified 300 DPI sample PDFs via `./scripts/render_release_samples.sh --upload vX.Y.Z`.
-4. Syncing GitHub description/topics and verifying public GHCR pull access via `./scripts/sync_github_metadata.sh`.
+2. Verifying green `main` CI (with full `tests/` mount parity), running live multi-region open-data E2E smoke tests (`GRIDFORGE_RUN_LIVE=1`), updating deployment/env-var docs (`deploy/hosted-mode.md`), refreshing showcase samples/visuals for headline features, and scanning tracked files for repo privacy.
+3. Passing `python3 scripts/release_preflight.py --tag vX.Y.Z` alongside offline pytest (`unit` + `integration` + `e2e`) and `npm --prefix web test`.
+4. Waiting for multi-arch GHCR publish, attaching verified 300–600 DPI sample PDFs via `./scripts/render_release_samples.sh --image ghcr.io/jremick/gridforge:vX.Y.Z --upload vX.Y.Z`, and verifying public GHCR pull + GitHub metadata via `./scripts/sync_github_metadata.sh`.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for local Docker/Vite development commands and PR guidelines.

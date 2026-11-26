@@ -66,20 +66,21 @@ Open **<http://127.0.0.1:8080>** in your browser (`127.0.0.1` loopback by defaul
 
 ---
 
-## Visual Map Gallery & Downloadable 300 DPI PDFs
+## Visual Map Gallery & Downloadable 300–600 DPI PDFs
 
-Every map below was rendered directly by GridForge at 300 DPI and verified automatically by [`tests/integration/verify_pdf.py`](tests/integration/verify_pdf.py) for exact MediaBox dimensions, 1 km MGRS orthogonality, and protractor scale accuracy.
+Every map below was rendered directly by GridForge at 300–600 DPI and verified automatically by [`tests/integration/verify_pdf.py`](tests/integration/verify_pdf.py) for exact MediaBox dimensions, 1 km MGRS orthogonality, and protractor scale accuracy.
 
-### Download Real 300 DPI Sample Vector PDFs (`v1.4.0` Release)
+### Download Real 300–600 DPI Sample Vector PDFs (`v1.5.0` Release)
 
 Inspect true vector contours, crisp MGRS grid labels, military collars, and RF Fresnel charts directly in your PDF viewer — no Docker required:
 
 | Sample PDF (Direct Download) | Region & Scale | Theme & Highlights |
 | :--- | :--- | :--- |
-| [**Yosemite Valley CA (`1:24,000` Letter)**](https://github.com/jremick/gridforge/releases/download/v1.4.0/sample-yosemite-alpine-24k-letter.pdf) | US · `11S KB` · `NAVD88` | **Alpine Winter** theme, USGS 3DEP 1 m LiDAR, USFS/NPS trails, PAD-US public lands & avalanche slope bands (`0.0046 mm` scale err) |
-| [**Banff / Sulphur Mtn AB (`1:25,000` A4)**](https://github.com/jremick/gridforge/releases/download/v1.4.0/sample-banff-night-red-25k-a4.pdf) | Canada · `11U NS/PS` · `CGVD2013` | **Night-Red** (red-headlamp safe, zero red ink), NRCan HRDEM/MRDEM, Parks Canada trails, 100 km square boundary |
-| [**Mt Kosciuszko NSW (`1:25,000` A4, 2 pages)**](https://github.com/jremick/gridforge/releases/download/v1.4.0/sample-kosciuszko-rf-tactical-25k-a4.pdf) | Australia · `55H FV` · `AHD` | **Color** + GDAL **RF Viewshed**, **915 MHz Curved-Earth 1st Fresnel Link Card (p. 2)**, concentric range rings & NSW trails |
-| [**Tongariro Alpine Crossing (`1:25,000` A4)**](https://github.com/jremick/gridforge/releases/download/v1.4.0/sample-tongariro-nz-1m-lidar-25k-a4.pdf) | New Zealand · `60H UB` · `NZVD2016` | **Color** + live AWS **LINZ 1 m LiDAR**, DOC Great Walk tracks & alpine huts, LINZ peaks & slope shading |
+| [**Boulder Flatirons CO (`1:10,000` Letter, 600 DPI)**](https://github.com/jremick/gridforge/releases/download/v1.5.0/sample-boulder-flatirons-10k-600dpi-letter.pdf) | US · `13S DE` · `NAVD88` | **Color (`600 DPI`)**, true **1.0 m USGS 3DEP LiDAR**, **`5 ft` high-density contours**, USFS/PAD-US trails & expanded backcountry POIs |
+| [**Yosemite Valley CA (`1:24,000` Letter)**](https://github.com/jremick/gridforge/releases/download/v1.5.0/sample-yosemite-alpine-24k-letter.pdf) | US · `11S KB` · `NAVD88` | **Alpine Winter** theme, USGS 3DEP 1 m LiDAR, USFS/NPS trails, PAD-US public lands & avalanche slope bands (`0.0046 mm` scale err) |
+| [**Banff / Sulphur Mtn AB (`1:25,000` A4)**](https://github.com/jremick/gridforge/releases/download/v1.5.0/sample-banff-night-red-25k-a4.pdf) | Canada · `11U NS/PS` · `CGVD2013` | **Night-Red** (red-headlamp safe, zero red ink), NRCan HRDEM/MRDEM, Parks Canada trails, 100 km square boundary |
+| [**Mt Kosciuszko NSW (`1:25,000` A4, 2 pages)**](https://github.com/jremick/gridforge/releases/download/v1.5.0/sample-kosciuszko-rf-tactical-25k-a4.pdf) | Australia · `55H FV` · `AHD` | **Color** + GDAL **RF Viewshed**, **915 MHz Curved-Earth 1st Fresnel Link Card (p. 2)**, concentric range rings & NSW trails |
+| [**Tongariro Alpine Crossing (`1:25,000` A4)**](https://github.com/jremick/gridforge/releases/download/v1.5.0/sample-tongariro-nz-1m-lidar-25k-a4.pdf) | New Zealand · `60H UB` · `NZVD2016` | **Color** + live AWS **LINZ 1 m LiDAR**, DOC Great Walk tracks & alpine huts, LINZ peaks & slope shading |
 
 ### Multi-Continent Themes, RF Fresnel Cards, Viewsheds & Atlas Index Covers
 
@@ -113,7 +114,7 @@ Inspect true vector contours, crisp MGRS grid labels, military collars, and RF F
 
 ### Self-Hosted MapLibre Print Studio
 
-![GridForge Studio — Live 915 MHz Fresnel Chart, Tactical Ruler/Rings/Sectors, 4 Map Themes, and Saved Projects](docs/images/studio-v14-rf-tactical.jpg)
+![GridForge Studio v1.5 — Vector HD Basemap, Collapsible/Resizable Sidebar, 1:10,000 Scale, and 600 DPI Print & Export Selectors](docs/images/studio-v15-vector-dpi.jpg)
 
 - **32 Curated Regional Quick-Jump Presets (`NSW/VIC` · `AU` · `NZ` · `NA`) & Crisp Basemaps:** Defaults to 8 NSW & Victoria outdoor destinations with one-click region tabs for Australia-wide, New Zealand, and North America (US & Canada), `/` place search (Nominatim proxy), direct `lat,lon` / MGRS jump, a collapsible/resizable sidebar (`[` shortcut), and a zero-key **Vector HD** (OpenFreeMap) basemap alongside OpenTopoMap, OSM Standard, Esri Imagery, and Offline MBTiles.
 - **Live Tilted UTM Footprint & Fine Tactical Scales (`1:10k`–`1:50k`, `300–600 DPI`):** Previews exact true-scale paper footprints, convergence tilt, and 1 km MGRS grid (`1×1` through `3×3`, `F` to fit) with independent Print PDF and Digital Tile DPI selectors. Rejects antimeridian (`±180°`) wraps and cross-zone/cross-hemisphere atlas layouts before queueing.
@@ -244,7 +245,7 @@ GridForge binds to IPv4 loopback (`127.0.0.1:8080`) by default, disables wildcar
 - **SSH Tunnel:** `ssh -L 8080:127.0.0.1:8080 user@homelab`
 - **Private Tailnet:** See [deploy/tailscale-serve.md](deploy/tailscale-serve.md)
 - **Authenticated HTTPS Reverse Proxy:** See [deploy/Caddyfile.example](deploy/Caddyfile.example) and [deploy/traefik-compose.override.yml](deploy/traefik-compose.override.yml) — set `GRIDFORGE_ALLOWED_HOSTS`, preserve original `Host` (with port), set `X-Forwarded-Proto`, and configure `FORWARDED_ALLOW_IPS`.
-- **Public Hosted Multi-Tenant Mode (`GRIDFORGE_AUTH_MODE=hosted`):** Power a public deployment (like **[GridMaps](https://gridmaps.net)** on single-container Railway + Cloudflare Free) with SQLite-backed `Guest` / invite-only `Friend` / `Admin` roles, email/password + Google OAuth, Cloudflare Turnstile bot protection, per-role quotas, Admin usage dashboard & kill switch, automatic artifact TTL + LRU cache pruning, and custom instance branding via `GRIDFORGE_BRAND_NAME` / `GRIDFORGE_BRAND_SUBTITLE`.
+- **Public Hosted Multi-Tenant Mode (`GRIDFORGE_AUTH_MODE=hosted`):** See [deploy/hosted-mode.md](deploy/hosted-mode.md) — power a public deployment (like **[GridMaps](https://gridmaps.net)** on single-container Railway + Cloudflare Free) with SQLite-backed `Guest` / invite-only `Friend` / `Admin` roles, email/password + Google OAuth, Cloudflare Turnstile bot protection, per-role quotas & DPI caps, Admin usage dashboard & kill switch, automatic artifact TTL + LRU cache pruning, and custom instance branding via `GRIDFORGE_BRAND_NAME` / `GRIDFORGE_BRAND_SUBTITLE`.
 - **Air-Gapped Studio Basemap:** Building any regional pack with **Include Offline Basemap** automatically enables Studio's **Offline** basemap switcher via `/api/basemap/{z}/{x}/{y}.{ext}?pack_id=...`, or mount a global archive at `GRIDFORGE_BASEMAP_MBTILES=/data/basemap.mbtiles`.
 
 ---
@@ -310,9 +311,9 @@ docker run --rm -e GRIDFORGE_RUN_LIVE=1 -v "$(pwd):/app" gridforge:dev pytest -q
 
 ## Roadmap & Release History
 
-See **[CHANGELOG.md](CHANGELOG.md)** and **[GitHub Releases](https://github.com/jremick/gridforge/releases)** for full per-version notes (`v1.0.0` through `v1.4.0`).
+See **[CHANGELOG.md](CHANGELOG.md)** and **[GitHub Releases](https://github.com/jremick/gridforge/releases)** for full per-version notes (`v1.0.0` through `v1.5.0`).
 
-- **Planned Backlog (`v1.5+`):** European & UK open regional LiDAR providers (Swisstopo / IGN France / UK Environment Agency / Kartverket Norway), user-defined custom ArcGIS/WFS/GeoJSON overlay feeds in Studio, organization collar/legend branding profiles, and automated duplex folded booklet imposition (`A3`/`A2` print spreads).
+- **Planned Backlog (`v1.6+`):** European & UK open regional LiDAR providers (Swisstopo / IGN France / UK Environment Agency / Kartverket Norway), user-defined custom ArcGIS/WFS/GeoJSON overlay feeds in Studio, organization collar/legend branding profiles, and automated duplex folded booklet imposition (`A3`/`A2` print spreads).
 
 ---
 
