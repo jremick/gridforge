@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 from pypdf import PdfReader, PdfWriter
+from pyproj import Transformer
 
 from gridforge.config import (
     BBox,
@@ -20,6 +21,7 @@ from gridforge.config import (
     PaperSize,
     RenderResult,
 )
+from gridforge.geo.crs import compute_sheet_layout
 from gridforge.web import db
 from gridforge.web.app import create_app
 from gridforge.web.schemas import JobStatus
@@ -62,7 +64,74 @@ def client_and_dirs(tmp_path: Path) -> tuple[TestClient, Path, Path, Path]:
         web_dist_dir=web_dist,
         memory_budget_mb=3072,
     )
-    return (TestClient(app), data_dir, packs_dir, data_dir / "gridforge_jobs.sqlite3")
+    client = TestClient(app, base_url="http://localhost:8080")
+    return (client, data_dir, packs_dir, data_dir / "gridforge_jobs.sqlite3")
+
+
+class TestStudioAccess:
+    def test_same_origin_job_lifecycle(self, client_and_dirs) -> None:
+        client, *_ = client_and_dirs
+        headers = {"Origin": "http://localhost:8080", "Sec-Fetch-Site": "same-origin"}
+        created = client.post(
+            "/api/jobs",
+            files={"payload": (None, json.dumps({"center": "10,10"}))},
+            headers=headers,
+        )
+        assert created.status_code == 202
+        job_url = "/api/jobs/" + created.json()["job_id"]
+        assert client.post(job_url + "/cancel", headers=headers).json()["status"] == "cancelled"
+        assert client.delete(job_url, headers=headers).status_code == 200
+
+    @pytest.mark.parametrize(
+        "headers",
+        [
+            {"Origin": "http://localhost:5173"},
+            {"Origin": "null"},
+            {"Sec-Fetch-Site": "cross-site"},
+            {"Sec-Fetch-Site": "same-site"},
+        ],
+    )
+    def test_api_write_requires_matching_browser_origin(self, client_and_dirs, headers) -> None:
+        client, *_ = client_and_dirs
+        response = client.post("/api/jobs", json={"center": "10,10"}, headers=headers)
+        assert response.status_code == 403
+        assert client.get("/api/jobs").json()["jobs"] == []
+
+        # New v1.3.0 write routes are equally protected by SameOriginWritesMiddleware
+        assert (
+            client.post("/api/packs/build", json={"region_or_bbox": "act"}, headers=headers).status_code
+            == 403
+        )
+        assert (
+            client.post(
+                "/api/viewshed-preview",
+                json={"observer": {"lat": -33.732, "lon": 150.312}},
+                headers=headers,
+            ).status_code
+            == 403
+        )
+        assert client.delete("/api/packs/blue-mountains", headers=headers).status_code == 403
+
+    def test_host_and_cors_defaults(self, client_and_dirs) -> None:
+        client, *_ = client_and_dirs
+        assert client.get("/api/health", headers={"Host": "[::1]:8080"}).status_code == 200
+        assert client.get("/api/health", headers={"Host": "LOCALHOST:8080"}).status_code == 200
+        assert client.get("/api/health", headers={"Host": "unlisted.example"}).status_code == 400
+        resp = client.get("/api/health", headers={"Origin": "https://other.example"})
+        assert "access-control-allow-origin" not in resp.headers
+
+    def test_configured_hostname_works_behind_https_proxy(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("GRIDFORGE_ALLOWED_HOSTS", "studio.example")
+        app = create_app(data_dir=tmp_path / "jobs", packs_dir=tmp_path / "packs")
+        with TestClient(app, base_url="https://studio.example:443") as client:
+            created = client.post(
+                "/api/jobs",
+                json={"center": "10,10"},
+                headers={"Origin": "https://studio.example"},
+            )
+            assert created.status_code == 202
 
 
 class TestWebMemoryHygieneAndHealth:
@@ -579,13 +648,9 @@ class TestSQLiteStoreAndWorker:
         assert not seen_work_dirs[0].exists()
 
     def test_process_multi_sheet_2x2_atlas_merges_4_pages(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, client_and_dirs, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        data_dir = tmp_path / "jobs"
-        packs_dir = tmp_path / "packs"
-        db_path = data_dir / "gridforge_jobs.sqlite3"
-        db.init_db(db_path)
-        packs_dir.mkdir(parents=True)
+        client, data_dir, packs_dir, db_path = client_and_dirs
 
         req_json = json.dumps(
             {
@@ -619,13 +684,13 @@ class TestSQLiteStoreAndWorker:
         assert claimed is not None
         assert claimed.record.grid_cols == 2 and claimed.record.grid_rows == 2
 
-        rendered_titles: list[str] = []
+        rendered_layouts = []
 
         def _fake_prepare(spec, job_dir, **kwargs):
-            rendered_titles.append(spec.title or "")
-            return spec
+            return compute_sheet_layout(spec)
 
         def _fake_render_pdf(self, workspace, output_pdf: Path):
+            rendered_layouts.append(workspace)
             # Write a real valid 1-page A4 PDF so pypdf merges cleanly
             w = PdfWriter()
             w.add_blank_page(width=595.28, height=841.89)
@@ -652,7 +717,19 @@ class TestSQLiteStoreAndWorker:
         )
         assert done is not None
         assert done.status == JobStatus.SUCCEEDED
-        assert len(rendered_titles) == 4
+        preview = client.post("/api/footprint", json=json.loads(req_json))
+        assert preview.status_code == 200
+        features = preview.json()["footprint_geojson"]["features"]
+        assert len(rendered_layouts) == len(features) == 4
+        for layout, feature in zip(rendered_layouts, features, strict=True):
+            assert layout.utm_epsg == feature["properties"]["utm_epsg"]
+            project = Transformer.from_crs(4326, layout.utm_epsg, always_xy=True)
+            ring = feature["geometry"]["coordinates"][0]
+            xs, ys = project.transform(*zip(*ring))
+            assert layout.utm_bbox.as_tuple() == pytest.approx(
+                (min(xs), min(ys), max(xs), max(ys)), abs=0.02, rel=0
+            )
+        rendered_titles = [layout.spec.title or "" for layout in rendered_layouts]
         assert "Sheet A1 (1/4)" in rendered_titles[0]
         assert "Sheet A2 (2/4)" in rendered_titles[1]
         assert "Sheet B1 (3/4)" in rendered_titles[2]
@@ -758,3 +835,78 @@ class TestSQLiteStoreAndWorker:
         cal_text = re.sub(r"\s+", " ", reader.pages[3].extract_text() or "")
         assert "TACTICAL ROUTE CARD" in rc_text
         assert "PRINTER SCALE VERIFICATION" in cal_text
+
+
+@pytest.mark.parametrize(
+    ("center", "cols", "rows"),
+    [("45,6", 2, 1), ("0,3", 1, 2), ("60,3", 2, 1)],
+)
+def test_incompatible_atlas_projections_rejected_before_enqueue(
+    client_and_dirs, center: str, cols: int, rows: int
+) -> None:
+    client, _, _, _ = client_and_dirs
+    request = {"center": center, "grid_cols": cols, "grid_rows": rows}
+    preview = client.post("/api/footprint", json=request)
+    job = client.post("/api/jobs", json=request)
+    assert preview.status_code == job.status_code == 422
+    assert "Atlas sheet" in preview.json()["detail"]
+    assert preview.json()["detail"] == job.json()["detail"]
+    assert client.get("/api/jobs").json()["jobs"] == []
+
+    # Device-only exports use the center sheet, regardless of the PDF grid setting.
+    digital = client.post("/api/jobs", json={**request, "outputs": {"pdf": False, "kmz": True}})
+    assert digital.status_code == 202
+
+
+def test_atlas_across_latitude_band_keeps_native_page_labels(client_and_dirs) -> None:
+    client, _, _, _ = client_and_dirs
+    preview = client.post("/api/footprint", json={"center": "48,3", "grid_rows": 2})
+    assert preview.status_code == 200
+    pages = preview.json()["footprint_geojson"]["features"]
+    assert [page["properties"]["gzd"] for page in pages] == ["31U", "31T"]
+    assert all(page["properties"]["utm_epsg"] == 32631 for page in pages)
+
+
+def test_worker_rechecks_previously_queued_incompatible_atlas(
+    client_and_dirs, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, data_dir, packs_dir, db_path = client_and_dirs
+    center = "45,6"
+    db.create_job(
+        db_path,
+        job_id="atlaszone0001",
+        title=None,
+        center=center,
+        center_mgrs=None,
+        scale=25000,
+        paper=PaperSize.A4,
+        orientation=Orientation.PORTRAIT,
+        color_mode=ColorMode.COLOR,
+        grid_cols=2,
+        request_json=json.dumps({"center": center, "grid_cols": 2}),
+    )
+    claimed = db.claim_next_job(db_path)
+    assert claimed is not None
+    monkeypatch.setattr(
+        "gridforge.web.worker.runner.prepare_job_workspace",
+        lambda *a, **kw: pytest.fail("An incompatible atlas must fail before preparing any page"),
+    )
+    job = process_single_job(claimed, db_path=db_path, data_dir=data_dir, packs_dir=packs_dir)
+    assert job is not None and job.status == JobStatus.FAILED
+    assert job.error is not None and "Atlas sheet" in job.error
+    assert job.artifacts == []
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_antimeridian_extents_refused_before_fetch(client_and_dirs, sign: int) -> None:
+    client, _, _, _ = client_and_dirs
+    for lon, cols in [(179.98, 1), (179.94, 3)]:
+        # In the three-column case the center is safe but an outer page wraps.
+        payload = {"center": f"45,{sign * lon}", "grid_cols": cols}
+        for endpoint in ("/api/footprint", "/api/jobs"):
+            response = client.post(endpoint, json=payload)
+            assert response.status_code == 422
+            assert "antimeridian" in response.json()["detail"]
+    assert client.get("/api/jobs").json()["jobs"] == []
+    nearby = client.post("/api/footprint", json={"center": f"45,{sign * 179.8}", "grid_cols": 3})
+    assert nearby.status_code == 200

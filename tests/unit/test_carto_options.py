@@ -92,10 +92,11 @@ def test_all_svg_icons_exist_and_parse_xml() -> None:
         "hut.svg",
         "campground.svg",
         "trig.svg",
+        "observer.svg",
     )
     root = get_icons_root()
     assert root.is_dir()
-    assert len(expected) == 21
+    assert len(expected) == 22
     for name in expected:
         p = get_icon_path(name, icons_root=root)
         assert p.is_file(), f"Missing icon: {p}"
@@ -109,7 +110,7 @@ def test_multiscale_factors() -> None:
 
 
 def test_all_qml_styles_roundtrip(tmp_path: Path) -> None:
-    assert len(STYLE_ROLES) == 36
+    assert len(STYLE_ROLES) == 39
     _run_pyqgis_snippet(
         f"""
         from osgeo import gdal
@@ -130,6 +131,13 @@ def test_all_qml_styles_roundtrip(tmp_path: Path) -> None:
         for idx_b, val in ((1, 229), (2, 62), (3, 62), (4, 185)):
             sds.GetRasterBand(idx_b).Fill(val)
         sds = None
+
+        vs_tif = Path({str(tmp_path / "viewshed.tif")!r})
+        vds = gdal.GetDriverByName("GTiff").Create(str(vs_tif), 4, 4, 4, gdal.GDT_Byte)
+        vds.SetGeoTransform((250000.0, 10.0, 0.0, 6265000.0, 0.0, -10.0))
+        for idx_b, val in ((1, 0), (2, 212), (3, 146), (4, 130)):
+            vds.GetRasterBand(idx_b).Fill(val)
+        vds = None
 
         geom_by_role = {{
             "landcover": "MultiPolygon",
@@ -166,6 +174,8 @@ def test_all_qml_styles_roundtrip(tmp_path: Path) -> None:
             "overlay_points": "Point",
             "waypoint_route": "LineString",
             "waypoint_points": "Point",
+            "viewshed_rings": "LineString",
+            "viewshed_observers": "Point",
         }}
 
         for mode in (ColorMode.COLOR, ColorMode.BW):
@@ -174,13 +184,18 @@ def test_all_qml_styles_roundtrip(tmp_path: Path) -> None:
             assert apply_layer_style(rl, "hillshade", mode, prefer_qml=True) is True
             del rl
 
+            assert get_qml_path("viewshed", mode).is_file()
+            vl_vs = QgsRasterLayer(str(vs_tif), "vs")
+            assert apply_layer_style(vl_vs, "viewshed", mode, prefer_qml=True) is True
+            del vl_vs
+
             assert get_qml_path("slope_shading", mode).is_file()
             sl = QgsRasterLayer(str(slope_tif), "slope")
             assert apply_layer_style(sl, "slope_shading", mode, prefer_qml=True) is True
             del sl
 
             for role in STYLE_ROLES:
-                if role in ("hillshade", "slope_shading"):
+                if role in ("hillshade", "slope_shading", "viewshed"):
                     continue
                 assert get_qml_path(role, mode).is_file(), f"Missing QML: {{mode.value}}/{{role}}.qml"
                 vl = QgsVectorLayer(
@@ -785,12 +800,16 @@ def test_v12_pan_australia_all_state_trail_keys_and_dynamic_attributions(
     ov_dir.mkdir(parents=True)
     bundled = ov_dir / "au_state_trails.gpkg"
     bundled.write_bytes(b"gpkg")
+    (pack_dir / "dem.tif").write_bytes(b"dem")
+    (pack_dir / "osm.osm.pbf").write_bytes(b"pbf")
     manifest = PackManifest(
         pack_id="tas",
         name="Tasmania Test Pack",
         region="tas",
         bbox_wgs84=BBox(min_x=144.0, min_y=-43.5, max_x=148.5, max_y=-40.0),
         utm_zones=["55G"],
+        dem_path="dem.tif",
+        osm_pbf_path="osm.osm.pbf",
         overlays={"au-state-trails": "overlays/au_state_trails.gpkg"},
         attributions=[],
         created_at="2026-11-26T00:00:00Z",
@@ -909,3 +928,317 @@ def test_v12_pan_australia_all_state_trail_keys_and_dynamic_attributions(
                 proj.clear()
         """
     )
+
+
+def test_v13_viewshed_nz_trails_fold_marks_and_cli_parsing(tmp_path: Path) -> None:
+    from gridforge.cli import _parse_viewsheds
+    from gridforge.config import (
+        DeclinationInfo,
+        JobWorkspace,
+        MGRSGridMeta,
+        NZOverlayKind,
+    )
+    from gridforge.geo.crs import compute_sheet_layout
+    from gridforge.render.layout import _NZ_TRAIL_KEYS
+
+    # 1. Verify CLI --viewshed parser (defaults + custom heights/range/label)
+    obs = _parse_viewsheds(
+        [
+            "-36.456,148.263",
+            "-36.456,148.263,10,1.5,12.5,Mt Kosciuszko Repeater",
+        ]
+    )
+    assert len(obs) == 2
+    assert obs[0].label == "Observer 1"
+    assert obs[0].observer_height_m == 2.0
+    assert obs[0].target_height_m == 1.5
+    assert obs[0].max_distance_m == 10000.0
+    assert obs[1].label == "Mt Kosciuszko Repeater"
+    assert obs[1].observer_height_m == 10.0
+    assert obs[1].max_distance_m == 12500.0
+
+    assert NZOverlayKind.NZ_DOC_TRAILS.value in _NZ_TRAIL_KEYS
+
+    # 2. Create synthetic viewshed RGBA raster, viewshed_observers.gpkg, and NZ DOC trails GPKG
+    from osgeo import gdal, ogr, osr
+
+    gdal.UseExceptions()
+    ogr.UseExceptions()
+    osr.UseExceptions()
+
+    vs_tif = tmp_path / "viewshed.tif"
+    drv_tif = gdal.GetDriverByName("GTiff")
+    vds = drv_tif.Create(str(vs_tif), 4, 4, 4, gdal.GDT_Byte)
+    vds.SetGeoTransform((360000.0, 10.0, 0.0, 5667000.0, 0.0, -10.0))
+    for b, val in ((1, 0), (2, 212), (3, 146), (4, 130)):
+        vds.GetRasterBand(b).Fill(val)
+    vds = None
+
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(32760)
+    srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    gpkg_drv = ogr.GetDriverByName("GPKG")
+
+    obs_gpkg = tmp_path / "viewshed_observers.gpkg"
+    ods = gpkg_drv.CreateDataSource(str(obs_gpkg))
+    lo = ods.CreateLayer("viewshed_observers", srs=srs, geom_type=ogr.wkbPoint)
+    lo.CreateField(ogr.FieldDefn("label", ogr.OFTString))
+    lo.CreateField(ogr.FieldDefn("observer_height_m", ogr.OFTReal))
+    lo.CreateField(ogr.FieldDefn("target_height_m", ogr.OFTReal))
+    lo.CreateField(ogr.FieldDefn("max_distance_m", ogr.OFTReal))
+    lo.CreateField(ogr.FieldDefn("elev_m", ogr.OFTReal))
+    lr = ods.CreateLayer("viewshed_rings", srs=srs, geom_type=ogr.wkbLineString)
+    lr.CreateField(ogr.FieldDefn("label", ogr.OFTString))
+    lr.CreateField(ogr.FieldDefn("max_distance_m", ogr.OFTReal))
+    ods = None
+
+    nz_gpkg = tmp_path / "nz_doc_trails.gpkg"
+    nds = gpkg_drv.CreateDataSource(str(nz_gpkg))
+    lt = nds.CreateLayer("au_state_trails", srs=srs, geom_type=ogr.wkbMultiLineString)
+    for fn in ("name", "trail_class", "surface", "state"):
+        lt.CreateField(ogr.FieldDefn(fn, ogr.OFTString))
+    lp = nds.CreateLayer("au_state_pois", srs=srs, geom_type=ogr.wkbPoint)
+    lp.CreateField(ogr.FieldDefn("name", ogr.OFTString))
+    lp.CreateField(ogr.FieldDefn("poi_type", ogr.OFTString))
+    lp.CreateField(ogr.FieldDefn("elev_m", ogr.OFTReal))
+    lp.CreateField(ogr.FieldDefn("state", ogr.OFTString))
+    nds = None
+
+    empty_osm = tmp_path / "empty_nz_osm.gpkg"
+    eds = gpkg_drv.CreateDataSource(str(empty_osm))
+    eds.CreateLayer("lines", srs=srs, geom_type=ogr.wkbLineString)
+    eds = None
+
+    nz_spec = SheetSpec(
+        center_lat=-39.133,
+        center_lon=175.642,
+        scale=25000,
+        nz_overlays=[NZOverlayKind.NZ_DOC_TRAILS],
+        show_fold_marks=True,
+    )
+    nz_layout = compute_sheet_layout(nz_spec)
+    ws = JobWorkspace(
+        job_dir=tmp_path,
+        layout=nz_layout,
+        declination=DeclinationInfo(
+            decimal_year=2026.5,
+            magnetic_declination_deg=22.1,
+            annual_change_deg=0.05,
+            grid_convergence_deg=0.3,
+            gm_angle_deg=21.8,
+            gm_angle_mils=387.5,
+            grid_convergence_mils=5.3,
+        ),
+        mgrs_meta=MGRSGridMeta(
+            gzd="60H",
+            square_ids_100km=["UC"],
+            center_mgrs_10m="60H UC 8263 6685",
+            grid_spacing_mm=40.0,
+            crosses_100km_boundary=False,
+            crosses_utm_zone_boundary=False,
+            ticks=[],
+        ),
+        osm_gpkg=empty_osm,
+        terrain_gpkg=empty_osm,
+        hillshade_tif=tmp_path / "missing_hs.tif",
+        dem_utm_tif=tmp_path / "missing_dem.tif",
+        mgrs_gpkg=empty_osm,
+        declination_svg=tmp_path / "decl.svg",
+        grid_ref_svg=tmp_path / "grid.svg",
+        contour_interval_display="10 m (index 50 m)",
+        attributions=["DOC & LINZ CC BY 4.0"],
+        vertical_datum="NZVD2016",
+        dem_source_name="nz-linz",
+        regional_overlays={"nz-doc-trails": nz_gpkg},
+        viewshed_tif=vs_tif,
+        viewshed_observers_gpkg=obs_gpkg,
+    )
+    ws_json = ws.model_dump_json()
+
+    _run_pyqgis_snippet(
+        f"""
+        from qgis.core import (
+            QgsExpression,
+            QgsExpressionContext,
+            QgsExpressionContextUtils,
+            QgsFeature,
+            QgsLayoutItemLabel,
+            QgsLayoutItemPolyline,
+            QgsProject,
+            QgsVectorLayer,
+        )
+        from gridforge.config import ColorMode, JobWorkspace, Units
+        from gridforge.render.layout import _split_base_and_vector_layers, build_print_layout
+        from gridforge.render.styles import apply_programmatic_style, populate_project_layers
+
+        ws_obj = JobWorkspace.model_validate_json({ws_json!r})
+        proj = QgsProject.instance()
+        proj.clear()
+        layers = populate_project_layers(proj, ws_obj, include_grid=False)
+        names = [l.name() for l in layers]
+        assert "LOS / RF Observers" in names
+        assert "LOS / RF Max Range" in names
+        assert "LOS Viewshed" in names
+        assert "NZ DOC Huts, Camps & Trigs" in names
+        assert "NZ DOC Fire Trails & Tracks" in names
+
+        # Viewshed raster sits on bottom raster stack so vectors remain pure!
+        top_v, bot_r = _split_base_and_vector_layers(layers)
+        assert all(l.name() != "LOS Viewshed" for l in top_v)
+        assert any(l.name() == "LOS Viewshed" for l in bot_r)
+
+        # Print layout renders fold/join marks, NZVD2016 vertical datum, and LOS/NZ Map Key rows
+        pl, _map_item = build_print_layout(proj, ws_obj, layers)
+        labels = [it.text() for it in pl.items() if isinstance(it, QgsLayoutItemLabel)]
+        polylines = [it for it in pl.items() if isinstance(it, QgsLayoutItemPolyline)]
+        assert any("NZVD2016" in t for t in labels), labels
+        assert any("LOS / RF Viewshed" in t for t in labels), labels
+        assert any("Tracks / Huts / Trigs" in t for t in labels), labels
+        assert any("FOLD / JOIN" in t for t in labels), labels
+        assert len(polylines) >= 11
+
+        # Observer label formatting (Metric & Imperial)
+        vl_obs = QgsVectorLayer(
+            "Point?crs=EPSG:32760&field=label:string&field=observer_height_m:double",
+            "obs",
+            "memory",
+        )
+        for units, expected_lbl in [
+            (Units.METRIC, "Repeater 1 (10 m AGL)"),
+            (Units.IMPERIAL, "Repeater 1 (33 ft AGL)"),
+        ]:
+            apply_programmatic_style(vl_obs, "viewshed_observers", ColorMode.COLOR, units=units)
+            expr = QgsExpression(vl_obs.labeling().settings().fieldName)
+            assert not expr.hasParserError(), expr.parserErrorString()
+            f = QgsFeature(vl_obs.fields())
+            f.setAttribute("label", "Repeater 1")
+            f.setAttribute("observer_height_m", 10.0)
+            ctx = QgsExpressionContext()
+            ctx.appendScopes(QgsExpressionContextUtils.globalProjectLayerScopes(vl_obs))
+            ctx.setFeature(f)
+            assert expr.evaluate(ctx) == expected_lbl
+
+        del pl, _map_item, vl_obs
+        layers.clear()
+        proj.clear()
+        """
+    )
+
+
+def test_pr1_pr2_pr5_cli_and_runner_regressions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import inspect
+
+    import pytest
+    import typer
+    from typer.testing import CliRunner
+
+    from gridforge import cli as cli_mod
+    from gridforge.config import BBox, PackManifest, RenderResult
+    from gridforge.pipeline import runner
+    from gridforge.sources.overlay_user import UserOverlaySource
+
+    # 1. PR #1: `gridforge serve` defaults to loopback 127.0.0.1 (never 0.0.0.0)
+    host_param = inspect.signature(cli_mod.serve_cmd).parameters["host"]
+    assert host_param.default.default == "127.0.0.1"
+
+    # 2. PR #5: `_parse_waypoints` preserves commas & spacing inside waypoint notes
+    wps = cli_mod._parse_waypoints(
+        ["Creek crossing,-33.731234,150.312345,waypoint,Bridge, wooden deck"]
+    )
+    assert len(wps) == 1
+    assert wps[0].label == "Creek crossing"
+    assert wps[0].notes == "Bridge, wooden deck"
+
+    # 3. PR #5: `_infer_route_file_from_overlays` inspects `UserOverlaySource.paths`
+    route_geojson = tmp_path / "creek_walk.geojson"
+    route_geojson.write_text('{"type": "FeatureCollection", "features": []}', encoding="utf-8")
+    inferred = runner._infer_route_file_from_overlays(None, [UserOverlaySource(route_geojson)])
+    assert inferred == route_geojson.resolve()
+
+    # 4. PR #5: `_cli_pack` resolves renamed pack directories by manifest pack_id & guards mutual exclusion
+    packs_root = tmp_path / "packs"
+    renamed_pack = packs_root / "renamed pack directory"
+    renamed_pack.mkdir(parents=True)
+    (renamed_pack / "dem.tif").write_bytes(b"dem")
+    (renamed_pack / "osm.osm.pbf").write_bytes(b"pbf")
+    manifest = PackManifest(
+        pack_id="local-fixture",
+        name="Renamed Pack",
+        region="test",
+        bbox_wgs84=BBox(min_x=150.2, min_y=-33.8, max_x=150.4, max_y=-33.6),
+        utm_zones=["56H"],
+        dem_path="dem.tif",
+        osm_pbf_path="osm.osm.pbf",
+        created_at="2026-01-01",
+    )
+    (renamed_pack / "pack.json").write_text(manifest.model_dump_json(), encoding="utf-8")
+    monkeypatch.setenv("GRIDFORGE_PACKS_DIR", str(packs_root))
+
+    assert cli_mod._cli_pack(None, "local-fixture") == renamed_pack.resolve()
+    with pytest.raises(typer.BadParameter, match="either --pack or --pack-id"):
+        cli_mod._cli_pack(renamed_pack, "local-fixture")
+    with pytest.raises(typer.BadParameter, match="missing-pack"):
+        cli_mod._cli_pack(None, "missing-pack")
+
+    # 5. PR #5: CLI `render` wires `--pack-id` & `--no-export-grid`, `export` wires `--pack-id`
+    captured: dict[str, object] = {}
+
+    def _fake_render(spec, output_pdf, **kwargs):
+        captured["render_pack_dir"] = kwargs["pack_dir"]
+        captured["export_include_grid"] = kwargs["export_include_grid"]
+        return RenderResult(
+            output_pdf=Path(output_pdf),
+            page_width_mm=210.0,
+            page_height_mm=297.0,
+            scale=spec.scale,
+            utm_epsg=32756,
+            elapsed_seconds=0.1,
+        )
+
+    def _fake_export(spec, fmt, output_path, **kwargs):
+        captured["export_pack_dir"] = kwargs["pack_dir"]
+        captured["export_grid"] = kwargs["include_grid"]
+        return []
+
+    monkeypatch.setattr(cli_mod, "run_render_job", _fake_render)
+    monkeypatch.setattr(cli_mod, "run_export_job", _fake_export)
+
+    cli_runner = CliRunner()
+    out_pdf = tmp_path / "sheet.pdf"
+    res_render = cli_runner.invoke(
+        cli_mod.app,
+        [
+            "render",
+            "--center",
+            "-33.732,150.312",
+            "--output",
+            str(out_pdf),
+            "--pack-id",
+            "local-fixture",
+            "--no-export-grid",
+        ],
+    )
+    assert res_render.exit_code == 0, res_render.output
+    assert captured["render_pack_dir"] == renamed_pack.resolve()
+    assert captured["export_include_grid"] is False
+
+    res_export = cli_runner.invoke(
+        cli_mod.app,
+        [
+            "export",
+            "--center",
+            "-33.732,150.312",
+            "--format",
+            "mbtiles",
+            "--output",
+            str(tmp_path / "sheet.mbtiles"),
+            "--pack-id",
+            "local-fixture",
+            "--no-grid",
+        ],
+    )
+    assert res_export.exit_code == 0, res_export.output
+    assert captured["export_pack_dir"] == renamed_pack.resolve()
+    assert captured["export_grid"] is False

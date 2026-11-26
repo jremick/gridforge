@@ -17,6 +17,7 @@ from gridforge.packs.builder import (
     build_offline_pack,
     discover_packs,
     load_pack_manifest,
+    resolve_pack_directory,
 )
 from gridforge.packs.catalog import (
     AUSTRALIA_REGIONS,
@@ -256,3 +257,79 @@ class TestOfflinePackBuilder:
         assert out1 == out2 == dest
         assert dest.read_bytes() == b"chunk1-chunk2"
         assert calls["count"] == 1  # Second call hit disk cache cleanly!
+
+
+@pytest.mark.parametrize(
+    ("missing", "option"), [("dem_path", "--offline-dem"), ("osm_pbf_path", "--offline-pbf")]
+)
+def test_partial_pack_requires_missing_input_before_fetch(tmp_path, monkeypatch, missing, option):
+    from gridforge.config import PackManifest, SheetSpec
+    from gridforge.pipeline import runner
+
+    manifest = PackManifest(
+        pack_id="partial",
+        name="Partial pack",
+        region="test",
+        utm_zones=["56H"],
+        bbox_wgs84=BBox(min_x=150, min_y=-34, max_x=151, max_y=-33),
+        created_at="2026-01-01",
+        dem_path="dem.tif",
+        osm_pbf_path="osm.pbf",
+    ).model_copy(update={missing: None})
+    (tmp_path / "pack.json").write_text(manifest.model_dump_json())
+    (tmp_path / "dem.tif").touch()
+    (tmp_path / "osm.pbf").touch()
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("Pack validation must finish before selecting or fetching online data")
+
+    monkeypatch.setattr(runner, "_resolve_elevation_source", unexpected)
+    monkeypatch.setattr(runner, "OverpassOSMSource", unexpected)
+    monkeypatch.setattr(runner.LocalDEMSource, "fetch_dem", unexpected)
+    spec = SheetSpec(center_lat=-33.5, center_lon=150.5)
+    with pytest.raises(ValueError, match=option):
+        runner.prepare_job_workspace(spec, tmp_path / "job", pack_dir=tmp_path)
+
+    # The corresponding explicit local CLI input completes a partial pack.
+    dem = runner.LocalDEMSource(tmp_path / "dem.tif") if missing == "dem_path" else None
+    osm = runner.LocalPBFSource(tmp_path / "osm.pbf") if missing == "osm_pbf_path" else None
+    _, elev_src, _, vec_src, *_ = runner._resolve_pack_sources(
+        tmp_path,
+        spec,
+        runner.compute_sheet_layout(spec),
+        elevation_source=dem,
+        vector_source=osm,
+        regional_overlay_overrides=None,
+    )
+    assert isinstance(elev_src, runner.LocalDEMSource)
+    assert isinstance(vec_src, runner.LocalPBFSource)
+
+
+def test_resolve_pack_directory_finds_renamed_pack_by_manifest_id(tmp_path: Path) -> None:
+    from gridforge.config import PackManifest
+
+    packs_root = tmp_path / "packs"
+    renamed_dir = packs_root / "renamed pack directory"
+    renamed_dir.mkdir(parents=True)
+    decoy_dir = packs_root / "local-fixture"
+    decoy_dir.mkdir(parents=True)
+
+    manifest = PackManifest(
+        pack_id="local-fixture",
+        name="Renamed Local Pack",
+        region="test",
+        utm_zones=["56H"],
+        bbox_wgs84=BBox(min_x=150, min_y=-34, max_x=151, max_y=-33),
+        created_at="2026-01-01",
+    )
+    (renamed_dir / "pack.json").write_text(manifest.model_dump_json(), encoding="utf-8")
+    decoy = manifest.model_copy(update={"pack_id": "other-pack", "name": "Other"})
+    (decoy_dir / "pack.json").write_text(decoy.model_dump_json(), encoding="utf-8")
+
+    # Resolves by manifest pack_id rather than directory name.
+    assert resolve_pack_directory(packs_root, "local-fixture") == renamed_dir.resolve()
+    assert resolve_pack_directory(packs_root, "other-pack") == decoy_dir.resolve()
+    assert [m.pack_id for m in discover_packs(packs_root)] == ["local-fixture", "other-pack"]
+
+    with pytest.raises(FileNotFoundError, match="missing-pack"):
+        resolve_pack_directory(packs_root, "missing-pack")

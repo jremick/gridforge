@@ -458,7 +458,7 @@ class TestOfflineV11Usability:
         route_bytes = KATOOMBA_ROUTE_GEOJSON.read_bytes()
         route_json = json.loads(route_bytes.decode("utf-8"))
 
-        with fastapi_testclient.TestClient(app) as client:
+        with fastapi_testclient.TestClient(app, base_url="http://localhost:8080") as client:
             # 1. POST /api/strip-plan via multipart/form-data
             sp_mp = client.post(
                 "/api/strip-plan",

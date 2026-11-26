@@ -13,6 +13,7 @@ from gridforge.config import (
     SheetSpec,
 )
 from gridforge.geo.crs import (
+    compute_atlas_layouts,
     compute_sheet_layout,
     parse_center,
     resolve_utm_zone,
@@ -211,3 +212,60 @@ class TestComputeSheetLayout:
         assert layout.wgs84_fetch_bbox.max_x > layout.wgs84_bbox.max_x
         assert layout.wgs84_fetch_bbox.min_y < layout.wgs84_bbox.min_y
         assert layout.wgs84_fetch_bbox.max_y > layout.wgs84_bbox.max_y
+
+    @pytest.mark.parametrize("sign", [-1, 1])
+    def test_antimeridian_sheet_or_fetch_margin_rejected(self, sign: int) -> None:
+        # Sheet/fetch margin crossing ±180° must fail loudly rather than producing a ~360° BBox.
+        spec_cross = SheetSpec(center_lat=45.0, center_lon=sign * 179.98, scale=25000)
+        with pytest.raises(ValueError, match="antimeridian"):
+            compute_sheet_layout(spec_cross)
+
+        # Safe nearby sheet well clear of ±180° succeeds with a compact longitude span.
+        spec_safe = SheetSpec(center_lat=45.0, center_lon=sign * 179.8, scale=25000)
+        layout = compute_sheet_layout(spec_safe)
+        assert layout.wgs84_fetch_bbox.max_x - layout.wgs84_fetch_bbox.min_x < 1.0
+
+
+class TestComputeAtlasLayouts:
+    def test_single_sheet_returns_anchor(self) -> None:
+        anchor = compute_sheet_layout(SheetSpec(center_lat=-33.732, center_lon=150.312))
+        sheets = compute_atlas_layouts(anchor, 1, 1)
+        assert sheets == [("A1", anchor)]
+
+    def test_2x2_atlas_edge_matched_and_shared_crs(self) -> None:
+        anchor = compute_sheet_layout(SheetSpec(center_lat=-33.732, center_lon=150.312))
+        sheets = compute_atlas_layouts(anchor, 2, 2)
+        assert [sid for sid, _ in sheets] == ["A1", "A2", "B1", "B2"]
+        by_id = dict(sheets)
+        for page in by_id.values():
+            assert page.utm_epsg == anchor.utm_epsg
+        # East/west and north/south edges match within sub-millimeter projection round-trip
+        assert by_id["A1"].utm_bbox.max_x == pytest.approx(by_id["A2"].utm_bbox.min_x, abs=0.01)
+        assert by_id["A1"].utm_bbox.min_y == pytest.approx(by_id["B1"].utm_bbox.max_y, abs=0.01)
+
+    def test_latitude_band_crossing_preserves_native_gzds(self) -> None:
+        anchor = compute_sheet_layout(SheetSpec(center_lat=48.0, center_lon=3.0))
+        sheets = compute_atlas_layouts(anchor, 1, 2)
+        assert [page.gzd for _, page in sheets] == ["31U", "31T"]
+        assert all(page.utm_epsg == 32631 for _, page in sheets)
+
+    @pytest.mark.parametrize(
+        ("lat", "lon", "cols", "rows"),
+        [
+            (45.0, 6.0, 2, 1),  # UTM zone 31/32 seam
+            (0.0, 3.0, 1, 2),   # Equator N/S hemisphere seam
+            (60.0, 3.0, 2, 1),  # Norway 31V/32V seam
+        ],
+    )
+    def test_incompatible_utm_zone_or_hemisphere_rejected(
+        self, lat: float, lon: float, cols: int, rows: int
+    ) -> None:
+        anchor = compute_sheet_layout(SheetSpec(center_lat=lat, center_lon=lon))
+        with pytest.raises(ValueError, match="Atlas sheet"):
+            compute_atlas_layouts(anchor, cols, rows)
+
+    @pytest.mark.parametrize("sign", [-1, 1])
+    def test_outer_atlas_page_crossing_antimeridian_rejected(self, sign: int) -> None:
+        anchor = compute_sheet_layout(SheetSpec(center_lat=45.0, center_lon=sign * 179.94))
+        with pytest.raises(ValueError, match="antimeridian"):
+            compute_atlas_layouts(anchor, 3, 1)

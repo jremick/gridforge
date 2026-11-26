@@ -211,6 +211,7 @@ class TestMBTilesExport:
         )
         out_mbtiles = tmp_path / f"out_{expected_meta_fmt}.mbtiles"
 
+        out_mbtiles.write_bytes(b"previous archive")
         res = export_mbtiles(
             workspace,
             out_mbtiles,
@@ -325,6 +326,7 @@ class TestGarminKMZExport:
         )
         out_kmz = tmp_path / "standard.kmz"
 
+        out_kmz.write_bytes(b"previous archive")
         res = export_garmin_kmz(
             workspace,
             out_kmz,
@@ -502,3 +504,74 @@ class TestCollarlessPyQGISPipelineExport:
         assert 1 <= kmz_res.tile_count <= 100
         assert kmz_res.max_tile_px is not None
         assert kmz_res.max_tile_px[0] <= 1024 and kmz_res.max_tile_px[1] <= 1024
+
+
+@pytest.mark.parametrize("existing", [True, False])
+@pytest.mark.parametrize("extension", ["kmz", "mbtiles"])
+def test_failed_export_does_not_publish_partial_archive(tmp_path, monkeypatch, extension, existing):
+    from gridforge.export import kmz, mbtiles
+
+    workspace = _make_stub_workspace(tmp_path)
+    src = _create_synthetic_utm_geotiff(tmp_path / "source.tif", workspace, 128, 128)
+    out_dir = tmp_path / "output"
+    out_dir.mkdir()
+    out = out_dir / f"map.{extension}"
+    previous = b"previous contents"
+    if existing:
+        out.write_bytes(previous)
+
+    def fail(*args, **kwargs):
+        assert (out.read_bytes() if out.exists() else None) == (previous if existing else None)
+        raise OSError("injected late export failure")
+
+    if extension == "kmz":
+        # JPEG entries have already been written when KML generation starts.
+        monkeypatch.setattr(kmz, "_build_kml", fail)
+        export = export_garmin_kmz
+    else:
+        # Tile generation completed before the overview pyramid is requested.
+        monkeypatch.setattr(mbtiles, "_compute_overview_factors", fail)
+        export = export_mbtiles
+
+    with pytest.raises(OSError, match="injected late export failure"):
+        export(workspace, out, collarless_tif=src)
+    assert list(out_dir.iterdir()) == ([out] if existing else [])
+    if existing:
+        assert out.read_bytes() == previous
+
+
+def test_mbtiles_preserves_database_with_sidecars(tmp_path):
+    workspace = _make_stub_workspace(tmp_path)
+    src = _create_synthetic_utm_geotiff(tmp_path / "source.tif", workspace, 128, 128)
+    out = tmp_path / "existing.mbtiles"
+    out.write_bytes(b"previous archive")
+    journal = tmp_path / "existing.mbtiles-journal"
+    journal.write_bytes(b"previous journal")
+
+    with pytest.raises(FileExistsError, match=journal.name):
+        export_mbtiles(workspace, out, collarless_tif=src)
+    assert out.read_bytes() == b"previous archive"
+    assert journal.read_bytes() == b"previous journal"
+    assert not list(tmp_path.glob(".gridforge-*"))
+
+
+@pytest.mark.parametrize("extension", ["kmz", "mbtiles"])
+def test_scratch_cleanup_failure_precedes_publication(tmp_path, monkeypatch, extension):
+    import tempfile
+
+    workspace = _make_stub_workspace(tmp_path)
+    src = _create_synthetic_utm_geotiff(tmp_path / "source.tif", workspace, 128, 128)
+    out = tmp_path / f"existing.{extension}"
+    out.write_bytes(b"previous archive")
+    cleanup = tempfile.TemporaryDirectory.cleanup
+
+    def fail_scratch_cleanup(directory):
+        cleanup(directory)
+        if Path(directory.name).name.startswith(f"gridforge_{extension}_"):
+            raise PermissionError("injected scratch cleanup failure")
+
+    monkeypatch.setattr(tempfile.TemporaryDirectory, "cleanup", fail_scratch_cleanup)
+    export = export_garmin_kmz if extension == "kmz" else export_mbtiles
+    with pytest.raises(PermissionError, match="injected scratch cleanup failure"):
+        export(workspace, out, collarless_tif=src)
+    assert out.read_bytes() == b"previous archive"

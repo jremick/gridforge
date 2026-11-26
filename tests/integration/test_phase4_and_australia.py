@@ -462,7 +462,7 @@ class TestOfflineAustraliaPackAndWebAPI:
         monkeypatch.setenv("GRIDFORGE_PACKS_DIR", str(packs_root))
 
         app = create_app()
-        with fastapi_testclient.TestClient(app) as client:
+        with fastapi_testclient.TestClient(app, base_url="http://localhost:8080") as client:
             health = client.get("/api/health")
             assert health.status_code == 200
             hdata = health.json()
