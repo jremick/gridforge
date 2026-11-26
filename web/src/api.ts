@@ -10,10 +10,15 @@ import type {
   Orientation,
   PackBuildRequest,
   PackBuildTask,
+  PackRegionGroup,
   PackRegionPreset,
   PacksResponse,
   PaperSize,
+  RFLinkProfileResponse,
+  RFLinkSpec,
   RouteMetricsResponse,
+  RulerMetricsResponse,
+  SavedProject,
   StripPlanResponse,
   Units,
   ViewshedObserver,
@@ -77,8 +82,11 @@ export function fetchHealth(): Promise<HealthResponse> {
   return requestJson<HealthResponse>("/api/health");
 }
 
-export function fetchBasemapInfo(): Promise<BasemapInfoResponse> {
-  return requestJson<BasemapInfoResponse>("/api/basemap/info");
+export function fetchBasemapInfo(
+  packId?: string | null
+): Promise<BasemapInfoResponse> {
+  const qs = packId ? `?pack_id=${encodeURIComponent(packId)}` : "";
+  return requestJson<BasemapInfoResponse>(`/api/basemap/info${qs}`);
 }
 
 export function fetchPacks(): Promise<PacksResponse> {
@@ -89,10 +97,24 @@ interface RawPackRegion {
   region_id?: string;
   id?: string;
   name: string;
+  group?: string;
   kind?: string;
   bbox_wgs84: PackRegionPreset["bbox_wgs84"];
   utm_zones?: string[];
   description?: string;
+  estimated_size_hint?: string;
+}
+
+function normalizeRegionGroup(raw: RawPackRegion): PackRegionGroup {
+  if (
+    raw.group === "au_tactical" ||
+    raw.group === "au_state" ||
+    raw.group === "nz" ||
+    raw.group === "na"
+  ) {
+    return raw.group;
+  }
+  return raw.kind === "state" ? "au_state" : "au_tactical";
 }
 
 export async function fetchPackRegions(): Promise<PackRegionPreset[]> {
@@ -103,10 +125,12 @@ export async function fetchPackRegions(): Promise<PackRegionPreset[]> {
   return rawList.map((r) => ({
     region_id: r.region_id ?? r.id ?? r.name,
     name: r.name,
+    group: normalizeRegionGroup(r),
     kind: r.kind === "state" ? "state" : "tactical",
     bbox_wgs84: r.bbox_wgs84,
     utm_zones: r.utm_zones ?? [],
     description: r.description,
+    estimated_size_hint: r.estimated_size_hint,
   }));
 }
 
@@ -125,12 +149,6 @@ export async function fetchPackTasks(): Promise<PackBuildTask[]> {
     "/api/packs/tasks"
   );
   return Array.isArray(data) ? data : data.tasks;
-}
-
-export function fetchPackTask(taskId: string): Promise<PackBuildTask> {
-  return requestJson<PackBuildTask>(
-    `/api/packs/tasks/${encodeURIComponent(taskId)}`
-  );
 }
 
 export async function deletePack(packId: string): Promise<void> {
@@ -187,6 +205,42 @@ export function fetchViewshedPreview(
   });
 }
 
+export function fetchRFLinkProfile(
+  spec: RFLinkSpec,
+  demSource: DemSourceKind = "auto",
+  packId?: string | null,
+  signal?: AbortSignal
+): Promise<RFLinkProfileResponse> {
+  return requestJson<RFLinkProfileResponse>("/api/rf-link-profile", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      ...spec,
+      dem_source: demSource,
+      pack_id: packId || null,
+    }),
+    signal,
+  });
+}
+
+export function fetchRulerMetrics(
+  points: { lat: number; lon: number }[],
+  demSource?: DemSourceKind,
+  packId?: string | null,
+  signal?: AbortSignal
+): Promise<RulerMetricsResponse> {
+  return requestJson<RulerMetricsResponse>("/api/ruler-metrics", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      points,
+      dem_source: demSource ?? "auto",
+      pack_id: packId || null,
+    }),
+    signal,
+  });
+}
+
 export function fetchStripPlan(
   routeFile: File,
   params: {
@@ -230,6 +284,75 @@ export function fetchRouteMetrics(
     }),
     signal,
   });
+}
+
+interface RawSavedProject {
+  id?: string;
+  project_id?: string;
+  name: string;
+  description?: string | null;
+  notes?: string | null;
+  created_at: string;
+  updated_at: string;
+  last_job_id?: string | null;
+  thumbnail_url?: string | null;
+  state: Record<string, unknown>;
+}
+
+function normalizeSavedProject(raw: RawSavedProject): SavedProject {
+  const id = raw.project_id ?? raw.id ?? "";
+  const desc = raw.description ?? raw.notes ?? null;
+  return {
+    project_id: id,
+    name: raw.name,
+    description: desc,
+    notes: desc,
+    created_at: raw.created_at,
+    updated_at: raw.updated_at,
+    last_job_id: raw.last_job_id ?? null,
+    thumbnail_url: raw.thumbnail_url ?? null,
+    state: raw.state ?? {},
+  };
+}
+
+export async function fetchProjects(): Promise<SavedProject[]> {
+  const data = await requestJson<
+    RawSavedProject[] | { projects: RawSavedProject[] }
+  >("/api/projects");
+  const list = Array.isArray(data) ? data : data.projects;
+  return list.map(normalizeSavedProject);
+}
+
+export async function createProject(req: {
+  name: string;
+  description?: string | null;
+  notes?: string | null;
+  state: Record<string, unknown>;
+  last_job_id?: string | null;
+}): Promise<SavedProject> {
+  const description = (req.description ?? req.notes ?? "").trim();
+  const raw = await requestJson<RawSavedProject>("/api/projects", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      name: req.name,
+      description,
+      notes: description,
+      state: req.state,
+      last_job_id: req.last_job_id ?? null,
+    }),
+  });
+  return normalizeSavedProject(raw);
+}
+
+export async function deleteProject(projectId: string): Promise<void> {
+  const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}`, {
+    method: "DELETE",
+  });
+  if (!res.ok) {
+    const detail = await parseErrorDetail(res);
+    throw new ApiError(detail, res.status);
+  }
 }
 
 export async function fetchJobs(): Promise<JobRecord[]> {
@@ -290,4 +413,8 @@ export function artifactPreviewUrl(
   const base = artifactDownloadUrl(jobId, filename, explicitUrl);
   const sep = base.includes("?") ? "&" : "?";
   return `${base}${sep}inline=1`;
+}
+
+export function jobThumbnailUrl(jobId: string): string {
+  return `/api/jobs/${encodeURIComponent(jobId)}/thumbnail.png`;
 }

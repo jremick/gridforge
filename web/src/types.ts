@@ -2,11 +2,17 @@ import type { FeatureCollection } from "geojson";
 
 export type PaperSize = "a4" | "letter" | "legal" | "a3";
 export type Orientation = "portrait" | "landscape";
-export type ColorMode = "color" | "bw";
+export type ColorMode = "color" | "bw" | "night-red" | "alpine";
 export type Units = "metric" | "imperial";
 export type DensityLevel = "low" | "normal" | "high";
 export type HillshadeStrength = "off" | "light" | "normal" | "strong";
-export type DemSourceKind = "auto" | "au-elvis" | "nz-linz" | "glo30" | "usgs3dep";
+export type DemSourceKind =
+  | "auto"
+  | "au-elvis"
+  | "nz-linz"
+  | "ca-hrdem"
+  | "glo30"
+  | "usgs3dep";
 export type AUStateTrailKind =
   | "au-nsw-trails"
   | "au-vic-trails"
@@ -24,12 +30,42 @@ export type AUOverlayKind =
   | "au-infra"
   | "au-aviation";
 export type NZOverlayKind = "nz-doc-trails";
-export type USOverlayKind = "fema" | "nhd" | "towers" | "enc";
+export type CAOverlayKind = "ca-canvec-trails";
+export type USOverlayKind =
+  | "us-trails"
+  | "us-public-lands"
+  | "fema"
+  | "nhd"
+  | "towers"
+  | "enc";
 export type WaypointCategory = "waypoint" | "camp" | "water" | "hazard" | "lz";
 export type MBTilesFormat = "png" | "jpg";
 export type GarminProfile = "standard" | "modern";
 export type BasemapId = "opentopo" | "osm" | "satellite" | "offline";
-export type PackDemTier = "srtm-1s" | "glo30" | "au-elvis";
+export type PackDemTier =
+  | "auto"
+  | "srtm-1s"
+  | "glo30"
+  | "au-elvis"
+  | "nz-linz"
+  | "usgs3dep"
+  | "ca-hrdem";
+export type PresetRegionTab = "nsw-vic" | "au" | "nz" | "na";
+export type PackRegionGroup = "au_tactical" | "au_state" | "nz" | "na";
+export type TacticalGraphicKind =
+  | "bearing_line"
+  | "range_ring"
+  | "corridor"
+  | "sector";
+
+export type MapInteractionMode =
+  | "pan"
+  | "markup"
+  | "los"
+  | "rf-link"
+  | "ruler"
+  | "ring"
+  | "sector";
 
 export type JobStatus =
   | "queued"
@@ -59,6 +95,9 @@ export interface OutputOptions {
   kmz: boolean;
   garmin_profile: GarminProfile;
   include_grid_on_digital: boolean;
+  gpkg_tiles: boolean;
+  osmand_sqlitedb: boolean;
+  field_bundle_zip: boolean;
 }
 
 export interface WaypointInput {
@@ -96,6 +135,84 @@ export interface ViewshedEntry {
   preview: ViewshedPreviewResponse | null;
 }
 
+export interface RFLinkSpec {
+  from_lat: number;
+  from_lon: number;
+  to_lat: number;
+  to_lon: number;
+  from_height_m: number;
+  to_height_m: number;
+  freq_mhz: number;
+  k_factor: number;
+  from_label: string;
+  to_label: string;
+}
+
+export interface RFLinkSample {
+  dist_km: number;
+  terrain_m: number;
+  los_m: number;
+  fresnel_lo_m: number;
+  fresnel_hi_m: number;
+  fresnel60_lo_m: number;
+  clearance_m: number;
+}
+
+export interface RFLinkProfileResponse {
+  status: "CLEAR" | "MARGINAL" | "OBSTRUCTED";
+  distance_km: number;
+  freq_mhz: number;
+  fspl_db: number;
+  min_clearance_m: number;
+  min_fresnel_pct: number;
+  los_clear: boolean;
+  fresnel_60pct_clear: boolean;
+  bearing_true_deg: number;
+  bearing_grid_deg: number;
+  bearing_mag_deg: number;
+  bearing_mils: number;
+  from_elev_m: number | null;
+  to_elev_m: number | null;
+  from_mgrs: string;
+  to_mgrs: string;
+  samples: RFLinkSample[];
+}
+
+export interface RFLinkEntry {
+  id: string;
+  spec: RFLinkSpec;
+  loading: boolean;
+  error: string | null;
+  profile: RFLinkProfileResponse | null;
+}
+
+export interface TacticalGraphic {
+  kind: TacticalGraphicKind;
+  label: string;
+  points: [number, number][];
+  radii_km: number[];
+  color?: string | null;
+  notes?: string | null;
+}
+
+export interface RulerSegment {
+  from_idx: number;
+  to_idx: number;
+  distance_m: number;
+  bearing_true_deg: number;
+  bearing_grid_deg: number;
+  bearing_mag_deg: number;
+  bearing_mils: number;
+  elev_start_m?: number | null;
+  elev_end_m?: number | null;
+  grade_pct?: number | null;
+}
+
+export interface RulerMetricsResponse {
+  total_distance_m: number;
+  segments: RulerSegment[];
+}
+
 export interface BasemapInfoResponse {
   available: boolean;
   name: string | null;
@@ -104,6 +221,7 @@ export interface BasemapInfoResponse {
   maxzoom: number;
   bounds: number[] | null;
   attribution: string | null;
+  pack_id?: string | null;
 }
 
 export interface RouteMetricsWaypoint {
@@ -183,6 +301,7 @@ export interface PackSummary {
   utm_zones: string[];
   vertical_datum: string;
   size_bytes: number;
+  has_basemap?: boolean;
 }
 
 export interface PacksResponse {
@@ -192,10 +311,12 @@ export interface PacksResponse {
 export interface PackRegionPreset {
   region_id: string;
   name: string;
+  group: PackRegionGroup;
   kind: "state" | "tactical";
   bbox_wgs84: BBox;
   utm_zones: string[];
   description?: string;
+  estimated_size_hint?: string;
 }
 
 export interface PackBuildRequest {
@@ -204,6 +325,7 @@ export interface PackBuildRequest {
   include_osm: boolean;
   include_dem: boolean;
   include_overlays: boolean;
+  include_basemap: boolean;
   dem_tier: PackDemTier;
 }
 
@@ -216,6 +338,18 @@ export interface PackBuildTask {
   elapsed_seconds?: number | null;
   error?: string | null;
   manifest?: PackSummary | null;
+}
+
+export interface SavedProject {
+  project_id: string;
+  name: string;
+  description?: string | null;
+  notes?: string | null;
+  created_at: string;
+  updated_at: string;
+  last_job_id?: string | null;
+  thumbnail_url?: string | null;
+  state: Record<string, unknown>;
 }
 
 export interface GeocodeResult {
@@ -290,6 +424,7 @@ export interface CreateJobPayload {
   pack_id: string | null;
   au_overlays: AUOverlayKind[];
   nz_overlays: NZOverlayKind[];
+  ca_overlays: CAOverlayKind[];
   us_overlays: USOverlayKind[];
   carto: CartoOptions;
   outputs: OutputOptions;
@@ -297,11 +432,14 @@ export interface CreateJobPayload {
   grid_rows: number;
   waypoints: WaypointInput[];
   viewsheds: ViewshedObserver[];
+  rf_links: RFLinkSpec[];
+  tactical_graphics: TacticalGraphic[];
   strip_sheets?: StripSheetPlan[];
   include_calibration_page: boolean;
   include_route_card: boolean;
   include_elevation_profile: boolean;
   include_atlas_index: boolean;
+  include_rf_link_card: boolean;
   show_fold_marks: boolean;
 }
 
@@ -351,6 +489,7 @@ export interface AppFormState {
   pack_id: string;
   au_overlays: AUOverlayKind[];
   nz_overlays: NZOverlayKind[];
+  ca_overlays: CAOverlayKind[];
   us_overlays: USOverlayKind[];
   carto: CartoOptions;
   outputs: OutputOptions;
@@ -362,16 +501,25 @@ export interface AppFormState {
     target_height_m: number;
     max_distance_km: number;
   };
+  rfLinks: RFLinkEntry[];
+  rfLinkDefaults: {
+    freq_mhz: number;
+    from_height_m: number;
+    to_height_m: number;
+  };
+  tacticalGraphics: TacticalGraphic[];
   stripPlan: StripPlanResponse | null;
   include_calibration_page: boolean;
   include_route_card: boolean;
   include_elevation_profile: boolean;
   include_atlas_index: boolean;
+  include_rf_link_card: boolean;
   show_fold_marks: boolean;
 }
 
 export interface LocationPreset {
   id: string;
+  tab: PresetRegionTab;
   label: string;
   regionTag: string;
   lat: number;
@@ -381,6 +529,9 @@ export interface LocationPreset {
   units: Units;
   dem_source?: DemSourceKind;
   au_overlays?: AUOverlayKind[];
+  nz_overlays?: NZOverlayKind[];
+  ca_overlays?: CAOverlayKind[];
+  us_overlays?: USOverlayKind[];
   defaultTitle: string;
   zoom: number;
 }

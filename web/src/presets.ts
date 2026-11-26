@@ -4,12 +4,15 @@ import type {
   AppFormState,
   AtlasGridOption,
   BasemapId,
+  CAOverlayKind,
+  ColorMode,
   DemSourceKind,
   DensityLevel,
   HillshadeStrength,
   LocationPreset,
   NZOverlayKind,
   PaperSize,
+  PresetRegionTab,
   USOverlayKind,
   WaypointCategory,
 } from "./types";
@@ -18,9 +21,21 @@ export const DEFAULT_CENTER_LAT = -33.732;
 export const DEFAULT_CENTER_LON = 150.312;
 export const DEFAULT_MAP_ZOOM = 12;
 
+export const PRESET_REGION_TABS: readonly {
+  id: PresetRegionTab;
+  label: string;
+}[] = [
+  { id: "nsw-vic", label: "NSW/VIC" },
+  { id: "au", label: "AU" },
+  { id: "nz", label: "NZ" },
+  { id: "na", label: "NA" },
+];
+
 export const LOCATION_PRESETS: readonly LocationPreset[] = [
+  // Default NSW / VIC tab (preserved exact 8 cards!)
   {
     id: "blue-mountains",
+    tab: "nsw-vic",
     label: "Blue Mountains NSW",
     regionTag: "NSW · 56H",
     lat: -33.732,
@@ -35,6 +50,7 @@ export const LOCATION_PRESETS: readonly LocationPreset[] = [
   },
   {
     id: "mt-kosciuszko",
+    tab: "nsw-vic",
     label: "Mt Kosciuszko NSW",
     regionTag: "NSW · 55H",
     lat: -36.456,
@@ -49,6 +65,7 @@ export const LOCATION_PRESETS: readonly LocationPreset[] = [
   },
   {
     id: "budawangs",
+    tab: "nsw-vic",
     label: "Budawangs NSW",
     regionTag: "NSW · 56H",
     lat: -35.276,
@@ -63,6 +80,7 @@ export const LOCATION_PRESETS: readonly LocationPreset[] = [
   },
   {
     id: "warrumbungles",
+    tab: "nsw-vic",
     label: "Warrumbungles NSW",
     regionTag: "NSW · 55J",
     lat: -31.298,
@@ -77,6 +95,7 @@ export const LOCATION_PRESETS: readonly LocationPreset[] = [
   },
   {
     id: "grampians",
+    tab: "nsw-vic",
     label: "Grampians VIC",
     regionTag: "VIC · 54H",
     lat: -37.145,
@@ -91,6 +110,7 @@ export const LOCATION_PRESETS: readonly LocationPreset[] = [
   },
   {
     id: "wilsons-prom",
+    tab: "nsw-vic",
     label: "Wilsons Prom VIC",
     regionTag: "VIC · 55H",
     lat: -39.032,
@@ -105,6 +125,7 @@ export const LOCATION_PRESETS: readonly LocationPreset[] = [
   },
   {
     id: "mt-bogong",
+    tab: "nsw-vic",
     label: "Mt Bogong VIC",
     regionTag: "VIC · 55H",
     lat: -36.733,
@@ -119,6 +140,7 @@ export const LOCATION_PRESETS: readonly LocationPreset[] = [
   },
   {
     id: "cathedral-range",
+    tab: "nsw-vic",
     label: "Cathedral Range VIC",
     regionTag: "VIC · 55H",
     lat: -37.392,
@@ -129,6 +151,372 @@ export const LOCATION_PRESETS: readonly LocationPreset[] = [
     dem_source: "auto",
     au_overlays: ["au-hydro", "au-parks"],
     defaultTitle: "CATHEDRAL RANGE — SUGARLOAF",
+    zoom: 12,
+  },
+
+  // AU (Pan-Australia)
+  {
+    id: "cradle-mountain",
+    tab: "au",
+    label: "Cradle Mountain TAS",
+    regionTag: "TAS · 55G",
+    lat: -41.684,
+    lon: 145.951,
+    scale: 25000,
+    paper: "a4",
+    units: "metric",
+    dem_source: "auto",
+    au_overlays: ["au-state-trails", "au-hydro", "au-parks"],
+    defaultTitle: "CRADLE MOUNTAIN — OVERLAND",
+    zoom: 12,
+  },
+  {
+    id: "lamington-qld",
+    tab: "au",
+    label: "Lamington NP QLD",
+    regionTag: "QLD · 56J",
+    lat: -28.2,
+    lon: 153.19,
+    scale: 25000,
+    paper: "a4",
+    units: "metric",
+    dem_source: "auto",
+    au_overlays: ["au-state-trails", "au-hydro", "au-parks"],
+    defaultTitle: "LAMINGTON — BINNA BURRA",
+    zoom: 12,
+  },
+  {
+    id: "namadgi-act",
+    tab: "au",
+    label: "Namadgi NP ACT",
+    regionTag: "ACT · 55H",
+    lat: -35.64,
+    lon: 148.98,
+    scale: 25000,
+    paper: "a4",
+    units: "metric",
+    dem_source: "auto",
+    au_overlays: ["au-state-trails", "au-hydro", "au-parks"],
+    defaultTitle: "NAMADGI — ORRORAL VALLEY",
+    zoom: 12,
+  },
+  {
+    id: "stirling-range-wa",
+    tab: "au",
+    label: "Stirling Range WA",
+    regionTag: "WA · 50H",
+    lat: -34.375,
+    lon: 118.255,
+    scale: 25000,
+    paper: "a4",
+    units: "metric",
+    dem_source: "auto",
+    au_overlays: ["au-state-trails", "au-hydro", "au-parks"],
+    defaultTitle: "STIRLING RANGE — BLUFF KNOLL",
+    zoom: 12,
+  },
+  {
+    id: "flinders-ranges-sa",
+    tab: "au",
+    label: "Flinders Ranges SA",
+    regionTag: "SA · 54J",
+    lat: -31.53,
+    lon: 138.6,
+    scale: 25000,
+    paper: "a4",
+    units: "metric",
+    dem_source: "auto",
+    au_overlays: ["au-state-trails", "au-hydro", "au-parks"],
+    defaultTitle: "FLINDERS RANGES — WILPENA",
+    zoom: 12,
+  },
+  {
+    id: "west-macdonnell-nt",
+    tab: "au",
+    label: "Larapinta Trail NT",
+    regionTag: "NT · 53K",
+    lat: -23.73,
+    lon: 133.24,
+    scale: 25000,
+    paper: "a4",
+    units: "metric",
+    dem_source: "auto",
+    au_overlays: ["au-state-trails", "au-hydro", "au-parks"],
+    defaultTitle: "WEST MACDONNELL — LARAPINTA",
+    zoom: 12,
+  },
+  {
+    id: "uluru-nt",
+    tab: "au",
+    label: "Uluru / Kata Tjuta NT",
+    regionTag: "NT · 52J",
+    lat: -25.3444,
+    lon: 131.0369,
+    scale: 25000,
+    paper: "a4",
+    units: "metric",
+    dem_source: "auto",
+    au_overlays: ["au-hydro", "au-parks", "au-aviation"],
+    defaultTitle: "ULURU — KATA TJUTA NT",
+    zoom: 12,
+  },
+  {
+    id: "sydney-harbour",
+    tab: "au",
+    label: "Sydney Harbour NSW",
+    regionTag: "NSW · 56H",
+    lat: -33.8568,
+    lon: 151.2153,
+    scale: 25000,
+    paper: "a4",
+    units: "metric",
+    dem_source: "auto",
+    au_overlays: ["au-hydro", "au-parks"],
+    defaultTitle: "SYDNEY HARBOUR — NORTH SHORE",
+    zoom: 12.5,
+  },
+
+  // NZ (New Zealand)
+  {
+    id: "tongariro-nz",
+    tab: "nz",
+    label: "Tongariro Crossing",
+    regionTag: "NZ · 60H",
+    lat: -39.133,
+    lon: 175.642,
+    scale: 25000,
+    paper: "a4",
+    units: "metric",
+    dem_source: "nz-linz",
+    nz_overlays: ["nz-doc-trails"],
+    defaultTitle: "TONGARIRO ALPINE CROSSING",
+    zoom: 12,
+  },
+  {
+    id: "aoraki-mt-cook-nz",
+    tab: "nz",
+    label: "Aoraki / Mt Cook",
+    regionTag: "NZ · 59G",
+    lat: -43.735,
+    lon: 170.096,
+    scale: 25000,
+    paper: "a4",
+    units: "metric",
+    dem_source: "nz-linz",
+    nz_overlays: ["nz-doc-trails"],
+    defaultTitle: "AORAKI — MOUNT COOK NP",
+    zoom: 12,
+  },
+  {
+    id: "milford-track-nz",
+    tab: "nz",
+    label: "Milford Track",
+    regionTag: "NZ · 58G",
+    lat: -44.788,
+    lon: 167.775,
+    scale: 25000,
+    paper: "a4",
+    units: "metric",
+    dem_source: "nz-linz",
+    nz_overlays: ["nz-doc-trails"],
+    defaultTitle: "FIORDLAND — MILFORD TRACK",
+    zoom: 12,
+  },
+  {
+    id: "routeburn-nz",
+    tab: "nz",
+    label: "Routeburn Track",
+    regionTag: "NZ · 58G",
+    lat: -44.73,
+    lon: 168.176,
+    scale: 25000,
+    paper: "a4",
+    units: "metric",
+    dem_source: "nz-linz",
+    nz_overlays: ["nz-doc-trails"],
+    defaultTitle: "ROUTEBURN — HARRIS SADDLE",
+    zoom: 12,
+  },
+  {
+    id: "arthurs-pass-nz",
+    tab: "nz",
+    label: "Arthur's Pass",
+    regionTag: "NZ · 59G",
+    lat: -42.942,
+    lon: 171.561,
+    scale: 25000,
+    paper: "a4",
+    units: "metric",
+    dem_source: "nz-linz",
+    nz_overlays: ["nz-doc-trails"],
+    defaultTitle: "ARTHUR'S PASS — AVALANCHE PK",
+    zoom: 12,
+  },
+  {
+    id: "abel-tasman-nz",
+    tab: "nz",
+    label: "Abel Tasman Coast",
+    regionTag: "NZ · 59G",
+    lat: -40.916,
+    lon: 173.046,
+    scale: 25000,
+    paper: "a4",
+    units: "metric",
+    dem_source: "nz-linz",
+    nz_overlays: ["nz-doc-trails"],
+    defaultTitle: "ABEL TASMAN COAST TRACK",
+    zoom: 12,
+  },
+  {
+    id: "mt-taranaki-nz",
+    tab: "nz",
+    label: "Mt Taranaki",
+    regionTag: "NZ · 60H",
+    lat: -39.297,
+    lon: 174.063,
+    scale: 25000,
+    paper: "a4",
+    units: "metric",
+    dem_source: "nz-linz",
+    nz_overlays: ["nz-doc-trails"],
+    defaultTitle: "TE PAPAKURA O TARANAKI",
+    zoom: 12,
+  },
+  {
+    id: "wanaka-roys-nz",
+    tab: "nz",
+    label: "Mt Aspiring / Wanaka",
+    regionTag: "NZ · 59G",
+    lat: -44.692,
+    lon: 169.046,
+    scale: 25000,
+    paper: "a4",
+    units: "metric",
+    dem_source: "nz-linz",
+    nz_overlays: ["nz-doc-trails"],
+    defaultTitle: "WANAKA — ROYS PEAK",
+    zoom: 12,
+  },
+
+  // NA (North America — US + Canada)
+  {
+    id: "boulder-co",
+    tab: "na",
+    label: "Boulder Flatirons CO",
+    regionTag: "US · 13T",
+    lat: 40.005,
+    lon: -105.285,
+    scale: 24000,
+    paper: "letter",
+    units: "imperial",
+    dem_source: "auto",
+    us_overlays: ["us-trails", "us-public-lands"],
+    defaultTitle: "BOULDER — FLATIRONS CO",
+    zoom: 12,
+  },
+  {
+    id: "yosemite-ca",
+    tab: "na",
+    label: "Yosemite Valley CA",
+    regionTag: "US · 11S",
+    lat: 37.745,
+    lon: -119.533,
+    scale: 24000,
+    paper: "letter",
+    units: "imperial",
+    dem_source: "auto",
+    us_overlays: ["us-trails", "us-public-lands"],
+    defaultTitle: "YOSEMITE — HALF DOME CA",
+    zoom: 12,
+  },
+  {
+    id: "mt-rainier-wa",
+    tab: "na",
+    label: "Mt Rainier WA",
+    regionTag: "US · 10T",
+    lat: 46.786,
+    lon: -121.735,
+    scale: 24000,
+    paper: "letter",
+    units: "imperial",
+    dem_source: "auto",
+    us_overlays: ["us-trails", "us-public-lands"],
+    defaultTitle: "MT RAINIER — PARADISE WA",
+    zoom: 12,
+  },
+  {
+    id: "grand-teton-wy",
+    tab: "na",
+    label: "Grand Teton WY",
+    regionTag: "US · 12T",
+    lat: 43.741,
+    lon: -110.752,
+    scale: 24000,
+    paper: "letter",
+    units: "imperial",
+    dem_source: "auto",
+    us_overlays: ["us-trails", "us-public-lands"],
+    defaultTitle: "GRAND TETON — JENNY LAKE",
+    zoom: 12,
+  },
+  {
+    id: "banff-ab",
+    tab: "na",
+    label: "Banff / Lake Louise AB",
+    regionTag: "CA · 11U",
+    lat: 51.416,
+    lon: -116.216,
+    scale: 25000,
+    paper: "letter",
+    units: "metric",
+    dem_source: "ca-hrdem",
+    ca_overlays: ["ca-canvec-trails"],
+    defaultTitle: "BANFF — LAKE LOUISE AB",
+    zoom: 12,
+  },
+  {
+    id: "squamish-bc",
+    tab: "na",
+    label: "Squamish / Garibaldi BC",
+    regionTag: "CA · 10U",
+    lat: 49.946,
+    lon: -123.025,
+    scale: 25000,
+    paper: "letter",
+    units: "metric",
+    dem_source: "ca-hrdem",
+    ca_overlays: ["ca-canvec-trails"],
+    defaultTitle: "GARIBALDI — SQUAMISH BC",
+    zoom: 12,
+  },
+  {
+    id: "white-mtns-nh",
+    tab: "na",
+    label: "Mt Washington NH",
+    regionTag: "US · 19T",
+    lat: 44.27,
+    lon: -71.303,
+    scale: 24000,
+    paper: "letter",
+    units: "imperial",
+    dem_source: "auto",
+    us_overlays: ["us-trails", "us-public-lands"],
+    defaultTitle: "PRESIDENTIAL RANGE NH",
+    zoom: 12,
+  },
+  {
+    id: "zion-ut",
+    tab: "na",
+    label: "Zion Canyon UT",
+    regionTag: "US · 12S",
+    lat: 37.269,
+    lon: -112.948,
+    scale: 24000,
+    paper: "letter",
+    units: "imperial",
+    dem_source: "auto",
+    us_overlays: ["us-trails", "us-public-lands"],
+    defaultTitle: "ZION — ANGELS LANDING UT",
     zoom: 12,
   },
 ];
@@ -152,6 +540,38 @@ export const PAPER_OPTIONS: readonly {
   { value: "a3", label: "A3", dims: "297 × 420 mm" },
 ];
 
+export const COLOR_MODE_OPTIONS: readonly {
+  value: ColorMode;
+  label: string;
+  swatch: string;
+  hint: string;
+}[] = [
+  {
+    value: "color",
+    label: "Color",
+    swatch: "#22C55E",
+    hint: "Standard military topographic color",
+  },
+  {
+    value: "bw",
+    label: "B&W Print",
+    swatch: "#CBD5E1",
+    hint: "High-contrast laser monochrome",
+  },
+  {
+    value: "night-red",
+    label: "Night (Red-Light)",
+    swatch: "#38BDF8",
+    hint: "Red-headlamp safe (zero red/orange critical ink)",
+  },
+  {
+    value: "alpine",
+    label: "Alpine",
+    swatch: "#60A5FA",
+    hint: "Winter/glacier contours & vivid avalanche slopes",
+  },
+];
+
 export const ATLAS_GRID_OPTIONS: readonly AtlasGridOption[] = [
   { id: "1x1", label: "1×1", cols: 1, rows: 1 },
   { id: "2x1", label: "2×1", cols: 2, rows: 1 },
@@ -168,8 +588,9 @@ export const DEM_SOURCE_OPTIONS: readonly {
   { value: "auto", label: "Auto (Best Regional Elevation)" },
   { value: "au-elvis", label: "Australia GA 5m / SRTM (AHD)" },
   { value: "nz-linz", label: "New Zealand LINZ 1 m LiDAR / 8 m (NZVD2016)" },
-  { value: "glo30", label: "Copernicus GLO-30 (EGM2008)" },
+  { value: "ca-hrdem", label: "Canada NRCan HRDEM 1m / CDEM (CGVD2013)" },
   { value: "usgs3dep", label: "USGS 3DEP 1m / 10m (NAVD88)" },
+  { value: "glo30", label: "Copernicus GLO-30 (EGM2008)" },
 ];
 
 export const AU_STATE_TRAIL_CHIPS: readonly {
@@ -232,11 +653,33 @@ export const NZ_OVERLAY_OPTIONS: readonly {
   },
 ];
 
+export const CA_OVERLAY_OPTIONS: readonly {
+  value: CAOverlayKind;
+  label: string;
+  hint: string;
+}[] = [
+  {
+    value: "ca-canvec-trails",
+    label: "Canada CanVec / Parks Trails & Huts",
+    hint: "NRCan CanVec / Parks Canada trails, shelters & parks (OGL-CA)",
+  },
+];
+
 export const US_OVERLAY_OPTIONS: readonly {
   value: USOverlayKind;
   label: string;
   hint: string;
 }[] = [
+  {
+    value: "us-trails",
+    label: "USFS / NPS / USGS Trails & POIs",
+    hint: "Backcountry trails, trailheads, campgrounds & peaks",
+  },
+  {
+    value: "us-public-lands",
+    label: "US Public Lands & Wilderness (PAD-US)",
+    hint: "USFS, NPS, BLM & wilderness boundaries",
+  },
   {
     value: "fema",
     label: "FEMA Flood Zones",
@@ -257,6 +700,16 @@ export const US_OVERLAY_OPTIONS: readonly {
     label: "NOAA ENC Charts",
     hint: "Coastal depth soundings & buoys",
   },
+];
+
+export const RF_BAND_PRESETS: readonly { label: string; freq_mhz: number }[] = [
+  { label: "LoRa / Meshtastic 915 MHz (AU/US)", freq_mhz: 915 },
+  { label: "UHF CB 477 MHz (AU)", freq_mhz: 477 },
+  { label: "GMRS / FRS 462 MHz (US)", freq_mhz: 462 },
+  { label: "VHF 2m Amateur 146 MHz", freq_mhz: 146 },
+  { label: "LoRa 868 MHz (EU/NZ)", freq_mhz: 868 },
+  { label: "Wi-Fi / AREDN 2.4 GHz", freq_mhz: 2412 },
+  { label: "PtP Microwave 5.8 GHz", freq_mhz: 5800 },
 ];
 
 export const WAYPOINT_CATEGORY_OPTIONS: readonly {
@@ -329,6 +782,7 @@ export function createInitialFormState(): AppFormState {
     pack_id: "",
     au_overlays: [],
     nz_overlays: [],
+    ca_overlays: [],
     us_overlays: [],
     carto: {
       contour_density: "normal",
@@ -350,6 +804,9 @@ export function createInitialFormState(): AppFormState {
       kmz: false,
       garmin_profile: "standard",
       include_grid_on_digital: true,
+      gpkg_tiles: false,
+      osmand_sqlitedb: false,
+      field_bundle_zip: false,
     },
     overlayFile: null,
     waypoints: [],
@@ -359,11 +816,19 @@ export function createInitialFormState(): AppFormState {
       target_height_m: 1.5,
       max_distance_km: 10,
     },
+    rfLinks: [],
+    rfLinkDefaults: {
+      freq_mhz: 915,
+      from_height_m: 2,
+      to_height_m: 2,
+    },
+    tacticalGraphics: [],
     stripPlan: null,
     include_calibration_page: false,
     include_route_card: false,
     include_elevation_profile: false,
     include_atlas_index: false,
+    include_rf_link_card: false,
     show_fold_marks: false,
   };
 }
@@ -466,10 +931,13 @@ const STAGE_LABELS: Record<string, string> = {
   viewshed: "Computing RF / LOS viewshed",
   rendering: "Rendering PyQGIS map sheet",
   rendering_pdf: "Rendering 300 DPI print PDF",
-  rendering_supplements: "Generating Index / Route Card / Calibration",
+  rendering_supplements: "Generating RF Link / Route Card / Index",
   merging_atlas: "Merging multi-sheet Atlas PDF",
   exporting_mbtiles: "Exporting ATAK .mbtiles",
   exporting_kmz: "Exporting Garmin .kmz",
+  exporting_gpkg: "Exporting GeoPackage .gpkg",
+  exporting_osmand: "Exporting OsmAnd .sqlitedb",
+  exporting_bundle: "Packaging Field Bundle .zip",
   finalizing: "Finalizing artifacts",
   done: "Completed",
   completed: "Completed",
@@ -499,6 +967,15 @@ export function formatArtifactLabel(kind: string, filename: string): string {
   if (lowerKind.includes("kmz") || lowerName.endsWith(".kmz")) {
     return "Garmin .kmz";
   }
+  if (lowerKind.includes("gpkg") || lowerName.endsWith(".gpkg")) {
+    return "GeoPackage .gpkg";
+  }
+  if (lowerKind.includes("osmand") || lowerKind.includes("sqlitedb") || lowerName.endsWith(".sqlitedb")) {
+    return "OsmAnd .sqlitedb";
+  }
+  if (lowerKind.includes("bundle") || lowerKind.includes("zip") || lowerName.endsWith(".zip")) {
+    return "Field Bundle .zip";
+  }
   return filename;
 }
 
@@ -521,7 +998,12 @@ export type CliCopyResult = { command: string } | { error: string };
 
 export function buildCliCommand(state: AppFormState): CliCopyResult {
   const pdfEnabled = state.outputs.pdf;
-  const digital = state.outputs.mbtiles || state.outputs.kmz;
+  const legacyDigital = state.outputs.mbtiles || state.outputs.kmz;
+  const extraDigital =
+    state.outputs.gpkg_tiles ||
+    state.outputs.osmand_sqlitedb ||
+    state.outputs.field_bundle_zip;
+  const digital = legacyDigital || extraDigital;
   if (!pdfEnabled && !digital) {
     return { error: "Select at least one output to copy a command." };
   }
@@ -541,6 +1023,25 @@ export function buildCliCommand(state: AppFormState): CliCopyResult {
     return {
       error:
         "To copy a strip PDF command, select its route file and PDF as the only output. Studio can generate the combined job.",
+    };
+  }
+  if (!pdfEnabled && extraDigital && !legacyDigital) {
+    // Support single export format for gpkg/osmand/bundle via gridforge export, or error on mixed multi-extra without PDF
+    const enabledExtras = [
+      state.outputs.gpkg_tiles ? "gpkg" : null,
+      state.outputs.osmand_sqlitedb ? "osmand" : null,
+      state.outputs.field_bundle_zip ? "bundle" : null,
+    ].filter((v): v is string => v !== null);
+    if (enabledExtras.length > 1) {
+      return {
+        error:
+          "Select Print PDF or a single export format to copy a CLI command, or use Generate Map Sheet.",
+      };
+    }
+  } else if (!pdfEnabled && extraDigital && legacyDigital) {
+    return {
+      error:
+        "Use Generate Map Sheet for combined device exports without Print PDF, or enable Print PDF to copy a CLI command.",
     };
   }
 
@@ -590,6 +1091,9 @@ export function buildCliCommand(state: AppFormState): CliCopyResult {
   }
   for (const ov of state.nz_overlays) {
     args.push(`--nz-overlay ${ov}`);
+  }
+  for (const ov of state.ca_overlays) {
+    args.push(`--ca-overlay ${ov}`);
   }
   for (const ov of state.us_overlays) {
     args.push(`--us-overlay ${ov}`);
@@ -648,6 +1152,35 @@ export function buildCliCommand(state: AppFormState): CliCopyResult {
     args.push(`--viewshed ${shellQuote(vsSpec)}`);
   }
 
+  for (const link of state.rfLinks) {
+    const s = link.spec;
+    const specStr = `${s.from_lat.toFixed(5)},${s.from_lon.toFixed(5)},${s.to_lat.toFixed(5)},${s.to_lon.toFixed(5)},${s.freq_mhz},${s.from_height_m},${s.to_height_m}`;
+    args.push(`--rf-link ${shellQuote(specStr)}`);
+  }
+
+  for (const tg of state.tacticalGraphics) {
+    if (tg.kind === "range_ring" && tg.points[0]) {
+      const [lat, lon] = tg.points[0];
+      const radii = tg.radii_km.join(":");
+      const lbl = tg.label.replace(/,/g, " ").trim();
+      const parts = [lat.toFixed(5), lon.toFixed(5), radii];
+      if (lbl) parts.push(lbl);
+      args.push(`--range-ring ${shellQuote(parts.join(","))}`);
+    } else if (tg.kind === "bearing_line" && tg.points.length >= 2) {
+      const p0 = tg.points[0]!;
+      const p1 = tg.points[tg.points.length - 1]!;
+      const lbl = tg.label.replace(/,/g, " ").trim();
+      const parts = [
+        p0[0].toFixed(5),
+        p0[1].toFixed(5),
+        p1[0].toFixed(5),
+        p1[1].toFixed(5),
+      ];
+      if (lbl) parts.push(lbl);
+      args.push(`--tactical-line ${shellQuote(parts.join(","))}`);
+    }
+  }
+
   if (pdfEnabled) {
     if (state.outputs.geopdf) args.push("--geopdf");
     if (state.show_fold_marks) args.push("--fold-marks");
@@ -655,6 +1188,7 @@ export function buildCliCommand(state: AppFormState): CliCopyResult {
     if (state.include_calibration_page) args.push("--calibration-page");
     if (state.include_route_card) args.push("--route-card");
     if (state.include_elevation_profile) args.push("--elevation-profile");
+    if (state.include_rf_link_card) args.push("--rf-link-card");
     if (state.outputs.mbtiles) {
       args.push(`--mbtiles /out/${slug}.mbtiles`);
       if (state.outputs.mbtiles_format !== "png") {
@@ -667,7 +1201,22 @@ export function buildCliCommand(state: AppFormState): CliCopyResult {
         args.push(`--garmin-profile ${state.outputs.garmin_profile}`);
       }
     }
+    if (state.outputs.gpkg_tiles) {
+      args.push(`--gpkg /out/${slug}.gpkg`);
+    }
+    if (state.outputs.osmand_sqlitedb) {
+      args.push(`--osmand /out/${slug}.sqlitedb`);
+    }
+    if (state.outputs.field_bundle_zip) {
+      args.push(`--field-bundle /out/${slug}_field_bundle.zip`);
+    }
     args.push(`--output /out/${slug}.pdf`);
+  } else if (state.outputs.gpkg_tiles) {
+    args.push(`--format gpkg`, `--output /out/${slug}.gpkg`);
+  } else if (state.outputs.osmand_sqlitedb) {
+    args.push(`--format osmand`, `--output /out/${slug}.sqlitedb`);
+  } else if (state.outputs.field_bundle_zip) {
+    args.push(`--format bundle`, `--output /out/${slug}_field_bundle.zip`);
   } else {
     const fmt =
       state.outputs.mbtiles && state.outputs.kmz

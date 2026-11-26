@@ -1,4 +1,8 @@
-import { artifactDownloadUrl, artifactPreviewUrl } from "../api";
+import {
+  artifactDownloadUrl,
+  artifactPreviewUrl,
+  jobThumbnailUrl,
+} from "../api";
 import {
   escapeHtml,
   formatArtifactLabel,
@@ -157,7 +161,14 @@ export class JobsDrawer {
       job.title?.trim() || job.center_mgrs || job.center || "Untitled Sheet";
     const scaleStr = `1:${job.scale.toLocaleString()}`;
     const paperStr = `${job.paper.toUpperCase()} ${job.orientation === "landscape" ? "Landscape" : "Portrait"}`;
-    const modeStr = job.color_mode === "bw" ? "B&W" : "Color";
+    const modeStr =
+      job.color_mode === "bw"
+        ? "B&W"
+        : job.color_mode === "night-red"
+          ? "Night Red"
+          : job.color_mode === "alpine"
+            ? "Alpine"
+            : "Color";
     const cols = job.grid_cols ?? 1;
     const rows = job.grid_rows ?? 1;
     const atlasStr = cols * rows > 1 ? ` · ${cols}×${rows} Atlas` : "";
@@ -258,12 +269,20 @@ export class JobsDrawer {
       ? `<button type="button" class="gf-mini-btn danger" data-action="cancel" data-job-id="${escapeHtml(job.job_id)}" ${isBusy ? "disabled" : ""}>${isBusy ? "Cancelling…" : "Cancel"}</button>`
       : `<button type="button" class="gf-mini-btn danger" data-action="delete" data-job-id="${escapeHtml(job.job_id)}" ${isBusy ? "disabled" : ""}>${isBusy ? "Deleting…" : "Delete"}</button>`;
 
+    const thumbHtml =
+      job.status === "succeeded"
+        ? `<img class="gf-job-thumb" src="${escapeHtml(jobThumbnailUrl(job.job_id))}" alt="" loading="lazy" onerror="this.style.display='none'" />`
+        : "";
+
     return `
       <article class="gf-job-card status-${escapeHtml(job.status)}">
         <div class="gf-job-head">
-          <div>
-            <div class="gf-job-title">${escapeHtml(displayTitle)}</div>
-            <div class="gf-job-sub">${escapeHtml(job.center_mgrs ?? job.center)} · ${escapeHtml(scaleStr)} · ${escapeHtml(paperStr)} · ${escapeHtml(modeStr)}${escapeHtml(atlasStr)}</div>
+          <div class="gf-job-head-left">
+            ${thumbHtml}
+            <div>
+              <div class="gf-job-title">${escapeHtml(displayTitle)}</div>
+              <div class="gf-job-sub">${escapeHtml(job.center_mgrs ?? job.center)} · ${escapeHtml(scaleStr)} · ${escapeHtml(paperStr)} · ${escapeHtml(modeStr)}${escapeHtml(atlasStr)}</div>
+            </div>
           </div>
           <span class="gf-badge ${escapeHtml(job.status)}">${escapeHtml(job.status)}</span>
         </div>

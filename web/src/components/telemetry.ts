@@ -12,6 +12,7 @@ import type {
 
 export interface TelemetryCallbacks {
   onToggleDrawer: () => void;
+  onToggleProjects: () => void;
   onCopyMgrs: (mgrs: string) => void;
 }
 
@@ -24,6 +25,7 @@ export class TelemetryBar {
   private readonly declEl: HTMLElement;
   private readonly statusDotEl: HTMLElement;
   private readonly statusTextEl: HTMLElement;
+  private readonly projectsToggleBtn: HTMLButtonElement;
   private readonly queueToggleBtn: HTMLButtonElement;
   private readonly queueBadgeEl: HTMLElement;
   private latestMgrs = "";
@@ -74,6 +76,9 @@ export class TelemetryBar {
           <span class="gf-status-dot" data-role="status-dot"></span>
           <span class="mono" data-role="status-text">Connecting…</span>
         </button>
+        <button type="button" class="gf-queue-toggle gf-projects-toggle" data-role="projects-toggle" aria-expanded="false" title="Saved Trip Projects">
+          <span>Projects</span>
+        </button>
         <button type="button" class="gf-queue-toggle" data-role="queue-toggle" aria-expanded="false">
           <span>Queue</span>
           <span class="gf-queue-badge" data-role="queue-badge">0</span>
@@ -88,6 +93,9 @@ export class TelemetryBar {
     this.declEl = this.q("[data-role='decl']");
     this.statusDotEl = this.q("[data-role='status-dot']");
     this.statusTextEl = this.q("[data-role='status-text']");
+    this.projectsToggleBtn = this.q<HTMLButtonElement>(
+      "[data-role='projects-toggle']"
+    );
     this.queueToggleBtn = this.q<HTMLButtonElement>("[data-role='queue-toggle']");
     this.queueBadgeEl = this.q("[data-role='queue-badge']");
 
@@ -100,6 +108,10 @@ export class TelemetryBar {
 
     this.q("[data-role='status-pill']").addEventListener("click", () => {
       callbacks.onToggleDrawer();
+    });
+
+    this.projectsToggleBtn.addEventListener("click", () => {
+      callbacks.onToggleProjects();
     });
 
     this.queueToggleBtn.addEventListener("click", () => {
@@ -174,15 +186,20 @@ export class TelemetryBar {
     const statusPill = this.q("[data-role='status-pill']");
     if (health.worker_alive) {
       this.statusDotEl.classList.add(health.queue_depth > 0 ? "busy" : "online");
-      this.statusTextEl.textContent = `Online · Queue: ${health.queue_depth}`;
+      this.statusTextEl.innerHTML = `Online · <span class="gf-queue-word">Queue: </span><span class="gf-queue-short">Q:</span>${health.queue_depth}`;
       statusPill.title = `Worker alive · RAM budget: ${health.memory_budget_mb} MB · Offline packs: ${health.packs_count}`;
     } else {
       this.statusDotEl.classList.add("offline");
-      this.statusTextEl.textContent = `Worker Offline · Queue: ${health.queue_depth}`;
+      this.statusTextEl.innerHTML = `<span class="gf-queue-word">Worker </span>Offline · <span class="gf-queue-word">Queue: </span><span class="gf-queue-short">Q:</span>${health.queue_depth}`;
       statusPill.title = health.worker_last_seen
         ? `Last seen: ${escapeHtml(health.worker_last_seen)}`
         : "Worker has not checked in yet";
     }
+  }
+
+  updateProjectsOpen(open: boolean): void {
+    this.projectsToggleBtn.classList.toggle("active", open);
+    this.projectsToggleBtn.setAttribute("aria-expanded", String(open));
   }
 
   updateQueueCounts(

@@ -89,3 +89,57 @@ test("annotation text is preserved or the copy action explains the limitation", 
   assert.match(buildCliCommand(state).error, /label/i);
   assert.equal(buildCliCommand(state).command, undefined);
 });
+
+test("v1.4.0 themes, Canada overlays, RF links, tactical graphics, and new digital exports emit exact flags", () => {
+  const state = createInitialFormState();
+  state.color_mode = "night-red";
+  state.dem_source = "ca-hrdem";
+  state.ca_overlays = ["ca-canvec-trails"];
+  state.us_overlays = ["us-trails", "us-public-lands"];
+  state.include_rf_link_card = true;
+  state.rfLinks = [
+    {
+      id: "rf-1",
+      loading: false,
+      error: null,
+      profile: null,
+      spec: {
+        from_lat: -36.456,
+        from_lon: 148.263,
+        to_lat: -36.421,
+        to_lon: 148.301,
+        from_height_m: 3,
+        to_height_m: 2,
+        freq_mhz: 915,
+        k_factor: 1.333,
+        from_label: "A1",
+        to_label: "B1",
+      },
+    },
+  ];
+  state.tacticalGraphics = [
+    {
+      kind: "range_ring",
+      label: "BASE",
+      points: [[-36.456, 148.263]],
+      radii_km: [1, 3, 5],
+    },
+  ];
+  Object.assign(state.outputs, {
+    gpkg_tiles: true,
+    osmand_sqlitedb: true,
+    field_bundle_zip: true,
+  });
+
+  const args = dockerArgs(state);
+  assert.equal(args[0], "render");
+  assert.equal(option(args, "--mode"), "night-red");
+  assert.equal(option(args, "--dem-source"), "ca-hrdem");
+  assert.equal(option(args, "--ca-overlay"), "ca-canvec-trails");
+  assert.ok(args.includes("--rf-link-card"));
+  assert.equal(option(args, "--rf-link"), "-36.45600,148.26300,-36.42100,148.30100,915,3,2");
+  assert.equal(option(args, "--range-ring"), "-36.45600,148.26300,1:3:5,BASE");
+  assert.equal(option(args, "--gpkg"), "/out/sheet_25k_a4_night-red.gpkg");
+  assert.equal(option(args, "--osmand"), "/out/sheet_25k_a4_night-red.sqlitedb");
+  assert.equal(option(args, "--field-bundle"), "/out/sheet_25k_a4_night-red_field_bundle.zip");
+});

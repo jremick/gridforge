@@ -9,6 +9,7 @@ import { escapeHtml, formatBytes, formatDuration } from "../presets";
 import type {
   PackBuildTask,
   PackDemTier,
+  PackRegionGroup,
   PackRegionPreset,
   PackSummary,
 } from "../types";
@@ -16,11 +17,20 @@ import type {
 export interface PacksModalCallbacks {
   onPacksUpdated: (packs: PackSummary[]) => void;
   onSelectPack: (packId: string) => void;
+  onBasemapRefresh: () => void;
   onToast: (message: string, kind: "success" | "error" | "info") => void;
   getCurrentBBoxString: () => string | null;
 }
 
-type RegionTab = "tactical" | "state" | "custom";
+type ModalRegionTab = PackRegionGroup | "custom";
+
+function formatLonDeg(lon: number): string {
+  return `${Math.abs(lon).toFixed(1)}°${lon >= 0 ? "E" : "W"}`;
+}
+
+function formatLatDeg(lat: number): string {
+  return `${Math.abs(lat).toFixed(1)}°${lat >= 0 ? "N" : "S"}`;
+}
 
 export class PacksModal {
   private readonly root: HTMLElement;
@@ -32,9 +42,10 @@ export class PacksModal {
   private readonly incOsmCheck: HTMLInputElement;
   private readonly incDemCheck: HTMLInputElement;
   private readonly incOverlaysCheck: HTMLInputElement;
+  private readonly incBasemapCheck: HTMLInputElement;
 
   private isOpen = false;
-  private activeTab: RegionTab = "tactical";
+  private activeTab: ModalRegionTab = "au_tactical";
   private packs: PackSummary[] = [];
   private regions: PackRegionPreset[] = [];
   private tasks: PackBuildTask[] = [];
@@ -71,18 +82,20 @@ export class PacksModal {
           <section class="gf-modal-section">
             <div class="gf-modal-section-head">
               <h3>Installed Offline Packs</h3>
-              <span class="gf-sublabel">Air-gapped DEM + OSM PBF + Overlays</span>
+              <span class="gf-sublabel">Air-gapped DEM + OSM PBF + Overlays + Basemap</span>
             </div>
             <div class="gf-pack-installed-list" data-role="installed-list"></div>
           </section>
 
           <section class="gf-modal-section">
             <div class="gf-modal-section-head">
-              <h3>Build Australia Regional Pack</h3>
-              <div class="gf-segmented gf-modal-tabs" data-role="region-tabs">
-                <button type="button" class="gf-seg-btn active" data-tab="tactical">Tactical (7)</button>
-                <button type="button" class="gf-seg-btn" data-tab="state">States (8)</button>
-                <button type="button" class="gf-seg-btn" data-tab="custom">Custom BBox</button>
+              <h3>Build Regional Offline Pack</h3>
+              <div class="gf-segmented gf-modal-tabs gf-modal-tabs-5" data-role="region-tabs">
+                <button type="button" class="gf-seg-btn active" data-tab="au_tactical">AU Tactical</button>
+                <button type="button" class="gf-seg-btn" data-tab="au_state">AU States</button>
+                <button type="button" class="gf-seg-btn" data-tab="nz">New Zealand</button>
+                <button type="button" class="gf-seg-btn" data-tab="na">North America</button>
+                <button type="button" class="gf-seg-btn" data-tab="custom">Custom</button>
               </div>
             </div>
 
@@ -90,8 +103,12 @@ export class PacksModal {
               <label class="gf-inline-check">
                 <span>DEM</span>
                 <select class="gf-mini-select" data-role="pack-dem-tier">
-                  <option value="srtm-1s">DEA SRTM 1s (AHD)</option>
-                  <option value="au-elvis">GA 5m / SRTM (AHD)</option>
+                  <option value="auto" selected>Auto (Best Regional DEM)</option>
+                  <option value="srtm-1s">DEA SRTM 1s (AU AHD)</option>
+                  <option value="au-elvis">GA 5m / SRTM (AU AHD)</option>
+                  <option value="nz-linz">LINZ 1m / 8m (NZVD2016)</option>
+                  <option value="usgs3dep">USGS 3DEP (NAVD88)</option>
+                  <option value="ca-hrdem">NRCan HRDEM (CGVD2013)</option>
                   <option value="glo30">Copernicus GLO-30</option>
                 </select>
               </label>
@@ -105,7 +122,11 @@ export class PacksModal {
               </label>
               <label class="gf-inline-check">
                 <input type="checkbox" data-role="pack-inc-overlays" checked />
-                <span>AU Overlays</span>
+                <span>Overlays</span>
+              </label>
+              <label class="gf-inline-check" title="Pre-render an offline basemap.mbtiles for air-gapped map browsing">
+                <input type="checkbox" data-role="pack-inc-basemap" checked />
+                <span>Include Offline Basemap</span>
               </label>
             </div>
 
@@ -123,6 +144,9 @@ export class PacksModal {
     this.incDemCheck = this.q<HTMLInputElement>("[data-role='pack-inc-dem']");
     this.incOverlaysCheck = this.q<HTMLInputElement>(
       "[data-role='pack-inc-overlays']"
+    );
+    this.incBasemapCheck = this.q<HTMLInputElement>(
+      "[data-role='pack-inc-basemap']"
     );
 
     this.bindEvents();
@@ -153,7 +177,7 @@ export class PacksModal {
       .querySelectorAll<HTMLButtonElement>("[data-tab]")
       .forEach((btn) => {
         btn.addEventListener("click", () => {
-          const tab = btn.dataset.tab as RegionTab;
+          const tab = btn.dataset.tab as ModalRegionTab;
           this.activeTab = tab;
           this.root
             .querySelectorAll<HTMLButtonElement>("[data-tab]")
@@ -253,6 +277,30 @@ export class PacksModal {
     }
   }
 
+  private updateTabLabels(): void {
+    const counts: Record<PackRegionGroup, number> = {
+      au_tactical: 0,
+      au_state: 0,
+      nz: 0,
+      na: 0,
+    };
+    for (const r of this.regions) {
+      counts[r.group] += 1;
+    }
+    const labels: Record<PackRegionGroup, string> = {
+      au_tactical: `AU Tactical${counts.au_tactical ? ` (${counts.au_tactical})` : ""}`,
+      au_state: `AU States${counts.au_state ? ` (${counts.au_state})` : ""}`,
+      nz: `NZ${counts.nz ? ` (${counts.nz})` : ""}`,
+      na: `North America${counts.na ? ` (${counts.na})` : ""}`,
+    };
+    (Object.keys(labels) as PackRegionGroup[]).forEach((key) => {
+      const btn = this.root.querySelector<HTMLButtonElement>(
+        `[data-tab='${key}']`
+      );
+      if (btn) btn.textContent = labels[key];
+    });
+  }
+
   private async refreshAll(): Promise<void> {
     const [packsRes, regionsRes, tasksRes] = await Promise.allSettled([
       fetchPacks(),
@@ -266,6 +314,7 @@ export class PacksModal {
     }
     if (regionsRes.status === "fulfilled") {
       this.regions = regionsRes.value;
+      this.updateTabLabels();
     }
     if (tasksRes.status === "fulfilled") {
       this.tasks = tasksRes.value;
@@ -303,6 +352,7 @@ export class PacksModal {
           (t) => prevRunningIds.has(t.task_id) && t.status === "succeeded"
         );
         if (succeeded) {
+          this.callbacks.onBasemapRefresh();
           this.callbacks.onToast(
             `Offline pack ready: ${succeeded.manifest?.name ?? succeeded.region}`,
             "success"
@@ -330,6 +380,7 @@ export class PacksModal {
         include_osm: this.incOsmCheck.checked,
         include_dem: this.incDemCheck.checked,
         include_overlays: this.incOverlaysCheck.checked,
+        include_basemap: this.incBasemapCheck.checked,
         dem_tier: this.demTierSelect.value as PackDemTier,
       });
       this.tasks = [task, ...this.tasks.filter((t) => t.task_id !== task.task_id)];
@@ -354,6 +405,7 @@ export class PacksModal {
       await deletePack(packId);
       this.packs = this.packs.filter((p) => p.pack_id !== packId);
       this.callbacks.onPacksUpdated(this.packs);
+      this.callbacks.onBasemapRefresh();
       this.callbacks.onToast(`Deleted offline pack "${packId}"`, "info");
     } catch (err) {
       const msg =
@@ -399,7 +451,7 @@ export class PacksModal {
     if (this.packs.length === 0) {
       this.installedEl.innerHTML = `
         <div class="gf-wp-empty">
-          No offline packs installed yet. Build any curated region below for 100% air-gapped rendering.
+          No offline packs installed yet. Build any curated AU, NZ, or North America region below for 100% air-gapped rendering.
         </div>
       `;
       return;
@@ -409,12 +461,15 @@ export class PacksModal {
       .map((p) => {
         const busy = this.deletingIds.has(p.pack_id);
         const zones = p.utm_zones.join(", ");
+        const basemapPill = p.has_basemap
+          ? ` · <span class="gf-pack-bm-pill">Basemap</span>`
+          : "";
         return `
           <div class="gf-pack-card">
             <div class="gf-pack-card-main">
               <div class="gf-pack-card-title">${escapeHtml(p.name)}</div>
               <div class="gf-pack-card-meta mono">
-                ${escapeHtml(p.region)} · UTM ${escapeHtml(zones || "—")} · ${escapeHtml(p.vertical_datum)} · ${escapeHtml(formatBytes(p.size_bytes))}
+                ${escapeHtml(p.region)} · UTM ${escapeHtml(zones || "—")} · ${escapeHtml(p.vertical_datum)} · ${escapeHtml(formatBytes(p.size_bytes))}${basemapPill}
               </div>
             </div>
             <div class="gf-pack-card-actions">
@@ -473,22 +528,25 @@ export class PacksModal {
     }
 
     this.regionsEl.className = "gf-pack-regions-grid";
-    const filtered = this.regions.filter((r) => r.kind === this.activeTab);
+    const filtered = this.regions.filter((r) => r.group === this.activeTab);
     if (filtered.length === 0) {
-      this.regionsEl.innerHTML = `<div class="gf-wp-empty">Loading curated Australian regions…</div>`;
+      this.regionsEl.innerHTML = `<div class="gf-wp-empty">Loading curated offline pack regions…</div>`;
       return;
     }
 
     this.regionsEl.innerHTML = filtered
       .map((r) => {
         const b = r.bbox_wgs84;
-        const bboxText = `${b.min_x.toFixed(1)}°E–${b.max_x.toFixed(1)}°E, ${Math.abs(b.max_y).toFixed(1)}°S–${Math.abs(b.min_y).toFixed(1)}°S`;
+        const bboxText = `${formatLonDeg(b.min_x)}–${formatLonDeg(b.max_x)}, ${formatLatDeg(b.min_y)}–${formatLatDeg(b.max_y)}`;
+        const sizeHint = r.estimated_size_hint
+          ? ` · ${r.estimated_size_hint}`
+          : "";
         const busy = this.submittingRegion === r.region_id;
         return `
           <div class="gf-region-card">
             <div class="gf-region-info">
               <div class="gf-region-name">${escapeHtml(r.name)}</div>
-              <div class="gf-region-meta mono">UTM ${escapeHtml(r.utm_zones.join(", "))} · ${escapeHtml(bboxText)}</div>
+              <div class="gf-region-meta mono">UTM ${escapeHtml(r.utm_zones.join(", ") || "—")} · ${escapeHtml(bboxText)}${escapeHtml(sizeHint)}</div>
             </div>
             <button
               type="button"

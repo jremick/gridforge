@@ -3,13 +3,17 @@ import {
   ATLAS_GRID_OPTIONS,
   AU_OVERLAY_OPTIONS,
   AU_STATE_TRAIL_CHIPS,
+  CA_OVERLAY_OPTIONS,
   CARTO_TOGGLES,
+  COLOR_MODE_OPTIONS,
   DEM_SOURCE_OPTIONS,
   DENSITY_OPTIONS,
   HILLSHADE_OPTIONS,
   LOCATION_PRESETS,
   NZ_OVERLAY_OPTIONS,
   PAPER_OPTIONS,
+  PRESET_REGION_TABS,
+  RF_BAND_PRESETS,
   SCALE_OPTIONS,
   US_OVERLAY_OPTIONS,
   WAYPOINT_CATEGORY_OPTIONS,
@@ -18,10 +22,12 @@ import {
   isStripEligibleFile,
   looksLikeCoordOrMgrs,
 } from "../presets";
+import { renderRFLinkSvg } from "./rfChart";
 import type {
   AUOverlayKind,
   AUStateTrailKind,
   AppFormState,
+  CAOverlayKind,
   ColorMode,
   DemSourceKind,
   DensityLevel,
@@ -30,11 +36,14 @@ import type {
   HillshadeStrength,
   LocationPreset,
   MBTilesFormat,
+  MapInteractionMode,
   NZOverlayKind,
   Orientation,
   PackSummary,
   PaperSize,
+  PresetRegionTab,
   RouteMetricsResponse,
+  RulerMetricsResponse,
   USOverlayKind,
   Units,
   WaypointCategory,
@@ -47,17 +56,25 @@ export interface SidebarCallbacks {
   onPresetSelect: (preset: LocationPreset) => void;
   onFootprintParamsChange: (options?: { fitAfterLoad?: boolean }) => void;
   onStateChange: () => void;
+  onPackChange: (packId: string) => void;
   onOverlayFileChange: (file: File | null) => void;
   onAutoStripPlan: () => void;
   onClearStripPlan: () => void;
-  onToggleMarkupMode: () => void;
-  onToggleViewshedMode: () => void;
+  onToggleInteractionMode: (mode: MapInteractionMode) => void;
   onWaypointEdit: (
     index: number,
     patch: { label?: string; category?: WaypointCategory }
   ) => void;
   onWaypointDelete: (index: number) => void;
   onWaypointsClear: () => void;
+  onRulerPinToPdf: () => void;
+  onRulerClear: () => void;
+  onRingRadiiChange: (radiiKm: number[]) => void;
+  onSectorFinish: () => void;
+  onSectorCancel: () => void;
+  onTacticalLabelEdit: (index: number, label: string) => void;
+  onTacticalDelete: (index: number) => void;
+  onTacticalClear: () => void;
   onViewshedEdit: (
     id: string,
     patch: {
@@ -71,6 +88,10 @@ export interface SidebarCallbacks {
   onViewshedRecompute: (id: string) => void;
   onViewshedDelete: (id: string) => void;
   onViewshedsClear: () => void;
+  onRFLinkUseObservers: () => void;
+  onRFLinkRecompute: (id: string) => void;
+  onRFLinkDelete: (id: string) => void;
+  onRFLinksClear: () => void;
   onManagePacks: () => void;
   onRefreshPacks: () => void;
   onSubmitJob: () => void;
@@ -88,6 +109,14 @@ const STATE_TRAIL_CHIP_SET = new Set<AUOverlayKind>(
   AU_STATE_TRAIL_CHIPS.map((c) => c.value)
 );
 
+function parseRingRadiiText(raw: string): number[] {
+  const parsed = raw
+    .split(/[,\s]+/)
+    .map((s) => Number(s.trim()))
+    .filter((n) => Number.isFinite(n) && n > 0 && n <= 100);
+  return parsed.length > 0 ? parsed.slice(0, 6) : [1, 3, 5];
+}
+
 export class SidebarPanel {
   private readonly root: HTMLElement;
   private readonly state: AppFormState;
@@ -96,6 +125,8 @@ export class SidebarPanel {
   private centerInput!: HTMLInputElement;
   private geocodeWrapEl!: HTMLElement;
   private geocodeMenuEl!: HTMLElement;
+  private presetTabsEl!: HTMLElement;
+  private presetGridEl!: HTMLElement;
   private titleInput!: HTMLInputElement;
   private scaleSelect!: HTMLSelectElement;
   private paperSelect!: HTMLSelectElement;
@@ -116,13 +147,21 @@ export class SidebarPanel {
   private fileClearBtn!: HTMLButtonElement;
   private dropzoneEl!: HTMLElement;
   private stripBarEl!: HTMLElement;
+
+  // Section 05 Waypoints & Tactical Markup
   private waypointsSectionEl!: HTMLDetailsElement;
   private waypointsPillEl!: HTMLElement;
-  private wpMarkupBtn!: HTMLButtonElement;
   private wpClearBtn!: HTMLButtonElement;
   private wpRouteCardCheck!: HTMLInputElement;
   private wpListEl!: HTMLElement;
   private wpTotalEl!: HTMLElement;
+  private rulerBoxEl!: HTMLElement;
+  private ringRadiiInput!: HTMLInputElement;
+  private sectorDraftBarEl!: HTMLElement;
+  private tacticalListEl!: HTMLElement;
+  private tacticalClearBtn!: HTMLButtonElement;
+
+  // Section 06 RF / Viewshed
   private viewshedSectionEl!: HTMLDetailsElement;
   private viewshedPillEl!: HTMLElement;
   private vsToggleBtn!: HTMLButtonElement;
@@ -131,12 +170,26 @@ export class SidebarPanel {
   private vsDefTgtInput!: HTMLInputElement;
   private vsDefRadInput!: HTMLInputElement;
   private vsListEl!: HTMLElement;
+  private rfPickBtn!: HTMLButtonElement;
+  private rfUseObsBtn!: HTMLButtonElement;
+  private rfClearBtn!: HTMLButtonElement;
+  private rfBandSelect!: HTMLSelectElement;
+  private rfFreqInput!: HTMLInputElement;
+  private rfTxHInput!: HTMLInputElement;
+  private rfRxHInput!: HTMLInputElement;
+  private rfCardCheck!: HTMLInputElement;
+  private rfLinksListEl!: HTMLElement;
+
+  // Sticky Footer Outputs
   private outPdfCheck!: HTMLInputElement;
   private outGeoPdfCheck!: HTMLInputElement;
   private outMbtilesCheck!: HTMLInputElement;
   private outMbtilesFmt!: HTMLSelectElement;
   private outKmzCheck!: HTMLInputElement;
   private outGarminProfile!: HTMLSelectElement;
+  private outGpkgCheck!: HTMLInputElement;
+  private outOsmandCheck!: HTMLInputElement;
+  private outBundleCheck!: HTMLInputElement;
   private outDigitalGridCheck!: HTMLInputElement;
   private digitalGridRow!: HTMLElement;
   private suppPagesBoxEl!: HTMLElement;
@@ -144,17 +197,23 @@ export class SidebarPanel {
   private outRouteCardCheck!: HTMLInputElement;
   private outElevProfileCheck!: HTMLInputElement;
   private outAtlasIndexCheck!: HTMLInputElement;
+  private outRfLinkCardCheck!: HTMLInputElement;
   private generateBtn!: HTMLButtonElement;
   private formErrorEl!: HTMLElement;
   private sheetPillEl!: HTMLElement;
   private overlayPillEl!: HTMLElement;
   private cartoPillEl!: HTMLElement;
 
+  private activePresetTab: PresetRegionTab = "nsw-vic";
   private activePresetId: string | null = "blue-mountains";
-  private markupMode = false;
-  private viewshedMode = false;
+  private interactionMode: MapInteractionMode = "pan";
   private planningStrip = false;
   private routeMetrics: RouteMetricsResponse | null = null;
+  private rulerPoints: { lat: number; lon: number }[] = [];
+  private rulerMetrics: RulerMetricsResponse | null = null;
+  private rulerLoading = false;
+  private sectorDraftCount = 0;
+  private rfPendingFrom = false;
 
   private geocodeTimer: number | null = null;
   private geocodeAbort: AbortController | null = null;
@@ -179,13 +238,9 @@ export class SidebarPanel {
   }
 
   private render(): void {
-    const presetsHtml = LOCATION_PRESETS.map(
-      (p) => `
-        <button type="button" class="gf-preset-btn" data-preset="${escapeHtml(p.id)}">
-          <span class="gf-preset-name">${escapeHtml(p.label)}</span>
-          <span class="gf-preset-tag">${escapeHtml(p.regionTag)} · 1:${(p.scale / 1000).toFixed(0)}k</span>
-        </button>
-      `
+    const presetTabsHtml = PRESET_REGION_TABS.map(
+      (t) =>
+        `<button type="button" class="gf-seg-btn ${t.id === this.activePresetTab ? "active" : ""}" data-preset-tab="${t.id}">${escapeHtml(t.label)}</button>`
     ).join("");
 
     const scaleOptsHtml = SCALE_OPTIONS.map(
@@ -200,6 +255,15 @@ export class SidebarPanel {
     const atlasBtnsHtml = ATLAS_GRID_OPTIONS.map(
       (a) =>
         `<button type="button" class="gf-atlas-btn" data-atlas-cols="${a.cols}" data-atlas-rows="${a.rows}" title="${a.cols * a.rows === 1 ? "Single sheet" : `${a.cols * a.rows} edge-matched sheets`}">${escapeHtml(a.label)}</button>`
+    ).join("");
+
+    const themeBtnsHtml = COLOR_MODE_OPTIONS.map(
+      (m) => `
+        <button type="button" class="gf-theme-btn" data-value="${m.value}" title="${escapeHtml(m.hint)}">
+          <span class="gf-theme-swatch" style="background:${m.swatch}"></span>
+          <span>${escapeHtml(m.label)}</span>
+        </button>
+      `
     ).join("");
 
     const demOptsHtml = DEM_SOURCE_OPTIONS.map(
@@ -227,6 +291,18 @@ export class SidebarPanel {
       (o) => `
         <label class="gf-check-row">
           <input type="checkbox" data-nz-overlay="${o.value}" />
+          <span class="gf-check-text">
+            <span class="gf-check-title">${escapeHtml(o.label)}</span>
+            <span class="gf-check-hint">${escapeHtml(o.hint)}</span>
+          </span>
+        </label>
+      `
+    ).join("");
+
+    const caOverlaysHtml = CA_OVERLAY_OPTIONS.map(
+      (o) => `
+        <label class="gf-check-row">
+          <input type="checkbox" data-ca-overlay="${o.value}" />
           <span class="gf-check-text">
             <span class="gf-check-title">${escapeHtml(o.label)}</span>
             <span class="gf-check-hint">${escapeHtml(o.hint)}</span>
@@ -264,6 +340,14 @@ export class SidebarPanel {
       `
     ).join("");
 
+    const rfBandOptsHtml = [
+      ...RF_BAND_PRESETS.map(
+        (b) =>
+          `<option value="${b.freq_mhz}">${escapeHtml(b.label)} (${b.freq_mhz} MHz)</option>`
+      ),
+      `<option value="custom">Custom MHz</option>`,
+    ].join("");
+
     this.root.innerHTML = `
       <div class="gf-sidebar-scroll">
         <!-- 1. Location & Presets -->
@@ -299,10 +383,14 @@ export class SidebarPanel {
               </div>
             </div>
             <div class="gf-field">
-              <span class="gf-label">Quick-Jump Presets</span>
-              <div class="gf-preset-grid">
-                ${presetsHtml}
+              <div class="gf-label">
+                <span>Quick-Jump Presets</span>
+                <span class="gf-sublabel">32 curated regions</span>
               </div>
+              <div class="gf-segmented gf-preset-tabs" data-role="preset-tabs">
+                ${presetTabsHtml}
+              </div>
+              <div class="gf-preset-grid" data-role="preset-grid"></div>
             </div>
           </div>
         </details>
@@ -369,6 +457,16 @@ export class SidebarPanel {
               </div>
             </div>
 
+            <div class="gf-field">
+              <span class="gf-label">
+                <span>Map Theme</span>
+                <span class="gf-sublabel">Color · B&amp;W · Night-Red · Alpine</span>
+              </span>
+              <div class="gf-theme-grid" data-seg="color_mode">
+                ${themeBtnsHtml}
+              </div>
+            </div>
+
             <div class="gf-field-row">
               <div class="gf-field">
                 <span class="gf-label">Orientation</span>
@@ -378,19 +476,11 @@ export class SidebarPanel {
                 </div>
               </div>
               <div class="gf-field">
-                <span class="gf-label">Color Mode</span>
-                <div class="gf-segmented" data-seg="color_mode">
-                  <button type="button" class="gf-seg-btn" data-value="color">Color</button>
-                  <button type="button" class="gf-seg-btn" data-value="bw">B&amp;W Print</button>
+                <span class="gf-label">Units</span>
+                <div class="gf-segmented" data-seg="units">
+                  <button type="button" class="gf-seg-btn" data-value="metric">Metric</button>
+                  <button type="button" class="gf-seg-btn" data-value="imperial">Imperial</button>
                 </div>
-              </div>
-            </div>
-
-            <div class="gf-field">
-              <span class="gf-label">Elevation &amp; Scale Bar Units</span>
-              <div class="gf-segmented" data-seg="units">
-                <button type="button" class="gf-seg-btn" data-value="metric">Metric (m / km)</button>
-                <button type="button" class="gf-seg-btn" data-value="imperial">Imperial (ft / mi)</button>
               </div>
             </div>
           </div>
@@ -452,8 +542,9 @@ export class SidebarPanel {
             </div>
 
             <div class="gf-overlay-group">
-              <span class="gf-overlay-heading">North America Overlays</span>
+              <span class="gf-overlay-heading">North America Overlays (US &amp; Canada)</span>
               ${usOverlaysHtml}
+              ${caOverlaysHtml}
             </div>
           </div>
         </details>
@@ -534,12 +625,12 @@ export class SidebarPanel {
           </div>
         </details>
 
-        <!-- 5. Waypoints & Route Card -->
+        <!-- 5. Waypoints & Tactical Markup -->
         <details class="gf-section" data-role="waypoints-section">
           <summary class="gf-section-summary">
             <span class="gf-section-title-group">
               <span class="gf-section-index">05</span>
-              <span class="gf-section-title">Waypoints &amp; Route Card</span>
+              <span class="gf-section-title">Waypoints &amp; Tactical</span>
             </span>
             <span class="gf-section-meta">
               <span class="gf-section-pill" data-role="waypoints-pill">0 WPs</span>
@@ -547,13 +638,39 @@ export class SidebarPanel {
             </span>
           </summary>
           <div class="gf-section-body">
-            <div class="gf-wp-controls">
-              <button type="button" class="gf-wp-markup-btn" data-role="wp-markup-toggle">
-                <span>⌖ Drop on Map</span>
-              </button>
-              <button type="button" class="gf-mini-btn danger" data-role="wp-clear-all" disabled>
-                Clear All
-              </button>
+            <div class="gf-tactical-tools-grid">
+              <button type="button" class="gf-tool-btn" data-tool-btn="markup" title="Drop numbered waypoints on map (M)">⌖ WP</button>
+              <button type="button" class="gf-tool-btn" data-tool-btn="ruler" title="Measure distance, magnetic bearing & grade (R)">📏 Ruler</button>
+              <button type="button" class="gf-tool-btn" data-tool-btn="ring" title="Drop concentric range rings on map">◎ Ring</button>
+              <button type="button" class="gf-tool-btn" data-tool-btn="sector" title="Click ≥3 vertices to draw shaded AOI sector">⬠ Sector</button>
+            </div>
+
+            <div class="gf-ruler-box hidden" data-role="ruler-box"></div>
+            <div class="gf-sector-draft-bar hidden" data-role="sector-draft-bar"></div>
+
+            <div class="gf-field-row gf-ring-opt-row">
+              <div class="gf-field">
+                <label class="gf-label" for="gf-ring-radii">Ring Radii (km)</label>
+                <input
+                  id="gf-ring-radii"
+                  class="gf-input mono"
+                  type="text"
+                  data-role="ring-radii-input"
+                  value="1, 3, 5"
+                  placeholder="1, 3, 5"
+                />
+              </div>
+              <div class="gf-field gf-tactical-clear-wrap">
+                <span class="gf-label">Graphics</span>
+                <button type="button" class="gf-mini-btn danger" data-role="tactical-clear-all" disabled>Clear Graphics</button>
+              </div>
+            </div>
+
+            <div class="gf-wp-list" data-role="tactical-list"></div>
+
+            <div class="gf-subdivider">
+              <span>Route Waypoints</span>
+              <button type="button" class="gf-mini-btn danger" data-role="wp-clear-all" disabled>Clear WPs</button>
             </div>
 
             <label class="gf-inline-check gf-wp-card-toggle">
@@ -566,7 +683,7 @@ export class SidebarPanel {
           </div>
         </details>
 
-        <!-- 6. RF / Line-of-Sight Viewshed -->
+        <!-- 6. RF / Line-of-Sight Viewshed & Link Profile -->
         <details class="gf-section" data-role="viewshed-section">
           <summary class="gf-section-summary">
             <span class="gf-section-title-group">
@@ -579,6 +696,7 @@ export class SidebarPanel {
             </span>
           </summary>
           <div class="gf-section-body">
+            <div class="gf-subdivider"><span>Area Viewshed (DEM LOS)</span></div>
             <div class="gf-wp-controls">
               <button type="button" class="gf-wp-markup-btn gf-vs-toggle-btn" data-role="vs-toggle">
                 <span>📡 Drop Observer</span>
@@ -591,43 +709,63 @@ export class SidebarPanel {
             <div class="gf-field-row-3">
               <div class="gf-field">
                 <label class="gf-label" for="gf-vs-obs-h">Obs H (m)</label>
-                <input
-                  id="gf-vs-obs-h"
-                  class="gf-input mono"
-                  type="number"
-                  min="0"
-                  max="500"
-                  step="0.5"
-                  value="2"
-                />
+                <input id="gf-vs-obs-h" class="gf-input mono" type="number" min="0" max="500" step="0.5" value="2" />
               </div>
               <div class="gf-field">
                 <label class="gf-label" for="gf-vs-tgt-h">Tgt H (m)</label>
-                <input
-                  id="gf-vs-tgt-h"
-                  class="gf-input mono"
-                  type="number"
-                  min="0"
-                  max="500"
-                  step="0.5"
-                  value="1.5"
-                />
+                <input id="gf-vs-tgt-h" class="gf-input mono" type="number" min="0" max="500" step="0.5" value="1.5" />
               </div>
               <div class="gf-field">
                 <label class="gf-label" for="gf-vs-rad-km">Max (km)</label>
-                <input
-                  id="gf-vs-rad-km"
-                  class="gf-input mono"
-                  type="number"
-                  min="0.25"
-                  max="25"
-                  step="0.5"
-                  value="10"
-                />
+                <input id="gf-vs-rad-km" class="gf-input mono" type="number" min="0.25" max="25" step="0.5" value="10" />
               </div>
             </div>
 
             <div class="gf-wp-list" data-role="vs-list"></div>
+
+            <!-- Point-to-Point RF Link Profile (A ↔ B) -->
+            <div class="gf-subdivider">
+              <span>Point-to-Point RF Link (A ↔ B)</span>
+              <button type="button" class="gf-mini-btn danger" data-role="rf-link-clear" disabled>Clear</button>
+            </div>
+
+            <div class="gf-wp-controls">
+              <button type="button" class="gf-wp-markup-btn gf-rf-pick-btn" data-role="rf-link-toggle">
+                <span>⚡ A ↔ B Pick</span>
+              </button>
+              <button type="button" class="gf-mini-btn" data-role="rf-use-obs" disabled title="Compute Fresnel link between OBS1 and OBS2">
+                OBS1 → OBS2
+              </button>
+            </div>
+
+            <div class="gf-field">
+              <label class="gf-label" for="gf-rf-band">Radio Band / Frequency</label>
+              <select id="gf-rf-band" class="gf-select" data-role="rf-band">
+                ${rfBandOptsHtml}
+              </select>
+            </div>
+
+            <div class="gf-field-row-3">
+              <div class="gf-field">
+                <label class="gf-label" for="gf-rf-freq">Freq (MHz)</label>
+                <input id="gf-rf-freq" class="gf-input mono" type="number" min="30" max="60000" step="0.1" value="915" />
+              </div>
+              <div class="gf-field">
+                <label class="gf-label" for="gf-rf-tx-h">Tx H (m)</label>
+                <input id="gf-rf-tx-h" class="gf-input mono" type="number" min="0" max="500" step="0.5" value="2" />
+              </div>
+              <div class="gf-field">
+                <label class="gf-label" for="gf-rf-rx-h">Rx H (m)</label>
+                <input id="gf-rf-rx-h" class="gf-input mono" type="number" min="0" max="500" step="0.5" value="2" />
+              </div>
+            </div>
+
+            <label class="gf-inline-check">
+              <input type="checkbox" data-role="rf-link-card" />
+              <span>Include RF Fresnel Link Card PDF Page</span>
+            </label>
+
+            <div class="gf-wp-list gf-rf-list" data-role="rf-links-list"></div>
           </div>
         </details>
       </div>
@@ -664,6 +802,10 @@ export class SidebarPanel {
                 <input type="checkbox" data-role="out-atlas-index" />
                 <span>Atlas Index</span>
               </label>
+              <label class="gf-inline-check" title="Append RF Fresnel Zone & FSPL Link Card PDF page">
+                <input type="checkbox" data-role="out-rf-link-card" />
+                <span>RF Link Card</span>
+              </label>
             </div>
           </div>
 
@@ -691,6 +833,21 @@ export class SidebarPanel {
                 <option value="modern">Modern ≤500</option>
               </select>
             </div>
+          </div>
+
+          <div class="gf-extra-outputs">
+            <label class="gf-output-chip" title="OGC GeoPackage Raster Tiles (.gpkg) for QGIS, AlpineQuest & Gaia">
+              <input type="checkbox" data-role="out-gpkg" />
+              <span>.gpkg</span>
+            </label>
+            <label class="gf-output-chip" title="OsmAnd / Locus Map BigPlanet SQLite (.sqlitedb)">
+              <input type="checkbox" data-role="out-osmand" />
+              <span>.sqlitedb</span>
+            </label>
+            <label class="gf-output-chip gf-bundle-chip" title="Single Field Bundle (.zip) containing PDF, digital tiles, GPX 1.1 & README">
+              <input type="checkbox" data-role="out-bundle" />
+              <span>Field Bundle (.zip)</span>
+            </label>
           </div>
 
           <label class="gf-inline-check" data-role="digital-grid-row" style="padding: 1px 4px;">
@@ -724,6 +881,8 @@ export class SidebarPanel {
     this.centerInput = this.q<HTMLInputElement>("#gf-center-input");
     this.geocodeWrapEl = this.q("[data-role='geocode-wrap']");
     this.geocodeMenuEl = this.q("[data-role='geocode-menu']");
+    this.presetTabsEl = this.q("[data-role='preset-tabs']");
+    this.presetGridEl = this.q("[data-role='preset-grid']");
     this.titleInput = this.q<HTMLInputElement>("#gf-title-input");
     this.scaleSelect = this.q<HTMLSelectElement>("#gf-scale-select");
     this.paperSelect = this.q<HTMLSelectElement>("#gf-paper-select");
@@ -746,19 +905,27 @@ export class SidebarPanel {
     this.fileClearBtn = this.q<HTMLButtonElement>("[data-role='file-clear']");
     this.dropzoneEl = this.q("[data-role='dropzone']");
     this.stripBarEl = this.q("[data-role='strip-bar']");
+
     this.waypointsSectionEl = this.q<HTMLDetailsElement>(
       "[data-role='waypoints-section']"
     );
     this.waypointsPillEl = this.q("[data-role='waypoints-pill']");
-    this.wpMarkupBtn = this.q<HTMLButtonElement>(
-      "[data-role='wp-markup-toggle']"
-    );
     this.wpClearBtn = this.q<HTMLButtonElement>("[data-role='wp-clear-all']");
     this.wpRouteCardCheck = this.q<HTMLInputElement>(
       "[data-role='wp-route-card']"
     );
     this.wpListEl = this.q("[data-role='wp-list']");
     this.wpTotalEl = this.q("[data-role='wp-total']");
+    this.rulerBoxEl = this.q("[data-role='ruler-box']");
+    this.ringRadiiInput = this.q<HTMLInputElement>(
+      "[data-role='ring-radii-input']"
+    );
+    this.sectorDraftBarEl = this.q("[data-role='sector-draft-bar']");
+    this.tacticalListEl = this.q("[data-role='tactical-list']");
+    this.tacticalClearBtn = this.q<HTMLButtonElement>(
+      "[data-role='tactical-clear-all']"
+    );
+
     this.viewshedSectionEl = this.q<HTMLDetailsElement>(
       "[data-role='viewshed-section']"
     );
@@ -769,6 +936,17 @@ export class SidebarPanel {
     this.vsDefTgtInput = this.q<HTMLInputElement>("#gf-vs-tgt-h");
     this.vsDefRadInput = this.q<HTMLInputElement>("#gf-vs-rad-km");
     this.vsListEl = this.q("[data-role='vs-list']");
+
+    this.rfPickBtn = this.q<HTMLButtonElement>("[data-role='rf-link-toggle']");
+    this.rfUseObsBtn = this.q<HTMLButtonElement>("[data-role='rf-use-obs']");
+    this.rfClearBtn = this.q<HTMLButtonElement>("[data-role='rf-link-clear']");
+    this.rfBandSelect = this.q<HTMLSelectElement>("[data-role='rf-band']");
+    this.rfFreqInput = this.q<HTMLInputElement>("#gf-rf-freq");
+    this.rfTxHInput = this.q<HTMLInputElement>("#gf-rf-tx-h");
+    this.rfRxHInput = this.q<HTMLInputElement>("#gf-rf-rx-h");
+    this.rfCardCheck = this.q<HTMLInputElement>("[data-role='rf-link-card']");
+    this.rfLinksListEl = this.q("[data-role='rf-links-list']");
+
     this.outPdfCheck = this.q<HTMLInputElement>("[data-role='out-pdf']");
     this.outGeoPdfCheck = this.q<HTMLInputElement>("[data-role='out-geopdf']");
     this.outMbtilesCheck = this.q<HTMLInputElement>("[data-role='out-mbtiles']");
@@ -779,6 +957,9 @@ export class SidebarPanel {
     this.outGarminProfile = this.q<HTMLSelectElement>(
       "[data-role='out-garmin-profile']"
     );
+    this.outGpkgCheck = this.q<HTMLInputElement>("[data-role='out-gpkg']");
+    this.outOsmandCheck = this.q<HTMLInputElement>("[data-role='out-osmand']");
+    this.outBundleCheck = this.q<HTMLInputElement>("[data-role='out-bundle']");
     this.outDigitalGridCheck = this.q<HTMLInputElement>(
       "[data-role='out-digital-grid']"
     );
@@ -796,17 +977,48 @@ export class SidebarPanel {
     this.outAtlasIndexCheck = this.q<HTMLInputElement>(
       "[data-role='out-atlas-index']"
     );
+    this.outRfLinkCardCheck = this.q<HTMLInputElement>(
+      "[data-role='out-rf-link-card']"
+    );
     this.generateBtn = this.q<HTMLButtonElement>("[data-role='generate-btn']");
     this.formErrorEl = this.q("[data-role='form-error']");
     this.sheetPillEl = this.q("[data-role='sheet-pill']");
     this.overlayPillEl = this.q("[data-role='overlay-pill']");
     this.cartoPillEl = this.q("[data-role='carto-pill']");
+
+    this.renderPresetCards();
   }
 
   private q<T extends HTMLElement = HTMLElement>(selector: string): T {
     const el = this.root.querySelector<T>(selector);
     if (!el) throw new Error(`Sidebar element not found: ${selector}`);
     return el;
+  }
+
+  private renderPresetCards(): void {
+    const list = LOCATION_PRESETS.filter((p) => p.tab === this.activePresetTab);
+    this.presetGridEl.innerHTML = list
+      .map(
+        (p) => `
+          <button type="button" class="gf-preset-btn ${p.id === this.activePresetId ? "active" : ""}" data-preset="${escapeHtml(p.id)}">
+            <span class="gf-preset-name">${escapeHtml(p.label)}</span>
+            <span class="gf-preset-tag">${escapeHtml(p.regionTag)} · 1:${(p.scale / 1000).toFixed(0)}k</span>
+          </button>
+        `
+      )
+      .join("");
+  }
+
+  private hasAnyOutputEnabled(): boolean {
+    const o = this.state.outputs;
+    return (
+      o.pdf ||
+      o.mbtiles ||
+      o.kmz ||
+      o.gpkg_tiles ||
+      o.osmand_sqlitedb ||
+      o.field_bundle_zip
+    );
   }
 
   private bindEvents(): void {
@@ -828,6 +1040,7 @@ export class SidebarPanel {
         this.closeGeocodeMenu();
         this.activePresetId = null;
         this.updatePresetButtons();
+        this.setFormError(null);
         this.callbacks.onCenterSubmit(value);
         return;
       }
@@ -863,6 +1076,7 @@ export class SidebarPanel {
     });
 
     this.centerInput.addEventListener("input", () => {
+      this.setFormError(null);
       const value = this.centerInput.value.trim();
       if (value.length < 2 || looksLikeCoordOrMgrs(value)) {
         this.closeGeocodeMenu();
@@ -922,33 +1136,49 @@ export class SidebarPanel {
       }
     });
 
-    this.root
-      .querySelectorAll<HTMLButtonElement>("[data-preset]")
-      .forEach((btn) => {
-        btn.addEventListener("click", () => {
-          const preset = LOCATION_PRESETS.find(
-            (p) => p.id === btn.dataset.preset
-          );
-          if (!preset) return;
-          this.closeGeocodeMenu();
-          this.activePresetId = preset.id;
-          this.callbacks.onPresetSelect(preset);
-        });
-      });
+    // Preset Region Tabs
+    this.presetTabsEl.addEventListener("click", (e) => {
+      const target = e.target as HTMLElement | null;
+      const btn = target?.closest<HTMLButtonElement>("[data-preset-tab]");
+      if (!btn) return;
+      const tab = btn.dataset.presetTab as PresetRegionTab;
+      if (!tab || tab === this.activePresetTab) return;
+      this.activePresetTab = tab;
+      this.presetTabsEl
+        .querySelectorAll<HTMLButtonElement>("[data-preset-tab]")
+        .forEach((b) => b.classList.toggle("active", b === btn));
+      this.renderPresetCards();
+    });
+
+    // Delegated Preset Card clicks
+    this.presetGridEl.addEventListener("click", (e) => {
+      const target = e.target as HTMLElement | null;
+      const btn = target?.closest<HTMLButtonElement>("[data-preset]");
+      if (!btn) return;
+      const preset = LOCATION_PRESETS.find((p) => p.id === btn.dataset.preset);
+      if (!preset) return;
+      this.closeGeocodeMenu();
+      this.activePresetId = preset.id;
+      this.setFormError(null);
+      this.callbacks.onPresetSelect(preset);
+    });
 
     this.titleInput.addEventListener("input", () => {
       this.state.title = this.titleInput.value;
+      this.setFormError(null);
       this.callbacks.onStateChange();
     });
 
     this.scaleSelect.addEventListener("change", () => {
       this.state.scale = Number(this.scaleSelect.value);
+      this.setFormError(null);
       this.updateSectionPills();
       this.callbacks.onFootprintParamsChange();
     });
 
     this.paperSelect.addEventListener("change", () => {
       this.state.paper = this.paperSelect.value as PaperSize;
+      this.setFormError(null);
       this.updateSectionPills();
       this.callbacks.onFootprintParamsChange();
     });
@@ -957,6 +1187,7 @@ export class SidebarPanel {
       this.state.include_atlas_index = checked;
       this.sheetAtlasIndexCheck.checked = checked;
       this.outAtlasIndexCheck.checked = checked;
+      this.setFormError(null);
       this.callbacks.onStateChange();
     };
 
@@ -985,6 +1216,7 @@ export class SidebarPanel {
             this.sheetAtlasIndexCheck.checked = false;
             this.outAtlasIndexCheck.checked = false;
           }
+          this.setFormError(null);
           this.updateAtlasButtons();
           this.updateSectionPills();
           this.callbacks.onFootprintParamsChange({ fitAfterLoad: true });
@@ -993,6 +1225,7 @@ export class SidebarPanel {
 
     this.foldMarksCheck.addEventListener("change", () => {
       this.state.show_fold_marks = this.foldMarksCheck.checked;
+      this.setFormError(null);
       this.callbacks.onStateChange();
     });
 
@@ -1002,29 +1235,35 @@ export class SidebarPanel {
 
     this.bindSegmented("orientation", (val) => {
       this.state.orientation = val as Orientation;
+      this.setFormError(null);
       this.updateSectionPills();
       this.callbacks.onFootprintParamsChange();
     });
 
     this.bindSegmented("color_mode", (val) => {
       this.state.color_mode = val as ColorMode;
+      this.setFormError(null);
       this.callbacks.onStateChange();
     });
 
     this.bindSegmented("units", (val) => {
       this.state.units = val as Units;
+      this.setFormError(null);
       this.callbacks.onFootprintParamsChange();
     });
 
     this.demSelect.addEventListener("change", () => {
       this.state.dem_source = this.demSelect.value as DemSourceKind;
+      this.setFormError(null);
       this.updateSectionPills();
       this.callbacks.onStateChange();
     });
 
     this.packSelect.addEventListener("change", () => {
       this.state.pack_id = this.packSelect.value;
+      this.setFormError(null);
       this.updateSectionPills();
+      this.callbacks.onPackChange(this.state.pack_id);
       this.callbacks.onStateChange();
     });
 
@@ -1043,6 +1282,7 @@ export class SidebarPanel {
       this.state.au_overlays = this.stateAutoCheck.checked
         ? ["au-state-trails", ...others]
         : others;
+      this.setFormError(null);
       this.syncStateTrailControls();
       this.updateSectionPills();
       this.callbacks.onStateChange();
@@ -1061,6 +1301,7 @@ export class SidebarPanel {
           } else {
             this.state.au_overlays = [...withoutAuto, kind];
           }
+          this.setFormError(null);
           this.syncStateTrailControls();
           this.updateSectionPills();
           this.callbacks.onStateChange();
@@ -1081,6 +1322,7 @@ export class SidebarPanel {
               (k) => k !== kind
             );
           }
+          this.setFormError(null);
           this.updateSectionPills();
           this.callbacks.onStateChange();
         });
@@ -1100,6 +1342,27 @@ export class SidebarPanel {
               (k) => k !== kind
             );
           }
+          this.setFormError(null);
+          this.updateSectionPills();
+          this.callbacks.onStateChange();
+        });
+      });
+
+    this.root
+      .querySelectorAll<HTMLInputElement>("[data-ca-overlay]")
+      .forEach((cb) => {
+        cb.addEventListener("change", () => {
+          const kind = cb.dataset.caOverlay as CAOverlayKind;
+          if (cb.checked) {
+            if (!this.state.ca_overlays.includes(kind)) {
+              this.state.ca_overlays = [...this.state.ca_overlays, kind];
+            }
+          } else {
+            this.state.ca_overlays = this.state.ca_overlays.filter(
+              (k) => k !== kind
+            );
+          }
+          this.setFormError(null);
           this.updateSectionPills();
           this.callbacks.onStateChange();
         });
@@ -1119,6 +1382,7 @@ export class SidebarPanel {
               (k) => k !== kind
             );
           }
+          this.setFormError(null);
           this.updateSectionPills();
           this.callbacks.onStateChange();
         });
@@ -1127,6 +1391,7 @@ export class SidebarPanel {
     this.contourSelect.addEventListener("change", () => {
       this.state.carto.contour_density = this.contourSelect
         .value as DensityLevel;
+      this.setFormError(null);
       this.updateSectionPills();
       this.callbacks.onStateChange();
     });
@@ -1134,6 +1399,7 @@ export class SidebarPanel {
     this.hillshadeSelect.addEventListener("change", () => {
       this.state.carto.hillshade_strength = this.hillshadeSelect
         .value as HillshadeStrength;
+      this.setFormError(null);
       this.updateSectionPills();
       this.callbacks.onStateChange();
     });
@@ -1141,6 +1407,7 @@ export class SidebarPanel {
     this.labelDensitySelect.addEventListener("change", () => {
       this.state.carto.label_density = this.labelDensitySelect
         .value as DensityLevel;
+      this.setFormError(null);
       this.updateSectionPills();
       this.callbacks.onStateChange();
     });
@@ -1159,6 +1426,7 @@ export class SidebarPanel {
             key === "show_river_arrows"
           ) {
             this.state.carto[key] = cb.checked;
+            this.setFormError(null);
             this.updateSectionPills();
             this.callbacks.onStateChange();
           }
@@ -1167,6 +1435,7 @@ export class SidebarPanel {
 
     this.slopeCheck.addEventListener("change", () => {
       this.state.carto.show_slope_shading = this.slopeCheck.checked;
+      this.setFormError(null);
       this.updateSectionPills();
       this.callbacks.onStateChange();
     });
@@ -1212,6 +1481,7 @@ export class SidebarPanel {
       const target = e.target as HTMLElement | null;
       const btn = target?.closest<HTMLButtonElement>("button[data-strip-action]");
       if (!btn) return;
+      this.setFormError(null);
       const action = btn.dataset.stripAction;
       if (action === "plan") {
         this.callbacks.onAutoStripPlan();
@@ -1220,12 +1490,75 @@ export class SidebarPanel {
       }
     });
 
-    // Section 05 Waypoints
-    this.wpMarkupBtn.addEventListener("click", () => {
-      this.callbacks.onToggleMarkupMode();
+    // Section 05 Waypoints & Tactical Markup
+    this.root
+      .querySelectorAll<HTMLButtonElement>("[data-tool-btn]")
+      .forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const tool = btn.dataset.toolBtn as MapInteractionMode;
+          this.callbacks.onToggleInteractionMode(tool);
+        });
+      });
+
+    this.rulerBoxEl.addEventListener("click", (e) => {
+      const target = e.target as HTMLElement | null;
+      const btn = target?.closest<HTMLButtonElement>("button[data-ruler-action]");
+      if (!btn) return;
+      if (btn.dataset.rulerAction === "pin") {
+        this.setFormError(null);
+        this.callbacks.onRulerPinToPdf();
+      } else if (btn.dataset.rulerAction === "clear") {
+        this.callbacks.onRulerClear();
+      }
+    });
+
+    this.sectorDraftBarEl.addEventListener("click", (e) => {
+      const target = e.target as HTMLElement | null;
+      const btn = target?.closest<HTMLButtonElement>(
+        "button[data-sector-action]"
+      );
+      if (!btn) return;
+      if (btn.dataset.sectorAction === "finish") {
+        this.setFormError(null);
+        this.callbacks.onSectorFinish();
+      } else if (btn.dataset.sectorAction === "cancel") {
+        this.callbacks.onSectorCancel();
+      }
+    });
+
+    this.ringRadiiInput.addEventListener("change", () => {
+      const radii = parseRingRadiiText(this.ringRadiiInput.value);
+      this.ringRadiiInput.value = radii.join(", ");
+      this.callbacks.onRingRadiiChange(radii);
+    });
+
+    this.tacticalClearBtn.addEventListener("click", () => {
+      this.setFormError(null);
+      this.callbacks.onTacticalClear();
+    });
+
+    this.tacticalListEl.addEventListener("change", (e) => {
+      const target = e.target as HTMLElement | null;
+      if (target instanceof HTMLInputElement && target.dataset.tgLabel) {
+        const idx = Number(target.dataset.tgLabel);
+        this.setFormError(null);
+        this.callbacks.onTacticalLabelEdit(
+          idx,
+          target.value.trim() || `TG${idx + 1}`
+        );
+      }
+    });
+
+    this.tacticalListEl.addEventListener("click", (e) => {
+      const target = e.target as HTMLElement | null;
+      const btn = target?.closest<HTMLButtonElement>("button[data-tg-del]");
+      if (!btn) return;
+      this.setFormError(null);
+      this.callbacks.onTacticalDelete(Number(btn.dataset.tgDel));
     });
 
     this.wpClearBtn.addEventListener("click", () => {
+      this.setFormError(null);
       this.callbacks.onWaypointsClear();
     });
 
@@ -1233,6 +1566,7 @@ export class SidebarPanel {
       this.state.include_route_card = checked;
       this.wpRouteCardCheck.checked = checked;
       this.outRouteCardCheck.checked = checked;
+      this.setFormError(null);
       this.callbacks.onStateChange();
     };
 
@@ -1243,6 +1577,7 @@ export class SidebarPanel {
     this.wpListEl.addEventListener("change", (e) => {
       const target = e.target as HTMLElement | null;
       if (!target) return;
+      this.setFormError(null);
       if (target instanceof HTMLInputElement && target.dataset.wpName) {
         const idx = Number(target.dataset.wpName);
         this.callbacks.onWaypointEdit(idx, {
@@ -1260,20 +1595,26 @@ export class SidebarPanel {
       const target = e.target as HTMLElement | null;
       const btn = target?.closest<HTMLButtonElement>("button[data-wp-del]");
       if (!btn) return;
-      const idx = Number(btn.dataset.wpDel);
-      this.callbacks.onWaypointDelete(idx);
+      this.setFormError(null);
+      this.callbacks.onWaypointDelete(Number(btn.dataset.wpDel));
     });
 
-    // Section 06 RF / Viewshed
+    // Section 06 RF / Viewshed + Point-to-Point RF Link
     this.vsToggleBtn.addEventListener("click", () => {
-      this.callbacks.onToggleViewshedMode();
+      this.callbacks.onToggleInteractionMode("los");
     });
 
     this.vsClearBtn.addEventListener("click", () => {
+      this.setFormError(null);
       this.callbacks.onViewshedsClear();
     });
 
-    const clampNum = (val: string, min: number, max: number, fallback: number) => {
+    const clampNum = (
+      val: string,
+      min: number,
+      max: number,
+      fallback: number
+    ) => {
       const n = Number(val);
       if (!Number.isFinite(n)) return fallback;
       return Math.min(max, Math.max(min, n));
@@ -1303,6 +1644,7 @@ export class SidebarPanel {
       const id = target.dataset.vsId;
       const field = target.dataset.vsField;
       if (!id || !field) return;
+      this.setFormError(null);
       if (field === "label") {
         this.callbacks.onViewshedEdit(
           id,
@@ -1337,6 +1679,7 @@ export class SidebarPanel {
       const action = btn.dataset.vsAction;
       const id = btn.dataset.vsId;
       if (!id) return;
+      this.setFormError(null);
       if (action === "delete") {
         this.callbacks.onViewshedDelete(id);
       } else if (action === "recompute") {
@@ -1344,31 +1687,103 @@ export class SidebarPanel {
       }
     });
 
+    // RF Point-to-Point Link controls
+    this.rfPickBtn.addEventListener("click", () => {
+      this.callbacks.onToggleInteractionMode("rf-link");
+    });
+
+    this.rfUseObsBtn.addEventListener("click", () => {
+      this.setFormError(null);
+      this.callbacks.onRFLinkUseObservers();
+    });
+
+    this.rfClearBtn.addEventListener("click", () => {
+      this.setFormError(null);
+      this.callbacks.onRFLinksClear();
+    });
+
+    this.rfBandSelect.addEventListener("change", () => {
+      if (this.rfBandSelect.value !== "custom") {
+        const freq = Number(this.rfBandSelect.value);
+        if (Number.isFinite(freq)) {
+          this.state.rfLinkDefaults.freq_mhz = freq;
+          this.rfFreqInput.value = String(freq);
+        }
+      }
+    });
+
+    this.rfFreqInput.addEventListener("change", () => {
+      const v = clampNum(this.rfFreqInput.value, 30, 60000, 915);
+      this.state.rfLinkDefaults.freq_mhz = v;
+      this.rfFreqInput.value = String(v);
+      const match = RF_BAND_PRESETS.find((b) => Math.abs(b.freq_mhz - v) < 0.05);
+      this.rfBandSelect.value = match ? String(match.freq_mhz) : "custom";
+    });
+
+    this.rfTxHInput.addEventListener("change", () => {
+      const v = clampNum(this.rfTxHInput.value, 0, 500, 2);
+      this.state.rfLinkDefaults.from_height_m = v;
+      this.rfTxHInput.value = String(v);
+    });
+
+    this.rfRxHInput.addEventListener("change", () => {
+      const v = clampNum(this.rfRxHInput.value, 0, 500, 2);
+      this.state.rfLinkDefaults.to_height_m = v;
+      this.rfRxHInput.value = String(v);
+    });
+
+    const syncRfCardChecks = (checked: boolean) => {
+      this.state.include_rf_link_card = checked;
+      this.rfCardCheck.checked = checked;
+      this.outRfLinkCardCheck.checked = checked;
+      this.setFormError(null);
+      this.callbacks.onStateChange();
+    };
+
+    this.rfCardCheck.addEventListener("change", () => {
+      syncRfCardChecks(this.rfCardCheck.checked);
+    });
+
+    this.rfLinksListEl.addEventListener("click", (e) => {
+      const target = e.target as HTMLElement | null;
+      const btn = target?.closest<HTMLButtonElement>("button[data-rf-action]");
+      if (!btn) return;
+      const id = btn.dataset.rfId;
+      if (!id) return;
+      this.setFormError(null);
+      if (btn.dataset.rfAction === "delete") {
+        this.callbacks.onRFLinkDelete(id);
+      } else if (btn.dataset.rfAction === "recompute") {
+        this.callbacks.onRFLinkRecompute(id);
+      }
+    });
+
     // Outputs
     const syncOutputControls = () => {
-      const pdfOn = this.state.outputs.pdf;
+      const o = this.state.outputs;
+      const pdfOn = o.pdf;
       this.outGeoPdfCheck.disabled = !pdfOn;
       this.outCalibrationCheck.disabled = !pdfOn;
       this.outRouteCardCheck.disabled = !pdfOn;
       this.outElevProfileCheck.disabled = !pdfOn;
       this.outAtlasIndexCheck.disabled = !pdfOn;
+      this.outRfLinkCardCheck.disabled = !pdfOn;
       this.suppPagesBoxEl.style.opacity = pdfOn ? "1" : "0.45";
       if (!pdfOn) {
-        this.state.outputs.geopdf = false;
+        o.geopdf = false;
         this.outGeoPdfCheck.checked = false;
       }
-      this.outMbtilesFmt.disabled = !this.state.outputs.mbtiles;
-      this.outGarminProfile.disabled = !this.state.outputs.kmz;
-      const anyDigital = this.state.outputs.mbtiles || this.state.outputs.kmz;
+      this.outMbtilesFmt.disabled = !o.mbtiles;
+      this.outGarminProfile.disabled = !o.kmz;
+      const anyDigital =
+        o.mbtiles || o.kmz || o.gpkg_tiles || o.osmand_sqlitedb;
       this.outDigitalGridCheck.disabled = !anyDigital;
       this.digitalGridRow.style.opacity = anyDigital ? "1" : "0.45";
 
-      const anyOutput =
-        this.state.outputs.pdf ||
-        this.state.outputs.mbtiles ||
-        this.state.outputs.kmz;
-      if (!anyOutput) {
-        this.setFormError("Select at least one output (PDF, MBTiles, or KMZ).");
+      if (!this.hasAnyOutputEnabled()) {
+        this.setFormError(
+          "Select at least one output (PDF, MBTiles, KMZ, GPKG, SQLiteDB, or Bundle)."
+        );
       } else {
         this.setFormError(null);
       }
@@ -1382,11 +1797,13 @@ export class SidebarPanel {
 
     this.outGeoPdfCheck.addEventListener("change", () => {
       this.state.outputs.geopdf = this.outGeoPdfCheck.checked;
+      this.setFormError(null);
       this.callbacks.onStateChange();
     });
 
     this.outCalibrationCheck.addEventListener("change", () => {
       this.state.include_calibration_page = this.outCalibrationCheck.checked;
+      this.setFormError(null);
       this.callbacks.onStateChange();
     });
 
@@ -1396,11 +1813,16 @@ export class SidebarPanel {
 
     this.outElevProfileCheck.addEventListener("change", () => {
       this.state.include_elevation_profile = this.outElevProfileCheck.checked;
+      this.setFormError(null);
       this.callbacks.onStateChange();
     });
 
     this.outAtlasIndexCheck.addEventListener("change", () => {
       syncAtlasIndexChecks(this.outAtlasIndexCheck.checked);
+    });
+
+    this.outRfLinkCardCheck.addEventListener("change", () => {
+      syncRfCardChecks(this.outRfLinkCardCheck.checked);
     });
 
     this.outMbtilesCheck.addEventListener("change", () => {
@@ -1412,6 +1834,7 @@ export class SidebarPanel {
     this.outMbtilesFmt.addEventListener("change", () => {
       this.state.outputs.mbtiles_format = this.outMbtilesFmt
         .value as MBTilesFormat;
+      this.setFormError(null);
       this.callbacks.onStateChange();
     });
 
@@ -1424,22 +1847,40 @@ export class SidebarPanel {
     this.outGarminProfile.addEventListener("change", () => {
       this.state.outputs.garmin_profile = this.outGarminProfile
         .value as GarminProfile;
+      this.setFormError(null);
+      this.callbacks.onStateChange();
+    });
+
+    this.outGpkgCheck.addEventListener("change", () => {
+      this.state.outputs.gpkg_tiles = this.outGpkgCheck.checked;
+      syncOutputControls();
+      this.callbacks.onStateChange();
+    });
+
+    this.outOsmandCheck.addEventListener("change", () => {
+      this.state.outputs.osmand_sqlitedb = this.outOsmandCheck.checked;
+      syncOutputControls();
+      this.callbacks.onStateChange();
+    });
+
+    this.outBundleCheck.addEventListener("change", () => {
+      this.state.outputs.field_bundle_zip = this.outBundleCheck.checked;
+      syncOutputControls();
       this.callbacks.onStateChange();
     });
 
     this.outDigitalGridCheck.addEventListener("change", () => {
       this.state.outputs.include_grid_on_digital =
         this.outDigitalGridCheck.checked;
+      this.setFormError(null);
       this.callbacks.onStateChange();
     });
 
     this.generateBtn.addEventListener("click", () => {
-      const anyOutput =
-        this.state.outputs.pdf ||
-        this.state.outputs.mbtiles ||
-        this.state.outputs.kmz;
-      if (!anyOutput) {
-        this.setFormError("Select at least one output (PDF, MBTiles, or KMZ).");
+      if (!this.hasAnyOutputEnabled()) {
+        this.setFormError(
+          "Select at least one output (PDF, MBTiles, KMZ, GPKG, SQLiteDB, or Bundle)."
+        );
         return;
       }
       this.setFormError(null);
@@ -1525,6 +1966,7 @@ export class SidebarPanel {
     this.closeGeocodeMenu();
     this.activePresetId = null;
     this.updatePresetButtons();
+    this.setFormError(null);
     this.callbacks.onPlaceSelect(place);
   }
 
@@ -1539,13 +1981,13 @@ export class SidebarPanel {
   private bindSegmented(name: string, onChange: (val: string) => void): void {
     const group = this.q(`[data-seg='${name}']`);
     group
-      .querySelectorAll<HTMLButtonElement>(".gf-seg-btn")
+      .querySelectorAll<HTMLButtonElement>("button[data-value]")
       .forEach((btn) => {
         btn.addEventListener("click", () => {
           const val = btn.dataset.value;
           if (!val) return;
           group
-            .querySelectorAll<HTMLButtonElement>(".gf-seg-btn")
+            .querySelectorAll<HTMLButtonElement>("button[data-value]")
             .forEach((b) => b.classList.toggle("active", b === btn));
           onChange(val);
         });
@@ -1555,7 +1997,7 @@ export class SidebarPanel {
   private setSegmentedValue(name: string, value: string): void {
     const group = this.q(`[data-seg='${name}']`);
     group
-      .querySelectorAll<HTMLButtonElement>(".gf-seg-btn")
+      .querySelectorAll<HTMLButtonElement>("button[data-value]")
       .forEach((b) => b.classList.toggle("active", b.dataset.value === value));
   }
 
@@ -1599,7 +2041,7 @@ export class SidebarPanel {
   }
 
   private updatePresetButtons(): void {
-    this.root
+    this.presetGridEl
       .querySelectorAll<HTMLButtonElement>("[data-preset]")
       .forEach((btn) => {
         btn.classList.toggle("active", btn.dataset.preset === this.activePresetId);
@@ -1654,19 +2096,189 @@ export class SidebarPanel {
     }
   }
 
+  private syncToolButtons(): void {
+    this.root
+      .querySelectorAll<HTMLButtonElement>("[data-tool-btn]")
+      .forEach((btn) => {
+        const active = btn.dataset.toolBtn === this.interactionMode;
+        btn.classList.toggle("active", active);
+        btn.setAttribute("aria-pressed", String(active));
+      });
+    this.vsToggleBtn.classList.toggle("active", this.interactionMode === "los");
+    this.vsToggleBtn.innerHTML =
+      this.interactionMode === "los"
+        ? `<span>📡 LOS ON (Click Map)</span>`
+        : `<span>📡 Drop Observer</span>`;
+
+    this.rfPickBtn.classList.toggle("active", this.interactionMode === "rf-link");
+    this.rfPickBtn.innerHTML =
+      this.interactionMode === "rf-link"
+        ? this.rfPendingFrom
+          ? `<span>⚡ Click Point B…</span>`
+          : `<span>⚡ Click Point A…</span>`
+        : `<span>⚡ A ↔ B Pick</span>`;
+  }
+
+  private renderRulerBox(): void {
+    const count = this.rulerPoints.length;
+    if (count === 0 && this.interactionMode !== "ruler") {
+      this.rulerBoxEl.classList.add("hidden");
+      this.rulerBoxEl.innerHTML = "";
+      return;
+    }
+
+    this.rulerBoxEl.classList.remove("hidden");
+    if (count === 0) {
+      this.rulerBoxEl.innerHTML = `
+        <div class="gf-ruler-head">
+          <span class="gf-ruler-title">📏 Ruler Active</span>
+          <span class="gf-sublabel">Click map points to measure</span>
+        </div>
+      `;
+      return;
+    }
+
+    const totalM = this.rulerMetrics?.total_distance_m ?? 0;
+    const useImp = this.state.units === "imperial";
+    const totalStr =
+      count < 2
+        ? "Click next point…"
+        : this.rulerLoading
+          ? "Computing…"
+          : useImp
+            ? `${(totalM / 1609.344).toFixed(2)} mi (${(totalM / 1000).toFixed(2)} km)`
+            : `${(totalM / 1000).toFixed(2)} km (${Math.round(totalM)} m)`;
+
+    const lastSeg =
+      this.rulerMetrics && this.rulerMetrics.segments.length > 0
+        ? this.rulerMetrics.segments[this.rulerMetrics.segments.length - 1]
+        : null;
+
+    const segMeta = lastSeg
+      ? `
+        <div class="gf-ruler-meta mono">
+          <span>Mag ${Math.round(lastSeg.bearing_mag_deg).toString().padStart(3, "0")}° (${Math.round(lastSeg.bearing_mils)}m)</span>
+          <span>True ${Math.round(lastSeg.bearing_true_deg).toString().padStart(3, "0")}° · Grid ${Math.round(lastSeg.bearing_grid_deg).toString().padStart(3, "0")}°</span>
+          ${typeof lastSeg.grade_pct === "number" ? `<span>Grade ${lastSeg.grade_pct >= 0 ? "+" : ""}${lastSeg.grade_pct.toFixed(1)}%</span>` : ""}
+        </div>
+      `
+      : "";
+
+    this.rulerBoxEl.innerHTML = `
+      <div class="gf-ruler-head">
+        <span class="gf-ruler-title mono">${escapeHtml(totalStr)}</span>
+        <div class="gf-ruler-actions">
+          <button type="button" class="gf-mini-btn gf-pin-btn" data-ruler-action="pin" ${count < 2 ? "disabled" : ""}>Pin to PDF</button>
+          <button type="button" class="gf-mini-btn danger" data-ruler-action="clear">Clear</button>
+        </div>
+      </div>
+      ${segMeta}
+    `;
+  }
+
+  private renderSectorDraftBar(): void {
+    if (this.sectorDraftCount === 0 && this.interactionMode !== "sector") {
+      this.sectorDraftBarEl.classList.add("hidden");
+      this.sectorDraftBarEl.innerHTML = "";
+      return;
+    }
+    this.sectorDraftBarEl.classList.remove("hidden");
+    this.sectorDraftBarEl.innerHTML = `
+      <div class="gf-ruler-head">
+        <span class="gf-ruler-title mono">⬠ Sector Draft: ${this.sectorDraftCount} pt${this.sectorDraftCount === 1 ? "" : "s"}</span>
+        <div class="gf-ruler-actions">
+          <button type="button" class="gf-mini-btn gf-pin-btn" data-sector-action="finish" ${this.sectorDraftCount < 3 ? "disabled" : ""}>Finish</button>
+          <button type="button" class="gf-mini-btn danger" data-sector-action="cancel">Cancel</button>
+        </div>
+      </div>
+    `;
+  }
+
+  renderTacticalGraphicsList(): void {
+    const list = this.state.tacticalGraphics;
+    this.tacticalClearBtn.disabled = list.length === 0;
+    this.updateWaypointsPill();
+
+    if (list.length === 0) {
+      this.tacticalListEl.innerHTML = "";
+      return;
+    }
+
+    this.tacticalListEl.innerHTML = list
+      .map((g, idx) => {
+        const badge =
+          g.kind === "range_ring"
+            ? "RING"
+            : g.kind === "sector"
+              ? "AOI"
+              : "LINE";
+        const color =
+          g.color ||
+          (g.kind === "range_ring"
+            ? "#38BDF8"
+            : g.kind === "sector"
+              ? "#F59E0B"
+              : "#F97316");
+        const meta =
+          g.kind === "range_ring"
+            ? `Radii: ${g.radii_km.join(", ")} km · ${g.points[0] ? `${g.points[0][0].toFixed(4)}, ${g.points[0][1].toFixed(4)}` : ""}`
+            : g.kind === "sector"
+              ? `${g.points.length} vertices polygon`
+              : `${g.points.length} pts bearing line`;
+
+        return `
+          <div class="gf-wp-row">
+            <div class="gf-wp-top">
+              <span class="gf-wp-code mono" style="border-color:${color};color:${color}">${badge}</span>
+              <input
+                type="text"
+                class="gf-wp-name-input"
+                data-tg-label="${idx}"
+                value="${escapeHtml(g.label)}"
+                maxlength="48"
+                aria-label="Tactical graphic ${idx + 1} label"
+              />
+              <button type="button" class="gf-wp-del" data-tg-del="${idx}" title="Remove graphic">×</button>
+            </div>
+            <div class="gf-wp-meta mono">
+              <span>${escapeHtml(meta)}</span>
+            </div>
+          </div>
+        `;
+      })
+      .join("");
+  }
+
+  private updateWaypointsPill(): void {
+    const wps = this.state.waypoints;
+    const tgs = this.state.tacticalGraphics.length;
+    const parts: string[] = [];
+    if (wps.length > 0) {
+      const useImperial = this.state.units === "imperial";
+      if (wps.length >= 2 && this.routeMetrics) {
+        parts.push(
+          `${wps.length} WPs · ${useImperial ? `${this.routeMetrics.total_distance_mi.toFixed(1)} mi` : `${this.routeMetrics.total_distance_km.toFixed(1)} km`}`
+        );
+      } else {
+        parts.push(`${wps.length} WP${wps.length === 1 ? "" : "s"}`);
+      }
+    }
+    if (tgs > 0) {
+      parts.push(`${tgs} TG`);
+    }
+    this.waypointsPillEl.textContent = parts.length > 0 ? parts.join(" · ") : "0 WPs";
+  }
+
   private renderWaypointsList(): void {
     const wps = this.state.waypoints;
     this.wpClearBtn.disabled = wps.length === 0;
-    this.wpMarkupBtn.classList.toggle("active", this.markupMode);
-    this.wpMarkupBtn.innerHTML = this.markupMode
-      ? `<span>⌖ Markup ON (Click Map)</span>`
-      : `<span>⌖ Drop on Map</span>`;
+    this.syncToolButtons();
+    this.updateWaypointsPill();
 
     if (wps.length === 0) {
-      this.waypointsPillEl.textContent = "0 WPs";
       this.wpListEl.innerHTML = `
         <div class="gf-wp-empty">
-          Toggle <strong>⌖ Markup</strong> (or press <kbd>M</kbd>) and click the map to drop numbered waypoints, MGRS grids &amp; magnetic bearings.
+          Use <strong>⌖ WP</strong> (<kbd>M</kbd>), <strong>📏 Ruler</strong> (<kbd>R</kbd>), <strong>◎ Ring</strong>, or <strong>⬠ Sector</strong> to annotate your sheet.
         </div>
       `;
       this.wpTotalEl.classList.add("hidden");
@@ -1677,11 +2289,6 @@ export class SidebarPanel {
     const totalKm = this.routeMetrics?.total_distance_km ?? 0;
     const totalMi = this.routeMetrics?.total_distance_mi ?? 0;
     const useImperial = this.state.units === "imperial";
-
-    this.waypointsPillEl.textContent =
-      wps.length >= 2 && this.routeMetrics
-        ? `${wps.length} WPs · ${useImperial ? `${totalMi.toFixed(1)} mi` : `${totalKm.toFixed(1)} km`}`
-        : `${wps.length} WP${wps.length === 1 ? "" : "s"}`;
 
     this.wpListEl.innerHTML = wps
       .map((wp, idx) => {
@@ -1750,34 +2357,40 @@ export class SidebarPanel {
     }
   }
 
+  private updateViewshedAndRFPill(): void {
+    const obsCount = this.state.viewsheds.length;
+    const rfCount = this.state.rfLinks.length;
+    if (obsCount === 0 && rfCount === 0) {
+      this.viewshedPillEl.textContent = "Off";
+      return;
+    }
+    const parts: string[] = [];
+    if (obsCount > 0) {
+      const anyLoading = this.state.viewsheds.some((e) => e.loading);
+      parts.push(anyLoading ? `${obsCount} OBS…` : `${obsCount} OBS`);
+    }
+    if (rfCount > 0) {
+      const anyRfLoading = this.state.rfLinks.some((l) => l.loading);
+      parts.push(anyRfLoading ? `${rfCount} RF…` : `${rfCount} RF`);
+    }
+    this.viewshedPillEl.textContent = parts.join(" · ");
+  }
+
   renderViewshedsList(): void {
     const entries = this.state.viewsheds;
     this.vsClearBtn.disabled = entries.length === 0;
-    this.vsToggleBtn.classList.toggle("active", this.viewshedMode);
-    this.vsToggleBtn.innerHTML = this.viewshedMode
-      ? `<span>📡 LOS ON (Click Map)</span>`
-      : `<span>📡 Drop Observer</span>`;
+    this.rfUseObsBtn.disabled = entries.length < 2;
+    this.syncToolButtons();
+    this.updateViewshedAndRFPill();
 
     if (entries.length === 0) {
-      this.viewshedPillEl.textContent = "Off";
       this.vsListEl.innerHTML = `
         <div class="gf-wp-empty">
-          Toggle <strong>📡 LOS</strong> (or press <kbd>V</kbd>) and click a summit or repeater site to preview real DEM line-of-sight RF coverage.
+          Click <strong>📡 Drop Observer</strong> (<kbd>V</kbd>) and click a summit or repeater site to preview DEM line-of-sight RF coverage.
         </div>
       `;
       return;
     }
-
-    const totalArea = entries.reduce(
-      (sum, e) => sum + (e.preview?.visible_area_km2 ?? 0),
-      0
-    );
-    const anyLoading = entries.some((e) => e.loading);
-    this.viewshedPillEl.textContent = anyLoading
-      ? `${entries.length} OBS · …`
-      : totalArea > 0
-        ? `${entries.length} OBS · ${totalArea.toFixed(1)} km²`
-        : `${entries.length} OBS`;
 
     this.vsListEl.innerHTML = entries
       .map((entry, idx) => {
@@ -1834,6 +2447,64 @@ export class SidebarPanel {
       .join("");
   }
 
+  renderRFLinksList(): void {
+    const links = this.state.rfLinks;
+    this.rfClearBtn.disabled = links.length === 0;
+    this.syncToolButtons();
+    this.updateViewshedAndRFPill();
+
+    if (links.length === 0) {
+      this.rfLinksListEl.innerHTML = `
+        <div class="gf-wp-empty">
+          Click <strong>⚡ A ↔ B Pick</strong> and select two points on the map (or use <strong>OBS1 → OBS2</strong>) for live Fresnel zone &amp; FSPL clearance analysis.
+        </div>
+      `;
+      return;
+    }
+
+    this.rfLinksListEl.innerHTML = links
+      .map((entry) => {
+        const s = entry.spec;
+        let bodyHtml = "";
+        let badgeHtml = `<span class="gf-rf-badge pending">PENDING</span>`;
+
+        if (entry.loading) {
+          badgeHtml = `<span class="gf-rf-badge pending">COMPUTING…</span>`;
+          bodyHtml = `<div class="gf-wp-meta mono"><span class="gf-vs-loading">Sampling DEM terrain &amp; Fresnel zone…</span></div>`;
+        } else if (entry.error) {
+          badgeHtml = `<span class="gf-rf-badge obstructed">ERROR</span>`;
+          bodyHtml = `<div class="gf-wp-meta mono"><span class="gf-vs-err">${escapeHtml(entry.error)}</span></div>`;
+        } else if (entry.profile) {
+          const p = entry.profile;
+          const stClass = p.status.toLowerCase();
+          badgeHtml = `<span class="gf-rf-badge ${escapeHtml(stClass)}">${escapeHtml(p.status)}</span>`;
+          const chartSvg = renderRFLinkSvg(p);
+          bodyHtml = `
+            <div class="gf-rf-chart-wrap">${chartSvg}</div>
+            <div class="gf-rf-metrics mono">
+              <span>${p.distance_km.toFixed(2)} km</span>
+              <span>FSPL ${p.fspl_db.toFixed(1)} dB</span>
+              <span>F1 ${Math.round(p.min_fresnel_pct)}%</span>
+              <span>Mag ${Math.round(p.bearing_mag_deg).toString().padStart(3, "0")}° (${Math.round(p.bearing_mils)}m)</span>
+            </div>
+          `;
+        }
+
+        return `
+          <div class="gf-wp-row gf-rf-card">
+            <div class="gf-wp-top">
+              <span class="gf-rf-title mono">${escapeHtml(s.from_label)} ↔ ${escapeHtml(s.to_label)} · ${s.freq_mhz} MHz</span>
+              ${badgeHtml}
+              <button type="button" class="gf-wp-del" data-rf-action="recompute" data-rf-id="${escapeHtml(entry.id)}" title="Recompute RF link">↻</button>
+              <button type="button" class="gf-wp-del" data-rf-action="delete" data-rf-id="${escapeHtml(entry.id)}" title="Remove RF link">×</button>
+            </div>
+            ${bodyHtml}
+          </div>
+        `;
+      })
+      .join("");
+  }
+
   private updateSectionPills(): void {
     const scaleK = `1:${Math.round(this.state.scale / 1000)}k`;
     const paperLbl = this.state.paper.toUpperCase();
@@ -1848,6 +2519,7 @@ export class SidebarPanel {
     const overlayCount =
       this.state.au_overlays.length +
       this.state.nz_overlays.length +
+      this.state.ca_overlays.length +
       this.state.us_overlays.length;
     const demShort = this.state.pack_id
       ? "Pack"
@@ -1857,9 +2529,11 @@ export class SidebarPanel {
           ? "AU GA"
           : this.state.dem_source === "nz-linz"
             ? "NZ LINZ"
-            : this.state.dem_source === "usgs3dep"
-              ? "3DEP"
-              : "GLO-30";
+            : this.state.dem_source === "ca-hrdem"
+              ? "CA HRDEM"
+              : this.state.dem_source === "usgs3dep"
+                ? "3DEP"
+                : "GLO-30";
     this.overlayPillEl.textContent =
       overlayCount > 0 ? `${demShort} · +${overlayCount}` : demShort;
 
@@ -1919,6 +2593,14 @@ export class SidebarPanel {
       });
 
     this.root
+      .querySelectorAll<HTMLInputElement>("[data-ca-overlay]")
+      .forEach((cb) => {
+        cb.checked = this.state.ca_overlays.includes(
+          cb.dataset.caOverlay as CAOverlayKind
+        );
+      });
+
+    this.root
       .querySelectorAll<HTMLInputElement>("[data-us-overlay]")
       .forEach((cb) => {
         cb.checked = this.state.us_overlays.includes(
@@ -1950,9 +2632,18 @@ export class SidebarPanel {
       this.state.viewshedDefaults.max_distance_km
     );
 
-    const pdfOn = this.state.outputs.pdf;
+    this.rfFreqInput.value = String(this.state.rfLinkDefaults.freq_mhz);
+    this.rfTxHInput.value = String(this.state.rfLinkDefaults.from_height_m);
+    this.rfRxHInput.value = String(this.state.rfLinkDefaults.to_height_m);
+    const bandMatch = RF_BAND_PRESETS.find(
+      (b) => Math.abs(b.freq_mhz - this.state.rfLinkDefaults.freq_mhz) < 0.05
+    );
+    this.rfBandSelect.value = bandMatch ? String(bandMatch.freq_mhz) : "custom";
+
+    const o = this.state.outputs;
+    const pdfOn = o.pdf;
     this.outPdfCheck.checked = pdfOn;
-    this.outGeoPdfCheck.checked = this.state.outputs.geopdf;
+    this.outGeoPdfCheck.checked = o.geopdf;
     this.outGeoPdfCheck.disabled = !pdfOn;
     this.outCalibrationCheck.checked = this.state.include_calibration_page;
     this.outCalibrationCheck.disabled = !pdfOn;
@@ -1963,23 +2654,32 @@ export class SidebarPanel {
     this.outElevProfileCheck.disabled = !pdfOn;
     this.outAtlasIndexCheck.checked = this.state.include_atlas_index;
     this.outAtlasIndexCheck.disabled = !pdfOn;
+    this.outRfLinkCardCheck.checked = this.state.include_rf_link_card;
+    this.outRfLinkCardCheck.disabled = !pdfOn;
+    this.rfCardCheck.checked = this.state.include_rf_link_card;
     this.suppPagesBoxEl.style.opacity = pdfOn ? "1" : "0.45";
 
-    this.outMbtilesCheck.checked = this.state.outputs.mbtiles;
-    this.outMbtilesFmt.value = this.state.outputs.mbtiles_format;
-    this.outMbtilesFmt.disabled = !this.state.outputs.mbtiles;
-    this.outKmzCheck.checked = this.state.outputs.kmz;
-    this.outGarminProfile.value = this.state.outputs.garmin_profile;
-    this.outGarminProfile.disabled = !this.state.outputs.kmz;
-    this.outDigitalGridCheck.checked =
-      this.state.outputs.include_grid_on_digital;
-    const anyDigital = this.state.outputs.mbtiles || this.state.outputs.kmz;
+    this.outMbtilesCheck.checked = o.mbtiles;
+    this.outMbtilesFmt.value = o.mbtiles_format;
+    this.outMbtilesFmt.disabled = !o.mbtiles;
+    this.outKmzCheck.checked = o.kmz;
+    this.outGarminProfile.value = o.garmin_profile;
+    this.outGarminProfile.disabled = !o.kmz;
+    this.outGpkgCheck.checked = o.gpkg_tiles;
+    this.outOsmandCheck.checked = o.osmand_sqlitedb;
+    this.outBundleCheck.checked = o.field_bundle_zip;
+    this.outDigitalGridCheck.checked = o.include_grid_on_digital;
+    const anyDigital = o.mbtiles || o.kmz || o.gpkg_tiles || o.osmand_sqlitedb;
     this.outDigitalGridCheck.disabled = !anyDigital;
     this.digitalGridRow.style.opacity = anyDigital ? "1" : "0.45";
 
     this.syncFileDisplay();
+    this.renderRulerBox();
+    this.renderSectorDraftBar();
+    this.renderTacticalGraphicsList();
     this.renderWaypointsList();
     this.renderViewshedsList();
+    this.renderRFLinksList();
     this.updateAtlasButtons();
     this.updatePresetButtons();
     this.updateSectionPills();
@@ -1990,14 +2690,28 @@ export class SidebarPanel {
     this.renderStripBar();
   }
 
-  setMarkupMode(active: boolean): void {
-    this.markupMode = active;
-    this.renderWaypointsList();
+  setInteractionMode(mode: MapInteractionMode, rfPendingFrom = false): void {
+    this.interactionMode = mode;
+    this.rfPendingFrom = rfPendingFrom;
+    this.syncToolButtons();
+    this.renderRulerBox();
+    this.renderSectorDraftBar();
   }
 
-  setViewshedMode(active: boolean): void {
-    this.viewshedMode = active;
-    this.renderViewshedsList();
+  setRulerState(
+    points: { lat: number; lon: number }[],
+    metrics: RulerMetricsResponse | null,
+    loading: boolean
+  ): void {
+    this.rulerPoints = points;
+    this.rulerMetrics = metrics;
+    this.rulerLoading = loading;
+    this.renderRulerBox();
+  }
+
+  setSectorDraftCount(count: number): void {
+    this.sectorDraftCount = count;
+    this.renderSectorDraftBar();
   }
 
   setRouteMetrics(metrics: RouteMetricsResponse | null): void {
