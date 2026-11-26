@@ -5,6 +5,29 @@ All notable changes to **GridForge** are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-11-26
+
+Pan-Australia release extending live open-government fire-trail, 4WD/walking track, backcountry hut, campground, and trig station overlays to **all 8 Australian states and territories**, backed by an automatic cross-border router, low-RAM streaming, air-gapped pack bundling, and a redesigned Studio state selector.
+
+### Added
+
+- **Pan-Australia State Trail, Fire-Trail, Hut & Trig Overlays (All 8 States & Territories):**
+  - Joining **NSW** (`au-nsw-trails`) and **Victoria** (`au-vic-trails`) with six new live CC BY government overlay sources outputting one unified 2-layer UTM GeoPackage schema (`au_state_trails` + `au_state_pois`):
+    - **Tasmania (`au-tas-trails`, `TASTrailsSource`):** *the LIST* (NRE Tas, **CC BY 3.0 AU**) — Overland/walking tracks, fire trails, alpine huts (*Kitchen Hut*, *Rangers Hut*, *Scott-Kilvert Memorial Hut*), and survey control trigs.
+    - **Queensland (`au-qld-trails`, `QLDTrailsSource`):** **QSpatial** (DESI / Dept. of Natural Resources & Mines, **CC BY 4.0**) — QPWS Great Walks, park firelines, tourist facilities, lookouts, and survey marks.
+    - **ACT (`au-act-trails`, `ACTTrailsSource`):** **ACTmapi / EPSDD** (**CC BY 4.0**) — Namadgi/Tidbinbilla fire trails, heritage walking tracks, huts (*Booth Cottage*), campgrounds, and AHD71 survey marks.
+    - **Western Australia (`au-wa-trails`, `WATrailsSource`):** **DBCA AGOL** + **Landgate SLIP** (**CC BY 4.0**) — Tracks & trails, fire breaks, RATIS sites/facilities, fire towers (`DBCA-061`), and geodetic marks (`LGATE-076`); strictly excludes non-commercial `DBCA-027` (CC BY-NC).
+    - **South Australia (`au-sa-trails`, `SATrailsSource`):** **DEW / DHUD / Location SA** + **Geoscience Australia Topo250K** (**CC BY 4.0**) — Heysen & Mawson recreation trails streamed via memory-safe GDAL `/vsizip/` + OGR `SetSpatialFilterRect` (`< 20 MB` RSS), DEW fire access tracks, parks facilities JSON, and AHD survey marks.
+    - **Northern Territory (`au-nt-trails`, `NTTrailsSource`):** **NTLIS / DEPWS** GeoServer WFS 2.0 + **NTG Road Centrelines** + **GA Topo250K** (**CC BY 4.0**) — 4WD/unformed/Larapinta tracks, place names/lookouts, and AHD survey control marks.
+- **Automatic Cross-Border State Router (`--au-overlay au-state-trails`, `AutoStateTrailsSource`):**
+  - Automatically resolves all Australian states/territories intersecting the sheet bounding box, merges cross-border features cleanly into one `au_state_trails` + `au_state_pois` GeoPackage, and populates dynamic `resolved_attributions` so map collar footers credit **only** the states that contributed features.
+- **Air-Gapped Offline Pack Integration (`gridforge pack build`):**
+  - Bundles `au-state-trails` directly into offline Australian regional packs so `gridforge render --pack <dir> --au-overlay au-state-trails` renders 100% air-gapped with zero network calls.
+- **MapLibre Print Studio Auto + 8-State Override UI (`web/`):**
+  - Added an **Auto (All 8 States)** state trails toggle plus a compact 8-chip state override bar (`NSW`, `VIC`, `TAS`, `QLD`, `WA`, `SA`, `NT`, `ACT`) wired into URL permalinks, **Copy CLI**, and quick-jump presets (with non-wrapping `.gf-section-pill` header badges).
+- **Automated Verification (`211+` offline CI tests + `7/7` live Pan-Australia E2E):**
+  - Added `tests/unit/test_au_states_east.py`, `tests/unit/test_au_states_west.py`, and `tests/integration/test_v12_pan_australia_trails.py` validating cross-border merging, dynamic attribution filtering, `/vsizip/` low-RAM streaming, offline `--pack` CLI parity, and live 6-state renders (`Cradle Mountain TAS`, `Lamington QLD`, `Namadgi ACT`, `Stirling Range WA`, `Flinders Ranges SA`, `West MacDonnell NT`, and Auto TAS CLI routing).
+
 ## [1.1.0] - 2026-11-26
 
 Field navigation, backcountry alpine cartography, and print-verification release adding five high-impact operational tools across the CLI, PyQGIS renderer, and MapLibre Print Studio.

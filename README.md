@@ -8,10 +8,10 @@
 [![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](pyproject.toml)
 [![PyQGIS 3.40 LTR](https://img.shields.io/badge/PyQGIS-3.40%20LTR-589632?logo=qgis&logoColor=white)](Dockerfile)
 [![Multi-Arch](https://img.shields.io/badge/Docker-arm64%20%7C%20amd64-2496ED?logo=docker&logoColor=white)](Dockerfile)
-[![Tests](https://img.shields.io/badge/Tests-196%2B%20passing-2ea44f)](tests/)
+[![Tests](https://img.shields.io/badge/Tests-211%2B%20passing-2ea44f)](tests/)
 [![Idle Memory](https://img.shields.io/badge/Idle%20RAM-~124%20MiB-f59e0b)](docker-compose.yml)
 
-True-scale **local UTM** 300 DPI print PDFs · **GPX Strip Atlases** · **Slope-Angle Shading** · **Tactical Route Cards & 100 mm Romer Pages** · **ATAK `.mbtiles`** · **Garmin `.kmz`**
+True-scale **local UTM** 300 DPI print PDFs · **All-8-State AU Trails** · **GPX Strip Atlases** · **Slope-Angle Shading** · **Tactical Route Cards & 100 mm Romer Pages** · **ATAK `.mbtiles`** · **Garmin `.kmz`**
 
 </div>
 
@@ -53,6 +53,48 @@ Every sheet below was generated directly by GridForge at 300 DPI and verified au
 ### Offline Field Device Exports — ATAK `.mbtiles` & Garmin Custom Maps `.kmz`
 
 ![ATAK MBTiles and Garmin KMZ Offline Exports](docs/images/exports-atak-garmin.jpg)
+
+---
+
+## `v1.2.0` Pan-Australia State Trails, Huts & Trigs (All 8 States & Territories)
+
+GridForge `v1.2.0` completes live open-government fire-trail, 4WD/walking track, backcountry hut, campground, and trig station coverage across **every Australian state and territory** (`NSW`, `VIC`, `TAS`, `QLD`, `WA`, `SA`, `NT`, `ACT`) — plus a single **`--au-overlay au-state-trails`** Auto router that seamlessly merges cross-border sheets and dynamically emits collar attributions only for contributing states.
+
+![Pan-Australia State Fire Trails, Huts and Trigs across TAS, QLD, ACT, WA, SA and NT](docs/images/v12-pan-australia-states.jpg)
+
+| State / Mode | CLI Flag | Official Open-Data Agency & Datasets | License |
+| :--- | :--- | :--- | :--- |
+| **Auto (All 8 States)** | `--au-overlay au-state-trails` | Automatically routes & merges any intersecting states (e.g. NSW/ACT or NSW/VIC borders), bundles into offline `--pack`s, and credits only contributing states | **CC BY** (per-state) |
+| **New South Wales** | `--au-overlay au-nsw-trails` | **NSW Spatial Services (DCS)** — `NSW_Transport_Theme` fire trails/tracks, `NSW_POI`, huts & `SurveyMarkGDA2020` trigs | **CC BY 4.0** |
+| **Victoria** | `--au-overlay au-vic-trails` | **Victoria DEECA / DTP Vicmap WFS** — `tr_road` 4WD/fire access, `recweb_tracks`, `recweb_hut`, `recweb_site`, `geomark_point` | **CC BY 4.0** |
+| **Tasmania** | `--au-overlay au-tas-trails` | **the LIST (NRE Tas)** — OpenDataWFS walking/Overland tracks, fire trails, alpine huts & TopographyAndRelief survey trigs | **CC BY 3.0 AU** |
+| **Queensland** | `--au-overlay au-qld-trails` | **QSpatial (DESI / DNRM)** — QPWS Great Walks & firelines, RoadsAndTracks, tourist facilities, lookouts & FoundationData trigs | **CC BY 4.0** |
+| **ACT** | `--au-overlay au-act-trails` | **ACTmapi / EPSDD** — Namadgi/Tidbinbilla fire trails, heritage walking tracks, huts, campgrounds & AHD71 survey marks | **CC BY 4.0** |
+| **Western Australia** | `--au-overlay au-wa-trails` | **DBCA AGOL & Landgate SLIP** — Tracks/trails, fire breaks, RATIS sites/facilities, fire towers (`DBCA-061`) & geodetic marks (`LGATE-076`) *(strictly excludes CC BY-NC)* | **CC BY 4.0** |
+| **South Australia** | `--au-overlay au-sa-trails` | **DEW / DHUD / Location SA + GA Topo250K** — Heysen & Mawson trails (low-RAM `/vsizip/` + spatial filter `< 20 MB` RSS), DEW fire tracks, parks & AHD marks | **CC BY 4.0** |
+| **Northern Territory** | `--au-overlay au-nt-trails` | **NTLIS / DEPWS WFS 2.0 + NTG Roads + GA Topo250K** — Larapinta/4WD/unformed tracks, place names/lookouts & AHD survey control marks | **CC BY 4.0** |
+
+```bash
+# Automatic state routing anywhere in Australia (merges cross-border sheets & emits exact state attribution)
+docker run --rm -v "$(pwd)/out:/out" gridforge:dev \
+  gridforge render --center "-41.684,145.951" --scale 25000 --paper a4 \
+    --dem-source au-elvis --au-overlay au-state-trails --slope-shading \
+    --title "CRADLE MOUNTAIN — TASMANIA LIST" \
+    --output /out/cradle_mountain_tas_trails_color.pdf
+
+# Explicit per-state examples: QLD 5 m LiDAR Great Walks, SA Flinders Ranges (/vsizip/), NT West MacDonnell
+docker run --rm -v "$(pwd)/out:/out" gridforge:dev \
+  gridforge render --center "-28.200,153.190" --scale 25000 --paper a4 \
+    --dem-source au-elvis --au-overlay au-qld-trails --slope-shading \
+    --title "LAMINGTON — BINNA BURRA QLD" \
+    --output /out/lamington_qld_trails_color.pdf
+
+docker run --rm -v "$(pwd)/out:/out" gridforge:dev \
+  gridforge render --center "-31.530,138.600" --scale 25000 --paper a4 \
+    --dem-source au-elvis --au-overlay au-sa-trails \
+    --title "FLINDERS RANGES — WILPENA SA" \
+    --output /out/flinders_sa_trails_color.pdf
+```
 
 ---
 
@@ -213,7 +255,7 @@ Measured on an Apple Silicon **M5 (16 GB RAM)** host running native `linux/arm64
 | **Warm-cache A4 300 DPI render time** | **`2.25 s`** (Katoomba B&W) / **`5.92 s`** (Boulder 1 m LiDAR) | Fast interactive turnaround |
 | **1 km MGRS physical grid accuracy** | **`0.0046 mm`** (Letter 1:24k) / **`0.0185 mm`** (A4 1:25k) | `≤ 0.15 mm` protractor tolerance |
 | **MGRS grid orthogonality skew** | **`0.0000 mm`** across all tested UTM zones | `< 0.05 mm` |
-| **Automated test suite (`pytest`)** | **`196+` offline unit & integration tests passing** | Runs offline inside `gridforge:dev` |
+| **Automated test suite (`pytest`)** | **`211+` offline unit & integration tests passing** | Runs offline inside `gridforge:dev` |
 | **100 mm Calibration ruler accuracy** | **`0.0000 mm` error / `0.0000 mm` skew** (H & V) | `≤ 0.15 mm` |
 
 ---
@@ -251,8 +293,9 @@ docker run --rm -e GRIDFORGE_RUN_LIVE=1 -v "$(pwd):/app" gridforge:dev pytest te
 
 ## Roadmap & Backlog
 
+- **Shipped in `v1.2.0`:** Pan-Australia state fire-trail, hut, campground & trig coverage across all 8 states/territories (`NSW`, `VIC`, `TAS`, `QLD`, `WA`, `SA`, `NT`, `ACT`), automatic cross-border `au-state-trails` router with dynamic attribution, air-gapped pack bundling, and Studio Auto + 8-chip state selector.
 - **Shipped in `v1.1.0`:** NSW & Victoria state fire-trail/hut/trig layers, GDAL slope-angle avalanche shading, GPX/GeoJSON auto-strip-map builder + elevation profile cover, interactive waypoint markup + tactical route cards, and 100 mm printer scale calibration & MGRS Romer pages.
-- **Backlog (`v1.2+`):** **Air-Gapped Web Basemap Mode** (self-hosted local PMTiles/MBTiles basemap option in the MapLibre Studio UI for fully disconnected deployments), additional regional LiDAR providers (QLD/TAS/NZ/EU), and custom legend/collar branding profiles.
+- **Backlog (`v1.3+`):** **Air-Gapped Web Basemap Mode** (self-hosted local PMTiles/MBTiles basemap option in the MapLibre Studio UI for fully disconnected deployments), additional regional LiDAR providers (QLD/TAS/NZ/EU), and custom legend/collar branding profiles.
 
 ---
 
@@ -262,10 +305,16 @@ docker run --rm -e GRIDFORGE_RUN_LIVE=1 -v "$(pwd):/app" gridforge:dev pytest te
 | :--- | :--- | :--- |
 | **GridForge Source Code** | Application, styles, icons, web studio | **GNU GPL v3.0 or later** ([LICENSE](LICENSE)) |
 | **OpenStreetMap** | Global roads, trails, rail, water, buildings, landcover, POIs | **ODbL** — Map data © OpenStreetMap contributors (`openstreetmap.org/copyright`) |
-| **Geoscience Australia / DEA** | Australia 5 m LiDAR (2025) & SRTM 1s (`AHD`), Surface Hydrology, Electricity/Pipelines, Aviation/Homesteads | **CC BY 4.0** — © Commonwealth of Australia (Geoscience Australia / Digital Earth Australia) |
+| **Geoscience Australia / DEA** | Australia 5 m LiDAR (2025) & SRTM 1s (`AHD`), Surface Hydrology, Electricity/Pipelines, Aviation/Homesteads, Topo250K tracks | **CC BY 4.0** — © Commonwealth of Australia (Geoscience Australia / Digital Earth Australia) |
 | **DCCEEW CAPAD 2025** | Australia National Parks, Nature Reserves, IPAs | **CC BY 4.0** — © Commonwealth of Australia (DCCEEW) |
 | **NSW Spatial Services (DCS)** | NSW Fire Trails, 4WD/Walking Tracks, Huts, Campgrounds & GDA2020 Trig Stations (`au-nsw-trails`) | **CC BY 4.0** — © State of New South Wales (Spatial Services, DCS) |
 | **Victoria DEECA / DTP Vicmap** | Victoria 4WD/Fire Access Tracks, Walking Trails, Alpine Huts, Campgrounds & Survey Marks (`au-vic-trails`) | **CC BY 4.0** — © State of Victoria (DEECA / DTP Vicmap) |
+| **Tasmania the LIST (NRE Tas)** | Tasmania Walking/Overland Tracks, Fire Trails, Huts & Survey Control (`au-tas-trails`) | **CC BY 3.0 AU** — © State of Tasmania (the LIST, NRE Tas) |
+| **Queensland QSpatial (DESI / DNRM)** | Queensland QPWS Great Walks, Firelines, Parks Facilities & Survey Control (`au-qld-trails`) | **CC BY 4.0** — © State of Queensland (DESI / Dept. of Natural Resources & Mines) |
+| **ACTmapi / EPSDD** | ACT Fire Trails, Walking Tracks, Huts, Campgrounds & AHD71 Survey Marks (`au-act-trails`) | **CC BY 4.0** — © Australian Capital Territory (ACTmapi / EPSDD) |
+| **WA DBCA & Landgate SLIP** | Western Australia Trails, Fire Breaks, RATIS Parks/Facilities, Fire Towers & Geodetic Marks (`au-wa-trails`) | **CC BY 4.0** — © State of Western Australia (DBCA & Landgate SLIP) |
+| **SA DEW / DHUD / Location SA** | South Australia Recreation Trails (Heysen/Mawson), Fire Tracks, Parks & Survey Marks (`au-sa-trails`) | **CC BY 4.0** — © Government of South Australia (DEW / DHUD) & Geoscience Australia |
+| **NT NTLIS / DEPWS** | Northern Territory 4WD/Larapinta Tracks, Place Names/Lookouts & Survey Marks (`au-nt-trails`) | **CC BY 4.0** — © Northern Territory of Australia (NTLIS / DEPWS) & Geoscience Australia |
 | **Copernicus WorldDEM-30** | Global 30 m elevation (`EGM2008`) | **Copernicus DEM License** — © DLR e.V. 2010–2014 & © Airbus Defence and Space GmbH 2014–2018, EU & ESA |
 | **USGS 3DEP / NHD / FEMA / FAA / NOAA** | US 1 m & 10 m DEM (`NAVD88`), NHD streams, NFHL flood zones, DOF obstacle towers, ENC charts | **US Public Domain** |
 | **NOAA / NCEI WMM2025** | Global magnetic declination & secular variation (`2025.0–2030.0`) | **US Public Domain** |
