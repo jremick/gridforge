@@ -8,7 +8,8 @@ set -euo pipefail
 
 REPO="${1:-jremick/gridforge}"
 
-DESCRIPTION="Self-hosted tactical & backcountry MGRS topographic map generator — true-scale UTM PDFs, 4 themes (Night-Red/Alpine), RF viewsheds & Fresnel link cards, ATAK/Garmin/OsmAnd/GeoPackage, air-gapped packs across US, Canada, AU & NZ."
+HOMEPAGE="https://gridmaps.net"
+DESCRIPTION="Live at gridmaps.net (GridMaps) — Open-source tactical & backcountry MGRS topographic map generator: true-scale UTM PDFs, 4 themes (Night-Red/Alpine), RF viewsheds & Fresnel cards, ATAK/Garmin/OsmAnd/GeoPackage, air-gapped packs across US, Canada, AU & NZ."
 
 TOPICS=(
   atak
@@ -33,20 +34,21 @@ TOPICS=(
   utm
 )
 
-echo "Updating description & ${#TOPICS[@]} topics on ${REPO}..."
+echo "Updating homepage (${HOMEPAGE}), description & ${#TOPICS[@]} topics on ${REPO}..."
 TOPIC_ARGS=()
 for t in "${TOPICS[@]}"; do
   TOPIC_ARGS+=(--add-topic "$t")
 done
 
 gh repo edit "${REPO}" \
+  --homepage "${HOMEPAGE}" \
   --description "${DESCRIPTION}" \
   "${TOPIC_ARGS[@]}"
 
 echo
 echo "Checking repository metadata & Social Preview status..."
-gh repo view "${REPO}" --json description,repositoryTopics,usesCustomOpenGraphImage \
-  --jq '{description, topic_count: (.repositoryTopics | length), usesCustomOpenGraphImage}'
+gh repo view "${REPO}" --json homepageUrl,description,repositoryTopics,usesCustomOpenGraphImage \
+  --jq '{homepageUrl, description, topic_count: (.repositoryTopics | length), usesCustomOpenGraphImage}'
 
 USES_CUSTOM_OG="$(gh repo view "${REPO}" --json usesCustomOpenGraphImage --jq '.usesCustomOpenGraphImage')"
 if [ "${USES_CUSTOM_OG}" != "true" ]; then
