@@ -10,8 +10,19 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
-from gridforge.config import ColorMode, GridTick, JobWorkspace, SheetLayout
+from gridforge.config import (
+    AU_STATE_TRAIL_OVERLAY_KINDS,
+    ColorMode,
+    GridTick,
+    JobWorkspace,
+    SheetLayout,
+)
 from gridforge.render.styles import DEFAULT_FONT_FAMILY, map_background_hex
+
+_AU_STATE_TRAIL_KEYS: frozenset[str] = frozenset(
+    {k.value for k in AU_STATE_TRAIL_OVERLAY_KINDS}
+    | {k.value.replace("-", "_") for k in AU_STATE_TRAIL_OVERLAY_KINDS}
+)
 
 # Per-scale metric & imperial scale bar parameters calibrated to fit cleanly in ~40 mm width.
 # Format: (units_per_segment, segments_left, segments_right, unit_label, subdivision_count)
@@ -620,9 +631,7 @@ def _render_compact_map_key(
     has_au_parks = ("au-parks" in regional) or ("au_parks" in regional)
     has_au_hydro = ("au-hydro" in regional) or ("au_hydro" in regional)
     has_au_aviation = ("au-aviation" in regional) or ("au_aviation" in regional)
-    has_au_state_trails = any(
-        k in regional for k in ("au-nsw-trails", "au_nsw_trails", "au-vic-trails", "au_vic_trails")
-    )
+    has_au_state_trails = any(k in regional for k in _AU_STATE_TRAIL_KEYS)
     has_slope = bool(
         workspace is not None
         and workspace.slope_tif is not None

@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from gridforge.config import (
+    AU_STATE_TRAIL_OVERLAY_KINDS,
     CartoOptions,
     ColorMode,
     DensityLevel,
@@ -3972,12 +3973,26 @@ def populate_project_layers(
     au_aviation_path = Path(regional["au-aviation"]) if "au-aviation" in regional else (
         Path(regional["au_aviation"]) if "au_aviation" in regional else None
     )
-    au_nsw_trails_path = Path(regional["au-nsw-trails"]) if "au-nsw-trails" in regional else (
-        Path(regional["au_nsw_trails"]) if "au_nsw_trails" in regional else None
-    )
-    au_vic_trails_path = Path(regional["au-vic-trails"]) if "au-vic-trails" in regional else (
-        Path(regional["au_vic_trails"]) if "au_vic_trails" in regional else None
-    )
+
+    au_state_trail_entries: list[tuple[str, Path, set[str]]] = []
+    seen_state_paths: set[Path] = set()
+    for st_kind in AU_STATE_TRAIL_OVERLAY_KINDS:
+        raw_st = regional.get(st_kind.value) or regional.get(st_kind.value.replace("-", "_"))
+        if raw_st is None:
+            continue
+        st_path = Path(raw_st)
+        resolved_st = st_path.resolve()
+        if resolved_st in seen_state_paths:
+            continue
+        seen_state_paths.add(resolved_st)
+        st_layers = set(_list_gpkg_layers(st_path))
+        if st_layers:
+            label_prefix = (
+                "AU State"
+                if st_kind.value == "au-state-trails"
+                else st_kind.value.split("-")[1].upper()
+            )
+            au_state_trail_entries.append((label_prefix, st_path, st_layers))
 
     fema_layers = set(_list_gpkg_layers(fema_path)) if fema_path else set()
     nhd_layers = set(_list_gpkg_layers(nhd_path)) if nhd_path else set()
@@ -3987,8 +4002,6 @@ def populate_project_layers(
     au_parks_layers = set(_list_gpkg_layers(au_parks_path)) if au_parks_path else set()
     au_infra_layers = set(_list_gpkg_layers(au_infra_path)) if au_infra_path else set()
     au_aviation_layers = set(_list_gpkg_layers(au_aviation_path)) if au_aviation_path else set()
-    au_nsw_layers = set(_list_gpkg_layers(au_nsw_trails_path)) if au_nsw_trails_path else set()
-    au_vic_layers = set(_list_gpkg_layers(au_vic_trails_path)) if au_vic_trails_path else set()
     waypoints_path = workspace.waypoints_gpkg if (workspace.waypoints_gpkg and workspace.waypoints_gpkg.is_file()) else None
     waypoints_layers = set(_list_gpkg_layers(waypoints_path)) if waypoints_path else set()
 
@@ -4043,15 +4056,23 @@ def populate_project_layers(
                 )
             )
 
-    # 3. Regional Point Overlays (US Obstacles/Navaids + AU National + AU NSW/VIC Huts/Camps/Trigs)
+    # 3. Regional Point Overlays (US Obstacles/Navaids + AU National + Pan-AU State Huts/Camps/Trigs)
     if towers_path and "us_towers" in towers_layers:
         _push(_load_vector_layer(project, towers_path, "us_towers", "US Obstacle Towers", role="us_towers", workspace=workspace))
     if enc_path and "enc_navaids" in enc_layers:
         _push(_load_vector_layer(project, enc_path, "enc_navaids", "NOAA ENC Navaids", role="enc_navaids", workspace=workspace))
-    if au_nsw_trails_path and "au_state_pois" in au_nsw_layers:
-        _push(_load_vector_layer(project, au_nsw_trails_path, "au_state_pois", "NSW Huts, Camps & Trigs", role="au_state_pois", workspace=workspace))
-    if au_vic_trails_path and "au_state_pois" in au_vic_layers:
-        _push(_load_vector_layer(project, au_vic_trails_path, "au_state_pois", "VIC Huts, Camps & Trigs", role="au_state_pois", workspace=workspace))
+    for label_prefix, st_path, st_layers in au_state_trail_entries:
+        if "au_state_pois" in st_layers:
+            _push(
+                _load_vector_layer(
+                    project,
+                    st_path,
+                    "au_state_pois",
+                    f"{label_prefix} Huts, Camps & Trigs",
+                    role="au_state_pois",
+                    workspace=workspace,
+                )
+            )
     if au_aviation_path and "au_airfields" in au_aviation_layers:
         _push(_load_vector_layer(project, au_aviation_path, "au_airfields", "AU Airfields", role="au_airfields", workspace=workspace))
     if au_aviation_path and "au_homesteads" in au_aviation_layers:
@@ -4071,13 +4092,21 @@ def populate_project_layers(
             )
         )
 
-    # 5. OSM Transport & Infrastructure + AU Runways / NSW-VIC Fire Trails & Tracks / HV Power / Pipelines
+    # 5. OSM Transport & Infrastructure + AU Runways / Pan-AU State Fire Trails & Tracks / HV Power / Pipelines
     if au_aviation_path and "au_runways" in au_aviation_layers:
         _push(_load_vector_layer(project, au_aviation_path, "au_runways", "AU Runways", role="au_runways", workspace=workspace))
-    if au_nsw_trails_path and "au_state_trails" in au_nsw_layers:
-        _push(_load_vector_layer(project, au_nsw_trails_path, "au_state_trails", "NSW Fire Trails & Tracks", role="au_state_trails", workspace=workspace))
-    if au_vic_trails_path and "au_state_trails" in au_vic_layers:
-        _push(_load_vector_layer(project, au_vic_trails_path, "au_state_trails", "VIC Fire Trails & Tracks", role="au_state_trails", workspace=workspace))
+    for label_prefix, st_path, st_layers in au_state_trail_entries:
+        if "au_state_trails" in st_layers:
+            _push(
+                _load_vector_layer(
+                    project,
+                    st_path,
+                    "au_state_trails",
+                    f"{label_prefix} Fire Trails & Tracks",
+                    role="au_state_trails",
+                    workspace=workspace,
+                )
+            )
     if "lines" in osm_layers:
         _push(_load_vector_layer(project, workspace.osm_gpkg, "lines", "Roads & Transport", role="transport", workspace=workspace))
     if au_infra_path and "au_power_lines" in au_infra_layers and carto.show_power:

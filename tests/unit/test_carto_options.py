@@ -701,3 +701,211 @@ def test_v11_slope_state_trails_waypoints_styles_and_cli_parsing(tmp_path: Path)
             assert _eval(vl_wp, wp_expr, {{"code": "WP1", "label": "WP1"}}) == "WP1"
         """
     )
+
+
+def test_v12_pan_australia_all_state_trail_keys_and_dynamic_attributions(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from gridforge.config import (
+        AU_STATE_TRAIL_OVERLAY_KINDS,
+        DeclinationInfo,
+        JobWorkspace,
+        MGRSGridMeta,
+    )
+    from gridforge.geo.crs import compute_sheet_layout
+    from gridforge.pipeline import runner
+    from gridforge.render.layout import _AU_STATE_TRAIL_KEYS
+
+    # 1. All 9 canonical state-trail kinds (auto + 8 states/territories) must be recognized by layout Map Key
+    assert len(AU_STATE_TRAIL_OVERLAY_KINDS) == 9
+    expected_keys = {
+        "au-state-trails",
+        "au-nsw-trails",
+        "au-vic-trails",
+        "au-tas-trails",
+        "au-qld-trails",
+        "au-wa-trails",
+        "au-sa-trails",
+        "au-nt-trails",
+        "au-act-trails",
+    }
+    assert {k.value for k in AU_STATE_TRAIL_OVERLAY_KINDS} == expected_keys
+    for key in expected_keys:
+        assert key in _AU_STATE_TRAIL_KEYS
+        assert key.replace("-", "_") in _AU_STATE_TRAIL_KEYS
+
+    # 2. _fetch_regional_overlays must deduplicate dynamic resolved_attributions (cross-border Auto router)
+    dummy_gpkg = tmp_path / "au_state_trails.gpkg"
+    dummy_gpkg.write_bytes(b"placeholder")
+
+    class _MockAutoStateSource:
+        attribution = "Fallback attribution (should be ignored when resolved_attributions is set)"
+        resolved_attributions = [
+            "NSW Trails: © State of NSW (CC BY 4.0)",
+            "ACT Trails: © ACT Government (CC BY 4.0)",
+            "NSW Trails: © State of NSW (CC BY 4.0)",
+        ]
+
+        def fetch_overlay(self, layout, out_dir: Path) -> Path:
+            return dummy_gpkg
+
+    class _MockFallbackSource:
+        attribution = "Victoria Trails: © State of Victoria (CC BY 4.0)"
+
+        def fetch_overlay(self, layout, out_dir: Path) -> Path:
+            return dummy_gpkg
+
+    spec = SheetSpec(
+        center_lat=-35.640,
+        center_lon=148.980,
+        scale=25000,
+        au_overlays=[AUOverlayKind.AU_STATE_TRAILS, AUOverlayKind.AU_VIC_TRAILS],
+    )
+    layout = compute_sheet_layout(spec)
+
+    monkeypatch.setattr(
+        runner,
+        "build_au_overlay_sources",
+        lambda kinds, local_overrides=None: {
+            "au-state-trails": _MockAutoStateSource(),
+            "au-vic-trails": _MockFallbackSource(),
+        },
+    )
+    paths, attrs = runner._fetch_regional_overlays(spec, layout, tmp_path)
+    assert set(paths.keys()) == {"au-state-trails", "au-vic-trails"}
+    assert attrs == [
+        "NSW Trails: © State of NSW (CC BY 4.0)",
+        "ACT Trails: © ACT Government (CC BY 4.0)",
+        "Victoria Trails: © State of Victoria (CC BY 4.0)",
+    ]
+
+    # 3. Verify _resolve_pack_sources maps bundled au-state-trails cleanly (auto & specific state alias)
+    pack_dir = tmp_path / "tas-pack"
+    ov_dir = pack_dir / "overlays"
+    ov_dir.mkdir(parents=True)
+    bundled = ov_dir / "au_state_trails.gpkg"
+    bundled.write_bytes(b"gpkg")
+    manifest = PackManifest(
+        pack_id="tas",
+        name="Tasmania Test Pack",
+        region="tas",
+        bbox_wgs84=BBox(min_x=144.0, min_y=-43.5, max_x=148.5, max_y=-40.0),
+        utm_zones=["55G"],
+        overlays={"au-state-trails": "overlays/au_state_trails.gpkg"},
+        attributions=[],
+        created_at="2026-11-26T00:00:00Z",
+        size_bytes=512,
+    )
+    (pack_dir / "pack.json").write_text(manifest.model_dump_json(indent=2), encoding="utf-8")
+
+    tas_auto_spec = SheetSpec(center_lat=-41.684, center_lon=145.951, scale=25000)
+    tas_layout = compute_sheet_layout(tas_auto_spec)
+    _, _, _, _, overrides_auto, _, au_kinds_auto = runner._resolve_pack_sources(
+        pack_dir,
+        tas_auto_spec,
+        tas_layout,
+        elevation_source=None,
+        vector_source=None,
+        regional_overlay_overrides=None,
+    )
+    assert au_kinds_auto == [AUOverlayKind.AU_STATE_TRAILS]
+    assert overrides_auto["au-state-trails"] == bundled.resolve()
+
+    tas_explicit_spec = tas_auto_spec.model_copy(
+        update={"au_overlays": [AUOverlayKind.AU_TAS_TRAILS]}
+    )
+    _, _, _, _, overrides_tas, _, au_kinds_tas = runner._resolve_pack_sources(
+        pack_dir,
+        tas_explicit_spec,
+        tas_layout,
+        elevation_source=None,
+        vector_source=None,
+        regional_overlay_overrides=None,
+    )
+    assert au_kinds_tas == [AUOverlayKind.AU_TAS_TRAILS]
+    assert overrides_tas["au-tas-trails"] == bundled.resolve()
+
+    # 4. Verify populate_project_layers loads au_state_trails & au_state_pois for ALL 9 keys (Color & B&W)
+    from osgeo import ogr, osr
+
+    ogr.UseExceptions()
+    osr.UseExceptions()
+    state_gpkg = tmp_path / "state_sample.gpkg"
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(32755)
+    srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    drv = ogr.GetDriverByName("GPKG")
+    ds = drv.CreateDataSource(str(state_gpkg))
+    lt = ds.CreateLayer("au_state_trails", srs=srs, geom_type=ogr.wkbMultiLineString)
+    for fn in ("name", "trail_class", "surface", "state"):
+        lt.CreateField(ogr.FieldDefn(fn, ogr.OFTString))
+    lp = ds.CreateLayer("au_state_pois", srs=srs, geom_type=ogr.wkbPoint)
+    lp.CreateField(ogr.FieldDefn("name", ogr.OFTString))
+    lp.CreateField(ogr.FieldDefn("poi_type", ogr.OFTString))
+    lp.CreateField(ogr.FieldDefn("elev_m", ogr.OFTReal))
+    lp.CreateField(ogr.FieldDefn("state", ogr.OFTString))
+    ds = None
+
+    # Minimal empty placeholder files required by JobWorkspace model
+    empty_osm = tmp_path / "empty_osm.gpkg"
+    ds2 = drv.CreateDataSource(str(empty_osm))
+    ds2.CreateLayer("lines", srs=srs, geom_type=ogr.wkbLineString)
+    ds2 = None
+
+    ws_base = JobWorkspace(
+        job_dir=tmp_path,
+        layout=tas_layout,
+        declination=DeclinationInfo(
+            decimal_year=2026.5,
+            magnetic_declination_deg=13.5,
+            annual_change_deg=0.05,
+            grid_convergence_deg=-0.5,
+            gm_angle_deg=14.0,
+            gm_angle_mils=248.9,
+            grid_convergence_mils=-8.9,
+        ),
+        mgrs_meta=MGRSGridMeta(
+            gzd="55G",
+            square_ids_100km=["DP"],
+            center_mgrs_10m="55G DP 1234 5678",
+            grid_spacing_mm=40.0,
+            crosses_100km_boundary=False,
+            crosses_utm_zone_boundary=False,
+            ticks=[],
+        ),
+        osm_gpkg=empty_osm,
+        terrain_gpkg=empty_osm,
+        hillshade_tif=tmp_path / "missing_hs.tif",
+        dem_utm_tif=tmp_path / "missing_dem.tif",
+        mgrs_gpkg=empty_osm,
+        declination_svg=tmp_path / "decl.svg",
+        grid_ref_svg=tmp_path / "grid.svg",
+        contour_interval_display="10 m (index 50 m)",
+        attributions=[],
+    )
+    ws_json = ws_base.model_dump_json()
+
+    _run_pyqgis_snippet(
+        f"""
+        from qgis.core import QgsProject
+        from gridforge.config import AU_STATE_TRAIL_OVERLAY_KINDS, ColorMode, JobWorkspace
+        from gridforge.render.styles import populate_project_layers
+
+        base_ws = JobWorkspace.model_validate_json({ws_json!r})
+        gpkg = Path({str(state_gpkg)!r})
+
+        for mode in (ColorMode.COLOR, ColorMode.BW):
+            spec_m = base_ws.layout.spec.model_copy(update={{"color_mode": mode}})
+            layout_m = base_ws.layout.model_copy(update={{"spec": spec_m}})
+            for kind in AU_STATE_TRAIL_OVERLAY_KINDS:
+                ws = base_ws.model_copy(update={{"layout": layout_m, "regional_overlays": {{kind.value: gpkg}}}})
+                proj = QgsProject.instance()
+                proj.clear()
+                layers = populate_project_layers(proj, ws, include_grid=False)
+                names = [l.name() for l in layers]
+                assert any("Huts, Camps & Trigs" in n for n in names), f"Missing POIs layer for {{kind.value}} ({{mode.value}}): {{names}}"
+                assert any("Fire Trails & Tracks" in n for n in names), f"Missing Trails layer for {{kind.value}} ({{mode.value}}): {{names}}"
+                layers.clear()
+                proj.clear()
+        """
+    )

@@ -11,6 +11,7 @@ from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 from gridforge.config import (
+    AU_STATE_TRAIL_OVERLAY_KINDS,
     AUOverlayKind,
     CartoOptions,
     ColorMode,
@@ -192,6 +193,9 @@ def _resolve_pack_sources(
         for kind in spec.au_overlays:
             if kind.value in merged_overrides:
                 effective_au_kinds.append(kind)
+            elif kind in AU_STATE_TRAIL_OVERLAY_KINDS and "au-state-trails" in merged_overrides:
+                merged_overrides[kind.value] = merged_overrides["au-state-trails"]
+                effective_au_kinds.append(kind)
             else:
                 logger.warning(
                     "Requested AU overlay '%s' is not bundled in offline pack '%s'; skipping in air-gapped mode",
@@ -326,8 +330,17 @@ def _fetch_regional_overlays(
             continue
         if gpkg_path is not None and Path(gpkg_path).is_file():
             resolved_paths[key] = Path(gpkg_path)
-            if getattr(src, "attribution", None):
-                attributions.append(src.attribution)
+            resolved_attrs = getattr(src, "resolved_attributions", None)
+            if resolved_attrs:
+                for raw_attr in resolved_attrs:
+                    cleaned = str(raw_attr).strip()
+                    if cleaned and cleaned not in attributions:
+                        attributions.append(cleaned)
+            else:
+                raw_attr = getattr(src, "attribution", None)
+                cleaned = str(raw_attr).strip() if raw_attr else ""
+                if cleaned and cleaned not in attributions:
+                    attributions.append(cleaned)
 
     return resolved_paths, attributions
 

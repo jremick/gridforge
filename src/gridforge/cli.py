@@ -261,7 +261,11 @@ def render_cmd(
         None,
         "--au-overlay",
         case_sensitive=False,
-        help="Optional Australia CC BY 4.0 overlay (au-hydro, au-parks, au-infra, au-aviation, au-nsw-trails, au-vic-trails); repeatable.",
+        help=(
+            "Optional Australia CC BY 4.0 overlay (au-hydro, au-parks, au-infra, au-aviation, "
+            "au-state-trails [auto all 8 states/territories], au-nsw-trails, au-vic-trails, "
+            "au-tas-trails, au-qld-trails, au-wa-trails, au-sa-trails, au-nt-trails, au-act-trails); repeatable."
+        ),
     ),
     pack: Optional[Path] = typer.Option(
         None,
@@ -594,7 +598,11 @@ def export_cmd(
         None,
         "--au-overlay",
         case_sensitive=False,
-        help="Optional Australia CC BY 4.0 overlay (au-hydro, au-parks, au-infra, au-aviation, au-nsw-trails, au-vic-trails); repeatable.",
+        help=(
+            "Optional Australia CC BY 4.0 overlay (au-hydro, au-parks, au-infra, au-aviation, "
+            "au-state-trails [auto all 8 states/territories], au-nsw-trails, au-vic-trails, "
+            "au-tas-trails, au-qld-trails, au-wa-trails, au-sa-trails, au-nt-trails, au-act-trails); repeatable."
+        ),
     ),
     pack: Optional[Path] = typer.Option(
         None,
