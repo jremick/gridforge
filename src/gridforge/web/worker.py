@@ -7,7 +7,6 @@ memory stays safely below the 3 GB worker container limit on 16 GB hosts.
 from __future__ import annotations
 
 import argparse
-import inspect
 import logging
 import os
 import re
@@ -27,25 +26,26 @@ from gridforge.config import ColorMode, DeclinationInfo, SheetLayout, SheetSpec
 from gridforge.export.kmz import export_garmin_kmz
 from gridforge.export.mbtiles import export_mbtiles
 from gridforge.export.raster import render_collarless_geotiff
-from gridforge.geo.crs import compute_sheet_layout, parse_center
+from gridforge.geo.crs import compute_atlas_layouts, compute_sheet_layout, parse_center
 from gridforge.geo.strip_atlas import (
     StripAtlasPlan,
+    _format_mgrs_10m,
     parse_route_file,
     plan_strip_atlas,
     sample_route_elevation,
 )
 from gridforge.geo.supplements import (
+    AtlasIndexSheet,
     merge_pdf_pages,
+    render_atlas_index_pdf,
     render_calibration_pdf,
     render_elevation_profile_pdf,
     render_route_card_pdf,
 )
 from gridforge.geo.waypoints import compute_route_metrics
-from gridforge.packs.builder import discover_packs, load_pack_manifest
+from gridforge.packs.builder import discover_packs, resolve_pack_directory
 from gridforge.pipeline import runner
 from gridforge.render.pyqgis_worker import PyQGISRenderer
-from gridforge.sources.dem_local import LocalDEMSource
-from gridforge.sources.osm_pbf import LocalPBFSource
 from gridforge.sources.overlay_user import UserOverlaySource
 from gridforge.web import db
 from gridforge.web.schemas import CreateJobRequest, JobArtifact, JobRecord, JobStatus
@@ -70,40 +70,6 @@ def _artifact_stem(req: CreateJobRequest, center_mgrs: str | None) -> str:
     return f"{base}_{scale_k}_{req.paper.value}_{req.color_mode.value}"
 
 
-def _resolve_pack_dir(packs_dir: Path, pack_id: str) -> Path:
-    """Locate the directory containing ``pack.json`` for ``pack_id`` safely under ``packs_dir``."""
-    direct = (packs_dir / pack_id).resolve()
-    if direct.is_relative_to(packs_dir.resolve()) and (direct / "pack.json").is_file():
-        return direct
-    for child in sorted(packs_dir.iterdir()) if packs_dir.is_dir() else []:
-        if child.is_dir() and (child / "pack.json").is_file():
-            try:
-                manifest = load_pack_manifest(child)
-                if manifest.pack_id == pack_id:
-                    return child.resolve()
-            except Exception:
-                continue
-    raise FileNotFoundError(f"Offline pack '{pack_id}' not found in '{packs_dir}'.")
-
-
-class _PackLocalDEMSource(LocalDEMSource):
-    """LocalDEMSource carrying exact vertical_datum and attribution from a PackManifest."""
-
-    def __init__(
-        self,
-        path: Path | str,
-        *,
-        vertical_datum: str = "AHD",
-        attribution: str | None = None,
-    ) -> None:
-        super().__init__(path)
-        self.vertical_datum = vertical_datum
-        self.resolved_vertical_datum = vertical_datum
-        if attribution:
-            self.attribution = attribution
-            self.resolved_attribution = attribution
-
-
 def _build_spec_from_request(req: CreateJobRequest) -> SheetSpec:
     assert req.center is not None
     lat, lon, canonical_mgrs = parse_center(req.center)
@@ -124,10 +90,14 @@ def _build_spec_from_request(req: CreateJobRequest) -> SheetSpec:
         dem_source=req.dem_source,
         us_overlays=req.us_overlays,
         au_overlays=req.au_overlays,
+        nz_overlays=req.nz_overlays,
         waypoints=req.waypoints,
+        viewsheds=req.viewsheds,
         include_calibration_page=req.include_calibration_page,
         include_route_card=req.include_route_card,
         include_elevation_profile=req.include_elevation_profile,
+        include_atlas_index=req.include_atlas_index,
+        show_fold_marks=req.show_fold_marks,
     )
 
 
@@ -139,6 +109,22 @@ def _is_cancelled(db_path: Path, job_id: str) -> bool:
 def _merge_pdfs(sheet_pdfs: list[Path], output_pdf: Path) -> Path:
     """Losslessly merge per-sheet vector PDFs into a single multi-page Atlas PDF."""
     return merge_pdf_pages(sheet_pdfs, output_pdf)
+
+
+def _extract_route_lonlat(
+    req: CreateJobRequest,
+    overlay_path: Path | None,
+) -> list[tuple[float, float]] | None:
+    if overlay_path is not None and overlay_path.is_file():
+        try:
+            return parse_route_file(overlay_path)
+        except Exception as exc:
+            logger.warning("Could not parse overlay as route (%s)", exc)
+    if len(req.waypoints) >= 2:
+        return [(w.lon, w.lat) for w in req.waypoints]
+    if len(req.strip_sheets) >= 2:
+        return [(s.center_lon, s.center_lat) for s in req.strip_sheets]
+    return None
 
 
 def _assemble_supplemental_pages(
@@ -153,37 +139,69 @@ def _assemble_supplemental_pages(
     strip_plan: StripAtlasPlan | None,
     tmp_dir: Path,
     final_pdf: Path,
+    atlas_index_sheets: list[AtlasIndexSheet] | None = None,
+    atlas_overlap_pct: float = 0.0,
+    atlas_title: str | None = None,
 ) -> Path:
-    """Build requested Elevation Profile, Route Card, and 100 mm Calibration pages and merge."""
+    """Build requested Atlas Index Cover, Elevation Profile, Route Card, and 100 mm Calibration pages and merge."""
     bw = spec.color_mode == ColorMode.BW
     front_pages: list[Path] = []
     back_pages: list[Path] = []
     supp_dir = tmp_dir / "supplements"
     supp_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Optional Route Overview & Elevation Profile cover page
-    if req.include_elevation_profile and dem_paths:
-        route_lonlat: list[tuple[float, float]] | None = None
-        if overlay_path is not None and overlay_path.is_file():
-            try:
-                route_lonlat = parse_route_file(overlay_path)
-            except Exception as exc:
-                logger.warning("Could not parse overlay as route for elevation profile (%s)", exc)
-        if route_lonlat is None and len(req.waypoints) >= 2:
-            route_lonlat = [(w.lon, w.lat) for w in req.waypoints]
-        if route_lonlat is None and len(req.strip_sheets) >= 2:
-            route_lonlat = [(s.center_lon, s.center_lat) for s in req.strip_sheets]
+    route_lonlat = _extract_route_lonlat(req, overlay_path)
+    will_render_elev = bool(
+        req.include_elevation_profile
+        and dem_paths
+        and route_lonlat is not None
+        and len(route_lonlat) >= 2
+    )
+    will_render_index = bool(req.include_atlas_index and atlas_index_sheets)
+    first_map_page = 1 + (1 if will_render_index else 0) + (1 if will_render_elev else 0)
 
+    # 0. Optional Atlas Overview & Sheet Index Cover Page (Page 1)
+    if will_render_index and atlas_index_sheets:
+        indexed_sheets = [
+            sh.model_copy(update={"page_number": first_map_page + idx})
+            for idx, sh in enumerate(atlas_index_sheets)
+        ]
+        route_utm: list[tuple[float, float]] | None = None
         if route_lonlat is not None and len(route_lonlat) >= 2:
-            profile = sample_route_elevation(route_lonlat, dem_paths, anchor_layout.utm_epsg)
-            elev_pdf = render_elevation_profile_pdf(
-                profile,
-                strip_plan,
-                anchor_layout,
-                supp_dir / "elevation_profile.pdf",
-                bw=bw,
+            to_utm = Transformer.from_crs(
+                "EPSG:4326", f"EPSG:{anchor_layout.utm_epsg}", always_xy=True
             )
-            front_pages.append(elev_pdf)
+            xs, ys = to_utm.transform(
+                [p[0] for p in route_lonlat],
+                [p[1] for p in route_lonlat],
+            )
+            route_utm = [(float(x), float(y)) for x, y in zip(xs, ys)]
+
+        idx_pdf = render_atlas_index_pdf(
+            indexed_sheets,
+            page_width_mm=anchor_layout.page_width_mm,
+            page_height_mm=anchor_layout.page_height_mm,
+            scale=spec.scale,
+            utm_epsg=anchor_layout.utm_epsg,
+            title=atlas_title or spec.title or f"SHEET ATLAS ({anchor_layout.gzd})",
+            overlap_pct=atlas_overlap_pct,
+            route_utm=route_utm,
+            output_pdf=supp_dir / "atlas_index.pdf",
+            bw=bw,
+        )
+        front_pages.append(idx_pdf)
+
+    # 1. Optional Route Overview & Elevation Profile page
+    if will_render_elev and route_lonlat is not None:
+        profile = sample_route_elevation(route_lonlat, dem_paths, anchor_layout.utm_epsg)
+        elev_pdf = render_elevation_profile_pdf(
+            profile,
+            strip_plan,
+            anchor_layout,
+            supp_dir / "elevation_profile.pdf",
+            bw=bw,
+        )
+        front_pages.append(elev_pdf)
 
     # 2. Optional Tactical Route Card page
     if req.include_route_card and req.waypoints:
@@ -220,42 +238,6 @@ def _assemble_supplemental_pages(
     return merge_pdf_pages(all_pages, final_pdf)
 
 
-def _iter_atlas_sheet_specs(
-    anchor_spec: SheetSpec,
-    grid_cols: int,
-    grid_rows: int,
-    base_title: str,
-) -> list[tuple[str, SheetSpec]]:
-    """Generate ordered (sheet_id, SheetSpec) pairs for an edge-matched UTM multi-sheet atlas."""
-    anchor_layout = compute_sheet_layout(anchor_spec)
-    ground_w = anchor_layout.utm_bbox.width
-    ground_h = anchor_layout.utm_bbox.height
-    to_wgs84 = Transformer.from_crs(
-        f"EPSG:{anchor_layout.utm_epsg}", "EPSG:4326", always_xy=True
-    )
-    total = grid_cols * grid_rows
-    sheets: list[tuple[str, SheetSpec]] = []
-    idx = 0
-    for r in range(grid_rows):
-        row_letter = chr(ord("A") + r)
-        for c in range(grid_cols):
-            idx += 1
-            sheet_id = f"{row_letter}{c + 1}"
-            sheet_cx = anchor_layout.center_easting + (c - (grid_cols - 1) / 2.0) * ground_w
-            sheet_cy = anchor_layout.center_northing + ((grid_rows - 1) / 2.0 - r) * ground_h
-            sheet_lon, sheet_lat = to_wgs84.transform(sheet_cx, sheet_cy)
-            sheet_spec = anchor_spec.model_copy(
-                update={
-                    "center_lat": float(sheet_lat),
-                    "center_lon": float(sheet_lon),
-                    "center_mgrs": None,
-                    "title": f"{base_title} — Sheet {sheet_id} ({idx}/{total})",
-                }
-            )
-            sheets.append((sheet_id, sheet_spec))
-    return sheets
-
-
 def _build_prep_kwargs(
     req: CreateJobRequest,
     *,
@@ -269,34 +251,15 @@ def _build_prep_kwargs(
         else None
     )
 
-    prep_sig = inspect.signature(runner.prepare_job_workspace)
     prep_kwargs: dict[str, Any] = {
         "overlay_sources": overlay_sources,
     }
 
-    if progress_cb is not None and "progress_callback" in prep_sig.parameters:
+    if progress_cb is not None:
         prep_kwargs["progress_callback"] = progress_cb
 
     if req.pack_id is not None:
-        pack_dir = _resolve_pack_dir(packs_dir, req.pack_id)
-        if "pack_dir" in prep_sig.parameters:
-            prep_kwargs["pack_dir"] = pack_dir
-        else:
-            manifest = load_pack_manifest(pack_dir)
-            if manifest.dem_path:
-                prep_kwargs["elevation_source"] = _PackLocalDEMSource(
-                    pack_dir / manifest.dem_path,
-                    vertical_datum=manifest.vertical_datum,
-                    attribution=manifest.dem_attribution,
-                )
-            if manifest.osm_pbf_path:
-                prep_kwargs["vector_source"] = LocalPBFSource(
-                    pack_dir / manifest.osm_pbf_path
-                )
-            if manifest.overlays:
-                prep_kwargs["regional_overlay_overrides"] = {
-                    k: (pack_dir / rel) for k, rel in manifest.overlays.items()
-                }
+        prep_kwargs["pack_dir"] = resolve_pack_directory(packs_dir, req.pack_id)
     return prep_kwargs
 
 
@@ -331,6 +294,7 @@ def process_single_job(
             req.include_calibration_page
             or (req.include_route_card and len(req.waypoints) > 0)
             or req.include_elevation_profile
+            or (req.include_atlas_index and (is_strip or total_sheets > 1))
         )
 
         if not is_strip and total_sheets == 1:
@@ -388,18 +352,12 @@ def process_single_job(
                 "GRIDFORGE STRIP ATLAS" if is_strip else "GRIDFORGE ATLAS"
             )
             strip_plan_obj: StripAtlasPlan | None = None
+            atlas_sheets: list[tuple[str, SheetSpec]] = []
+            atlas_index_sheets: list[AtlasIndexSheet] = []
+            atlas_overlap_pct = 0.0
+
             if is_strip:
-                atlas_sheets: list[tuple[str, SheetSpec]] = []
-                for idx_s, sh in enumerate(req.strip_sheets, start=1):
-                    sheet_spec = spec.model_copy(
-                        update={
-                            "center_lat": float(sh.center_lat),
-                            "center_lon": float(sh.center_lon),
-                            "center_mgrs": None,
-                            "title": f"{base_title} — Sheet {sh.sheet_id} ({idx_s}/{total_sheets})",
-                        }
-                    )
-                    atlas_sheets.append((sh.sheet_id, sheet_spec))
+                atlas_overlap_pct = 10.0
                 if claimed.overlay_path is not None and claimed.overlay_path.is_file():
                     try:
                         strip_plan_obj = plan_strip_atlas(
@@ -411,10 +369,71 @@ def process_single_job(
                         )
                     except Exception:
                         strip_plan_obj = None
-            else:
-                atlas_sheets = _iter_atlas_sheet_specs(
-                    spec, req.grid_cols, req.grid_rows, base_title
+
+                strip_by_id = (
+                    {s.sheet_id: s for s in strip_plan_obj.sheets}
+                    if strip_plan_obj is not None
+                    else {}
                 )
+                for idx_s, sh in enumerate(req.strip_sheets, start=1):
+                    sheet_spec = spec.model_copy(
+                        update={
+                            "center_lat": float(sh.center_lat),
+                            "center_lon": float(sh.center_lon),
+                            "center_mgrs": None,
+                            "title": f"{base_title} — Sheet {sh.sheet_id} ({idx_s}/{total_sheets})",
+                        }
+                    )
+                    atlas_sheets.append((sh.sheet_id, sheet_spec))
+                    matched = strip_by_id.get(sh.sheet_id)
+                    if matched is not None:
+                        atlas_index_sheets.append(
+                            AtlasIndexSheet(
+                                sheet_id=sh.sheet_id,
+                                page_number=idx_s + 1,
+                                center_lat=matched.center_lat,
+                                center_lon=matched.center_lon,
+                                center_mgrs_10m=matched.center_mgrs_10m,
+                                utm_bbox=matched.utm_bbox,
+                            )
+                        )
+                    else:
+                        sh_layout = compute_sheet_layout(sheet_spec)
+                        atlas_index_sheets.append(
+                            AtlasIndexSheet(
+                                sheet_id=sh.sheet_id,
+                                page_number=idx_s + 1,
+                                center_lat=float(sh.center_lat),
+                                center_lon=float(sh.center_lon),
+                                center_mgrs_10m=_format_mgrs_10m(
+                                    float(sh.center_lat), float(sh.center_lon)
+                                ),
+                                utm_bbox=sh_layout.utm_bbox,
+                            )
+                        )
+            elif outputs.pdf:
+                # Re-validate native-UTM atlas projection compatibility before preparing any page.
+                grid_layouts = compute_atlas_layouts(
+                    compute_sheet_layout(spec), req.grid_cols, req.grid_rows
+                )
+                for idx_g, (sheet_id, page_layout) in enumerate(grid_layouts, start=1):
+                    sheet_spec = page_layout.spec.model_copy(
+                        update={"title": f"{base_title} — Sheet {sheet_id} ({idx_g}/{total_sheets})"}
+                    )
+                    atlas_sheets.append((sheet_id, sheet_spec))
+                    atlas_index_sheets.append(
+                        AtlasIndexSheet(
+                            sheet_id=sheet_id,
+                            page_number=idx_g + 1,
+                            center_lat=page_layout.spec.center_lat,
+                            center_lon=page_layout.spec.center_lon,
+                            center_mgrs_10m=_format_mgrs_10m(
+                                page_layout.spec.center_lat,
+                                page_layout.spec.center_lon,
+                            ),
+                            utm_bbox=page_layout.utm_bbox,
+                        )
+                    )
 
             sheet_pdfs_dir = tmp_work_dir / "atlas_pdfs"
             sheet_pdfs_dir.mkdir(parents=True, exist_ok=True)
@@ -490,6 +509,9 @@ def process_single_job(
                         strip_plan=strip_plan_obj,
                         tmp_dir=tmp_work_dir,
                         final_pdf=atlas_pdf_path,
+                        atlas_index_sheets=atlas_index_sheets,
+                        atlas_overlap_pct=atlas_overlap_pct,
+                        atlas_title=base_title,
                     )
                 else:
                     _merge_pdfs(rendered_sheet_pdfs, atlas_pdf_path)

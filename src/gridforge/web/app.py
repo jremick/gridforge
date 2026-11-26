@@ -9,13 +9,14 @@ import re
 import time
 import uuid
 from collections import OrderedDict
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import httpx
 import mgrs
-from fastapi import FastAPI, HTTPException, Query, Request, status
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, HTTPException, Query, Request, Response, status
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
@@ -23,7 +24,13 @@ from pyproj import Transformer
 
 from gridforge import __version__
 from gridforge.config import BBox, Orientation, PaperSize, SheetSpec, Units
-from gridforge.geo.crs import MAX_UTM_LAT, MIN_UTM_LAT, compute_sheet_layout, parse_center
+from gridforge.geo.crs import (
+    MAX_UTM_LAT,
+    MIN_UTM_LAT,
+    compute_atlas_layouts,
+    compute_sheet_layout,
+    parse_center,
+)
 from gridforge.geo.declination import compute_declination
 from gridforge.geo.strip_atlas import (
     parse_route_bytes,
@@ -33,6 +40,17 @@ from gridforge.geo.strip_atlas import (
 from gridforge.geo.waypoints import compute_route_metrics
 from gridforge.packs.builder import discover_packs
 from gridforge.web import db
+from gridforge.web.access import SameOriginWritesMiddleware
+from gridforge.web.basemap import BasemapInfoResponse, MBTilesBasemapStore
+from gridforge.web.pack_tasks import (
+    _TASK_ID_RE,
+    PackBuildRequest,
+    PackRegionsResponse,
+    PackTaskManager,
+    PackTaskRecord,
+    PackTasksListResponse,
+    get_pack_regions_response,
+)
 from gridforge.web.schemas import (
     CreateJobRequest,
     FootprintRequest,
@@ -48,7 +66,10 @@ from gridforge.web.schemas import (
     RouteMetricsResponse,
     StripPlanRequest,
     StripPlanResponse,
+    ViewshedPreviewRequest,
+    ViewshedPreviewResponse,
 )
+from gridforge.web.viewshed import compute_viewshed_preview
 
 logger = logging.getLogger(__name__)
 
@@ -209,6 +230,7 @@ def _build_footprint_preview(req: FootprintRequest) -> FootprintResponse:
             date_iso=req.date_iso,
         )
         layout = compute_sheet_layout(spec)
+        sheets = compute_atlas_layouts(layout, req.grid_cols, req.grid_rows)
         declination = compute_declination(layout, elevation_m=0.0)
     except ValueError as exc:
         raise HTTPException(status_code=_HTTP_422, detail=str(exc)) from exc
@@ -223,40 +245,30 @@ def _build_footprint_preview(req: FootprintRequest) -> FootprintResponse:
 
     # 1. Edge-matched multi-sheet UTM polygons in shared EPSG:{layout.utm_epsg}
     sheet_features: list[dict[str, Any]] = []
-    for r in range(rows):
-        row_letter = chr(ord("A") + r)
-        for c in range(cols):
-            sheet_id = f"{row_letter}{c + 1}"
-            sheet_cx = layout.center_easting + (c - (cols - 1) / 2.0) * ground_w
-            sheet_cy = layout.center_northing + ((rows - 1) / 2.0 - r) * ground_h
-            sheet_bbox = BBox(
-                min_x=sheet_cx - ground_w / 2.0,
-                min_y=sheet_cy - ground_h / 2.0,
-                max_x=sheet_cx + ground_w / 2.0,
-                max_y=sheet_cy + ground_h / 2.0,
-            )
-            ring_coords = _utm_box_to_ring(sheet_bbox, to_wgs84)
-            sheet_features.append(
-                {
-                    "type": "Feature",
-                    "properties": {
-                        "sheet_id": sheet_id,
-                        "label": sheet_id,
-                        "row": r,
-                        "col": c,
-                        "is_primary": (r == primary_row and c == primary_col),
-                        "scale": spec.scale,
-                        "paper": spec.paper.value,
-                        "orientation": spec.orientation.value,
-                        "utm_epsg": layout.utm_epsg,
-                        "gzd": layout.gzd,
-                    },
-                    "geometry": {
-                        "type": "Polygon",
-                        "coordinates": [ring_coords],
-                    },
-                }
-            )
+    for idx, (sheet_id, page) in enumerate(sheets):
+        r, c = divmod(idx, cols)
+        ring_coords = _utm_box_to_ring(page.utm_bbox, to_wgs84)
+        sheet_features.append(
+            {
+                "type": "Feature",
+                "properties": {
+                    "sheet_id": sheet_id,
+                    "label": sheet_id,
+                    "row": r,
+                    "col": c,
+                    "is_primary": (r == primary_row and c == primary_col),
+                    "scale": spec.scale,
+                    "paper": spec.paper.value,
+                    "orientation": spec.orientation.value,
+                    "utm_epsg": layout.utm_epsg,
+                    "gzd": page.gzd,
+                },
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [ring_coords],
+                },
+            }
+        )
 
     footprint_geojson: dict[str, Any] = {
         "type": "FeatureCollection",
@@ -421,8 +433,10 @@ def create_app(
     packs_dir: Path | str | None = None,
     web_dist_dir: Path | str | None = None,
     memory_budget_mb: int | None = None,
+    basemap_mbtiles: Path | str | None = None,
+    pack_builder: Callable[..., Any] | None = None,
 ) -> FastAPI:
-    """Create and configure the GridForge Phase 4 FastAPI application."""
+    """Create and configure the GridForge FastAPI application."""
     resolved_data_dir = (
         Path(data_dir).resolve()
         if data_dir is not None
@@ -445,21 +459,36 @@ def create_app(
     db_path = resolved_data_dir / "gridforge_jobs.sqlite3"
     db.init_db(db_path)
 
+    basemap_store = MBTilesBasemapStore(
+        packs_dir=resolved_packs_dir,
+        explicit_path=basemap_mbtiles,
+        allow_default_data_path=(packs_dir is None and basemap_mbtiles is None),
+    )
+    pack_manager = PackTaskManager(
+        resolved_packs_dir,
+        pack_builder=pack_builder,
+    )
+
     application = FastAPI(
         title="GridForge Map Studio API",
         version=__version__,
         description="Self-hosted military-style MGRS topographic map generator & offline pack studio.",
     )
+    application.add_middleware(SameOriginWritesMiddleware)
+    allowed_hosts = ["localhost", "127.0.0.1", "[::1]"]
+    extra_hosts = os.environ.get("GRIDFORGE_ALLOWED_HOSTS", "").split(",")
+    allowed_hosts.extend(host.strip() for host in extra_hosts if host.strip())
     application.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_methods=["*"],
-        allow_headers=["*"],
+        TrustedHostMiddleware,
+        allowed_hosts=allowed_hosts,
+        www_redirect=False,
     )
     application.state.data_dir = resolved_data_dir
     application.state.packs_dir = resolved_packs_dir
     application.state.db_path = db_path
     application.state.web_dist_dir = resolved_web_dist
+    application.state.basemap_store = basemap_store
+    application.state.pack_manager = pack_manager
 
     @application.get("/api/health", response_model=HealthResponse)
     def api_health() -> HealthResponse:
@@ -473,6 +502,27 @@ def create_app(
             worker_last_seen=last_seen,
             memory_budget_mb=resolved_mem_mb,
             packs_count=len(packs),
+        )
+
+    @application.get("/api/basemap/info", response_model=BasemapInfoResponse)
+    def api_basemap_info() -> BasemapInfoResponse:
+        return basemap_store.get_info()
+
+    @application.get("/api/basemap/{z}/{x}/{y}.{ext}")
+    def api_basemap_tile(z: int, x: int, y: int, ext: str) -> Response:
+        if ext.lower() not in {"png", "jpg", "jpeg", "webp"}:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Unsupported basemap tile extension '.{ext}'.",
+            )
+        result = basemap_store.get_tile(z, x, y, requested_ext=ext)
+        if result is None:
+            return Response(status_code=status.HTTP_204_NO_CONTENT)
+        tile_bytes, media_type = result
+        return Response(
+            content=tile_bytes,
+            media_type=media_type,
+            headers={"Cache-Control": "public, max-age=86400"},
         )
 
     @application.get("/api/packs", response_model=PacksResponse)
@@ -494,6 +544,78 @@ def create_app(
             for m in manifests
         ]
         return PacksResponse(packs=summaries)
+
+    @application.get("/api/packs/regions", response_model=PackRegionsResponse)
+    def api_pack_regions() -> PackRegionsResponse:
+        return get_pack_regions_response()
+
+    @application.post(
+        "/api/packs/build",
+        response_model=PackTaskRecord,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    def api_build_pack(req: PackBuildRequest) -> PackTaskRecord:
+        try:
+            return pack_manager.enqueue_build(req)
+        except ValueError as exc:
+            raise HTTPException(status_code=_HTTP_422, detail=str(exc)) from exc
+
+    @application.get("/api/packs/tasks", response_model=PackTasksListResponse)
+    def api_list_pack_tasks() -> PackTasksListResponse:
+        return PackTasksListResponse(tasks=pack_manager.list_tasks())
+
+    @application.get("/api/packs/tasks/{task_id}", response_model=PackTaskRecord)
+    def api_get_pack_task(task_id: str) -> PackTaskRecord:
+        if not _TASK_ID_RE.match(task_id):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid task_id.")
+        record = pack_manager.get_task(task_id)
+        if record is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pack task not found.")
+        return record
+
+    @application.delete("/api/packs/{pack_id}")
+    def api_delete_pack(pack_id: str) -> dict[str, Any]:
+        try:
+            deleted = pack_manager.delete_pack(pack_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        if not deleted:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Offline pack '{pack_id}' is not installed.",
+            )
+        return {"deleted": True, "pack_id": pack_id}
+
+    @application.post("/api/viewshed-preview", response_model=ViewshedPreviewResponse)
+    def api_viewshed_preview(req: ViewshedPreviewRequest) -> ViewshedPreviewResponse:
+        if req.pack_id is not None:
+            if not _PACK_ID_RE.match(req.pack_id):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid pack_id '{req.pack_id}'.",
+                )
+            installed_ids = {p.pack_id for p in discover_packs(resolved_packs_dir)}
+            if req.pack_id not in installed_ids:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Offline pack '{req.pack_id}' is not installed.",
+                )
+        try:
+            return compute_viewshed_preview(
+                req,
+                packs_dir=resolved_packs_dir,
+                pack_dir_finder=pack_manager.find_pack_dir,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=_HTTP_422, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception("Viewshed preview failed: %s", exc)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Viewshed preview failed: {exc}",
+            ) from exc
 
     @application.get("/api/geocode", response_model=GeocodeResponse)
     def api_geocode(
@@ -625,8 +747,8 @@ def create_app(
         assert job_req.center is not None
         try:
             lat, lon, canonical_mgrs = parse_center(job_req.center)
-            # Validate full SheetSpec bounds early before enqueueing.
-            SheetSpec(
+            # Validate full SheetSpec bounds and atlas projection early before enqueueing.
+            spec = SheetSpec(
                 center_lat=lat,
                 center_lon=lon,
                 center_mgrs=canonical_mgrs,
@@ -643,11 +765,29 @@ def create_app(
                 dem_source=job_req.dem_source,
                 us_overlays=job_req.us_overlays,
                 au_overlays=job_req.au_overlays,
+                nz_overlays=job_req.nz_overlays,
                 waypoints=job_req.waypoints,
+                viewsheds=job_req.viewsheds,
                 include_calibration_page=job_req.include_calibration_page,
                 include_route_card=job_req.include_route_card,
                 include_elevation_profile=job_req.include_elevation_profile,
+                include_atlas_index=job_req.include_atlas_index,
+                show_fold_marks=job_req.show_fold_marks,
             )
+            anchor = compute_sheet_layout(spec)
+            if job_req.outputs.pdf and not job_req.strip_sheets and job_req.grid_cols * job_req.grid_rows > 1:
+                compute_atlas_layouts(anchor, job_req.grid_cols, job_req.grid_rows)
+            elif job_req.outputs.pdf and job_req.strip_sheets:
+                for sh in job_req.strip_sheets:
+                    compute_sheet_layout(
+                        spec.model_copy(
+                            update={
+                                "center_lat": float(sh.center_lat),
+                                "center_lon": float(sh.center_lon),
+                                "center_mgrs": None,
+                            }
+                        )
+                    )
         except (ValueError, ValidationError) as exc:
             raise HTTPException(
                 status_code=_HTTP_422,

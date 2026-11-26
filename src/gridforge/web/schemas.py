@@ -17,14 +17,24 @@ from gridforge.config import (
     DemSourceKind,
     GarminProfile,
     MBTilesFormat,
+    NZOverlayKind,
     Orientation,
     PaperSize,
     Units,
     USOverlayKind,
+    ViewshedObserver,
     WaypointInput,
 )
 from gridforge.geo.strip_atlas import StripAtlasPlan
 from gridforge.geo.waypoints import RouteMetrics
+from gridforge.web.basemap import BasemapInfoResponse
+from gridforge.web.pack_tasks import (
+    PackBuildRequest,
+    PackRegionsResponse,
+    PackRegionSummary,
+    PackTaskRecord,
+    PackTasksListResponse,
+)
 
 
 class JobStatus(str, Enum):
@@ -187,6 +197,26 @@ class RouteMetricsRequest(BaseModel):
 RouteMetricsResponse = RouteMetrics
 
 
+class ViewshedPreviewRequest(BaseModel):
+    """Request payload for ``POST /api/viewshed-preview`` live terrain-masked RF/LOS preview."""
+
+    observer: ViewshedObserver
+    dem_source: DemSourceKind = DemSourceKind.AUTO
+    pack_id: str | None = None
+
+
+class ViewshedPreviewResponse(BaseModel):
+    """Live terrain-masked RF / Line-of-Sight viewshed coverage preview for MapLibre GL JS."""
+
+    observer_mgrs_10m: str
+    observer_elev_m: float
+    utm_epsg: int
+    max_distance_m: float
+    visible_area_km2: float
+    viewshed_geojson: dict[str, Any]
+    range_ring_geojson: dict[str, Any]
+
+
 class OutputOptions(BaseModel):
     """Requested print and offline digital export outputs for a job."""
 
@@ -202,6 +232,7 @@ class OutputOptions(BaseModel):
     include_calibration_page: bool = False
     include_route_card: bool = False
     include_elevation_profile: bool = False
+    include_atlas_index: bool = False
 
     @model_validator(mode="before")
     @classmethod
@@ -237,15 +268,19 @@ class CreateJobRequest(BaseModel):
     pack_id: str | None = None
     us_overlays: list[USOverlayKind] = Field(default_factory=list)
     au_overlays: list[AUOverlayKind] = Field(default_factory=list)
+    nz_overlays: list[NZOverlayKind] = Field(default_factory=list)
     carto: CartoOptions = Field(default_factory=CartoOptions)
     outputs: OutputOptions = Field(default_factory=OutputOptions)
     grid_cols: int = Field(default=1, ge=1, le=3)
     grid_rows: int = Field(default=1, ge=1, le=3)
     waypoints: list[WaypointInput] = Field(default_factory=list)
+    viewsheds: list[ViewshedObserver] = Field(default_factory=list)
     strip_sheets: list[StripSheetInput] = Field(default_factory=list)
     include_calibration_page: bool = False
     include_route_card: bool = False
     include_elevation_profile: bool = False
+    include_atlas_index: bool = False
+    show_fold_marks: bool = False
 
     @field_validator("scale")
     @classmethod
@@ -266,6 +301,9 @@ class CreateJobRequest(BaseModel):
         )
         self.include_elevation_profile = (
             self.include_elevation_profile or self.outputs.include_elevation_profile
+        )
+        self.include_atlas_index = (
+            self.include_atlas_index or self.outputs.include_atlas_index
         )
         if not self.center and self.strip_sheets:
             s0 = self.strip_sheets[0]
