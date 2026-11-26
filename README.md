@@ -8,10 +8,10 @@
 [![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](pyproject.toml)
 [![PyQGIS 3.40 LTR](https://img.shields.io/badge/PyQGIS-3.40%20LTR-589632?logo=qgis&logoColor=white)](Dockerfile)
 [![Multi-Arch](https://img.shields.io/badge/Docker-arm64%20%7C%20amd64-2496ED?logo=docker&logoColor=white)](Dockerfile)
-[![Tests](https://img.shields.io/badge/Tests-211%2B%20passing-2ea44f)](tests/)
+[![Tests](https://img.shields.io/badge/Tests-264%2B%20passing-2ea44f)](tests/)
 [![Idle Memory](https://img.shields.io/badge/Idle%20RAM-~124%20MiB-f59e0b)](docker-compose.yml)
 
-True-scale **local UTM** 300 DPI print PDFs · **All-8-State AU Trails** · **GPX Strip Atlases** · **Slope-Angle Shading** · **Tactical Route Cards & 100 mm Romer Pages** · **ATAK `.mbtiles`** · **Garmin `.kmz`**
+True-scale **local UTM** 300 DPI print PDFs · **RF Viewsheds** · **New Zealand 1 m LiDAR & All-8-State AU Trails** · **Atlas Index Covers & Fold Marks** · **Air-Gapped Studio** · **ATAK `.mbtiles`** · **Garmin `.kmz`**
 
 </div>
 
@@ -53,6 +53,47 @@ Every sheet below was generated directly by GridForge at 300 DPI and verified au
 ### Offline Field Device Exports — ATAK `.mbtiles` & Garmin Custom Maps `.kmz`
 
 ![ATAK MBTiles and Garmin KMZ Offline Exports](docs/images/exports-atak-garmin.jpg)
+
+---
+
+## `v1.3.0` RF Viewsheds, New Zealand 1 m LiDAR, QLD 2 m LiDAR & Air-Gapped Studio
+
+GridForge `v1.3.0` brings tactical radio/visual line-of-sight analysis, Trans-Tasman New Zealand support, Queensland Tier-0 2 m LiDAR, pure-vector Atlas Overview Index Covers & edge Fold/Join marks, a built-in Offline Pack Manager + Air-Gapped Web Basemap server, prebuilt multi-arch GHCR images, and local-first security & atomic-export hardening:
+
+![GridForge v1.3.0 Showcase — RF Viewshed, New Zealand LINZ 1 m LiDAR, Queensland 2 m LiDAR, and Atlas Index Cover](docs/images/v13-showcase.jpg)
+
+![GridForge Studio v1.3.0 — Live RF Viewshed Preview, Pack Manager, and New Zealand Support](docs/images/studio-v13-viewshed.jpg)
+
+- **RF / Line-of-Sight Viewshed Mapping (`--viewshed`, Studio `📡 LOS` / `V` hotkey):** Runs multi-observer `gdal_viewshed` analysis directly on the sheet DEM, rendering emerald LOS coverage on the lower raster stack (preserving 100% vector contours, roads, and MGRS lines) with dashed range rings and `observer.svg` beacons (`10 m AGL`). Preview live visible coverage (`km²`) directly inside MapLibre Studio before printing.
+- **New Zealand 1 m LiDAR / 8 m DEM (`NZVD2016`) & DOC Trails/Huts/Peaks (`--dem-source nz-linz`, `--nz-overlay nz-doc-trails`):** Streams zero-auth LERC COGs from AWS Open Data (`s3://nz-elevation`, 1 m LiDAR -> 8 m DEM -> Copernicus GLO-30) and overlays live CC BY 4.0 **DOC** Great Walks, alpine huts, campgrounds, and **LINZ** peaks (`AutoDEMSource` now routes US -> AU -> NZ -> Global automatically).
+- **Queensland Tier-0 2 m State LiDAR (`--dem-source au-elvis`):** Automatically upgrades Queensland sheets inside completed `QldDem` projects to 2 m State LiDAR (`AHD`, CC BY 4.0) before falling through to GA National 5 m LiDAR and DEA SRTM 1 s.
+- **Atlas Overview & Sheet Index Cover + Edge Fold/Join Marks (`--atlas-index`, `--fold-marks`):** Prepends a pure-vector schematic sheet index cover (`A1..C3` or `S1..Sn`, overlap hatching, route overlay, 10 m MGRS table) and adds `4.0 mm` corner crop & midpoint `FOLD / JOIN` registration marks outside the neatline.
+- **Studio Offline Pack Manager & Air-Gapped Basemap Mode:** Build, inspect, and delete any of the 15 Australian offline packs directly from the Studio **Manage Packs** modal (`GET /api/packs/regions`, `POST /api/packs/build`), and mount a local raster `.mbtiles` (`GRIDFORGE_BASEMAP_MBTILES=/data/basemap.mbtiles`) to enable zero-external-request **Offline** Studio basemaps.
+
+```bash
+# Mt Kosciuszko NSW — RF/LOS Viewshed (10 m AGL Relay, 8 km) + Edge Fold/Join Marks
+docker run --rm -v "$(pwd)/out:/out" gridforge:dev \
+  gridforge render --center "-36.456,148.263" --scale 25000 --paper a4 \
+    --dem-source au-elvis --au-overlay au-nsw-trails --fold-marks \
+    --viewshed "-36.4559,148.2636,10,1.5,8,Kosciuszko Relay" \
+    --title "MT KOSCIUSZKO — RF VIEWSHED" \
+    --output /out/kosciuszko_viewshed_25k_a4.pdf
+
+# New Zealand — Tongariro Alpine Crossing (LINZ 1 m LiDAR NZVD2016 + DOC Tracks/Huts + Slope Shading)
+docker run --rm -v "$(pwd)/out:/out" gridforge:dev \
+  gridforge render --center "-39.133,175.642" --scale 25000 --paper a4 \
+    --dem-source nz-linz --nz-overlay nz-doc-trails --slope-shading \
+    --title "TONGARIRO ALPINE CROSSING — NZ" \
+    --output /out/tongariro_nz_25k_a4.pdf
+
+# Bushwalk Strip Atlas + Pure-Vector Atlas Overview Index Cover + Elevation Profile + Fold Marks + Calibration
+docker run --rm -v "$(pwd)/out:/out" -v "$(pwd)/examples:/examples:ro" gridforge:dev \
+  gridforge render --strip-route /examples/katoomba_route.geojson --scale 25000 --paper a4 \
+    --dem-source au-elvis --au-overlay au-state-trails \
+    --atlas-index --elevation-profile --fold-marks --calibration-page \
+    --title "KATOOMBA BUSHWALK STRIP ATLAS" \
+    --output /out/katoomba_strip_atlas.pdf
+```
 
 ---
 
@@ -133,9 +174,20 @@ docker run --rm -v "$(pwd)/out:/out" -v "$(pwd)/examples:/examples:ro" gridforge
 
 ---
 
-## 60-Second Self-Hosted Quickstart (`docker compose up`)
+## 10-Second Self-Hosted Quickstart (Prebuilt GHCR or Source Build)
 
-Run the full self-hosted **MapLibre GL JS Print Studio** and async render worker locally on Apple Silicon (`arm64`) or Linux (`amd64`):
+Run the full self-hosted **MapLibre GL JS Print Studio** and async render worker locally on Apple Silicon (`arm64`) or Linux (`amd64`).
+
+### Option A — Zero-Build Prebuilt Image (`ghcr.io/jremick/gridforge:latest`)
+
+```bash
+git clone https://github.com/jremick/gridforge.git
+cd gridforge
+mkdir -p packs
+docker compose -f docker-compose.ghcr.yml up -d
+```
+
+### Option B — Build Locally From Source
 
 ```bash
 git clone https://github.com/jremick/gridforge.git
@@ -143,13 +195,16 @@ cd gridforge
 docker compose up --build -d
 ```
 
-Open **<http://localhost:8080>** in your browser:
+> **Air-Gapped Web Basemap Mode:** Place any raster tile archive at `./basemap.mbtiles`, uncomment `GRIDFORGE_BASEMAP_MBTILES=/data/basemap.mbtiles` and `./basemap.mbtiles:/data/basemap.mbtiles:ro` in [`docker-compose.ghcr.yml`](docker-compose.ghcr.yml), and restart `web` — Studio automatically enables an **Offline** basemap switcher served locally from `/api/basemap/{z}/{x}/{y}.{format}`.
 
+Open **<http://127.0.0.1:8080>** in your browser (`docker compose` binds IPv4 loopback `127.0.0.1:8080` by default and shares a single SQLite job queue; browser write requests must be same-origin):
+
+- **Remote / Homelab Access:** Forward port `8080` over SSH (`ssh -L 8080:127.0.0.1:8080 user@host`), publish privately over [Tailscale Serve](deploy/tailscale-serve.md), or place GridForge behind an authenticated HTTPS reverse proxy ([Caddy](deploy/Caddyfile.example) / [Traefik](deploy/traefik-compose.override.yml)) that sets `GRIDFORGE_ALLOWED_HOSTS`, preserves the original `Host` header (including port), sets `X-Forwarded-Proto`, and configures `FORWARDED_ALLOW_IPS`.
 - **Place Search & Direct Coordinates:** Press `/` to search any place name (via built-in Nominatim proxy), paste `lat,lon`, enter an MGRS coordinate (e.g. `56H KH 5100 6400`), jump to curated **NSW & Victoria outdoor presets** (*Blue Mountains, Mt Kosciuszko, Budawangs, Warrumbungles, Grampians, Wilsons Promontory, Mt Bogong, Cathedral Range*), or drag the crosshair reticle anywhere on the map.
-- **Live Tilted UTM Footprint & MGRS Preview:** Visually inspects the exact true-scale UTM paper frame and 1 km MGRS grid lines (including convergence tilt) in real time; press `F` to fit the sheet to view.
-- **Multi-Sheet Edge-Matched Atlas PDFs:** Select `1×1`, `2×1`, `1×2`, `2×2`, `3×2`, or `3×3` in **Sheet & Print** to preview labeled adjacent sheets (`A1`–`C3`) sharing one locked UTM projection and export a merged multi-page true-scale Atlas PDF.
-- **Custom Overlays & Offline Packs:** Drag and drop `.geojson`, `.gpx`, or `.csv` files (try [`examples/katoomba_route.geojson`](examples/katoomba_route.geojson)), toggle Australian/US federal overlays, or pick any air-gapped pack placed in `./packs/`.
-- **Shareable Permalinks & Copy CLI:** Bookmark or share any map setup directly via URL parameters, click **Copy CLI** for the exact reproducible Docker command, and **Preview** or **Download** finished PDF / `.mbtiles` / `.kmz` artifacts from the Queue drawer.
+- **Live Tilted UTM Footprint & MGRS Preview:** Visually inspects the exact true-scale UTM paper frame and 1 km MGRS grid lines (including convergence tilt) in real time; press `F` to fit the sheet to view. Sheets whose footprint or fetch margin crosses the antimeridian (`±180°`) are rejected with a clear validation error.
+- **Multi-Sheet Edge-Matched Atlas PDFs:** Select `1×1`, `2×1`, `1×2`, `2×2`, `3×2`, or `3×3` in **Sheet & Print** to preview labeled adjacent sheets (`A1`–`C3`) sharing one locked UTM projection and export a merged multi-page true-scale Atlas PDF. Every atlas sheet center must stay in the anchor sheet's native UTM zone and hemisphere (validated by Studio before queueing).
+- **Custom Overlays & Offline Packs:** Drag and drop `.geojson`, `.gpx`, or `.csv` files (try [`examples/katoomba_route.geojson`](examples/katoomba_route.geojson)), toggle Australian/US federal overlays, or pick any air-gapped pack placed in `./packs/` (Studio requires both DEM and OSM data in the selected pack).
+- **Shareable Permalinks & Copy CLI:** Bookmark or share any map setup directly via URL parameters, click **Copy CLI** for a reproducible `docker compose run --rm cli gridforge ...` command (writing outputs to `./out/`, reading uploaded overlays/routes from `./out/inputs/`, resolving packs by manifest ID via `--pack-id` under `./packs/`, and directing unsupported rectangular atlas PDFs or strip+digital combos to **Generate Map Sheet**), and **Preview** or **Download** finished PDF / `.mbtiles` / `.kmz` artifacts from the Queue drawer.
 
 Stop the stack cleanly anytime with `docker compose down`.
 
@@ -223,7 +278,9 @@ mkdir -p packs
 docker run --rm -v "$(pwd)/packs:/data/packs" gridforge:dev \
   gridforge pack build --region blue-mountains --output /data/packs/blue-mountains
 
-# Render 100% air-gapped (zero network calls) using --pack
+# Render 100% air-gapped (zero network calls) using --pack (or --pack-id by manifest ID)
+# Note: offline render/export require both DEM and OSM data; partial packs fail cleanly
+# without falling back online unless completed with --offline-dem or --offline-pbf.
 docker run --rm -v "$(pwd)/packs:/data/packs:ro" -v "$(pwd)/out:/out" gridforge:dev \
   gridforge render --center "-33.732,150.312" --scale 25000 --paper a4 \
     --pack /data/packs/blue-mountains --output /out/offline_sheet.pdf
@@ -255,35 +312,43 @@ Measured on an Apple Silicon **M5 (16 GB RAM)** host running native `linux/arm64
 | **Warm-cache A4 300 DPI render time** | **`2.25 s`** (Katoomba B&W) / **`5.92 s`** (Boulder 1 m LiDAR) | Fast interactive turnaround |
 | **1 km MGRS physical grid accuracy** | **`0.0046 mm`** (Letter 1:24k) / **`0.0185 mm`** (A4 1:25k) | `≤ 0.15 mm` protractor tolerance |
 | **MGRS grid orthogonality skew** | **`0.0000 mm`** across all tested UTM zones | `< 0.05 mm` |
-| **Automated test suite (`pytest`)** | **`211+` offline unit & integration tests passing** | Runs offline inside `gridforge:dev` |
+| **Automated test suite (`pytest` + Node)** | **`264` offline pytest + `5` Copy CLI unit tests passing** | Runs offline inside `gridforge:dev` & `npm --prefix web test` |
 | **100 mm Calibration ruler accuracy** | **`0.0000 mm` error / `0.0000 mm` skew** (H & V) | `≤ 0.15 mm` |
 
 ---
 
-## Architecture & Testing
+## Architecture, Contributing & Testing
+
+See **[CONTRIBUTING.md](CONTRIBUTING.md)** for development workflow and strict open-data licensing rules, **[docs/STYLING_GUIDE.md](docs/STYLING_GUIDE.md)** for customizing QGIS 3.40 `.qml` themes, and **`deploy/`** for homelab HTTPS reverse-proxy ([Caddy](deploy/Caddyfile.example), [Traefik](deploy/traefik-compose.override.yml)) and [Tailscale Serve](deploy/tailscale-serve.md) setups.
 
 ```text
 src/gridforge/
-├── config.py              # Pydantic v2 SheetSpec, CartoOptions, PackManifest, ExportResult contracts
+├── config.py              # Pydantic v2 SheetSpec, ViewshedObserver, CartoOptions, PackManifest contracts
 ├── cli.py                 # Typer CLI (`render`, `export`, `inspect`, `pack`, `serve`)
-├── geo/                   # UTM/MGRS CRS, 1 km/100 km grid generator, WMM2025 declination SVGs
-├── sources/               # GA 5m/SRTM (AU), USGS 3DEP (US), Copernicus GLO-30, Overpass, PBF, AU/US/user overlays
-├── packs/                 # Memory-safe streaming Australia offline pack catalog & builder (< 300 MB RAM)
-├── pipeline/              # OSM -> GeoPackage normalization, GDAL terrain/hillshade/contours, job runner
-├── render/                # Isolated PyQGIS subprocess worker, Color/B&W styling, QgsPrintLayout collar
-├── export/                # Collarless UTM GeoTIFF renderer, ATAK MBTiles 1.3, Garmin Custom Maps KMZ
-└── web/                   # FastAPI server (zero qgis imports), SQLite WAL queue, geocode proxy, atlas worker
-web/                       # TypeScript + Vite + MapLibre GL JS self-hosted tactical print studio SPA
+├── geo/                   # UTM/MGRS CRS, atlas/antimeridian checks, WMM2025 SVGs, Atlas Index & supplements
+├── sources/               # QLD 2m/GA 5m/SRTM (AU), LINZ 1m/8m (NZ), USGS 3DEP (US), GLO-30, OSM, AU/NZ/US overlays
+├── packs/                 # Memory-safe streaming Australia offline pack catalog, manifest-ID lookup & builder
+├── pipeline/              # OSM -> GeoPackage normalization, GDAL hillshade/contours/slope/viewshed, runner
+├── render/                # Isolated PyQGIS subprocess worker, Color/B&W styling, QgsPrintLayout collar & fold marks
+├── export/                # Atomic staged publication, collarless UTM GeoTIFF, ATAK MBTiles 1.3, Garmin KMZ
+└── web/                   # FastAPI server (zero qgis imports), SameOrigin/TrustedHost, MBTiles basemap, Pack Manager
+web/                       # TypeScript + Vite + MapLibre GL JS Print Studio SPA + Copy CLI tests
 config/osmconf.ini         # Shared GDAL OSM driver schema for online & air-gapped parity
 assets/
-├── icons/                 # 21 crisp self-contained military/topo/Outback/alpine SVG symbols
-└── styles/{color,bw}/     # 72 native QGIS 3.40 Color & dedicated laser-print B&W .qml styles
+├── icons/                 # 22 crisp self-contained military/topo/Outback/alpine/RF-observer SVG symbols
+└── styles/{color,bw}/     # 78 native QGIS 3.40 Color & dedicated laser-print B&W .qml styles
+deploy/                    # Caddyfile.example, Traefik v3 override, and Tailscale Serve homelab guide
+.github/workflows/         # Automated offline CI + multi-arch (amd64/arm64) GHCR release pipeline
 examples/                  # Sample Blue Mountains GeoJSON route overlay & runnable CLI cookbook
 ```
 
 ```bash
 # Offline unit + integration CI gate (no network required)
 docker run --rm -v "$(pwd):/app" gridforge:dev pytest tests/unit tests/integration
+
+# Web Studio Copy CLI unit & Compose parity tests
+npm --prefix web test
+npm --prefix web run test:compose
 
 # Live multi-region Australia & North America E2E tests
 docker run --rm -e GRIDFORGE_RUN_LIVE=1 -v "$(pwd):/app" gridforge:dev pytest tests/integration -m live
@@ -293,9 +358,10 @@ docker run --rm -e GRIDFORGE_RUN_LIVE=1 -v "$(pwd):/app" gridforge:dev pytest te
 
 ## Roadmap & Backlog
 
+- **Shipped in `v1.3.0`:** GDAL RF/LOS Viewshed mapping (`--viewshed` & Studio `📡 LOS`), New Zealand LINZ 1 m LiDAR / 8 m DEM (`NZVD2016`) + DOC trails/huts/peaks, Queensland Tier-0 2 m State LiDAR, pure-vector Atlas Overview Index Covers & Fold/Join marks, Studio Offline Pack Manager & Air-Gapped MBTiles Web Basemap Mode, multi-arch GHCR CI/CD + homelab deploy guides, and local-first security/atomic-export/projection hardening (PRs `#1`–`#5`).
 - **Shipped in `v1.2.0`:** Pan-Australia state fire-trail, hut, campground & trig coverage across all 8 states/territories (`NSW`, `VIC`, `TAS`, `QLD`, `WA`, `SA`, `NT`, `ACT`), automatic cross-border `au-state-trails` router with dynamic attribution, air-gapped pack bundling, and Studio Auto + 8-chip state selector.
 - **Shipped in `v1.1.0`:** NSW & Victoria state fire-trail/hut/trig layers, GDAL slope-angle avalanche shading, GPX/GeoJSON auto-strip-map builder + elevation profile cover, interactive waypoint markup + tactical route cards, and 100 mm printer scale calibration & MGRS Romer pages.
-- **Backlog (`v1.3+`):** **Air-Gapped Web Basemap Mode** (self-hosted local PMTiles/MBTiles basemap option in the MapLibre Studio UI for fully disconnected deployments), additional regional LiDAR providers (QLD/TAS/NZ/EU), and custom legend/collar branding profiles.
+- **Backlog (`v1.4+`):** European & UK open regional LiDAR providers (EU-DEM / Swisstopo / IGN / Environment Agency), custom organization collar/legend branding profiles, and downloadable regional offline basemap `.mbtiles` builder presets.
 
 ---
 
@@ -306,6 +372,9 @@ docker run --rm -e GRIDFORGE_RUN_LIVE=1 -v "$(pwd):/app" gridforge:dev pytest te
 | **GridForge Source Code** | Application, styles, icons, web studio | **GNU GPL v3.0 or later** ([LICENSE](LICENSE)) |
 | **OpenStreetMap** | Global roads, trails, rail, water, buildings, landcover, POIs | **ODbL** — Map data © OpenStreetMap contributors (`openstreetmap.org/copyright`) |
 | **Geoscience Australia / DEA** | Australia 5 m LiDAR (2025) & SRTM 1s (`AHD`), Surface Hydrology, Electricity/Pipelines, Aviation/Homesteads, Topo250K tracks | **CC BY 4.0** — © Commonwealth of Australia (Geoscience Australia / Digital Earth Australia) |
+| **Queensland QldDem LiDAR** | Queensland Tier-0 2 m State LiDAR (`AHD`, via `au-elvis`) | **CC BY 4.0** — © State of Queensland (Department of Resources) QldDem LiDAR |
+| **Toitū Te Whenua LINZ** | New Zealand 1 m LiDAR & 8 m DEM (`NZVD2016`, AWS `s3://nz-elevation`, via `nz-linz`) & `NZ_Maunga` peaks | **CC BY 4.0** — Toitū Te Whenua Land Information New Zealand (LINZ) |
+| **NZ Dept. of Conservation (DOC)** | New Zealand Great Walks, Tracks, Backcountry Huts & Campsites (`nz-doc-trails`) | **CC BY 4.0** — © Department of Conservation Te Papa Atawhai & Toitū Te Whenua LINZ |
 | **DCCEEW CAPAD 2025** | Australia National Parks, Nature Reserves, IPAs | **CC BY 4.0** — © Commonwealth of Australia (DCCEEW) |
 | **NSW Spatial Services (DCS)** | NSW Fire Trails, 4WD/Walking Tracks, Huts, Campgrounds & GDA2020 Trig Stations (`au-nsw-trails`) | **CC BY 4.0** — © State of New South Wales (Spatial Services, DCS) |
 | **Victoria DEECA / DTP Vicmap** | Victoria 4WD/Fire Access Tracks, Walking Trails, Alpine Huts, Campgrounds & Survey Marks (`au-vic-trails`) | **CC BY 4.0** — © State of Victoria (DEECA / DTP Vicmap) |

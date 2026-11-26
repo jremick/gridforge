@@ -5,6 +5,38 @@ All notable changes to **GridForge** are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-11-26
+
+Major operational, geospatial, self-hosting, and hardening release adding RF/LOS Viewshed mapping, New Zealand 1 m LiDAR & DOC trails, Queensland Tier-0 2 m State LiDAR, Atlas Overview Index Covers & Fold/Join Marks, Studio Offline Pack Manager & Air-Gapped Basemap Mode, multi-arch GHCR CI/CD + homelab reverse-proxy guides, and five production security/reliability hardening improvements (Codex PRs `#1`–`#5`).
+
+### Added
+
+- **RF / Line-of-Sight Viewshed Mapping (`--viewshed`, `POST /api/viewshed-preview`, Studio `📡 LOS` / `V` hotkey):**
+  - Multi-observer `gdal_viewshed` terrain visibility engine (`src/gridforge/pipeline/terrain.py`) rendering translucent emerald LOS coverage on the bottom raster stack (keeping all contours, roads, trails, and MGRS lines pure vector) paired with dashed range rings and `observer.svg` antenna beacons with AGL height callouts (`22` SVG icons, `78` native QGIS 3.40 `.qml` styles).
+  - Interactive MapLibre Studio `📡 LOS` tool drops observers directly on the map, previews terrain-masked coverage (`Visible: XX.X km²`), displays 10 m MGRS and ground elevation, and tunes observer height, target height, and max range (`250 m`–`25 km`) before printing.
+- **New Zealand Support — LINZ 1 m LiDAR / 8 m DEM (`NZVD2016`) & DOC Trails/Huts/Peaks (`--dem-source nz-linz`, `--nz-overlay nz-doc-trails`):**
+  - Streams zero-auth LERC COGs directly from AWS Open Data `s3://nz-elevation` via closed-form NZTM2000 Topo50 / 1:10k indexing (`1 m LiDAR -> 8 m DEM -> Copernicus GLO-30` fallback) and integrates into 4-way `AutoDEMSource` (`US -> AU -> NZ -> Global`).
+  - Live CC BY 4.0 **Department of Conservation (DOC)** Great Walks, walking tracks, alpine huts, campgrounds, and **Toitū Te Whenua LINZ** `NZ_Maunga` peaks (plus optional `LINZ_API_KEY` geodetic survey marks) rendered via the unified backcountry trail/POI schema.
+- **Australia Tier-0 Queensland 2 m State LiDAR (`dem_au_elvis.py`):**
+  - Automatically upgrades Queensland sheets inside completed `QldDem` LiDAR projects to **2 m State LiDAR (`AHD`, CC BY 4.0)** with shoreline cliff-ratio guards before seamlessly falling through to GA National 5 m LiDAR WCS and DEA SRTM 1 s.
+- **Atlas Overview & Sheet Index Cover Page + Edge Fold/Join Marks (`--atlas-index`, `--fold-marks`):**
+  - Prepends a mathematically exact pure-vector **Atlas Overview & Sheet Index Cover** (`src/gridforge/geo/supplements.py`) showing scaled sheet boxes (`A1..C3` or `S1..Sn`), diagonal overlap hatching, GPX/GeoJSON route polyline, North arrow, scale bar, and a complete 10 m MGRS & UTM extent table.
+  - Adds optional `4.0 mm` L-shaped corner registration crop marks and midpoint `FOLD / JOIN` edge ticks outside the neatline strictly clear of collar metadata and MGRS labels.
+- **Studio Offline Pack Manager & Air-Gapped Web Basemap Mode (`src/gridforge/web/{basemap,pack_tasks}.py`, `packsModal.ts`):**
+  - One-click **Manage Packs** modal in Print Studio backed by `GET /api/packs/regions` (all 15 Australian presets + custom BBox), single-concurrency `POST /api/packs/build` with live stage polling (`GET /api/packs/tasks`), and path-traversal-hardened `DELETE /api/packs/{pack_id}`.
+  - Zero-external-request **Air-Gapped Web Basemap Mode**: mount any raster `.mbtiles` archive (`GRIDFORGE_BASEMAP_MBTILES` or `/data/basemap.mbtiles`) to serve XYZ->TMS flipped tiles via `GET /api/basemap/info` & `GET /api/basemap/{z}/{x}/{y}.{ext}` with an automatic **Offline** switcher pill in MapLibre Studio.
+- **OSS CI/CD, Prebuilt Multi-Arch GHCR Images & Homelab/Contributor Docs:**
+  - Added `.github/workflows/ci.yml` (Node 22 Copy CLI tests + SPA build + Buildx Docker offline pytest suite) and `.github/workflows/release.yml` (multi-arch `linux/amd64,linux/arm64` push to `ghcr.io/jremick/gridforge:{latest,vX.Y,vX.Y.Z}` on tag push).
+  - Added zero-build `docker-compose.ghcr.yml`, homelab HTTPS guides (`deploy/Caddyfile.example`, `deploy/traefik-compose.override.yml`, `deploy/tailscale-serve.md`), `CONTRIBUTING.md`, `docs/STYLING_GUIDE.md`, and GitHub issue/PR templates.
+
+### Fixed & Hardened (Codex PRs `#1`–`#5`)
+
+- **Local-First Studio Security Defaults (PR `#1`):** Bound Compose ports and `gridforge serve` / Vite dev servers strictly to `127.0.0.1` by default, removed wildcard CORS, added `SameOriginWritesMiddleware` (`src/gridforge/web/access.py`) protecting all non-GET/HEAD/OPTIONS routes (`403` on cross-origin writes) plus `TrustedHostMiddleware` (`GRIDFORGE_ALLOWED_HOSTS`, `FORWARDED_ALLOW_IPS`), and pinned `starlette>=1.9` for IPv6 `[::1]` and mixed-case `Host` support.
+- **Strict Air-Gapped Partial Pack Handling (PR `#2`):** Offline renders/exports using `--pack` / `--pack-id` now fail cleanly before any online fetch when a partial pack omits DEM or OSM PBF (while allowing completion via `--offline-dem` / `--offline-pbf`), and Studio preserves unavailable or `?pack=` permalink selections without silent fallback.
+- **Atomic Offline Device Archive Publication (PR `#3`):** Added `src/gridforge/export/_atomic.py` (`staged_archive`) so Garmin `.kmz` and ATAK `.mbtiles` exports stage atomically on the destination filesystem, properly close SQLite handles, protect `-journal`/`-wal`/`-shm`/`.aux.xml` sidecars, and clean scratch files prior to final atomic rename.
+- **Multi-Sheet Atlas Projection & Antimeridian Validation (PR `#4`):** Added shared `compute_atlas_layouts` and antimeridian (`±180°`) extent rejection in `src/gridforge/geo/crs.py`, enforced consistently across `/api/footprint`, `/api/jobs`, and `worker.py`, with digital-only `1×1` footprint preview and stale-footprint clearing on validation errors in Studio.
+- **Reproducible Copy CLI & Manifest-ID Pack Lookup (PR `#5`):** Added `resolve_pack_directory` (`--pack-id`) supporting renamed pack folders, restored single-sheet `--elevation-profile` from uploaded `--overlay` routes, switched Studio **Copy CLI** to POSIX single-quoted `docker compose run --rm cli gridforge ...` targeting `/out/` and `/out/inputs/` with unsupported-combo clipboard guards, and added automated `web/tests/copy-cli.test.mjs` (`5/5` passing) + `264` offline pytest checks.
+
 ## [1.2.0] - 2026-11-26
 
 Pan-Australia release extending live open-government fire-trail, 4WD/walking track, backcountry hut, campground, and trig station overlays to **all 8 Australian states and territories**, backed by an automatic cross-border router, low-RAM streaming, air-gapped pack bundling, and a redesigned Studio state selector.
