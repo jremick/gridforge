@@ -1088,7 +1088,12 @@ class GridForgeMCPServer:
             return self._base_url
         return None
 
-    def _build_client(self, extra_headers: dict[str, str] | None = None) -> httpx.AsyncClient:
+    def _build_client(
+        self,
+        extra_headers: dict[str, str] | None = None,
+        *,
+        client_addr: tuple[str, int] | None = None,
+    ) -> httpx.AsyncClient:
         from gridforge.web.access import origin_proxy_header_name
 
         headers: dict[str, str] = {"Accept": "application/json"}
@@ -1112,7 +1117,11 @@ class GridForgeMCPServer:
                 headers[k] = v
 
         if target_app is not None:
-            transport = httpx.ASGITransport(app=target_app)
+            transport = (
+                httpx.ASGITransport(app=target_app, client=client_addr)
+                if client_addr is not None
+                else httpx.ASGITransport(app=target_app)
+            )
             return httpx.AsyncClient(
                 transport=transport,
                 base_url="http://127.0.0.1",
@@ -1278,6 +1287,7 @@ class GridForgeMCPServer:
         *,
         request_headers: dict[str, str] | None = None,
         public_url: str | None = None,
+        client_addr: tuple[str, int] | None = None,
     ) -> Any:
         """Handle a single JSON-RPC 2.0 object or a batch array; returns ``None`` for notifications."""
         if isinstance(payload, list):
@@ -1295,6 +1305,7 @@ class GridForgeMCPServer:
                     item,
                     request_headers=request_headers,
                     public_url=public_url,
+                    client_addr=client_addr,
                 )
                 if resp is not None:
                     responses.append(resp)
@@ -1303,6 +1314,7 @@ class GridForgeMCPServer:
             payload,
             request_headers=request_headers,
             public_url=public_url,
+            client_addr=client_addr,
         )
 
     async def handle_message(
@@ -1311,6 +1323,7 @@ class GridForgeMCPServer:
         *,
         request_headers: dict[str, str] | None = None,
         public_url: str | None = None,
+        client_addr: tuple[str, int] | None = None,
     ) -> dict[str, Any] | None:
         """Process a single JSON-RPC 2.0 request or notification."""
         if not isinstance(message, dict):
@@ -1342,6 +1355,7 @@ class GridForgeMCPServer:
                 params,
                 request_headers=request_headers,
                 public_url=public_url,
+                client_addr=client_addr,
             )
             if is_notification:
                 return None
@@ -1363,6 +1377,7 @@ class GridForgeMCPServer:
         *,
         request_headers: dict[str, str] | None = None,
         public_url: str | None = None,
+        client_addr: tuple[str, int] | None = None,
     ) -> dict[str, Any]:
         if method == "initialize":
             return build_initialize_result(
@@ -1381,6 +1396,7 @@ class GridForgeMCPServer:
                 params,
                 request_headers=request_headers,
                 public_url=public_url,
+                client_addr=client_addr,
             )
         if method == "resources/list":
             return {"resources": [r.to_dict() for r in self._resources]}
@@ -1390,6 +1406,7 @@ class GridForgeMCPServer:
             return await self._handle_resource_read(
                 params,
                 request_headers=request_headers,
+                client_addr=client_addr,
             )
         if method == "prompts/list":
             return {"prompts": [p.to_dict() for p in self._prompts]}
@@ -1407,6 +1424,7 @@ class GridForgeMCPServer:
         params: dict[str, Any],
         *,
         request_headers: dict[str, str] | None = None,
+        client_addr: tuple[str, int] | None = None,
     ) -> dict[str, Any]:
         uri = str(params.get("uri") or "").strip()
         if not uri:
@@ -1419,7 +1437,7 @@ class GridForgeMCPServer:
                 meta=APP_RESOURCE_META,
             )
         if uri == CAPABILITIES_URI:
-            async with self._build_client(request_headers) as client:
+            async with self._build_client(request_headers, client_addr=client_addr) as client:
                 caps = await self._fetch_capabilities_safe(client)
             return resource_read_result(
                 CAPABILITIES_URI,
@@ -1528,6 +1546,7 @@ class GridForgeMCPServer:
         *,
         request_headers: dict[str, str] | None = None,
         public_url: str | None = None,
+        client_addr: tuple[str, int] | None = None,
     ) -> dict[str, Any]:
         name = str(params.get("name") or "").strip()
         if name not in self._tool_map:
@@ -1544,7 +1563,7 @@ class GridForgeMCPServer:
             raise MCPError(METHOD_NOT_FOUND, f"Handler not implemented for tool '{name}'.")
 
         try:
-            async with self._build_client(request_headers) as client:
+            async with self._build_client(request_headers, client_addr=client_addr) as client:
                 return await handler(client, args, eff_public_url)
         except MCPError:
             raise

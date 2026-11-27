@@ -150,7 +150,7 @@ class TestApiKeysDBAndHostedAuth:
         sharer = {"X-API-Key": mint("Sharer", ["shares:write"])}
         center = {"center": "-33.732, 150.312"}
 
-        for scopes in ([], ["unrecognized"], ["all,planning"], ["all", "planning"]):
+        for scopes in ([], ["unrecognized"], ["all,planning"], ["all", "planning"], ["planning", "planning"]):
             invalid = session.post("/api/auth/api-keys", json={"name": "Invalid", "scopes": scopes})
             assert invalid.status_code == 422
 
@@ -181,6 +181,14 @@ class TestApiKeysDBAndHostedAuth:
         assert bot.post("/api/shares", headers=sharer, json={"name": "Map", "state": center}).status_code == 201
         assert bot.post("/api/shares", headers=sharer, json={"project_id": project_id}).status_code == 403
         assert bot.post("/api/shares", headers=all_key, json={"project_id": project_id}).status_code == 201
+
+        # Cross-tenant share moderation requires an Admin browser session, not an Admin PAT.
+        friend_client, _ = _create_friend(session, app, email="friend-share@example.com")
+        friend_share = friend_client.post("/api/shares", json={"name": "Friend map", "state": center})
+        assert friend_share.status_code == 201, friend_share.text
+        friend_share_id = friend_share.json()["share_id"]
+        assert bot.delete(f"/api/shares/{friend_share_id}", headers=all_key).status_code == 403
+        assert session.delete(f"/api/shares/{friend_share_id}").status_code == 200
 
         def tool(name: str, arguments: dict, headers: dict[str, str]) -> dict:
             reply = bot.post(

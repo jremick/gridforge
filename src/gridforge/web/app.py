@@ -1832,7 +1832,7 @@ def create_app(
     )
     def api_build_pack(req: PackBuildRequest, request: Request) -> PackTaskRecord:
         ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=False)
-        if auth_config.auth_mode == "hosted" and ctx.role != "admin":
+        if auth_config.auth_mode == "hosted" and (ctx.auth_method != "session" or ctx.role != "admin"):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Admin role required to manage offline packs.",
@@ -1856,7 +1856,7 @@ def create_app(
     )
     def api_list_pack_tasks(request: Request) -> PackTasksListResponse:
         ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=False)
-        if auth_config.auth_mode == "hosted" and ctx.role != "admin":
+        if auth_config.auth_mode == "hosted" and (ctx.auth_method != "session" or ctx.role != "admin"):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Admin role required to manage offline packs.",
@@ -1872,7 +1872,7 @@ def create_app(
     )
     def api_get_pack_task(task_id: str, request: Request) -> PackTaskRecord:
         ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=False)
-        if auth_config.auth_mode == "hosted" and ctx.role != "admin":
+        if auth_config.auth_mode == "hosted" and (ctx.auth_method != "session" or ctx.role != "admin"):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Admin role required to manage offline packs.",
@@ -1892,7 +1892,7 @@ def create_app(
     )
     def api_delete_pack(pack_id: str, request: Request) -> dict[str, Any]:
         ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=False)
-        if auth_config.auth_mode == "hosted" and ctx.role != "admin":
+        if auth_config.auth_mode == "hosted" and (ctx.auth_method != "session" or ctx.role != "admin"):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Admin role required to manage offline packs.",

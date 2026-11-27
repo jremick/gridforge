@@ -335,6 +335,55 @@ class TestGeocodeEndpoint:
         assert geocode(third, "LEURA").status_code == 200
         assert calls == ["Katoomba", "Leura"]
 
+    def test_geocode_zero_global_limit_admin_exemption_and_mcp_client_ip(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from gridforge.web import app as app_mod
+
+        app_mod._geocode_cache.clear()
+        monkeypatch.setenv("GRIDFORGE_AUTH_MODE", "none")
+        monkeypatch.setenv("GRIDFORGE_GEOCODE_HOURLY_LIMIT", "1")
+        monkeypatch.setenv("GRIDFORGE_GEOCODE_GLOBAL_HOURLY_LIMIT", "0")
+        disabled_app = create_app(data_dir=tmp_path / "zero_jobs", packs_dir=tmp_path / "packs")
+        zero_client = TestClient(disabled_app, base_url="http://localhost:8080", client=("192.0.2.10", 12345))
+        assert zero_client.get("/api/geocode", params={"q": "Katoomba"}).status_code == 429
+
+        # Distinct non-Cloudflare /mcp callers keep distinct per-IP geocode buckets,
+        # and transient provider failures do not poison the geocode cache.
+        app_mod._geocode_cache.clear()
+        monkeypatch.setenv("GRIDFORGE_GEOCODE_HOURLY_LIMIT", "1")
+        monkeypatch.setenv("GRIDFORGE_GEOCODE_GLOBAL_HOURLY_LIMIT", "10")
+        mcp_app = create_app(data_dir=tmp_path / "mcp_jobs", packs_dir=tmp_path / "packs")
+        seen: list[str] = []
+
+        def flaky_provider(url, *, params, **kwargs):
+            q = params["q"]
+            seen.append(q)
+            if q == "FlakyPeak" and seen.count("FlakyPeak") == 1:
+                raise httpx.ConnectError("upstream down")
+            return httpx.Response(200, json=[], request=httpx.Request("GET", url))
+
+        monkeypatch.setattr(app_mod, "_nominatim_http_get", flaky_provider)
+        c1 = TestClient(mcp_app, base_url="http://localhost:8080", client=("198.51.100.1", 1111))
+        c2 = TestClient(mcp_app, base_url="http://localhost:8080", client=("198.51.100.2", 2222))
+
+        def mcp_geocode(client: TestClient, query: str) -> dict:
+            resp = client.post(
+                "/mcp",
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {"name": "geocode_place", "arguments": {"query": query}},
+                },
+            )
+            assert resp.status_code == 200, resp.text
+            return resp.json()["result"]
+
+        assert not mcp_geocode(c1, "FlakyPeak").get("isError")
+        assert not mcp_geocode(c2, "FlakyPeak").get("isError")
+        assert seen == ["FlakyPeak", "FlakyPeak"]
+
     def test_geocode_mock_cache_and_offline_fallback(
         self, client_and_dirs, monkeypatch: pytest.MonkeyPatch
     ) -> None:
