@@ -1,0 +1,17 @@
+{
+  "name": "gridforge",
+  "displayName": "GridForge",
+  "version": "1.6.0",
+  "description": "True-scale local UTM MGRS topographic map studio, WMM2025 navigation briefings, curved-Earth RF Fresnel link and viewshed analysis, and 300-600 DPI printable PDF / ATAK / Garmin / OsmAnd exports with interactive inline MCP Apps.",
+  "author": {
+    "name": "GridForge Contributors",
+    "url": "https://github.com/jremick/gridforge"
+  },
+  "homepage": "https://github.com/jremick/gridforge",
+  "repository": "https://github.com/jremick/gridforge",
+  "suggestedPrompts": [
+    "Brief me on Mt Kosciuszko MGRS, declination, and 1:25k sheet",
+    "Check a 915 MHz LoRa link between two peaks",
+    "Render a 1:24,000 Alpine map of Yosemite Valley"
+  ]
+}

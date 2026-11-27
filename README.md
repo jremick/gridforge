@@ -18,7 +18,7 @@
 
 True-scale **local UTM** 300–600 DPI print PDFs (`1:10,000`–`1:50,000`) · **4 Themes (`Color` / `B&W` / `Night-Red` / `Alpine`)** · **True `1 m` LiDAR & `2 m` Contours** · **RF Viewsheds & 1st Fresnel Link Cards** · **US, Canada, Australia & New Zealand Open Data** · **ATAK / Garmin / OsmAnd / GeoPackage / Field Bundle `.zip`**
 
-**[Try GridMaps Live (`gridmaps.net`)](https://gridmaps.net)** · [30-Second Quickstart](#30-second-self-hosted-quickstart) · [Sample 300 DPI PDFs](#visual-map-gallery--downloadable-300-dpi-pdfs) · [Capabilities](#capabilities) · [CLI Cookbook](#cli-cookbook) · [Hosted & Homelab Deploy](#homelab--reverse-proxy-deployment) · [Changelog](CHANGELOG.md)
+**[Try GridMaps Live (`gridmaps.net`)](https://gridmaps.net)** · [30-Second Quickstart](#30-second-self-hosted-quickstart) · [Sample 300 DPI PDFs](#visual-map-gallery--downloadable-300-dpi-pdfs) · [Capabilities](#capabilities) · [CLI Cookbook](#cli-cookbook) · [AI Agents & MCP](#ai-tools-mcp--interactive-chat-ui) · [Hosted & Homelab Deploy](#homelab--reverse-proxy-deployment) · [Changelog](CHANGELOG.md)
 
 </div>
 
@@ -238,6 +238,30 @@ docker run --rm -v "$(pwd)/out:/out" ghcr.io/jremick/gridforge:latest \
 
 ---
 
+## AI Tools, MCP & Interactive Chat UI
+
+Connect GridForge directly to **Claude Desktop & Claude Code**, **OpenAI Codex**, **Google Antigravity**, **ChatGPT**, **Cursor**, and **VS Code** — no extra Python dependencies or third-party AI wrappers required:
+
+- **Native MCP (`stdio` + Streamable HTTP `/mcp`):** Run locally via `ghcr.io/jremick/gridforge:latest gridforge mcp` or connect directly to `/mcp` on any self-hosted or hosted GridForge deployment (`14` model-visible tools, `3` app-only UI tools, `3` resources, and `4` workflow prompts).
+- **Interactive SEP-1865 MCP Apps (`ui://gridforge/app.html`):** Supporting hosts (**Google Antigravity** — including side pane **`GridForge Studio`** and sidebar **`GridForge Maps`** entrypoints via [`plugins/antigravity/`](plugins/antigravity/README.md) — and MCP Apps-capable **Claude** clients) render an interactive inline UTM footprint & 1 km MGRS map canvas, SVG WMM2025 declination compass, hover-scrubbing curved-Earth 1st Fresnel RF link chart, and a live-polling multi-page printable PDF sheet viewer directly inside chat.
+- **Universal Visual PNG Cards & Natural-Language Q&A:** Every MCP host also receives concise Q&A answers alongside compact Pillow-generated PNG cards (UTM footprints, viewsheds, 760×360 Fresnel charts, route cards) and rasterized PDF page previews (`/api/jobs/{job_id}/pages/{page}.png`).
+- **ChatGPT Actions, Bearer API Keys & Agent Discovery:** Import `/openapi.json` into Custom GPT Actions with scoped `gf_...` Personal Access Tokens (`POST /api/auth/api-keys`), synchronous `POST /api/jobs?wait=true` renders, short-lived HMAC-signed download & preview URLs (`?sig=...`), `GET /api/capabilities`, `GET /llms.txt`, and structured CLI `gridforge render --spec-file`.
+
+```bash
+# Claude Code — connect to your local self-hosted Studio MCP endpoint
+claude mcp add --transport http gridforge http://127.0.0.1:8080/mcp
+
+# Google Antigravity — install the interactive MCP Apps plugin (inline + side pane + sidebar)
+cp -r plugins/antigravity ~/.gemini/config/plugins/gridforge
+
+# Any MCP stdio host — run the zero-build multi-arch container directly
+docker run -i --rm ghcr.io/jremick/gridforge:latest gridforge mcp --url http://host.docker.internal:8080
+```
+
+Read the full **[AI Agents & MCP Integration Guide (`docs/ai-agents.md`)](docs/ai-agents.md)**, install the reusable **[GridForge Agent Skill (`docs/agent-skill/SKILL.md`)](docs/agent-skill/SKILL.md)** for Claude Code / Codex / Antigravity, or grab the **[Google Antigravity Plugin (`plugins/antigravity/README.md`)](plugins/antigravity/README.md)**.
+
+---
+
 ## Homelab & Reverse-Proxy Deployment
 
 GridForge binds to IPv4 loopback (`127.0.0.1:8080`) by default, disables wildcard CORS, and enforces `TrustedHostMiddleware` + `SameOriginWritesMiddleware` on all mutating endpoints.
@@ -274,20 +298,22 @@ See **[CONTRIBUTING.md](CONTRIBUTING.md)** for development workflow and strict o
 ```text
 src/gridforge/
 ├── config.py              # Pydantic v2 SheetSpec, RFLinkSpec, TacticalGraphic, ViewshedObserver contracts
-├── cli.py                 # Typer CLI (`render`, `export`, `inspect`, `pack`, `basemap-pack`, `serve`)
+├── cli.py                 # Typer CLI (`render --spec-file`, `export`, `inspect`, `pack`, `basemap-pack`, `serve`, `mcp`)
 ├── geo/                   # UTM/MGRS CRS, atlas/antimeridian checks, tactical markup/ruler, RF Link Card & supplements
 ├── sources/               # US 3DEP/USFS/NPS/PAD-US, CA NRCan/Parks CA/DataBC, AU 2m/5m/8-states, NZ LINZ/DOC, GLO-30, OSM
 ├── packs/                 # 29-region global pack catalog, pure-GDAL offline basemap builder & manifest-ID lookup
 ├── pipeline/              # OSM -> GeoPackage normalization, GDAL hillshade/contours/slope/viewshed/Fresnel RF, runner
 ├── render/                # Isolated PyQGIS subprocess worker, 4-theme styling, QgsPrintLayout collar & fold marks
 ├── export/                # Atomic staged publication: ATAK MBTiles, Garmin KMZ, OGC GeoPackage, OsmAnd, Field Bundle .zip
-└── web/                   # FastAPI server (zero qgis imports), SameOrigin/TrustedHost, Projects & Shares CRUD, Basemap & Pack Manager
-web/                       # TypeScript + Vite + MapLibre GL JS Print Studio SPA + Copy CLI tests
+├── mcp/                   # Native MCP JSON-RPC server (stdio + Streamable HTTP /mcp), Pillow PNG cards & MCP App bundle
+└── web/                   # FastAPI server (zero qgis imports), API keys, signed URLs, /llms.txt, Projects, Shares & Packs
+web/                       # TypeScript + Vite + MapLibre GL JS Print Studio SPA + SEP-1865 MCP App (`web/mcp-app/`)
+plugins/antigravity/       # Ready-to-install Google Antigravity plugin (inline MCP Apps + Studio side pane + sidebar)
 config/osmconf.ini         # Shared GDAL OSM driver schema for online & fully offline parity
 assets/
 ├── icons/                 # 22 crisp self-contained military/topo/Outback/alpine/RF-observer SVG symbols
 └── styles/{color,bw,night-red,alpine}/  # 172 native QGIS 3.40 .qml styles across 4 themes
-deploy/                    # Caddyfile.example, Traefik v3 override, and Tailscale Serve homelab guide
+deploy/                    # Caddyfile.example, Traefik v3 override, Tailscale Serve & Hosted Mode guides
 scripts/                   # release_preflight.py, render_release_samples.sh, sync_github_metadata.sh
 .github/workflows/         # Automated offline CI + live multi-arch (amd64/arm64) GHCR release pipeline
 examples/                  # Sample Blue Mountains GeoJSON route overlay & runnable CLI cookbook
