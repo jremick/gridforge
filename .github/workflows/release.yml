@@ -27,7 +27,6 @@ env:
 jobs:
   resolve-release:
     name: Verify the release tag
-    if: github.event_name == 'push' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
@@ -40,14 +39,20 @@ jobs:
         with:
           ref: refs/heads/${{ github.event.repository.default_branch }}
           fetch-depth: 0
+          fetch-tags: true
           persist-credentials: false
 
       - name: Resolve release tag
         id: resolve
         env:
           INPUT_TAG: ${{ inputs.tag }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            if [ "${GITHUB_REF}" != "refs/heads/${DEFAULT_BRANCH}" ]; then
+              echo "Manual release runs must be dispatched from refs/heads/${DEFAULT_BRANCH} (got ${GITHUB_REF})." >&2
+              exit 1
+            fi
             TAG="${INPUT_TAG}"
           else
             TAG="${GITHUB_REF_NAME}"
@@ -130,6 +135,7 @@ jobs:
             org.opencontainers.image.source=https://github.com/jremick/gridforge
             org.opencontainers.image.url=https://github.com/jremick/gridforge
             org.opencontainers.image.version=${{ needs.resolve-release.outputs.tag }}
+            org.opencontainers.image.revision=${{ needs.resolve-release.outputs.commit }}
             org.opencontainers.image.licenses=GPL-3.0
 
       - name: Build and push multi-arch image
@@ -171,6 +177,10 @@ jobs:
         env:
           IMAGE_DIGEST: ${{ needs.build-and-push.outputs.digest }}
         run: |
+          if [[ ! "${IMAGE_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Invalid published image digest: ${IMAGE_DIGEST}" >&2
+            exit 1
+          fi
           IMAGE="${REGISTRY}/${IMAGE_NAME}@${IMAGE_DIGEST}"
           docker pull "${IMAGE}"
           ./scripts/render_release_samples.sh \
