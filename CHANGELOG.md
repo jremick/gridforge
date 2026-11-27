@@ -5,6 +5,36 @@ All notable changes to **GridForge** are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.0] - 2026-11-27
+
+AI-native integration and interactive chat UI release adding a zero-extra-dependency Model Context Protocol (MCP) server (`stdio` + Streamable HTTP `/mcp`), SEP-1865 interactive MCP Apps (`ui://gridforge/app.html` with Antigravity inline, side-pane, and sidebar entrypoints), Pillow PNG visual cards, scoped Bearer Personal Access Tokens (`gf_...`), HMAC-signed artifact/preview URLs, multi-page PDF previews, synchronous render waits (`POST /api/jobs?wait=true`), machine-readable discovery (`/api/capabilities`, `/llms.txt`, complete `/openapi.json`), CLI `--spec-file`, and a reusable Agent Skill + Antigravity plugin.
+
+### Added
+
+- **AI-Ready Web API, Scoped Bearer PATs & Signed URLs (`src/gridforge/web/{app,auth,capabilities,db,schemas}.py`):**
+  - Added SQLite-backed Personal Access Tokens (`GET/POST/DELETE /api/auth/api-keys`, `gf_...` prefix, SHA-256 hashed at rest, plaintext returned once, 25 active-key per-user cap) for `Friend` and `Admin` users in hosted mode (`Authorization: Bearer` or `X-API-Key`), bypassing guest-only Cloudflare Turnstile while preserving full per-role quotas, DPI/grid caps, and tenant isolation; plus optional static `GRIDFORGE_API_KEY` protection for single-tenant `auth_mode=none` deployments.
+  - Added short-lived HMAC-signed artifact download & page-preview URLs (`?sig=...`, `GRIDFORGE_SIGNED_URL_TTL_SECONDS=3600`), multi-page PDF rasterization (`GET /api/jobs/{job_id}/pages` and `GET /api/jobs/{job_id}/pages/{page}.png?width=...`), and synchronous render completion polling (`POST /api/jobs?wait=true&timeout_s=120`, returning `200 OK` on terminal state or `202 Accepted` if still running).
+  - Added machine-readable `GET /api/capabilities`, plain-text `GET /llms.txt` discovery, and complete `/openapi.json` schemas (`CreateJobRequest`, `StripPlanRequest`, `BearerAuth` / `ApiKeyHeader`, optional `servers` via `GRIDFORGE_PUBLIC_URL`, and `operationId`/summaries across all endpoints).
+- **Native Zero-Extra-Dep MCP Server & Pure-Pillow Visual Cards (`src/gridforge/mcp/`, `src/gridforge/cli.py`):**
+  - Added dual-transport MCP server (`gridforge mcp` over `stdio` + mounted FastAPI Streamable HTTP `/mcp`, supporting protocol versions `2025-06-18`, `2025-03-26`, and `2024-11-05`) with **14 model-visible tools** (`open_gridforge_studio`, `answer_location_briefing`, `geocode_place`, `preview_footprint`, `analyze_rf_link`, `compute_viewshed`, `measure_route`, `plan_strip_atlas`, `render_map`, `get_job_status`, `get_job_page_preview`, `create_share_link`, `list_packs`, `get_capabilities`), **3 app-only tools** (`app_get_job_status`, `app_get_job_page`, `app_get_capabilities`), **3 resources**, and **4 guided prompts**.
+  - Added fast pure-Pillow dark-tactical PNG visual cards (`src/gridforge/mcp/visuals.py`) for footprints, viewsheds, route cards, and 760×360 curved-Earth 1st Fresnel RF charts so *every* MCP host renders crisp inline graphics alongside natural-language answers.
+  - Added declarative JSON rendering via `gridforge render --spec-file <path|->` for shell-based coding agents.
+- **Interactive SEP-1865 MCP App Chat UI (`web/mcp-app/`, `src/gridforge/mcp/assets/mcp_app.html`, `Dockerfile`):**
+  - Built a self-contained single-file HTML/JS interactive MCP App (`ui://gridforge/app.html`, MIME `text/html;profile=mcp-app`, CSP `default-src 'none'` safe, dark/light host theme reactive) with a pan/zoom UTM & 1 km MGRS map canvas, SVG WMM2025 True/Grid/Magnetic North declination compass, hover-scrubbing 1st Fresnel RF chart with live band & antenna height recalculation, terrain viewshed & route/strip views, live-polling multi-page printable PDF viewer, and Antigravity `aux_pane` (**GridForge Studio**) + `global` (**GridForge Maps**) entrypoints.
+- **Documentation, Agent Skill & Antigravity Plugin (`docs/ai-agents.md`, `docs/agent-skill/SKILL.md`, `plugins/antigravity/`, `deploy/hosted-mode.md`):**
+  - Added end-to-end setup guides for Claude Desktop/Code, OpenAI Codex, Google Antigravity, ChatGPT Custom Actions/Remote MCP, Cursor, and VS Code, plus a drop-in Antigravity plugin (`plugins/antigravity/`) and portable Agent Skill (`docs/agent-skill/SKILL.md`).
+
+### Security
+
+- **Hosted Edge-Proxy, Subprocess & DoS Hardening (`src/gridforge/mcp/{http,server}.py`, `src/gridforge/subprocess_env.py`, `src/gridforge/web/{app,auth}.py`):**
+  - Enforced `OriginProxyAuthMiddleware` on `/mcp` while safely forwarding verified origin-proxy, `CF-Connecting-IP`, and `X-Forwarded-Proto` headers exclusively into in-process ASGI sub-requests (never external proxy URLs).
+  - Stripped `GRIDFORGE_API_KEY` and `*API_KEY*` variables from GIS/PDF subprocesses (`build_safe_subprocess_env`), guarded `pdftoppm` page preview rendering with per-job locks, bounded concurrency slots, and safe environments, capped JSON-RPC batches at 20 messages, rejected forged boolean `exp` claims in signed tokens, enforced a 25 active PAT per-user limit, scrubbed raw internal exceptions from `/mcp` errors, and expanded `scripts/release_preflight.py` privacy scanning to `web/mcp-app/`, `docs/`, and `plugins/`.
+
+### Verification
+
+- **Automated Suites (`575` offline pytest + `49` frontend tests + `26` live multi-region E2E):**
+  - Added `tests/unit/test_agent_api.py`, `tests/unit/test_mcp.py`, `tests/unit/test_mcp_e2e_app.py`, and `web/tests/mcp-app.test.mjs` verifying Bearer PAT lifecycle, cross-tenant `/mcp` isolation, `OriginProxyAuthMiddleware` forwarding, signed URLs, page previews, sync wait, OpenAPI completeness, all 17 MCP tools/resources/prompts, and interactive MCP App rendering.
+
 ## [1.6.1] - 2026-11-27
 
 Comprehensive security hardening, container least-privilege, and end-to-end GIS/web performance optimization release upgrading MapLibre GL JS to v6, isolating web secrets from GIS subprocesses, hardening proxy/origin verification, bounding hosted storage & DoS vectors, and substantially accelerating terrain derivation, PyQGIS styling, exports, and web/Studio responsiveness.

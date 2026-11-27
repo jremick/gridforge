@@ -54,15 +54,15 @@ Open **<http://127.0.0.1:8080>** (prefer building locally? Run `docker compose u
 
 ## Sample Print PDFs
 
-Rendered at 300–600 DPI (`v1.6.1`) and verified automatically by [`tests/integration/verify_pdf.py`](tests/integration/verify_pdf.py) — open directly in your PDF viewer to inspect crisp vector contours, collars, and RF charts:
+Rendered at 300–600 DPI (`v1.7.0`) and verified automatically by [`tests/integration/verify_pdf.py`](tests/integration/verify_pdf.py) — open directly in your PDF viewer to inspect crisp vector contours, collars, and RF charts:
 
 | Sample PDF | Region & Scale | Highlights |
 | :--- | :--- | :--- |
-| [**Boulder Flatirons CO (`1:10,000` Letter, 600 DPI)**](https://github.com/jremick/gridforge/releases/download/v1.6.1/sample-boulder-flatirons-10k-600dpi-letter.pdf) | US · `13S DE` · `NAVD88` | **Color (`600 DPI`)**, `1 m` USGS 3DEP LiDAR, `5 ft` contours, USFS/PAD-US trails |
-| [**Yosemite Valley CA (`1:24,000` Letter)**](https://github.com/jremick/gridforge/releases/download/v1.6.1/sample-yosemite-alpine-24k-letter.pdf) | US · `11S KB` · `NAVD88` | **Alpine Winter**, USGS 3DEP LiDAR, avalanche slope bands, USFS/NPS/PAD-US |
-| [**Banff / Sulphur Mtn AB (`1:25,000` A4)**](https://github.com/jremick/gridforge/releases/download/v1.6.1/sample-banff-night-red-25k-a4.pdf) | Canada · `11U NS/PS` · `CGVD2013` | **Night-Red** (red-headlamp safe), NRCan HRDEM/MRDEM, Parks Canada trails |
-| [**Mt Kosciuszko NSW (`1:25,000` A4, 2 pages)**](https://github.com/jremick/gridforge/releases/download/v1.6.1/sample-kosciuszko-rf-tactical-25k-a4.pdf) | Australia · `55H FV` · `AHD` | **Color** + GDAL **RF Viewshed**, **915 MHz Fresnel Link Card (p. 2)** & range rings |
-| [**Tongariro Alpine Crossing (`1:25,000` A4)**](https://github.com/jremick/gridforge/releases/download/v1.6.1/sample-tongariro-nz-1m-lidar-25k-a4.pdf) | New Zealand · `60H UB` · `NZVD2016` | **Color** + live AWS **LINZ 1 m LiDAR**, DOC Great Walk tracks, huts & peaks |
+| [**Boulder Flatirons CO (`1:10,000` Letter, 600 DPI)**](https://github.com/jremick/gridforge/releases/download/v1.7.0/sample-boulder-flatirons-10k-600dpi-letter.pdf) | US · `13S DE` · `NAVD88` | **Color (`600 DPI`)**, `1 m` USGS 3DEP LiDAR, `5 ft` contours, USFS/PAD-US trails |
+| [**Yosemite Valley CA (`1:24,000` Letter)**](https://github.com/jremick/gridforge/releases/download/v1.7.0/sample-yosemite-alpine-24k-letter.pdf) | US · `11S KB` · `NAVD88` | **Alpine Winter**, USGS 3DEP LiDAR, avalanche slope bands, USFS/NPS/PAD-US |
+| [**Banff / Sulphur Mtn AB (`1:25,000` A4)**](https://github.com/jremick/gridforge/releases/download/v1.7.0/sample-banff-night-red-25k-a4.pdf) | Canada · `11U NS/PS` · `CGVD2013` | **Night-Red** (red-headlamp safe), NRCan HRDEM/MRDEM, Parks Canada trails |
+| [**Mt Kosciuszko NSW (`1:25,000` A4, 2 pages)**](https://github.com/jremick/gridforge/releases/download/v1.7.0/sample-kosciuszko-rf-tactical-25k-a4.pdf) | Australia · `55H FV` · `AHD` | **Color** + GDAL **RF Viewshed**, **915 MHz Fresnel Link Card (p. 2)** & range rings |
+| [**Tongariro Alpine Crossing (`1:25,000` A4)**](https://github.com/jremick/gridforge/releases/download/v1.7.0/sample-tongariro-nz-1m-lidar-25k-a4.pdf) | New Zealand · `60H UB` · `NZVD2016` | **Color** + live AWS **LINZ 1 m LiDAR**, DOC Great Walk tracks, huts & peaks |
 
 ![GridForge Showcase — Yosemite Alpine Winter, Banff Night-Red, Mt Kosciuszko RF Viewshed & 915 MHz Fresnel Link Card](docs/images/v14-showcase.jpg)
 
@@ -77,7 +77,7 @@ Browse more regional renders, Studio screenshots, collar crops, field supplement
 - **RF Comms & Field Supplements:** Terrain-masked GDAL viewsheds, curved-Earth ($k = 4/3$) 1st Fresnel Link Cards (LoRa/Meshtastic, UHF, VHF), GPX/GeoJSON auto-strip atlases, overview index covers, elevation profiles, route cards, fold marks, and 100 mm Romer calibration pages.
 - **100% Offline Packs & Device Exports:** 29 curated regional packs with turnkey pure-GDAL offline terrain basemaps, plus atomic exports for **ATAK** (`.mbtiles`), **Garmin** (`.kmz`), **OGC GeoPackage** (`.gpkg`), **OsmAnd** (`.sqlitedb`), and **Field Bundle `.zip`** (with GPX 1.1).
 - **Multi-Continent Zero-Auth Open Data:** Automatic 5-way elevation & trail routing across the **US**, **Canada**, **Australia** (including all 8 states & territories), **New Zealand**, and global **Copernicus GLO-30** — see **[Data Sources & Attributions](docs/DATA_SOURCES.md)**.
-- **Lightweight & Verified:** `~150 MiB` combined idle RAM (`web` `~77 MiB` + `worker` `~73 MiB`, zero Redis), `< 400 MB` typical render RSS in ephemeral PyQGIS subprocesses, `2–6 s` warm-cache A4 renders, `≤ 0.02 mm` MGRS scale accuracy, and `553` offline pytest + `44` frontend tests.
+- **Lightweight & Verified:** `~150 MiB` combined idle RAM (`web` `~77 MiB` + `worker` `~73 MiB`, zero Redis), `< 400 MB` typical render RSS in ephemeral PyQGIS subprocesses, `2–6 s` warm-cache A4 renders, `≤ 0.02 mm` MGRS scale accuracy, and `575` offline pytest + `49` frontend tests.
 
 ---
 
@@ -151,9 +151,8 @@ GridForge pairs a lean FastAPI + SQLite WAL `web` server (`zero qgis imports`, `
 
 ## Planned Roadmap
 
-High-value capabilities prioritized next (kept updated as features ship — see **[CHANGELOG.md](CHANGELOG.md)** and **[GitHub Releases](https://github.com/jremick/gridforge/releases)** for full per-version history from `v1.0.0` through `v1.6.1`):
+High-value capabilities prioritized next (kept updated as features ship — see **[CHANGELOG.md](CHANGELOG.md)** and **[GitHub Releases](https://github.com/jremick/gridforge/releases)** for full per-version history from `v1.0.0` through `v1.7.0`):
 
-- [ ] **AI Agents, Native MCP Server & Interactive Chat UI *(in progress)*:** Native MCP (`stdio` + Streamable HTTP `/mcp`), interactive MCP App chat widgets, scoped Personal Access Tokens, synchronous render waits, and `/llms.txt` + OpenAPI discovery for Claude, Codex, Antigravity, and ChatGPT.
 - [ ] **European & UK Open Regional LiDAR + Offline Packs:** Zero-auth high-resolution elevation providers (Swisstopo, IGN France, UK Environment Agency, Kartverket Norway) with native vertical datums and matching regional offline packs.
 - [ ] **Custom Remote Overlay Feeds in Studio:** User-defined ArcGIS REST, WFS, and GeoJSON overlay URLs with per-layer styling and automatic collar attribution.
 - [ ] **Organization Collar & Legend Branding Profiles:** Reusable team, SAR, or club templates with custom logos, unit/datum defaults, and standardized collar layouts.
