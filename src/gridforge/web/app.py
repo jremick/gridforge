@@ -245,7 +245,7 @@ _API_KEY_OPERATION_SCOPES: dict[str, ApiKeyScope] = {
 
 _CONTENT_SECURITY_POLICY: str = (
     "default-src 'self'; "
-    "script-src 'self' https://challenges.cloudflare.com; "
+    "script-src 'self' https://challenges.cloudflare.com https://static.cloudflareinsights.com; "
     "style-src 'self' 'unsafe-inline'; "
     "img-src 'self' data: blob: https:; "
     "font-src 'self' data: https:; "

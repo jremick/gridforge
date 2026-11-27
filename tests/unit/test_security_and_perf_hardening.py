@@ -146,8 +146,11 @@ class TestOriginProxyAndWebSecurity:
             assert ok.headers.get("x-content-type-options") == "nosniff"
             assert ok.headers.get("x-frame-options") == "DENY"
             csp = ok.headers.get("content-security-policy", "")
+            script_src = csp.split("script-src", 1)[1].split(";", 1)[0]
             assert "script-src 'self'" in csp
-            assert "'unsafe-inline'" not in csp.split("script-src", 1)[1].split(";", 1)[0]
+            assert "https://challenges.cloudflare.com" in script_src
+            assert "https://static.cloudflareinsights.com" in script_src
+            assert "'unsafe-inline'" not in script_src
             assert client.get(
                 "/docs",
                 headers={"X-GridForge-Origin-Secret": "origin-secret-token-abcdef012345"},
