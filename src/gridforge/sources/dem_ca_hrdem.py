@@ -8,38 +8,46 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, Final, Literal
-from urllib.parse import urlparse
 
 import httpx
 
 from gridforge.config import BBox, SheetLayout
+from gridforge.sources._cog_ranges import cog_range_paths
+from gridforge.sources._http import bounded_response_chunks, read_bounded_file, write_cache_bytes
 from gridforge.sources.dem_copernicus import CopernicusGLO30Source, GDAL_VSICURL_ENV
 from gridforge.subprocess_env import build_safe_subprocess_env
 
 logger = logging.getLogger(__name__)
 
-_ALLOWED_CA_HOST_SUFFIXES: Final[tuple[str, ...]] = (
-    "nrcan.gc.ca",
-    "geo.ca",
-    "canada.ca",
-    "amazonaws.com",
+# The public NRCan CanElevation buckets in AWS Canada Central.
+_ALLOWED_CA_ASSET_HOSTS = frozenset(
+    {
+        "canelevation-dem.s3.ca-central-1.amazonaws.com",
+        "datacube-prod-data-public.s3.ca-central-1.amazonaws.com",
+    }
 )
+_CA_COG_URL = re.compile(r"https://([a-z0-9.-]+)/([a-z0-9_./-]+\.tiff?)", re.IGNORECASE | re.ASCII)
+_MAX_STAC_BYTES = 2 * 1024 * 1024
+_MAX_STAC_ASSETS = 12
 
 
 def _is_allowed_ca_tile_url(url: str) -> bool:
-    if any(ch in url for ch in ("\r", "\n", "\x00")):
+    if len(url) > 2048:
         return False
-    parsed = urlparse(url)
-    if parsed.scheme.lower() != "https" or parsed.username or parsed.password:
+    match = _CA_COG_URL.fullmatch(url)
+    if match is None:
         return False
-    host = (parsed.hostname or "").lower().rstrip(".")
-    if not host or ".." in parsed.path.split("/"):
-        return False
-    return any(host == suffix or host.endswith(f".{suffix}") for suffix in _ALLOWED_CA_HOST_SUFFIXES)
+    host, key = match.groups()
+    return host.lower() in _ALLOWED_CA_ASSET_HOSTS and not any(
+        part in ("", ".", "..") for part in key.split("/")
+    )
+
 
 NRCAN_STAC_SEARCH_URL: Final[str] = "https://datacube.services.geo.ca/stac/api/search"
 NRCAN_MRDEM_30_DTM_URL: Final[str] = (
@@ -234,23 +242,22 @@ def extract_stac_cog_hrefs(
     preferred_assets: tuple[str, ...] = ("dtm", "dem"),
 ) -> list[str]:
     """Extract deduplicated HTTPS COG asset URLs from an NRCan STAC search FeatureCollection."""
+    features = stac_payload.get("features")
+    if not isinstance(features, list):
+        return []
+
     hrefs: list[str] = []
-    seen: set[str] = set()
-    for feat in stac_payload.get("features") or []:
-        if not isinstance(feat, dict):
-            continue
-        assets = feat.get("assets") or {}
+    for feature in features[:_MAX_STAC_ASSETS]:
+        assets = feature.get("assets") if isinstance(feature, dict) else None
         if not isinstance(assets, dict):
             continue
-        chosen: str | None = None
         for key in preferred_assets:
-            entry = assets.get(key)
-            if isinstance(entry, dict) and entry.get("href"):
-                chosen = str(entry["href"]).strip()
+            asset = assets.get(key)
+            url = asset.get("href") if isinstance(asset, dict) else None
+            if isinstance(url, str) and _is_allowed_ca_tile_url(url):
+                if url not in hrefs:
+                    hrefs.append(url)
                 break
-        if chosen and _is_allowed_ca_tile_url(chosen) and chosen not in seen:
-            seen.add(chosen)
-            hrefs.append(chosen)
     return hrefs
 
 
@@ -309,45 +316,77 @@ class CanadaHRDEMSource:
         self.resolved_vertical_datum: str = self.vertical_datum
         self.resolved_attribution: str = self.attribution
 
-    def _gdal_env(self) -> dict[str, str]:
-        extra = dict(GDAL_VSICURL_ENV)
-        extra["CPL_VSIL_CURL_ALLOWED_EXTENSIONS"] = ".tif,.tiff,.vrt"
-        return build_safe_subprocess_env(extra=extra)
+    def _provider_client(self) -> httpx.Client:
+        return httpx.Client(
+            timeout=httpx.Timeout(self.timeout_s, connect=min(8.0, self.timeout_s)),
+            follow_redirects=False,
+            trust_env=False,
+            headers={"User-Agent": USER_AGENT},
+        )
+
+    def _warp_cogs(
+        self, hrefs: list[str], args: list[str], output_tif: Path, *, context: str, timeout: int = 180
+    ) -> None:
+        if not 0 < len(hrefs) <= _MAX_STAC_ASSETS or not all(map(_is_allowed_ca_tile_url, hrefs)):
+            raise ValueError("Unapproved NRCan GeoTIFF assets")
+
+        env = build_safe_subprocess_env(extra={
+            **GDAL_VSICURL_ENV,
+            "CPL_VSIL_CURL_ALLOWED_EXTENSIONS": ".tif",
+            "CPL_VSIL_CURL_USE_HEAD": "YES",
+            "GDAL_HTTP_MULTIRANGE": "SERIAL",
+            "GDAL_HTTP_MAX_RETRY": "0",
+            "GDAL_HTTP_PROXY": "",
+            "NO_PROXY": "127.0.0.1",
+            "no_proxy": "127.0.0.1",
+            "PROJ_NETWORK": "OFF",
+            "VSI_CACHE_SIZE": "4194304",
+        })
+        owns_client = self._injected_client is None
+        http = self._injected_client if self._injected_client is not None else self._provider_client()
+        try:
+            with cog_range_paths(hrefs, http, timeout_s=timeout) as sources:
+                cmd = ["gdalwarp", "-if", "GTiff", *args, *sources, str(output_tif)]
+                _run_subprocess(cmd, env=env, context=context, timeout=timeout)
+        finally:
+            if owns_client:
+                http.close()
 
     def _stac_search(self, collection: str, clip_bbox: BBox) -> list[str]:
         key = _bbox_hash(clip_bbox)
         cache_path = self.cache_dir / "stac" / f"{collection}_{key}.json"
-        if self.use_clip_cache and cache_path.is_file() and cache_path.stat().st_size > 0:
+        if self.use_clip_cache and cache_path.is_file():
             try:
-                cached = json.loads(cache_path.read_text(encoding="utf-8"))
-                if isinstance(cached, list):
-                    return [str(u) for u in cached]
-            except json.JSONDecodeError:
+                cached = json.loads(read_bounded_file(cache_path, _MAX_STAC_BYTES))
+                if (
+                    isinstance(cached, list) and len(cached) <= _MAX_STAC_ASSETS
+                    and all(isinstance(url, str) and _is_allowed_ca_tile_url(url) for url in cached)
+                ):
+                    return cached
+            except (OSError, ValueError, RecursionError):
                 logger.warning("Ignoring corrupt cached NRCan STAC file: %s", cache_path)
 
         owns_client = self._injected_client is None
-        http = (
-            self._injected_client
-            if self._injected_client is not None
-            else httpx.Client(
-                timeout=httpx.Timeout(self.timeout_s, connect=min(8.0, self.timeout_s)),
-                follow_redirects=True,
-                headers={"User-Agent": USER_AGENT},
-            )
-        )
+        http = self._injected_client if self._injected_client is not None else self._provider_client()
         try:
-            resp = http.post(
+            deadline = time.monotonic() + self.timeout_s
+            with http.stream(
+                "POST",
                 self.stac_search_url,
                 json={
                     "collections": [collection],
-                    "bbox": [clip_bbox.min_x, clip_bbox.min_y, clip_bbox.max_x, clip_bbox.max_y],
-                    "limit": 12,
+                    "bbox": list(clip_bbox.as_tuple()),
+                    "limit": _MAX_STAC_ASSETS,
                 },
-                headers={"User-Agent": USER_AGENT},
-            )
-            resp.raise_for_status()
-            payload = resp.json()
-        except Exception as exc:
+                headers={"User-Agent": USER_AGENT, "Accept-Encoding": "identity"},
+                follow_redirects=False,
+            ) as resp:
+                resp.raise_for_status()
+                body = b"".join(bounded_response_chunks(resp, max_bytes=_MAX_STAC_BYTES, deadline=deadline))
+            payload = json.loads(body)
+            if not isinstance(payload, dict) or not isinstance(payload.get("features"), list):
+                raise ValueError("Invalid NRCan STAC response")
+        except (httpx.HTTPError, ValueError, RecursionError) as exc:
             logger.warning("NRCan STAC search for '%s' failed (%s)", collection, exc)
             return []
         finally:
@@ -356,10 +395,7 @@ class CanadaHRDEMSource:
 
         hrefs = extract_stac_cog_hrefs(payload)
         if self.use_clip_cache:
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = cache_path.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(hrefs), encoding="utf-8")
-            tmp.replace(cache_path)
+            write_cache_bytes(cache_path, json.dumps(hrefs).encode("utf-8"))
         return hrefs
 
     def _probe_cog_overview_coverage(
@@ -372,8 +408,7 @@ class CanadaHRDEMSource:
         """Fast 64×64 COG overview coverage probe so absent/partial HRDEM tiles fail in < 1 s."""
         probe_tif = work_dir / f"_ca_probe_{tag}.tif"
         b = layout.utm_fetch_bbox
-        cmd = [
-            "gdalwarp",
+        args = [
             "-overwrite",
             "-ovr",
             "AUTO",
@@ -393,11 +428,9 @@ class CanadaHRDEMSource:
             "-9999",
             "-ot",
             "Float32",
-            *[f"/vsicurl/{u}" for u in hrefs],
-            str(probe_tif),
         ]
         try:
-            _run_subprocess(cmd, env=self._gdal_env(), context=f"gdalwarp (NRCan {tag} probe)")
+            self._warp_cogs(hrefs, args, probe_tif, context=f"gdalwarp (NRCan {tag} probe)", timeout=30)
             return _raster_valid_pixel_fraction(probe_tif)
         except Exception as exc:
             logger.debug("NRCan %s overview probe failed: %s", tag, exc)
@@ -442,8 +475,7 @@ class CanadaHRDEMSource:
 
         tmp_tif = work_dir / f"_ca_{tier_name}_tmp.tif"
         b = layout.utm_fetch_bbox
-        cmd = [
-            "gdalwarp",
+        args = [
             "-overwrite",
             "-t_srs",
             f"EPSG:{layout.utm_epsg}",
@@ -465,12 +497,10 @@ class CanadaHRDEMSource:
             "COMPRESS=DEFLATE",
             "-co",
             "TILED=YES",
-            *[f"/vsicurl/{u}" for u in hrefs],
-            str(tmp_tif),
         ]
         logger.info("Streaming NRCan %s (%d COG(s)) at %.1f m -> %s", collection, len(hrefs), self.lidar_warp_res_m, out_tif)
         try:
-            _run_subprocess(cmd, env=self._gdal_env(), context=f"gdalwarp (NRCan {collection})")
+            self._warp_cogs(hrefs, args, tmp_tif, context=f"gdalwarp (NRCan {collection})")
             cov = _raster_valid_pixel_fraction(tmp_tif)
             if cov < self.min_hrdem_coverage_ratio:
                 logger.info("NRCan %s full-res coverage %.1f%% < %.1f%%; trying next tier", collection, cov * 100.0, self.min_hrdem_coverage_ratio * 100.0)
@@ -517,8 +547,7 @@ class CanadaHRDEMSource:
 
         tmp_tif = work_dir / "_ca_mrdem30_tmp.tif"
         b = layout.utm_fetch_bbox
-        cmd = [
-            "gdalwarp",
+        args = [
             "-overwrite",
             "-t_srs",
             f"EPSG:{layout.utm_epsg}",
@@ -540,12 +569,10 @@ class CanadaHRDEMSource:
             "COMPRESS=DEFLATE",
             "-co",
             "TILED=YES",
-            *[f"/vsicurl/{u}" for u in hrefs],
-            str(tmp_tif),
         ]
         logger.info("Streaming NRCan nationwide MRDEM-30 (CGVD2013) -> %s", out_tif)
         try:
-            _run_subprocess(cmd, env=self._gdal_env(), context="gdalwarp (NRCan MRDEM-30)")
+            self._warp_cogs(hrefs, args, tmp_tif, context="gdalwarp (NRCan MRDEM-30)")
             cov = _raster_valid_pixel_fraction(tmp_tif)
             if cov < 0.05:
                 tmp_tif.unlink(missing_ok=True)

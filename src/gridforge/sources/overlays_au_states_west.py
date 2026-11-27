@@ -21,14 +21,20 @@ import json
 import logging
 import os
 import re
+import stat
+import struct
+import tempfile
+import time
 import zipfile
-from collections.abc import Mapping
-from pathlib import Path
-from typing import Any, Final
+import zlib
+from collections.abc import Callable, Mapping
+from pathlib import Path, PurePosixPath
+from typing import Any, Final, TypeVar
 
 import httpx
 
 from gridforge.config import BBox, SheetLayout
+from gridforge.sources._http import bounded_response_chunks, read_bounded_file, stream_provider_get
 from gridforge.sources.overlays_au import (
     USER_AGENT,
     _BaseAUOverlaySource,
@@ -79,6 +85,10 @@ DEFAULT_SA_TRAILS_ZIP_URL: Final[str] = (
     "https://www.waterconnect.sa.gov.au/Content/Downloads/DEWNR/TOPO_RecreationTrails_geojson.zip"
 )
 DEFAULT_SA_TRAILS_ZIP_INNER: Final[str] = "TOPO_RecreationTrails_GDA2020.geojson"
+_MAX_SA_TRAILS_ZIP_BYTES = 32 * 1024 * 1024
+_MAX_SA_TRAILS_MEMBER_BYTES = 64 * 1024 * 1024
+_MAX_SA_TRAILS_ZIP_ENTRIES = 128
+_MAX_SA_PARKS_BYTES = 8 * 1024 * 1024
 DEFAULT_SA_FIRE_TRACKS_URL: Final[str] = (
     "https://services-ap1.arcgis.com/G7iVcvOu3F7YCq11/arcgis/rest/services/"
     "Fire_Management_Fire_Access_Tracks/FeatureServer/1/query"
@@ -235,177 +245,216 @@ def _write_unified_state_gpkg(
     return _write_projected_gpkg_layers(out_gpkg, layout.utm_epsg, layout.utm_fetch_bbox, layer_specs)
 
 
+_CacheValue = TypeVar("_CacheValue")
+
+
 def _stream_download_cached(
     url: str,
     dest: Path,
     *,
-    chunk_bytes: int = 1_048_576,
-    timeout_s: float = 60.0,
+    max_bytes: int,
+    validate: Callable[[Path], _CacheValue],
+    timeout_s: float,
     client: httpx.Client | None = None,
-) -> Path | None:
-    """Stream-download a file in 1 MiB chunks into ``dest`` with atomic rename and caching."""
-    if dest.is_file() and dest.stat().st_size > 0:
-        return dest
+    allowed_redirect_host_suffixes: tuple[str, ...] | None = None,
+) -> tuple[Path, _CacheValue] | None:
+    """Validate the existing cache or publish one complete, bounded provider response."""
+    if dest.is_file():
+        try:
+            if not 0 < dest.stat().st_size <= max_bytes:
+                raise ValueError("Cached overlay exceeds the byte budget or is empty")
+            return dest, validate(dest)
+        except (OSError, ValueError, RuntimeError, zipfile.BadZipFile, zlib.error):
+            logger.warning("Ignoring invalid cached SA overlay: %s", dest)
 
     dest.parent.mkdir(parents=True, exist_ok=True)
-    part_path = dest.with_suffix(dest.suffix + ".part")
-    if part_path.exists():
-        part_path.unlink()
-
     owns_client = client is None
     http = (
         client
         if client is not None
         else httpx.Client(
             timeout=httpx.Timeout(timeout_s, connect=min(15.0, timeout_s)),
-            follow_redirects=True,
             headers={"User-Agent": USER_AGENT},
         )
     )
     try:
-        with http.stream("GET", url, headers={"User-Agent": USER_AGENT}) as resp:
-            resp.raise_for_status()
-            with part_path.open("wb") as fh:
-                for chunk in resp.iter_bytes(chunk_size=chunk_bytes):
-                    if chunk:
-                        fh.write(chunk)
-        part_path.replace(dest)
-        return dest
-    except Exception as exc:
-        logger.warning("Failed streaming download %s (%s); skipping cleanly", url, exc)
-        if part_path.exists():
-            part_path.unlink()
+        with tempfile.NamedTemporaryFile(dir=dest.parent, suffix=".part", delete=False) as pending:
+            pending_path = Path(pending.name)
+            try:
+                deadline = time.monotonic() + timeout_s
+                with stream_provider_get(
+                    http,
+                    url,
+                    params=None,
+                    user_agent=USER_AGENT,
+                    deadline=deadline,
+                    allowed_redirect_host_suffixes=allowed_redirect_host_suffixes,
+                ) as resp:
+                    resp.raise_for_status()
+                    for chunk in bounded_response_chunks(resp, max_bytes=max_bytes, deadline=deadline):
+                        pending.write(chunk)
+                pending.close()
+                value = validate(pending_path)
+                pending_path.replace(dest)
+                return dest, value
+            finally:
+                pending_path.unlink(missing_ok=True)
+    except (OSError, httpx.HTTPError, ValueError, RuntimeError, zipfile.BadZipFile, zlib.error) as exc:
+        logger.warning("Failed streaming download %s (%s)", url, exc)
         return None
     finally:
         if owns_client:
             http.close()
 
 
-def _query_wfs_bbox_geojson(
-    wfs_url: str,
-    type_name: str,
-    bbox: BBox,
-    *,
-    cache_path: Path,
-    max_features: int = 1000,
-    timeout_s: float = 25.0,
-    retries: int = 2,
-    client: httpx.Client | None = None,
-) -> list[dict[str, Any]]:
-    """Query an OGC WFS 2.0.0 GeoJSON endpoint via standard CRS84 ``bbox`` parameter with cache."""
-    if cache_path.is_file() and cache_path.stat().st_size > 0:
-        try:
-            cached = json.loads(cache_path.read_text(encoding="utf-8"))
-            if isinstance(cached, list):
-                return cached
-        except json.JSONDecodeError:
-            logger.warning("Ignoring corrupt cached WFS overlay JSON: %s", cache_path)
+def _sa_parks_data(path: Path) -> list[dict[str, Any]]:
+    parks = json.loads(read_bounded_file(path, _MAX_SA_PARKS_BYTES))
+    if not isinstance(parks, list):
+        raise ValueError("SA parks data must be a JSON list")
+    return [entry for entry in parks if isinstance(entry, dict)]
 
-    params: dict[str, str] = {
-        "service": "WFS",
-        "version": "2.0.0",
-        "request": "GetFeature",
-        "typeNames": type_name,
-        "outputFormat": "application/json",
-        "srsName": "EPSG:4326",
-        "count": str(max_features),
-        "bbox": (
-            f"{bbox.min_x:.6f},{bbox.min_y:.6f},{bbox.max_x:.6f},{bbox.max_y:.6f},"
-            "urn:ogc:def:crs:OGC:1.3:CRS84"
-        ),
-    }
 
-    owns_client = client is None
-    http = (
-        client
-        if client is not None
-        else httpx.Client(
-            timeout=httpx.Timeout(timeout_s, connect=min(10.0, timeout_s)),
-            follow_redirects=True,
-            headers={"User-Agent": USER_AGENT},
+def _sa_trails_zip_member(path: Path) -> str:
+    """Check the layer name, archive resources, and full decompressed stream before GDAL."""
+    archive_size = path.stat().st_size
+    if not 0 < archive_size <= _MAX_SA_TRAILS_ZIP_BYTES:
+        raise ValueError("SA trails archive exceeds the byte budget or is empty")
+
+    with zipfile.ZipFile(path) as archive:
+        members = archive.infolist()
+        if len(members) > _MAX_SA_TRAILS_ZIP_ENTRIES:
+            raise ValueError("SA trails archive exceeds the entry budget")
+        selected = next(
+            (entry for entry in members if entry.filename == DEFAULT_SA_TRAILS_ZIP_INNER),
+            None,
         )
-    )
+        if selected is None:
+            selected = next(
+                (entry for entry in members if entry.filename.lower().endswith((".geojson", ".json"))),
+                None,
+            )
+        if selected is None:
+            raise ValueError("SA trails archive contains no GeoJSON layer")
 
-    last_error: str | None = None
-    try:
-        for attempt in range(max(1, retries)):
-            try:
-                resp = http.get(wfs_url, params=params, headers={"User-Agent": USER_AGENT})
-                resp.raise_for_status()
-                data = resp.json()
-            except Exception as exc:
-                last_error = f"{wfs_url} ({type_name}, try={attempt + 1}): {exc}"
-                continue
+        name = selected.filename
+        member = PurePosixPath(name)
+        if (
+            selected.is_dir()
+            or stat.S_ISLNK(selected.external_attr >> 16)
+            or member.is_absolute()
+            or ".." in member.parts
+            or "\\" in name
+            or ":" in name
+            or str(member) != name
+            or sum(entry.filename == name for entry in members) != 1
+        ):
+            raise ValueError("SA trails archive has an invalid GeoJSON layer name")
 
-            if not isinstance(data, dict) or not isinstance(data.get("features"), list):
-                last_error = f"{wfs_url} ({type_name}): unexpected WFS payload"
-                continue
+        if (
+            not 0 < selected.file_size <= _MAX_SA_TRAILS_MEMBER_BYTES
+            or not 0 < selected.compress_size <= archive_size
+            or selected.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED)
+            or selected.flag_bits & 1
+        ):
+            raise ValueError("SA trails archive layer exceeds the extraction budget or uses an unsupported format")
+        if selected.compress_type == zipfile.ZIP_STORED and selected.compress_size != selected.file_size:
+            raise ValueError("SA trails stored layer size mismatch")
 
-            features = [
-                f
-                for f in data["features"]
-                if isinstance(f, dict) and f.get("geometry") is not None
-            ]
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = cache_path.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(features), encoding="utf-8")
-            tmp.replace(cache_path)
-            return features
-    finally:
-        if owns_client:
-            http.close()
+        # Validate the raw compressed member directly so a forged file_size header
+        # cannot hide an oversized deflate stream from Python while expanding in GDAL /vsizip/.
+        with path.open("rb") as raw_file:
+            raw_file.seek(selected.header_offset)
+            lfh = raw_file.read(30)
+            if len(lfh) != 30 or lfh[:4] != b"PK\x03\x04":
+                raise zipfile.BadZipFile("Invalid ZIP local file header")
+            local_flags, local_method, _, _, local_crc, local_csize, local_fsize, fname_len, extra_len = (
+                struct.unpack("<HHHHIIIHH", lfh[6:30])
+            )
+            if local_method != selected.compress_type:
+                raise zipfile.BadZipFile("ZIP local compression method mismatch")
+            if not (local_flags & 0x08) and (
+                local_crc != selected.CRC
+                or local_csize != selected.compress_size
+                or local_fsize != selected.file_size
+            ):
+                raise zipfile.BadZipFile("ZIP local header size/CRC mismatch")
+            raw_file.seek(fname_len + extra_len, 1)
 
-    if last_error:
-        logger.warning("AU WFS bbox overlay unavailable (%s); skipping cleanly", last_error)
-    return []
+            prefix_buf = bytearray()
+            total_out = 0
+            crc = 0
+            remaining_in = selected.compress_size
+            max_allowed = min(_MAX_SA_TRAILS_MEMBER_BYTES, selected.file_size)
+
+            def _consume_plain(plain: bytes) -> None:
+                nonlocal total_out, crc
+                if not plain:
+                    return
+                total_out += len(plain)
+                if total_out > max_allowed:
+                    raise ValueError("SA trails archive layer exceeds the extraction budget")
+                crc = zlib.crc32(plain, crc)
+                if len(prefix_buf) < 4096:
+                    prefix_buf.extend(plain[: 4096 - len(prefix_buf)])
+
+            if selected.compress_type == zipfile.ZIP_STORED:
+                while remaining_in > 0:
+                    chunk = raw_file.read(min(64 * 1024, remaining_in))
+                    if not chunk:
+                        raise zipfile.BadZipFile("Truncated stored ZIP layer")
+                    remaining_in -= len(chunk)
+                    _consume_plain(chunk)
+            else:
+                decompressor = zlib.decompressobj(-zlib.MAX_WBITS)
+                while remaining_in > 0:
+                    chunk = raw_file.read(min(64 * 1024, remaining_in))
+                    if not chunk:
+                        raise zipfile.BadZipFile("Truncated deflated ZIP layer")
+                    remaining_in -= len(chunk)
+                    data_in = chunk
+                    while data_in:
+                        budget_left = max_allowed - total_out + 1
+                        out = decompressor.decompress(data_in, budget_left)
+                        _consume_plain(out)
+                        data_in = decompressor.unconsumed_tail
+                        if decompressor.eof:
+                            break
+                    if decompressor.eof and remaining_in > 0:
+                        raise zipfile.BadZipFile("Unexpected trailing compressed bytes in ZIP layer")
+                while True:
+                    budget_left = max_allowed - total_out + 1
+                    tail = decompressor.flush(budget_left)
+                    if not tail:
+                        break
+                    _consume_plain(tail)
+                if not decompressor.eof or decompressor.unused_data:
+                    raise zipfile.BadZipFile("Incomplete or trailing deflate stream in ZIP layer")
+
+            if total_out != selected.file_size or (crc & 0xFFFFFFFF) != selected.CRC:
+                raise zipfile.BadZipFile("SA trails archive layer failed integrity verification")
+            prefix = bytes(prefix_buf).removeprefix(b"\xef\xbb\xbf").lstrip()
+            if not prefix.startswith(b"{"):
+                raise ValueError("SA trails archive layer is not a GeoJSON object")
+        return name
 
 
 def _read_sa_trails_from_vsizip(
     zip_path: Path,
     bbox: BBox,
-    *,
-    preferred_inner: str = DEFAULT_SA_TRAILS_ZIP_INNER,
+    inner_name: str,
 ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
-    """Stream-filter SA Recreation Trails directly from zipped GeoJSON via GDAL ``/vsizip/``.
-
-    Never loads the 18 MB statewide JSON file into Python memory (< 20 MB RSS).
-    """
+    """Stream-filter a validated SA Recreation Trails layer directly from its ZIP."""
     from osgeo import gdal  # type: ignore[import-untyped]  # system python3-gdal ships untyped osgeo bindings
 
     resolved = zip_path.resolve()
-    if not resolved.is_file():
-        return []
-
-    inner_name: str | None = None
-    try:
-        with zipfile.ZipFile(resolved, "r") as zf:
-            names = zf.namelist()
-            if preferred_inner in names:
-                inner_name = preferred_inner
-            else:
-                for candidate in names:
-                    low = candidate.lower()
-                    if low.endswith(".geojson") or low.endswith(".json"):
-                        inner_name = candidate
-                        break
-    except zipfile.BadZipFile as exc:
-        logger.warning("Corrupt SA trails archive %s (%s); skipping", resolved, exc)
-        return []
-
-    if not inner_name:
-        logger.warning("No GeoJSON layer found inside SA trails archive %s", resolved)
-        return []
-
-    norm_inner = inner_name.replace("\\", "/")
-    if norm_inner.startswith("/") or ".." in norm_inner.split("/"):
-        logger.warning("Rejected unsafe archive member '%s' in %s", inner_name, resolved)
-        return []
-
-    vsi_path = f"/vsizip/{resolved}/{norm_inner}"
+    vsi_path = f"/vsizip/{resolved}/{inner_name}"
     gdal.UseExceptions()
-    ds = gdal.OpenEx(vsi_path, gdal.OF_VECTOR, allowed_drivers=["GeoJSON"])
+    try:
+        ds = gdal.OpenEx(vsi_path, gdal.OF_VECTOR, allowed_drivers=["GeoJSON"])
+    except RuntimeError as exc:
+        logger.warning("GDAL rejected SA trail layer %s (%s)", zip_path, exc)
+        return []
     if ds is None:
-        logger.warning("GDAL failed to open %s", vsi_path)
         return []
 
     rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
@@ -826,28 +875,20 @@ class SATrailsSource(_BaseAUOverlaySource):
 
     def _load_sa_parks_in_bbox(self, bbox: BBox) -> list[tuple[dict[str, Any], dict[str, Any]]]:
         parks_cache = self.cache_dir / "sa_parks_data.json"
-        cached_path = _stream_download_cached(
+        cached = _stream_download_cached(
             self.parks_json_url,
             parks_cache,
-            chunk_bytes=262_144,
+            max_bytes=_MAX_SA_PARKS_BYTES,
+            validate=_sa_parks_data,
             timeout_s=self.timeout_s,
             client=self._injected_client,
         )
-        if cached_path is None or not cached_path.is_file():
+        if cached is None:
             return []
 
-        try:
-            parks = json.loads(cached_path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            logger.warning("Failed parsing SA parks-data.json (%s); skipping", exc)
-            return []
-        if not isinstance(parks, list):
-            return []
-
+        _, parks = cached
         rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
         for entry in parks:
-            if not isinstance(entry, dict):
-                continue
             lat = _to_float_or_none(entry.get("lat"))
             lon = _to_float_or_none(entry.get("lng") if "lng" in entry else entry.get("lon"))
             if lat is None or lon is None:
@@ -897,17 +938,25 @@ class SATrailsSource(_BaseAUOverlaySource):
         trail_rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
 
         # 1. DEW Recreation Trails ZIP -> low-RAM GDAL /vsizip/ spatial filter
-        zip_path: Path | None = self.trails_zip_path
-        if zip_path is None:
-            zip_path = _stream_download_cached(
+        if self.trails_zip_path is None:
+            trail_archive = _stream_download_cached(
                 self.trails_zip_url,
                 self.cache_dir / "sa_recreation_trails.zip",
-                chunk_bytes=1_048_576,
+                max_bytes=_MAX_SA_TRAILS_ZIP_BYTES,
+                validate=_sa_trails_zip_member,
                 timeout_s=max(45.0, self.timeout_s),
                 client=self._injected_client,
+                allowed_redirect_host_suffixes=("waterconnect.sa.gov.au",),
             )
-        if zip_path is not None and zip_path.is_file():
-            trail_rows.extend(_read_sa_trails_from_vsizip(zip_path, query_bbox))
+        else:
+            try:
+                trail_archive = (self.trails_zip_path, _sa_trails_zip_member(self.trails_zip_path))
+            except (OSError, ValueError, RuntimeError, zipfile.BadZipFile, zlib.error) as exc:
+                logger.warning("Ignoring invalid local SA trails ZIP %s (%s)", self.trails_zip_path, exc)
+                trail_archive = None
+        if trail_archive is not None:
+            zip_path, inner_name = trail_archive
+            trail_rows.extend(_read_sa_trails_from_vsizip(zip_path, query_bbox, inner_name))
 
         # 2. DEW SA Fire Access Tracks (Official DEW AGOL FeatureServer/1)
         fire_tracks = _query_arcgis_geojson(
@@ -1135,20 +1184,26 @@ class NTTrailsSource(_BaseAUOverlaySource):
             client=self._injected_client,
         )
         # 3. NTLIS GeoServer WFS 2.0 Place Names (Lookouts, Gorges, Waterfalls, Ranger Stations, etc.)
-        placenames = _query_wfs_bbox_geojson(
+        from gridforge.sources.overlays_au_states import query_wfs_geojson
+
+        placenames = query_wfs_geojson(
             self.wfs_url,
             "ntlis:PLACENAMES",
             query_bbox,
             cache_path=self.cache_dir / f"au_nt_placenames_{bhash}.json",
+            max_features=1000,
+            use_bbox_param=True,
             timeout_s=self.timeout_s,
             client=self._injected_client,
         )
         # 4. NTLIS GeoServer WFS 2.0 Survey Marks (AHD control marks)
-        survey_marks = _query_wfs_bbox_geojson(
+        survey_marks = query_wfs_geojson(
             self.wfs_url,
             "survey:SURVEY_MARKS",
             query_bbox,
             cache_path=self.cache_dir / f"au_nt_survey_marks_{bhash}.json",
+            max_features=1000,
+            use_bbox_param=True,
             timeout_s=self.timeout_s,
             client=self._injected_client,
         )

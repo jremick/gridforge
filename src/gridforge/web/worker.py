@@ -524,8 +524,13 @@ def process_single_job(
                     sheet_pct = 10 + int(((idx - 1) / total_sheets) * (pdf_budget_pct - 10))
                     _report_stage(f"rendering_sheet_{sheet_id} ({idx}/{total_sheets})", sheet_pct)
 
-                    sheet_work = tmp_work_dir / f"sheet_{idx:02d}_{sheet_id}"
-                    sheet_work.mkdir(parents=True, exist_ok=True)
+                    # Queued strip sheets may carry arbitrary display labels. Give
+                    # each page a filesystem identity derived only from its ordinal.
+                    sheet_name = f"sheet_{idx:02d}"
+                    sheet_work = tmp_work_dir / sheet_name
+                    if sheet_work.resolve() != sheet_work:
+                        raise ValueError("Atlas sheet workspace must be a direct child of the job workspace.")
+                    sheet_work.mkdir()
                     keep_for_export = False
                     try:
                         prep_kwargs = _build_prep_kwargs(
@@ -543,11 +548,11 @@ def process_single_job(
                             and hasattr(sheet_ws, "dem_utm_tif")
                             and Path(sheet_ws.dem_utm_tif).is_file()
                         ):
-                            dst_dem = saved_dems_dir / f"dem_{idx:02d}_{sheet_id}.tif"
+                            dst_dem = saved_dems_dir / f"{sheet_name}.tif"
                             shutil.copy2(sheet_ws.dem_utm_tif, dst_dem)
                             collected_dem_paths.append(dst_dem)
 
-                        sheet_pdf = sheet_pdfs_dir / f"sheet_{idx:02d}_{sheet_id}.pdf"
+                        sheet_pdf = sheet_pdfs_dir / f"{sheet_name}.pdf"
                         PyQGISRenderer().render_pdf(sheet_ws, sheet_pdf)
                         rendered_sheet_pdfs.append(sheet_pdf)
 

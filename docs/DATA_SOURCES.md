@@ -12,6 +12,21 @@ GridForge uses strictly commercial-friendly, zero-auth open geospatial data with
 - **Australia (`au-elvis`, `AHD`, CC BY):** Tier-0 Queensland `1 m / 2 m` State LiDAR → GA National `5 m` LiDAR → DEA SRTM 1 s, national overlays (`au-hydro`, `au-parks`, `au-infra`, `au-aviation`), plus all **8 States & Territories** below.
 - **Global Fallback (`glo30`, `EGM2008`):** Copernicus WorldDEM-30 (`30 m`) paired with OpenStreetMap.
 
+Live terrain previews use the regional non-LiDAR tiers or an installed pack DEM. RF previews
+support links up to 100 km. A terrain fetch can span up to 125 km per side and 8,000 km². A
+footprint crossing the antimeridian is unsupported. The ruler still returns geodesic measurements
+when its full path exceeds the terrain budget.
+
+Canadian DEM queries read GeoTIFF ranges only from NRCan's two regional AWS data buckets.
+Catalog and raster requests decline redirects. [CanElevation documentation](https://nrcan.github.io/CanElevation/stac-dem-mosaics/)
+and [MRDEM usage guide](https://download-telecharger.services.geo.ca/pub/elevation/dem_mne/MRDEM_MNEMR/CanElevation-MRDEM-Usage-Guide.pdf)
+
+## Online OpenStreetMap Queries
+
+GridForge sends the map bounding box to `OVERPASS_URL` when online OSM data is needed. The default
+endpoint is `https://overpass-api.de/api/interpreter`. Set `OVERPASS_FALLBACK_URLS` to a comma-separated
+list of mirrors if they may receive the same bounding boxes when the primary endpoint is unavailable.
+
 ## Australian State & Territory Trail Overlays
 
 | State / Mode | CLI Flag | Official Open-Data Agency & Datasets | License |
@@ -25,6 +40,10 @@ GridForge uses strictly commercial-friendly, zero-auth open geospatial data with
 | **Western Australia** | `--au-overlay au-wa-trails` | **DBCA AGOL & Landgate SLIP** — tracks/trails, fire breaks, fire towers & geodetic marks *(excludes CC BY-NC)* | **CC BY 4.0** |
 | **South Australia** | `--au-overlay au-sa-trails` | **DEW / DHUD / Location SA + GA Topo250K** — Heysen/Mawson trails (`/vsizip/` low-RAM), fire tracks & AHD marks | **CC BY 4.0** |
 | **Northern Territory** | `--au-overlay au-nt-trails` | **NTLIS / DEPWS WFS + NTG Roads + GA Topo250K** — Larapinta/4WD tracks, lookouts & AHD survey marks | **CC BY 4.0** |
+
+Live WFS layers use per-response byte, feature and geometry limits. The South Australian
+recreation-trails ZIP is limited to 32 MiB, with a 64 MiB limit for the selected GeoJSON layer.
+The South Australian parks JSON is limited to 8 MiB. Data that fails these checks is skipped.
 
 ## Data Sources, Attributions & License
 

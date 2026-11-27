@@ -210,6 +210,14 @@ class StripSheetInput(BaseModel):
     center_lon: float = Field(..., ge=-180.0, le=180.0)
     index: int | None = None
 
+    @field_validator("sheet_id")
+    @classmethod
+    def _validate_sheet_id(cls, value: str) -> str:
+        cleaned = "".join(ch for ch in value if ord(ch) >= 0x20 and ord(ch) != 0x7F).strip()
+        if not cleaned:
+            raise ValueError("sheet_id must contain visible characters.")
+        return cleaned[:16]
+
 
 class StripPlanRequest(BaseModel):
     """JSON request payload for ``POST /api/strip-plan``."""

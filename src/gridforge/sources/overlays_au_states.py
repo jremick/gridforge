@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import shutil
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Final
@@ -14,6 +16,7 @@ from typing import Any, Final
 import httpx
 
 from gridforge.config import BBox, SheetLayout
+from gridforge.sources._http import bounded_response_chunks, read_bounded_file, stream_provider_get, write_cache_bytes
 from gridforge.sources.base import OverlaySource
 from gridforge.sources.overlays_au import (
     USER_AGENT,
@@ -56,6 +59,10 @@ DEFAULT_NSW_HUTS_URL: Final[str] = (
 
 # Victoria DataVic / DEECA / DTP Vicmap OGC WFS 2.0.0 GeoJSON endpoint
 DEFAULT_VIC_WFS_URL: Final[str] = "https://opendata.maps.vic.gov.au/geoserver/wfs"
+_MAX_WFS_BYTES = 16 * 1024 * 1024
+_MAX_WFS_FEATURES = 2500
+_MAX_WFS_GEOMETRY_VALUES = 750_000
+_MAX_WFS_GEOMETRY_DEPTH = 10
 
 # Tasmania LISTdata (NRE Tas) CC BY 3.0 AU ArcGIS REST endpoints
 DEFAULT_TAS_OPENDATA_BASE_URL: Final[str] = (
@@ -247,6 +254,48 @@ def _redact_url_secrets(text: str) -> str:
     return redacted
 
 
+def _bounded_wfs_features(
+    payload: Any, feature_limit: int, *, from_cache: bool = False
+) -> list[dict[str, Any]]:
+    # Older caches contain a list of selected features. Accept that format
+    # subject to the same checks as newly fetched FeatureCollections.
+    features = payload.get("features") if isinstance(payload, dict) else None
+    if from_cache and isinstance(payload, list):
+        features = payload
+    if not isinstance(features, list) or len(features) > feature_limit:
+        raise ValueError("Unexpected WFS payload or feature budget exceeded")
+
+    remaining = _MAX_WFS_GEOMETRY_VALUES
+
+    def visit(value: Any, depth: int) -> None:
+        nonlocal remaining
+        remaining -= 1
+        if remaining < 0 or depth > _MAX_WFS_GEOMETRY_DEPTH:
+            raise ValueError("WFS geometry exceeds the complexity budget")
+        if isinstance(value, list):
+            for child in value:
+                visit(child, depth + 1)
+        elif isinstance(value, dict):
+            field = "geometries" if value.get("type") == "GeometryCollection" else "coordinates"
+            coordinates = value.get(field)
+            if not isinstance(coordinates, list):
+                raise ValueError("Invalid WFS geometry")
+            visit(coordinates, depth + 1)
+        elif type(value) not in (int, float) or not math.isfinite(value):
+            raise ValueError("Invalid WFS coordinate")
+
+    selected: list[dict[str, Any]] = []
+    for feature in features:
+        geometry = feature.get("geometry") if isinstance(feature, dict) else None
+        if isinstance(geometry, dict):
+            properties = feature.get("properties")
+            if properties is not None and not isinstance(properties, dict):
+                raise ValueError("Invalid WFS feature properties")
+            visit(geometry, 0)
+            selected.append(feature)
+    return selected
+
+
 def query_wfs_geojson(
     wfs_url: str,
     type_name: str,
@@ -267,13 +316,13 @@ def query_wfs_geojson(
     or standard OGC WFS 2.0 ``bbox=minx,miny,maxx,maxy,urn:ogc:def:crs:OGC:1.3:CRS84``
     when ``use_bbox_param=True``.
     """
-    if cache_path.is_file() and cache_path.stat().st_size > 0:
+    feature_limit = min(max_features, _MAX_WFS_FEATURES)
+    if cache_path.is_file():
         try:
-            cached = json.loads(cache_path.read_text(encoding="utf-8"))
-            if isinstance(cached, list):
-                return cached
-        except json.JSONDecodeError:
-            logger.warning("Ignoring corrupt cached WFS overlay JSON: %s", cache_path)
+            cached = json.loads(read_bounded_file(cache_path, _MAX_WFS_BYTES))
+            return _bounded_wfs_features(cached, feature_limit, from_cache=True)
+        except (OSError, ValueError, OverflowError, RecursionError):
+            logger.warning("Ignoring invalid cached WFS overlay JSON: %s", cache_path)
 
     params: dict[str, str] = {
         "service": "WFS",
@@ -282,7 +331,7 @@ def query_wfs_geojson(
         "typeNames": type_name,
         "outputFormat": "application/json",
         "srsName": "EPSG:4326",
-        "count": str(max_features),
+        "count": str(feature_limit),
     }
     if use_bbox_param and not cql_filter:
         params["bbox"] = (
@@ -302,7 +351,6 @@ def query_wfs_geojson(
         if client is not None
         else httpx.Client(
             timeout=httpx.Timeout(timeout_s, connect=min(8.0, timeout_s)),
-            follow_redirects=True,
             headers={"User-Agent": USER_AGENT},
         )
     )
@@ -311,26 +359,21 @@ def query_wfs_geojson(
     try:
         for attempt in range(max(1, retries)):
             try:
-                resp = http.get(wfs_url, params=params, headers={"User-Agent": USER_AGENT})
-                resp.raise_for_status()
-                data = resp.json()
+                deadline = time.monotonic() + timeout_s
+                with stream_provider_get(
+                    http, wfs_url, params=params, user_agent=USER_AGENT, deadline=deadline
+                ) as resp:
+                    resp.raise_for_status()
+                    body = b"".join(bounded_response_chunks(resp, max_bytes=_MAX_WFS_BYTES, deadline=deadline))
+                features = _bounded_wfs_features(json.loads(body), feature_limit)
+            except (ValueError, OverflowError, RecursionError) as exc:
+                last_error = f"{_redact_url_secrets(wfs_url)} ({type_name}): {exc}"
+                break
             except Exception as exc:
                 last_error = f"{_redact_url_secrets(wfs_url)} ({type_name}, try={attempt + 1}): {_redact_url_secrets(str(exc))}"
                 continue
 
-            if not isinstance(data, dict) or not isinstance(data.get("features"), list):
-                last_error = f"{_redact_url_secrets(wfs_url)} ({type_name}): unexpected WFS payload"
-                continue
-
-            features = [
-                f
-                for f in data["features"]
-                if isinstance(f, dict) and f.get("geometry") is not None
-            ]
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = cache_path.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(features), encoding="utf-8")
-            tmp.replace(cache_path)
+            write_cache_bytes(cache_path, body)
             return features
     finally:
         if owns_client:

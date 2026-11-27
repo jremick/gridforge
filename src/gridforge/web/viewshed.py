@@ -16,7 +16,7 @@ from typing import Any
 
 from osgeo import gdal
 from pydantic import BaseModel
-from pyproj import Transformer
+from pyproj import Geod, Transformer
 import shapely
 from shapely.geometry import shape as shapely_shape
 
@@ -29,14 +29,16 @@ from gridforge.config import (
     SheetSpec,
     ViewshedObserver,
 )
-from gridforge.geo.crs import MAX_UTM_LAT, MIN_UTM_LAT, resolve_utm_zone
+from gridforge.geo.crs import MAX_UTM_LAT, MIN_UTM_LAT, _utm_bbox_to_wgs84, resolve_utm_zone
 from gridforge.geo.strip_atlas import _format_mgrs_10m, _sample_dem_point_bilinear
 from gridforge.geo.tactical import RulerMetricsResponse, compute_ruler_metrics
 from gridforge.packs.builder import load_pack_manifest
 from gridforge.pipeline import terrain as terrain_mod
 from gridforge.sources.dem_au_elvis import AUElvisDEMSource
+from gridforge.sources.dem_ca_hrdem import CanadaHRDEMSource
 from gridforge.sources.dem_copernicus import CopernicusGLO30Source
 from gridforge.sources.dem_local import LocalDEMSource
+from gridforge.sources.dem_nz_linz import NZLinzDEMSource
 from gridforge.sources.dem_usgs3dep import AutoDEMSource, USGS3DEPSource
 from gridforge.web.schemas import (
     RFLinkProfileRequest,
@@ -49,6 +51,32 @@ from gridforge.web.schemas import (
 logger = logging.getLogger(__name__)
 
 _DEM_NODATA: float = -9999.0
+_GEOD = Geod(ellps="WGS84")
+_MAX_RF_LINK_M = 100_000.0
+_MAX_PREVIEW_DEM_SPAN_M = 125_000.0
+_MAX_PREVIEW_DEM_AREA_M2 = 8_000_000_000.0
+
+
+def _preview_wgs84_bbox(bbox: BBox, utm_epsg: int) -> BBox:
+    """Check the DEM footprint before any source resolves or fetches data."""
+    if (
+        not all(math.isfinite(value) for value in bbox.as_tuple())
+        or not 0 < bbox.width <= _MAX_PREVIEW_DEM_SPAN_M
+        or not 0 < bbox.height <= _MAX_PREVIEW_DEM_SPAN_M
+        or bbox.width * bbox.height > _MAX_PREVIEW_DEM_AREA_M2
+    ):
+        raise ValueError("The terrain preview footprint exceeds the supported DEM extent.")
+
+    wgs84 = _utm_bbox_to_wgs84(bbox, utm_epsg)
+    if (
+        not all(math.isfinite(value) for value in wgs84.as_tuple())
+        or not 0 < wgs84.width <= 15.0
+        or not 0 < wgs84.height <= 2.0
+    ):
+        raise ValueError("The terrain preview footprint exceeds the supported DEM extent.")
+    return wgs84.model_copy(
+        update={"min_y": max(MIN_UTM_LAT, wgs84.min_y), "max_y": min(MAX_UTM_LAT, wgs84.max_y)}
+    )
 
 
 def _build_range_ring_geojson(
@@ -113,21 +141,6 @@ def _build_viewshed_fetch_layout(
         max_y=oy + r + pad,
     )
 
-    to_wgs84 = Transformer.from_crs(f"EPSG:{utm_epsg}", "EPSG:4326", always_xy=True)
-
-    def _to_wgs84_bbox(b: BBox) -> BBox:
-        mx = 0.5 * (b.min_x + b.max_x)
-        my = 0.5 * (b.min_y + b.max_y)
-        xs = [b.min_x, mx, b.max_x, b.max_x, b.max_x, mx, b.min_x, b.min_x]
-        ys = [b.min_y, b.min_y, b.min_y, my, b.max_y, b.max_y, b.max_y, my]
-        lons, lats = to_wgs84.transform(xs, ys)
-        return BBox(
-            min_x=max(-180.0, float(min(lons))),
-            min_y=max(MIN_UTM_LAT, float(min(lats))),
-            max_x=min(180.0, float(max(lons))),
-            max_y=min(MAX_UTM_LAT, float(max(lats))),
-        )
-
     spec = SheetSpec(
         center_lat=observer.lat,
         center_lon=observer.lon,
@@ -150,8 +163,8 @@ def _build_viewshed_fetch_layout(
         frame_height_mm=235.0,
         utm_bbox=utm_bbox,
         utm_fetch_bbox=utm_fetch_bbox,
-        wgs84_bbox=_to_wgs84_bbox(utm_bbox),
-        wgs84_fetch_bbox=_to_wgs84_bbox(utm_fetch_bbox),
+        wgs84_bbox=_preview_wgs84_bbox(utm_bbox, utm_epsg),
+        wgs84_fetch_bbox=_preview_wgs84_bbox(utm_fetch_bbox, utm_epsg),
     )
 
 
@@ -180,33 +193,25 @@ def _resolve_preview_elevation_source(
                     if dem_file.is_file():
                         return LocalDEMSource(dem_file, attribution=manifest.dem_attribution)
 
-    if dem_source == DemSourceKind.USGS3DEP:
-        return USGS3DEPSource()
-    if dem_source == DemSourceKind.AU_ELVIS:
-        return AUElvisDEMSource()
     if dem_source == DemSourceKind.GLO30:
         return CopernicusGLO30Source()
+
+    # Preview warps use at least 30 m pixels. Skip native LiDAR tiers that
+    # would first fetch and clip the entire footprint at 1–5 m resolution.
+    if dem_source == DemSourceKind.USGS3DEP:
+        return USGS3DEPSource(prefer_1m=False)
+    if dem_source == DemSourceKind.AU_ELVIS:
+        return AUElvisDEMSource(prefer_state_lidar=False, prefer_5m=False)
     if dem_source == DemSourceKind.NZ_LINZ:
-        try:
-            from gridforge.sources.dem_nz_linz import NZLinzDEMSource  # type: ignore[import-not-found]
-
-            return NZLinzDEMSource()
-        except Exception:
-            logger.debug("NZLinzDEMSource unavailable; falling back to AutoDEMSource")
-            return AutoDEMSource()
+        return NZLinzDEMSource(prefer_1m=False)
     if dem_source == DemSourceKind.CA_HRDEM:
-        try:
-            from gridforge.sources import dem_ca_hrdem  # type: ignore[import-not-found]
-
-            cls = getattr(dem_ca_hrdem, "CanadaHRDEMSource", None) or getattr(
-                dem_ca_hrdem, "CAHrdemDEMSource", None
-            )
-            if cls is not None:
-                return cls()
-        except Exception:
-            logger.debug("CanadaHRDEMSource unavailable; falling back to AutoDEMSource")
-        return AutoDEMSource()
-    return AutoDEMSource()
+        return CanadaHRDEMSource(prefer_hrdem=False)
+    return AutoDEMSource(
+        usgs_source=USGS3DEPSource(prefer_1m=False),
+        au_source=AUElvisDEMSource(prefer_state_lidar=False, prefer_5m=False),
+        nz_source=NZLinzDEMSource(prefer_1m=False),
+        ca_source=CanadaHRDEMSource(prefer_hrdem=False),
+    )
 
 
 def _warp_dem_fast_utm(
@@ -395,13 +400,21 @@ def _build_extent_fetch_layout(
     pad_m: float = 1000.0,
 ) -> tuple[SheetLayout, int]:
     """Build a synthetic ``SheetLayout`` spanning ``(lat_pts, lon_pts)`` in midpoint UTM."""
+    if max(lon_pts) - min(lon_pts) > 180.0:
+        raise ValueError("The terrain preview points cross the antimeridian.")
     mid_lat = 0.5 * (min(lat_pts) + max(lat_pts))
     mid_lon = 0.5 * (min(lon_pts) + max(lon_pts))
+    _, _, distances_m = _GEOD.inv(
+        [mid_lon] * len(lon_pts), [mid_lat] * len(lat_pts), lon_pts, lat_pts
+    )
+    if not all(math.isfinite(d) and d <= _MAX_PREVIEW_DEM_SPAN_M for d in distances_m):
+        raise ValueError("The terrain preview points are too far apart for one local DEM.")
     utm_zone, utm_hemi, utm_epsg, gzd = resolve_utm_zone(mid_lat, mid_lon)
 
     to_utm = Transformer.from_crs("EPSG:4326", f"EPSG:{utm_epsg}", always_xy=True)
-    to_wgs84 = Transformer.from_crs(f"EPSG:{utm_epsg}", "EPSG:4326", always_xy=True)
     xs, ys = to_utm.transform(lon_pts, lat_pts)
+    if not all(math.isfinite(value) for value in (*xs, *ys)):
+        raise ValueError("The terrain preview points cannot be projected in a single local UTM zone.")
     min_x, max_x = float(min(xs)), float(max(xs))
     min_y, max_y = float(min(ys)), float(max(ys))
     cx = 0.5 * (min_x + max_x)
@@ -422,19 +435,6 @@ def _build_extent_fetch_layout(
         max_y=max_y + eff_pad,
     )
 
-    def _to_wgs84_bbox(b: BBox) -> BBox:
-        mx = 0.5 * (b.min_x + b.max_x)
-        my = 0.5 * (b.min_y + b.max_y)
-        bxs = [b.min_x, mx, b.max_x, b.max_x, b.max_x, mx, b.min_x, b.min_x]
-        bys = [b.min_y, b.min_y, b.min_y, my, b.max_y, b.max_y, b.max_y, my]
-        blons, blats = to_wgs84.transform(bxs, bys)
-        return BBox(
-            min_x=max(-180.0, float(min(blons))),
-            min_y=max(MIN_UTM_LAT, float(min(blats))),
-            max_x=min(180.0, float(max(blons))),
-            max_y=min(MAX_UTM_LAT, float(max(blats))),
-        )
-
     layout = SheetLayout(
         spec=SheetSpec(center_lat=mid_lat, center_lon=mid_lon, scale=25000),
         utm_epsg=utm_epsg,
@@ -452,8 +452,8 @@ def _build_extent_fetch_layout(
         frame_height_mm=235.0,
         utm_bbox=utm_bbox,
         utm_fetch_bbox=utm_fetch_bbox,
-        wgs84_bbox=_to_wgs84_bbox(utm_bbox),
-        wgs84_fetch_bbox=_to_wgs84_bbox(utm_fetch_bbox),
+        wgs84_bbox=_preview_wgs84_bbox(utm_bbox, utm_epsg),
+        wgs84_fetch_bbox=_preview_wgs84_bbox(utm_fetch_bbox, utm_epsg),
     )
     return (layout, utm_epsg)
 
@@ -478,6 +478,9 @@ def compute_rf_link_preview(
         from_label=req.from_label,
         to_label=req.to_label,
     )
+    _, _, distance_m = _GEOD.inv(link.from_lon, link.from_lat, link.to_lon, link.to_lat)
+    if not math.isfinite(distance_m) or distance_m > _MAX_RF_LINK_M:
+        raise ValueError("RF terrain previews support links up to 100 km.")
 
     compute_fn = getattr(terrain_mod, "compute_rf_link_profile", None)
     if compute_fn is None:
@@ -546,6 +549,11 @@ def compute_ruler_preview(
         return compute_ruler_metrics(pts, date_iso=req.date_iso)
 
     try:
+        fetch_layout, _ = _build_extent_fetch_layout(
+            [p[0] for p in pts],
+            [p[1] for p in pts],
+            pad_m=500.0,
+        )
         elev_src = (
             elevation_source
             if elevation_source is not None
@@ -555,11 +563,6 @@ def compute_ruler_preview(
                 packs_dir=packs_dir,
                 pack_dir_finder=pack_dir_finder,
             )
-        )
-        fetch_layout, _ = _build_extent_fetch_layout(
-            [p[0] for p in pts],
-            [p[1] for p in pts],
-            pad_m=500.0,
         )
         with tempfile.TemporaryDirectory(prefix="gf_ruler_") as tmp_s:
             raw_dem = elev_src.fetch_dem(fetch_layout, Path(tmp_s))
