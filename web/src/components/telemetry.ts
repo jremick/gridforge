@@ -555,6 +555,20 @@ export class TelemetryBar {
     this.shareShortResultEl.hidden = false;
   }
 
+  resetWorkspace(): void {
+    this.setAccountMenuOpen(false, { restoreFocus: false });
+    this.closeShareMenu();
+    this.setShareSummary({
+      headline: "",
+      detail: "",
+      directTruncated: false,
+      hasLocalOverlayFile: false,
+    });
+    this.setShortLinkResult(null);
+    this.setShortLinkBusy(false);
+    this.updateFootprint(null);
+  }
+
   updateSidebarCollapsed(collapsed: boolean): void {
     const expanded = !collapsed;
     this.sidebarToggleBtn.classList.toggle("active", expanded);
@@ -573,6 +587,10 @@ export class TelemetryBar {
       this.sheetEl.textContent = "—";
       this.gmEl.textContent = "—";
       this.declEl.textContent = "—";
+      this.utmEl.removeAttribute("title");
+      this.sheetEl.removeAttribute("title");
+      this.gmEl.removeAttribute("title");
+      this.declEl.removeAttribute("title");
       return;
     }
 

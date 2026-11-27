@@ -7,6 +7,8 @@ import {
 import { escapeHtml } from "../presets";
 import type { SavedProject } from "../types";
 
+const PROJECT_NAME_PLACEHOLDER = "Project name (e.g. Kosciuszko Winter Loop)";
+
 export interface ProjectsDrawerCallbacks {
   onClose: () => void;
   onLoadProject: (project: SavedProject) => void;
@@ -43,6 +45,7 @@ export class ProjectsDrawer {
   private projects: SavedProject[] = [];
   private busyIds = new Set<string>();
   private saving = false;
+  private requests = new AbortController();
 
   constructor(container: HTMLElement, callbacks: ProjectsDrawerCallbacks) {
     this.root = container;
@@ -67,7 +70,7 @@ export class ProjectsDrawer {
           class="gf-input"
           data-role="proj-name"
           maxlength="80"
-          placeholder="Project name (e.g. Kosciuszko Winter Loop)"
+          placeholder="${PROJECT_NAME_PLACEHOLDER}"
         />
         <div class="gf-input-group">
           <input
@@ -153,35 +156,50 @@ export class ProjectsDrawer {
     if (!this.nameInput.value.trim()) {
       const snap = this.callbacks.getCurrentSnapshot();
       this.nameInput.placeholder =
-        snap.suggestedName || "Project name (e.g. Kosciuszko Loop)";
+        snap.suggestedName || PROJECT_NAME_PLACEHOLDER;
     }
   }
 
   clear(): void {
+    this.requests.abort();
+    this.requests = new AbortController();
     this.projects = [];
+    this.busyIds.clear();
+    this.nameInput.value = "";
+    this.nameInput.placeholder = PROJECT_NAME_PLACEHOLDER;
+    this.notesInput.value = "";
+    this.setSaving(false);
     this.countEl.textContent = "0";
     this.renderList();
   }
 
   async refresh(): Promise<void> {
+    const { signal } = this.requests;
     try {
-      this.projects = await fetchProjects();
+      const projects = await fetchProjects(signal);
+      if (signal.aborted) return;
+      this.projects = projects;
       this.countEl.textContent = String(this.projects.length);
       this.renderList();
     } catch (err) {
-      this.callbacks.onApiError?.(err, "projects");
+      if (!signal.aborted) this.callbacks.onApiError?.(err, "projects");
     }
+  }
+
+  private setSaving(saving: boolean): void {
+    this.saving = saving;
+    this.saveBtn.disabled = saving;
+    this.saveBtn.textContent = saving ? "Saving…" : "Save";
   }
 
   private async handleSaveCurrent(): Promise<void> {
     if (this.saving) return;
+    const { signal } = this.requests;
     const snap = this.callbacks.getCurrentSnapshot();
     const name = this.nameInput.value.trim() || snap.suggestedName || "Untitled Trip";
     const notes = this.notesInput.value.trim();
 
-    this.saving = true;
-    this.saveBtn.disabled = true;
-    this.saveBtn.textContent = "Saving…";
+    this.setSaving(true);
 
     try {
       const created = await createProject({
@@ -190,7 +208,8 @@ export class ProjectsDrawer {
         notes,
         state: snap.state,
         last_job_id: snap.last_job_id,
-      });
+      }, signal);
+      if (signal.aborted) return;
       this.projects = [
         created,
         ...this.projects.filter((p) => p.project_id !== created.project_id),
@@ -201,29 +220,32 @@ export class ProjectsDrawer {
       this.renderList();
       this.callbacks.onToast(`Saved project "${created.name}"`, "success");
     } catch (err) {
+      if (signal.aborted) return;
       const msg = err instanceof Error ? err.message : "Failed to save project";
       this.callbacks.onToast(msg, "error");
       this.callbacks.onApiError?.(err, "projects");
     } finally {
-      this.saving = false;
-      this.saveBtn.disabled = false;
-      this.saveBtn.textContent = "Save";
+      if (!signal.aborted) this.setSaving(false);
     }
   }
 
   private async handleShare(proj: SavedProject): Promise<void> {
     if (!this.callbacks.onShareProject) return;
+    const { signal } = this.requests;
     this.busyIds.add(proj.project_id);
     this.renderList();
     try {
       await this.callbacks.onShareProject(proj);
     } finally {
-      this.busyIds.delete(proj.project_id);
-      this.renderList();
+      if (!signal.aborted) {
+        this.busyIds.delete(proj.project_id);
+        this.renderList();
+      }
     }
   }
 
   private async handleClone(proj: SavedProject): Promise<void> {
+    const { signal } = this.requests;
     this.busyIds.add(proj.project_id);
     this.renderList();
     try {
@@ -234,35 +256,44 @@ export class ProjectsDrawer {
         notes,
         state: proj.state,
         last_job_id: proj.last_job_id ?? null,
-      });
+      }, signal);
+      if (signal.aborted) return;
       this.projects = [cloned, ...this.projects];
       this.countEl.textContent = String(this.projects.length);
       this.callbacks.onToast(`Cloned "${proj.name}"`, "info");
     } catch (err) {
+      if (signal.aborted) return;
       const msg = err instanceof Error ? err.message : "Failed to clone project";
       this.callbacks.onToast(msg, "error");
       this.callbacks.onApiError?.(err, "projects");
     } finally {
-      this.busyIds.delete(proj.project_id);
-      this.renderList();
+      if (!signal.aborted) {
+        this.busyIds.delete(proj.project_id);
+        this.renderList();
+      }
     }
   }
 
   private async handleDelete(id: string): Promise<void> {
+    const { signal } = this.requests;
     this.busyIds.add(id);
     this.renderList();
     try {
-      await deleteProject(id);
+      await deleteProject(id, signal);
+      if (signal.aborted) return;
       this.projects = this.projects.filter((p) => p.project_id !== id);
       this.countEl.textContent = String(this.projects.length);
       this.callbacks.onToast("Deleted saved project", "info");
     } catch (err) {
+      if (signal.aborted) return;
       const msg = err instanceof Error ? err.message : "Failed to delete project";
       this.callbacks.onToast(msg, "error");
       this.callbacks.onApiError?.(err, "projects");
     } finally {
-      this.busyIds.delete(id);
-      this.renderList();
+      if (!signal.aborted) {
+        this.busyIds.delete(id);
+        this.renderList();
+      }
     }
   }
 

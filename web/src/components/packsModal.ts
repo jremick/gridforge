@@ -62,7 +62,11 @@ export class PacksModal {
   private customBboxVal = "";
   private customNameVal = "";
 
-  constructor(container: HTMLElement, callbacks: PacksModalCallbacks) {
+  constructor(
+    container: HTMLElement,
+    callbacks: PacksModalCallbacks,
+    private readonly signal: AbortSignal
+  ) {
     this.root = container;
     this.callbacks = callbacks;
     this.root.className = "gf-modal-backdrop hidden";
@@ -172,7 +176,7 @@ export class PacksModal {
       if (e.target === this.root) {
         this.close();
       }
-    });
+    }, { signal: this.signal });
 
     this.q("[data-role='modal-close']").addEventListener("click", () => {
       this.close();
@@ -284,6 +288,11 @@ export class PacksModal {
     this.focusTrap.deactivate();
   }
 
+  dispose(): void {
+    this.close();
+    this.root.replaceChildren();
+  }
+
   private stopPolling(): void {
     if (this.pollTimer !== null) {
       window.clearTimeout(this.pollTimer);
@@ -329,6 +338,7 @@ export class PacksModal {
   }
 
   private async refreshAll(): Promise<void> {
+    if (this.signal.aborted) return;
     if (!this.manageAllowed) {
       this.tasks = [];
       this.tasksDeniedMessage = "Admin access required to manage offline packs.";
@@ -337,10 +347,11 @@ export class PacksModal {
     }
 
     const [packsRes, regionsRes, tasksRes] = await Promise.allSettled([
-      fetchPacks(),
-      this.regions.length > 0 ? Promise.resolve(this.regions) : fetchPackRegions(),
-      fetchPackTasks(),
+      fetchPacks(this.signal),
+      this.regions.length > 0 ? Promise.resolve(this.regions) : fetchPackRegions(this.signal),
+      fetchPackTasks(this.signal),
     ]);
+    if (this.signal.aborted) return;
 
     if (packsRes.status === "fulfilled") {
       this.packs = packsRes.value.packs;
@@ -375,7 +386,8 @@ export class PacksModal {
     );
 
     try {
-      const tasks = await fetchPackTasks();
+      const tasks = await fetchPackTasks(this.signal);
+      if (this.signal.aborted) return;
       this.tasks = tasks;
       this.renderTasks();
 
@@ -385,7 +397,8 @@ export class PacksModal {
           (t.status === "succeeded" || t.status === "failed")
       );
       if (justFinished) {
-        const packsRes = await fetchPacks();
+        const packsRes = await fetchPacks(this.signal);
+        if (this.signal.aborted) return;
         this.packs = packsRes.packs;
         this.callbacks.onPacksUpdated(this.packs);
         this.renderInstalled();
@@ -423,19 +436,23 @@ export class PacksModal {
         include_overlays: this.incOverlaysCheck.checked,
         include_basemap: this.incBasemapCheck.checked,
         dem_tier: this.demTierSelect.value as PackDemTier,
-      });
+      }, this.signal);
+      if (this.signal.aborted) return;
       this.tasks = [task, ...this.tasks.filter((t) => t.task_id !== task.task_id)];
       this.renderTasks();
       this.callbacks.onToast(`Started pack build: ${task.region}`, "info");
       this.schedulePollIfActive();
     } catch (err) {
+      if (this.signal.aborted) return;
       const msg =
         err instanceof Error ? err.message : "Failed to start pack build";
       this.callbacks.onToast(msg, "error");
       this.callbacks.onApiError?.(err);
     } finally {
-      this.submittingRegion = null;
-      this.renderRegions();
+      if (!this.signal.aborted) {
+        this.submittingRegion = null;
+        this.renderRegions();
+      }
     }
   }
 
@@ -444,19 +461,23 @@ export class PacksModal {
     this.renderInstalled();
 
     try {
-      await deletePack(packId);
+      await deletePack(packId, this.signal);
+      if (this.signal.aborted) return;
       this.packs = this.packs.filter((p) => p.pack_id !== packId);
       this.callbacks.onPacksUpdated(this.packs);
       this.callbacks.onBasemapRefresh();
       this.callbacks.onToast(`Deleted offline pack "${packId}"`, "info");
     } catch (err) {
+      if (this.signal.aborted) return;
       const msg =
         err instanceof Error ? err.message : "Failed to delete offline pack";
       this.callbacks.onToast(msg, "error");
       this.callbacks.onApiError?.(err);
     } finally {
-      this.deletingIds.delete(packId);
-      this.renderInstalled();
+      if (!this.signal.aborted) {
+        this.deletingIds.delete(packId);
+        this.renderInstalled();
+      }
     }
   }
 

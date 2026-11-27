@@ -636,7 +636,7 @@ test("AuthModal.setSession preserves open signin password input and focus when a
     const container = doc.createElement("div");
     doc.body.appendChild(container);
     const modal = new AuthModal(container, {
-      onSessionChanged: () => {},
+      changeSession: (request) => request(),
       onOpenAdmin: () => {},
       onToast: () => {},
     });
@@ -998,4 +998,46 @@ test("ProjectsDrawer renders Share action per saved project and triggers callbac
   } finally {
     globalThis.fetch = origFetch;
   }
+});
+
+test("ProjectsDrawer resets draft fields and ignores a closed workspace's pending list", async () => {
+  const { ProjectsDrawer } = await bundleTsModule("src/components/projectsDrawer.ts");
+  await withDom(async ({ doc }) => {
+    const container = doc.createElement("aside");
+    doc.body.appendChild(container);
+    const drawer = new ProjectsDrawer(container, {
+      onClose: () => {},
+      onLoadProject: () => {},
+      getCurrentSnapshot: () => ({ suggestedName: "Training draft", state: {}, last_job_id: null }),
+      onToast: () => {},
+    });
+    const name = container.querySelector("[data-role='proj-name']");
+    const notes = container.querySelector("[data-role='proj-notes']");
+    drawer.prepareSuggestedName();
+    name.value = "Field exercise";
+    notes.value = "Draft itinerary";
+
+    let finishRequest;
+    let requestSignal;
+    globalThis.fetch = (_url, init) => {
+      requestSignal = init.signal;
+      return new Promise((resolve) => { finishRequest = resolve; });
+    };
+    const pending = drawer.refresh();
+    drawer.clear();
+    finishRequest(new Response(JSON.stringify({ projects: [{
+      project_id: "proj_closed_workspace",
+      name: "Training itinerary",
+      created_at: "2026-11-27T00:00:00Z",
+      updated_at: "2026-11-27T00:00:00Z",
+      state: {},
+    }] })));
+    await pending;
+
+    assert.equal(requestSignal.aborted, true);
+    assert.equal(name.value, "");
+    assert.equal(notes.value, "");
+    assert.equal(name.placeholder, "Project name (e.g. Kosciuszko Winter Loop)");
+    assert.match(container.querySelector("[data-role='projects-list']").textContent, /No saved trip projects/);
+  });
 });
