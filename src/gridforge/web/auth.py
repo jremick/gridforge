@@ -25,7 +25,10 @@ from gridforge.web import db
 from gridforge.web.access import get_client_ip, get_effective_scheme, is_secure_request
 from gridforge.web.limits import LimitsConfig, get_capabilities, get_quotas_snapshot
 from gridforge.web.schemas import (
+    API_KEY_SCOPES,
     AcceptInviteRequest,
+    ApiKeyScope,
+    AuthCapabilities,
     AuthSessionResponse,
     AuthUserSummary,
 )
@@ -372,6 +375,20 @@ class AuthContext:
     session_token_hash: str | None = None
     auth_method: Literal["none", "guest", "session", "api_key"] = "none"
     api_key_id: str | None = None
+    api_key_scopes: frozenset[str] = frozenset()
+
+    def require_api_key_scope(self, required: ApiKeyScope) -> None:
+        """Enforce a scope for hosted PATs in addition to the handler's role and owner checks."""
+        if self.auth_mode != "hosted" or self.auth_method != "api_key":
+            return
+        if "all" in self.api_key_scopes or required in self.api_key_scopes:
+            return
+        if required.endswith(":read") and f"{required.removesuffix(':read')}:write" in self.api_key_scopes:
+            return
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"API key requires the '{required}' scope.",
+        )
 
 
 class AuthManager:
@@ -480,6 +497,9 @@ class AuthManager:
 
         # Hosted mode: check Bearer / X-API-Key headers BEFORE session/guest cookies.
         if key_supplied:
+            cached_ctx = getattr(request.state, "hosted_api_key_context", None)
+            if cached_ctx is not None:
+                return cached_ctx
             if not raw_api_key:
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED,
@@ -495,7 +515,11 @@ class AuthManager:
                     headers={"WWW-Authenticate": "Bearer"},
                 )
             api_key_row, user = hit
-            if user.get("disabled"):
+            scopes = frozenset(api_key_row["scopes"])
+            invalid_scopes = not scopes or not scopes <= API_KEY_SCOPES or (
+                "all" in scopes and len(scopes) != 1
+            )
+            if user.get("disabled") or invalid_scopes:
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED,
                     detail="Invalid or expired API key.",
@@ -508,7 +532,7 @@ class AuthManager:
             role_val: Literal["friend", "admin"] = (
                 "admin" if user["role"] == "admin" else "friend"
             )
-            return AuthContext(
+            ctx = AuthContext(
                 auth_mode="hosted",
                 role=role_val,
                 authenticated=True,
@@ -517,7 +541,10 @@ class AuthManager:
                 client_ip=client_ip,
                 auth_method="api_key",
                 api_key_id=str(api_key_row["key_id"]),
+                api_key_scopes=scopes,
             )
+            request.state.hosted_api_key_context = ctx
+            return ctx
 
         clear_session = False
         raw_session_cookie = request.cookies.get(SESSION_COOKIE_NAME)
@@ -636,12 +663,11 @@ class AuthManager:
         )
         return raw_token
 
-    def build_session_response(
+    def get_request_capabilities(
         self,
         ctx: AuthContext,
         limits_cfg: LimitsConfig,
-    ) -> AuthSessionResponse:
-        """Build the ``GET /api/auth/session`` response payload."""
+    ) -> AuthCapabilities:
         caps = get_capabilities(
             ctx.role,
             limits_cfg,
@@ -649,6 +675,17 @@ class AuthManager:
             turnstile_configured=self.config.turnstile_configured,
             google_oauth_enabled=self.config.google_oauth_enabled,
         )
+        if ctx.auth_mode == "hosted" and ctx.auth_method == "api_key":
+            caps.packs_manage_allowed = False
+        return caps
+
+    def build_session_response(
+        self,
+        ctx: AuthContext,
+        limits_cfg: LimitsConfig,
+    ) -> AuthSessionResponse:
+        """Build the ``GET /api/auth/session`` response payload."""
+        caps = self.get_request_capabilities(ctx, limits_cfg)
         quotas = get_quotas_snapshot(
             self.db_path,
             role=ctx.role,

@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from pypdf import PdfReader, PdfWriter
@@ -278,6 +281,60 @@ class TestFootprintEndpoint:
 
 
 class TestGeocodeEndpoint:
+    @pytest.mark.parametrize("auth_mode", ["none", "hosted"])
+    def test_geocode_provider_budgets(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, auth_mode: str
+    ) -> None:
+        from gridforge.web import app as app_mod
+
+        app_mod._geocode_cache.clear()
+        monkeypatch.setenv("GRIDFORGE_AUTH_MODE", auth_mode)
+        monkeypatch.setenv("GRIDFORGE_SESSION_SECRET", "test-geocode-session-secret-0123456789")
+        monkeypatch.setenv("GRIDFORGE_GEOCODE_HOURLY_LIMIT", "1")
+        monkeypatch.setenv("GRIDFORGE_GEOCODE_GLOBAL_HOURLY_LIMIT", "2")
+        app = create_app(data_dir=tmp_path / "jobs", packs_dir=tmp_path / "packs")
+        clients = [
+            TestClient(app, base_url="http://localhost:8080", client=(f"192.0.2.{n}", 12345))
+            for n in range(1, 4)
+        ]
+        entered, release = threading.Event(), threading.Event()
+        calls: list[str] = []
+
+        def provider(url, *, params, **kwargs):
+            query = params["q"]
+            calls.append(query)
+            if query == "Leura":
+                entered.set()
+                assert release.wait(5)
+            return httpx.Response(200, json=[], request=httpx.Request("GET", url))
+
+        monkeypatch.setattr(app_mod, "_nominatim_http_get", provider)
+
+        def geocode(client: TestClient, q: str) -> httpx.Response:
+            return client.get("/api/geocode", params={"q": q})
+
+        first, second, third = clients
+        assert geocode(first, "Katoomba").status_code == 200
+        assert geocode(first, "Blackheath").status_code == 429
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            pending = executor.submit(geocode, second, "Leura")
+            try:
+                assert entered.wait(5)
+                assert geocode(third, "katoomba").status_code == 200
+                busy = geocode(third, "Blackheath")
+                assert busy.status_code == 503
+                assert "Retry-After" in busy.headers
+            finally:
+                release.set()
+            assert pending.result(timeout=5).status_code == 200
+
+        capped = geocode(third, "Blackheath")
+        assert capped.status_code == 429
+        assert "Global" in capped.json()["detail"]
+        assert geocode(third, "LEURA").status_code == 200
+        assert calls == ["Katoomba", "Leura"]
+
     def test_geocode_mock_cache_and_offline_fallback(
         self, client_and_dirs, monkeypatch: pytest.MonkeyPatch
     ) -> None:

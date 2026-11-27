@@ -72,11 +72,14 @@ See [`railway.toml`](../railway.toml) for the Railway build and `/api/health` he
 | `GRIDFORGE_GUEST_HOURLY_PREVIEWS` | `5` | Hourly DEM viewshed/ruler preview quota for Guests (`GRIDFORGE_FRIEND_HOURLY_PREVIEWS=60`). |
 | `GRIDFORGE_RF_LINK_HOURLY_LIMIT` | `30` | Hourly RF link profile preview quota for Guests (`GRIDFORGE_FRIEND_RF_LINK_HOURLY_LIMIT=120`). |
 | `GRIDFORGE_SHARE_HOURLY_LIMIT` | `30` | Hourly shareable snapshot creation cap for Guests (`GRIDFORGE_FRIEND_SHARE_HOURLY_LIMIT=120`). |
-| `GRIDFORGE_GEOCODE_HOURLY_LIMIT` | `30` | Per-IP hourly Nominatim geocode cache-miss limit. |
+| `GRIDFORGE_GEOCODE_HOURLY_LIMIT` | `30` | Per-IP hourly geocode cache-miss limit in hosted and local mode. Hosted Admin callers are exempt from this per-IP limit. |
+| `GRIDFORGE_GEOCODE_GLOBAL_HOURLY_LIMIT` | `300` | Shared hourly geocode cache-miss limit across all roles and clients using the same database, in both modes. A value of `0` disables outbound misses. |
 | `GRIDFORGE_AUTH_RATE_LIMIT_PER_MINUTE` | `20` | Per-IP and per-account 1-minute auth rate limit on login and invite redemption. |
 | `GRIDFORGE_GUEST_PROJECT_HOURLY_LIMIT` | `20` | Per-guest hourly project creation limit (`GRIDFORGE_MAX_PROJECTS_PER_GUEST=5`). |
 | `GRIDFORGE_MAX_GUEST_PROJECTS` | `500` | Global cap on stored anonymous Guest saved projects; oldest/expired Guest projects are evicted automatically on insert so SQLite storage stays bounded (`<= 32 MB` worst case). |
 | `GRIDFORGE_MAX_QUEUE_DEPTH` | `10` | Maximum queued jobs before returning `503 Service Unavailable`. |
+
+Each web process allows one outbound geocode lookup at a time. Cached lookups remain available during an in-flight request or after the hourly limit is reached. An uncached lookup returns `503` with `Retry-After` while the provider is busy, or `429` after the applicable hourly limit is reached.
 
 ### 5. Storage Retention & LRU Cache Pruning
 
@@ -103,11 +106,11 @@ GridForge includes a native Streamable HTTP **MCP server** (`/mcp`), an AI disco
 
 #### Scoped Bearer API Keys (PATs) & Turnstile Bypass (`hosted` Mode)
 
-- **Key Management Endpoints** (authenticated `friend` and `admin` roles only; returns `403` in `GRIDFORGE_AUTH_MODE=none`):
+- **Key management** requires a signed-in Friend or Admin browser session. The endpoints return `403` in local mode and when called with a valid PAT.
   - `GET /api/auth/api-keys` — lists active and revoked keys for the signed-in user (`key_prefix`, timestamps; never plaintext).
   - `POST /api/auth/api-keys` (`{"name": "Claude Desktop", "expires_days": 90}`) — returns `201 Created` with the plaintext `gf_...` token **once** (only its SHA-256 hash is stored in SQLite).
   - `DELETE /api/auth/api-keys/{key_id}` — immediately revokes a key.
-- **Request Auth & Turnstile Bypass:** Callers authenticate via `Authorization: Bearer gf_...` or `X-API-Key: gf_...` (evaluated before session cookies). Valid tokens resolve to the owning `friend` or `admin` account — automatically bypassing guest-only Cloudflare Turnstile challenges while preserving all per-role daily render caps, hourly preview limits, DPI/grid limits, and strict multi-tenant job/project isolation. Invalid, revoked, expired, or disabled-user keys always fail closed with `401 Unauthorized`.
+- **Request authentication** accepts `Authorization: Bearer gf_...` or `X-API-Key: gf_...` before session cookies. A valid token uses the account's role and quotas, bypasses guest-only Turnstile, and grants only its assigned [Studio scopes](../docs/ai-agents.md#hosted-multi-tenant-mode-gridforge_auth_modehosted). Account administration and pack management require an Admin browser session.
 - **AI Discovery & MCP Endpoints:**
   - `POST` / `GET` / `DELETE /mcp` — Streamable HTTP MCP server with interactive SEP-1865 MCP Apps (`ui://gridforge/app.html`), inline PNG visual cards, 14 model-visible tools, 3 app-only tools, 3 resources, and 4 prompts.
   - `GET /llms.txt` — concise plain-text AI index pointing to `/mcp`, `/api/capabilities`, `/openapi.json`, `/docs`, and CLI `--spec-file` / `--json`.

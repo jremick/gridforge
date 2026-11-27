@@ -113,6 +113,7 @@ class LimitsConfig:
     guest_share_ttl_hours: float = 168.0
     friend_share_ttl_hours: float = 720.0
     geocode_hourly_limit: int | None = 30
+    geocode_global_hourly_limit: int = 300
     auth_rate_limit_per_minute: int | None = 20
     max_queue_depth: int | None = 10
     global_daily_public_renders: int | None = 50
@@ -163,9 +164,8 @@ class LimitsConfig:
             friend_share_ttl_hours=max(
                 1.0, float(_env_int("GRIDFORGE_FRIEND_SHARE_TTL_HOURS", 720))
             ),
-            geocode_hourly_limit=_env_opt_int(
-                "GRIDFORGE_GEOCODE_HOURLY_LIMIT", 30 if is_hosted else None
-            ),
+            geocode_hourly_limit=_env_opt_int("GRIDFORGE_GEOCODE_HOURLY_LIMIT", 30),
+            geocode_global_hourly_limit=max(0, _env_int("GRIDFORGE_GEOCODE_GLOBAL_HOURLY_LIMIT", 300)),
             auth_rate_limit_per_minute=_env_opt_int(
                 "GRIDFORGE_AUTH_RATE_LIMIT_PER_MINUTE", 20 if is_hosted else None
             ),
@@ -300,7 +300,7 @@ def effective_rf_link_hourly_limit(role: str, cfg: LimitsConfig) -> int | None:
 
 
 def effective_geocode_hourly_limit(role: str, cfg: LimitsConfig) -> int | None:
-    if cfg.auth_mode != "hosted" or role in {"none", "admin"}:
+    if role == "admin":
         return None
     return cfg.geocode_hourly_limit
 
@@ -601,11 +601,8 @@ def enforce_and_record_geocode_miss(
     owner_id: str,
     client_ip: str,
     cfg: LimitsConfig,
-    query: str,
 ) -> None:
-    """Enforce per-IP hourly geocode cache-miss limit and record ``geocode_miss``."""
-    if cfg.auth_mode != "hosted":
-        return
+    """Reserve a geocode cache miss against the per-IP and shared hourly budgets."""
     limit = effective_geocode_hourly_limit(role, cfg)
     try:
         db.atomic_check_and_record_rate_limit(
@@ -617,7 +614,7 @@ def enforce_and_record_geocode_miss(
             limit=limit,
             window_seconds=3600,
             by_ip_only=True,
-            detail={"q": query[:80]},
+            global_limit=cfg.geocode_global_hourly_limit,
         )
     except db.QuotaLimitError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc

@@ -122,6 +122,112 @@ def _seed_pack(packs_dir: Path, pack_id: str = "kosciuszko") -> None:
 
 
 class TestApiKeysDBAndHostedAuth:
+    def test_hosted_key_scopes_on_http_and_mcp(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        app, _, _, _ = _make_hosted_app(tmp_path, monkeypatch)
+
+        @app.get("/api/future-operation")
+        def future_operation() -> dict[str, bool]:
+            return {"ok": True}
+
+        session = TestClient(app, base_url="http://localhost:8080")
+        bot = TestClient(app, base_url="http://localhost:8080")
+        _login(session, "admin@example.com", "AdminPassword123!")
+
+        def mint(name: str, scopes: list[str] | None = None) -> str:
+            payload = {"name": name}
+            if scopes is not None:
+                payload["scopes"] = scopes
+            result = session.post("/api/auth/api-keys", json=payload)
+            assert result.status_code == 201, result.text
+            return result.json()["token"]
+
+        all_key = {"Authorization": f"Bearer {mint('Default')}"}
+        reader = {"X-API-Key": mint("Reader", ["jobs:read"])}
+        writer = {"Authorization": f"Bearer {mint('Writer', ['jobs:write'])}"}
+        planner = {"X-API-Key": mint("Planner", ["planning"])}
+        sharer = {"X-API-Key": mint("Sharer", ["shares:write"])}
+        center = {"center": "-33.732, 150.312"}
+
+        for scopes in ([], ["unrecognized"], ["all,planning"], ["all", "planning"]):
+            invalid = session.post("/api/auth/api-keys", json={"name": "Invalid", "scopes": scopes})
+            assert invalid.status_code == 422
+
+        # A key is evaluated even when a valid session cookie accompanies it.
+        assert session.get("/api/auth/api-keys", headers=all_key).status_code == 403
+        assert session.post("/api/auth/api-keys", headers=all_key, json={"name": "New"}).status_code == 403
+        key_id = session.get("/api/auth/api-keys").json()["api_keys"][0]["key_id"]
+        assert session.delete(f"/api/auth/api-keys/{key_id}", headers=all_key).status_code == 403
+        assert bot.get("/api/admin/users", headers=all_key).status_code == 403
+        assert bot.get("/api/packs/tasks", headers=all_key).status_code == 403
+        assert bot.get("/api/future-operation", headers=all_key).status_code == 403
+        assert session.get("/api/admin/users").status_code == 200
+
+        created = bot.post("/api/jobs", headers=writer, json=center)
+        assert created.status_code == 202, created.text
+        job_id = created.json()["job_id"]
+        assert bot.get(f"/api/jobs/{job_id}", headers=writer).status_code == 200
+        assert bot.get(f"/api/jobs/{job_id}", headers=reader).status_code == 200
+        assert bot.get(f"/api/jobs/{job_id}", headers=all_key).status_code == 200
+        assert bot.post("/api/jobs", headers=reader, json=center).status_code == 403
+        assert bot.get("/api/projects", headers=reader).status_code == 403
+        assert bot.post("/api/footprint", headers=reader, json=center).status_code == 403
+        assert bot.post("/api/footprint", headers=planner, json=center).status_code == 200
+
+        project = session.post("/api/projects", json={"name": "Saved project", "state": center})
+        assert project.status_code == 201, project.text
+        project_id = project.json()["project_id"]
+        assert bot.post("/api/shares", headers=sharer, json={"name": "Map", "state": center}).status_code == 201
+        assert bot.post("/api/shares", headers=sharer, json={"project_id": project_id}).status_code == 403
+        assert bot.post("/api/shares", headers=all_key, json={"project_id": project_id}).status_code == 201
+
+        def tool(name: str, arguments: dict, headers: dict[str, str]) -> dict:
+            reply = bot.post(
+                "/mcp",
+                headers=headers,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {"name": name, "arguments": arguments},
+                },
+            )
+            assert reply.status_code == 200, reply.text
+            return reply.json()["result"]
+
+        result = tool("get_job_status", {"job_id": job_id}, reader)
+        assert result["structuredContent"]["job"]["job_id"] == job_id
+        render_args = {**center, "wait": False}
+        denied = tool("render_map", render_args, reader)
+        assert denied["isError"]
+        assert "403" in denied["content"][0]["text"]
+        result = tool("render_map", render_args, writer)
+        assert not result.get("isError"), result["content"]
+        assert result["structuredContent"]["job"]["status"] == "queued"
+        assert len(bot.get("/api/jobs", headers=reader).json()["jobs"]) == 2
+
+    @pytest.mark.parametrize("scopes", [[], ["unrecognized"], ["all", "unrecognized"]])
+    def test_invalid_legacy_key_scopes_do_not_grant_access(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scopes: list[str]
+    ) -> None:
+        app, _, _, db_path = _make_hosted_app(tmp_path, monkeypatch)
+        account = db.get_user_by_email(db_path, "admin@example.com")
+        assert account is not None
+        db.create_api_key(
+            db_path,
+            key_id="key_legacy0001",
+            user_id=account["user_id"],
+            name="Legacy fixture",
+            key_prefix="gf_legacy",
+            token_hash=sha256_hex("gf_legacy_fixture"),
+            scopes=scopes,
+        )
+        client = TestClient(app, base_url="http://localhost:8080")
+        headers = {"Authorization": "Bearer gf_legacy_fixture"}
+        assert client.get("/api/jobs", headers=headers).status_code == 401
+        assert client.get("/mcp", headers=headers).status_code == 401
+
     def test_db_api_keys_crud_expiry_and_revocation(self, tmp_path: Path) -> None:
         db_path = tmp_path / "keys.sqlite3"
         db.init_db(db_path)
@@ -539,9 +645,13 @@ class TestSignedArtifactAndPagePreviewUrls:
         png_owner = admin.get(f"/api/jobs/{job_id}/pages/2.png?width=360")
         assert png_owner.status_code == 200
         assert png_owner.headers["content-type"] == "image/png"
+        assert png_owner.headers["cache-control"] == "private, no-store"
         assert png_owner.content.startswith(b"\x89PNG\r\n\x1a\n")
         cached_file = data_dir / job_id / "pages" / "page_2_360.png"
         assert cached_file.is_file()
+        thumbnail = admin.get(f"/api/jobs/{job_id}/thumbnail.png")
+        assert thumbnail.status_code == 200
+        assert thumbnail.headers["cache-control"] == "private, no-store"
 
         # Anonymous client fetches signed page 2 PNG (even with custom width!) without cookies/Bearer
         assert anon.get(f"/api/jobs/{job_id}/pages/2.png").status_code == 403
@@ -728,14 +838,14 @@ class TestCapabilitiesLlmsTxtOpenAPIAndMcpFallback:
         assert g_caps["caller_capabilities"]["max_grid_cells"] == 1
         assert g_caps["caller_capabilities"]["packs_manage_allowed"] is False
 
-        # Admin via Bearer key sees elevated caller capabilities
+        # Admin role limits are preserved, with pack management available to sessions.
         a_caps = guest.get(
             "/api/capabilities", headers={"Authorization": f"Bearer {adm_key}"}
         ).json()
         assert a_caps["caller_role"] == "admin"
         assert a_caps["authenticated"] is True
         assert a_caps["caller_capabilities"]["max_grid_cells"] == 9
-        assert a_caps["caller_capabilities"]["packs_manage_allowed"] is True
+        assert a_caps["caller_capabilities"]["packs_manage_allowed"] is False
 
         # GET /llms.txt returns concise AI instructions (not swallowed by SPA!)
         llms = guest.get("/llms.txt")

@@ -24,7 +24,7 @@ from typing import Any
 import anyio
 import httpx
 import mgrs
-from fastapi import FastAPI, HTTPException, Query, Request, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
@@ -93,7 +93,6 @@ from gridforge.web.limits import (
     enforce_and_record_project_create,
     enforce_and_record_share_create,
     enforce_pre_upload_job_limits,
-    get_capabilities,
     validate_job_capabilities,
 )
 from gridforge.web.pack_tasks import (
@@ -129,6 +128,7 @@ from gridforge.web.schemas import (
     AdminUserRecord,
     AdminUsersResponse,
     ApiKeyRecord,
+    ApiKeyScope,
     ApiKeysListResponse,
     AuthSessionResponse,
     CreateApiKeyRequest,
@@ -186,6 +186,7 @@ _GEOCODE_CACHE_TTL_S: float = 300.0
 _GEOCODE_CACHE_MAX: int = 256
 _geocode_lock = threading.Lock()
 _geocode_cache: OrderedDict[tuple[str, int], tuple[float, list[GeocodeResult]]] = OrderedDict()
+_GEOCODE_PROVIDER_SLOT = threading.BoundedSemaphore(1)
 
 _ORIG_HTTPX_GET = httpx.get
 _NOMINATIM_HTTP_CLIENT: httpx.Client | None = None
@@ -202,6 +203,45 @@ _PACKS_CACHE_TTL_S: float = 5.0
 
 _DEFAULT_MAX_JSON_BODY_BYTES: int = 256 * 1024
 _UPLOAD_EXEMPT_PATHS: frozenset[str] = frozenset({"/api/jobs", "/api/strip-plan"})
+
+# A hosted PAT can only use explicitly listed API operations. Public discovery and
+# token introspection need no additional scope; MCP tools call the same API routes.
+_API_KEY_DISCOVERY_OPERATIONS = frozenset({
+    "getHealth",
+    "getCapabilities",
+    "getAuthSession",
+    "getBasemapInfo",
+    "getBasemapTile",
+    "listPacks",
+    "listPackRegions",
+    "getShare",
+})
+_API_KEY_OPERATION_SCOPES: dict[str, ApiKeyScope] = {
+    "geocodePlace": "planning",
+    "previewFootprint": "planning",
+    "planStripAtlas": "planning",
+    "computeRouteMetrics": "planning",
+    "computeRulerMetrics": "planning",
+    "computeViewshedPreview": "planning",
+    "computeRfLinkProfile": "planning",
+    "listJobs": "jobs:read",
+    "getJob": "jobs:read",
+    "downloadJobArtifact": "jobs:read",
+    "listJobPages": "jobs:read",
+    "getJobPagePreview": "jobs:read",
+    "getJobThumbnail": "jobs:read",
+    "createJob": "jobs:write",
+    "cancelJob": "jobs:write",
+    "deleteJob": "jobs:write",
+    "listProjects": "projects:read",
+    "getProject": "projects:read",
+    "createProject": "projects:write",
+    "updateProject": "projects:write",
+    "deleteProject": "projects:write",
+    "listShares": "shares:read",
+    "createShare": "shares:write",
+    "deleteShare": "shares:write",
+}
 
 _CONTENT_SECURITY_POLICY: str = (
     "default-src 'self'; "
@@ -375,29 +415,18 @@ class _MaxBodySizeMiddleware:
                 break
 
         received = 0
-        too_large = False
 
         async def _bounded_receive() -> Any:
-            nonlocal received, too_large
+            nonlocal received
             msg = await receive()
             if msg["type"] == "http.request":
-                body = msg.get("body", b"")
-                received += len(body)
+                received += len(msg.get("body", b""))
                 if received > self.max_bytes:
-                    too_large = True
-                    raise _BodyLimitExceededError()
+                    # FastAPI preserves HTTPException when parsing a request body.
+                    raise HTTPException(status_code=_HTTP_413, detail="Request body too large")
             return msg
 
-        try:
-            await self.app(scope, _bounded_receive, send)
-        except _BodyLimitExceededError:
-            if too_large:
-                resp = PlainTextResponse("Request body too large", status_code=_HTTP_413)
-                await resp(scope, receive, send)
-
-
-class _BodyLimitExceededError(Exception):
-    pass
+        await self.app(scope, _bounded_receive, send)
 
 
 class _ImmutableAssetsStaticFiles(StaticFiles):
@@ -441,28 +470,48 @@ def _search_nominatim(
                 return list(items)
             _geocode_cache.pop(cache_key, None)
 
-    if on_cache_miss is not None:
-        on_cache_miss()
+        if not _GEOCODE_PROVIDER_SLOT.acquire(blocking=False):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Geocoding provider is busy; please retry in a few seconds.",
+                headers={"Retry-After": "5"},
+            )
 
+    try:
+        if on_cache_miss is not None:
+            on_cache_miss()
+        results = _fetch_nominatim(cleaned, limit)
+        if results is None:
+            return []
+        with _geocode_lock:
+            _geocode_cache[cache_key] = (time.monotonic(), results)
+            while len(_geocode_cache) > _GEOCODE_CACHE_MAX:
+                _geocode_cache.popitem(last=False)
+        return list(results)
+    finally:
+        _GEOCODE_PROVIDER_SLOT.release()
+
+
+def _fetch_nominatim(query: str, limit: int) -> list[GeocodeResult] | None:
     url = os.environ.get("GRIDFORGE_NOMINATIM_URL", NOMINATIM_URL).strip()
     try:
         resp = _nominatim_http_get(
             url,
-            params={"format": "jsonv2", "limit": str(limit), "q": cleaned},
+            params={"format": "jsonv2", "limit": str(limit), "q": query},
             headers={"User-Agent": NOMINATIM_USER_AGENT, "Accept": "application/json"},
             timeout=5.0,
         )
         resp.raise_for_status()
         payload = resp.json()
     except Exception as exc:
-        logger.debug("Geocode lookup unavailable for %r (%s); returning empty results", cleaned, exc)
-        return []
+        logger.debug("Geocode lookup unavailable (%s); returning empty results", type(exc).__name__)
+        return None
 
     if not isinstance(payload, list):
-        return []
+        return None
 
     results: list[GeocodeResult] = []
-    for item in payload:
+    for item in payload[:limit]:
         if not isinstance(item, dict):
             continue
         try:
@@ -487,11 +536,7 @@ def _search_nominatim(
             )
         )
 
-    with _geocode_lock:
-        _geocode_cache[cache_key] = (now, results)
-        while len(_geocode_cache) > _GEOCODE_CACHE_MAX:
-            _geocode_cache.popitem(last=False)
-    return list(results)
+    return results
 
 
 def _decode_mgrs(raw: str | bytes) -> str:
@@ -949,8 +994,9 @@ def _build_llms_txt(auth_config: AuthConfig) -> str:
     def p(path: str) -> str:
         return f"{base}{path}" if base else path
     auth_note = (
-        "Hosted mode: mint a personal access token (`gf_...`) via `POST /api/auth/api-keys` "
-        "and send `Authorization: Bearer <token>` or `X-API-Key: <token>`."
+        "Hosted mode: use a signed-in browser session to mint a personal access token (`gf_...`) "
+        "via `POST /api/auth/api-keys`. Send it as `Authorization: Bearer <token>` or "
+        "`X-API-Key: <token>` for permitted Studio operations."
         if auth_config.auth_mode == "hosted"
         else (
             "Local mode with `GRIDFORGE_API_KEY` enabled: send `Authorization: Bearer <key>` "
@@ -1042,12 +1088,37 @@ def create_app(
         auth_config.auth_mode != "hosted"
         or os.environ.get("GRIDFORGE_ENABLE_DOCS", "").strip().lower() in {"1", "true", "yes"}
     )
+
+    def _enforce_hosted_api_key_policy(request: Request) -> None:
+        key_supplied, _ = extract_api_key_from_headers(request.headers)
+        if not key_supplied:
+            return
+        route = request.scope.get("route")
+        path = getattr(route, "path", None) or request.scope["path"]
+        if not (path.startswith("/api/") or path == "/mcp"):
+            return
+
+        ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=False)
+        operation = getattr(route, "operation_id", None)
+        if path == "/mcp" or operation in _API_KEY_DISCOVERY_OPERATIONS:
+            return
+        required_scope = _API_KEY_OPERATION_SCOPES.get(operation)
+        if required_scope is None:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="This operation requires a signed-in browser session.",
+            )
+        ctx.require_api_key_scope(required_scope)
+
     application = FastAPI(
         title=f"{auth_config.brand_name} Map Studio API",
         version=__version__,
         docs_url="/docs" if enable_docs else None,
         redoc_url="/redoc" if enable_docs else None,
         openapi_url="/openapi.json" if enable_docs else None,
+        dependencies=(
+            [Depends(_enforce_hosted_api_key_policy)] if auth_config.auth_mode == "hosted" else None
+        ),
         description=(
             f"{auth_config.brand_name} — true-scale local UTM MGRS topographic map generator & print studio "
             "(powered by open-source GridForge)."
@@ -1081,17 +1152,11 @@ def create_app(
     application.state.auth_manager = auth_manager
 
     def _caps_for(ctx: AuthContext):
-        return get_capabilities(
-            ctx.role,
-            limits_config,
-            turnstile_sitekey=auth_config.turnstile_site_key,
-            turnstile_configured=auth_config.turnstile_configured,
-            google_oauth_enabled=auth_config.google_oauth_enabled,
-        )
+        return auth_manager.get_request_capabilities(ctx, limits_config)
 
     def _require_admin(request: Request) -> AuthContext:
         ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=False)
-        if auth_config.auth_mode != "hosted" or ctx.role != "admin":
+        if auth_config.auth_mode != "hosted" or ctx.auth_method != "session" or ctx.role != "admin":
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Admin privileges required.",
@@ -1105,7 +1170,7 @@ def create_app(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="API key management is disabled when GRIDFORGE_AUTH_MODE=none.",
             )
-        if not ctx.authenticated or ctx.role not in {"friend", "admin"} or ctx.user is None:
+        if ctx.auth_method != "session" or ctx.role not in {"friend", "admin"} or ctx.user is None:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="API key management requires a signed-in Friend or Admin account.",
@@ -2233,6 +2298,8 @@ def create_app(
         response: Response,
     ) -> ShareSnapshotPublic:
         ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=True)
+        if req.project_id is not None:
+            ctx.require_api_key_scope("projects:read")
         auth_manager.apply_auth_cookies(response, ctx, request)
         if auth_config.auth_mode == "hosted":
             auth_manager.verify_turnstile_if_required(request, ctx)
@@ -2357,8 +2424,8 @@ def create_app(
         owner_id, _owner_role = owner
         if (
             auth_config.auth_mode == "hosted"
-            and ctx.role != "admin"
             and owner_id != ctx.owner_id
+            and not (ctx.role == "admin" and ctx.auth_method == "session")
         ):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -2385,16 +2452,16 @@ def create_app(
         limit: int = Query(default=5, ge=1, le=10),
     ) -> GeocodeResponse:
         ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=False)
-        on_miss = (
-            lambda: enforce_and_record_geocode_miss(
+
+        def on_miss() -> None:
+            enforce_and_record_geocode_miss(
                 db_path,
                 role=ctx.role,
                 owner_id=ctx.owner_id,
                 client_ip=ctx.client_ip,
                 cfg=limits_config,
-                query=q,
             )
-        ) if auth_config.auth_mode == "hosted" else None
+
         return GeocodeResponse(results=_search_nominatim(q, limit=limit, on_cache_miss=on_miss))
 
     @application.post(
@@ -3242,7 +3309,7 @@ def create_app(
                     rendered_png.replace(cached_png)
 
         cache_header = (
-            "private, max-age=3600"
+            "private, no-store"
             if auth_config.auth_mode == "hosted"
             else "public, max-age=3600"
         )
@@ -3335,7 +3402,7 @@ def create_app(
                     rendered_png.replace(thumb_path)
 
         cache_header = (
-            "private, max-age=3600"
+            "private, no-store"
             if auth_config.auth_mode == "hosted"
             else "public, max-age=3600"
         )
