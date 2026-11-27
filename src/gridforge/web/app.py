@@ -50,7 +50,7 @@ from gridforge.geo.strip_atlas import (
 from gridforge.geo.tactical import RulerMetricsResponse
 from gridforge.geo.waypoints import compute_route_metrics
 from gridforge.packs.builder import discover_packs
-from gridforge.web import db, projects as projects_store
+from gridforge.web import db, projects as projects_store, shares as shares_store
 from gridforge.web.access import SameOriginWritesMiddleware, get_client_ip
 from gridforge.web.auth import (
     OAUTH_STATE_COOKIE_NAME,
@@ -62,10 +62,12 @@ from gridforge.web.auth import (
 from gridforge.web.basemap import BasemapInfoResponse, MBTilesBasemapStore
 from gridforge.web.limits import (
     LimitsConfig,
+    effective_share_ttl_hours,
     enforce_and_create_job,
     enforce_and_record_auth_attempt,
     enforce_and_record_geocode_miss,
     enforce_and_record_preview,
+    enforce_and_record_share_create,
     enforce_pre_upload_job_limits,
     get_capabilities,
     validate_job_capabilities,
@@ -84,6 +86,12 @@ from gridforge.web.projects import (
     ProjectRecord,
     ProjectsListResponse,
     ProjectUpdateRequest,
+)
+from gridforge.web.shares import (
+    ShareCreateRequest,
+    SharePayloadTooLargeError,
+    ShareSnapshotPublic,
+    SharesListResponse,
 )
 from gridforge.web.schemas import (
     AcceptInviteRequest,
@@ -1421,6 +1429,150 @@ def create_app(
         if not deleted:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found.")
         return {"deleted": True, "id": project_id, "project_id": project_id}
+
+    @application.get("/api/shares", response_model=SharesListResponse)
+    def api_list_shares(
+        request: Request,
+        response: Response,
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> SharesListResponse:
+        ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=True)
+        auth_manager.apply_auth_cookies(response, ctx, request)
+        owner_filter = ctx.owner_id if auth_config.auth_mode == "hosted" else None
+        return SharesListResponse(
+            shares=shares_store.list_shares(db_path, limit=limit, owner_id=owner_filter)
+        )
+
+    @application.post(
+        "/api/shares",
+        response_model=ShareSnapshotPublic,
+        status_code=status.HTTP_201_CREATED,
+    )
+    def api_create_share(
+        req: ShareCreateRequest,
+        request: Request,
+        response: Response,
+    ) -> ShareSnapshotPublic:
+        ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=True)
+        auth_manager.apply_auth_cookies(response, ctx, request)
+        enforce_and_record_share_create(
+            db_path,
+            role=ctx.role,
+            owner_id=ctx.owner_id,
+            client_ip=ctx.client_ip,
+            cfg=limits_config,
+        )
+
+        resolved_name = req.name
+        resolved_notes = req.notes
+        resolved_state = req.state
+        source_project_id: str | None = None
+
+        if req.project_id is not None:
+            if not projects_store.is_valid_project_id(req.project_id):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Invalid project_id.",
+                )
+            proj = projects_store.get_project(db_path, req.project_id)
+            if proj is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Project not found.",
+                )
+            if auth_config.auth_mode == "hosted" and proj.owner_id != ctx.owner_id:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="You do not have permission to share this project.",
+                )
+            source_project_id = proj.project_id
+            resolved_name = resolved_name or proj.name
+            resolved_notes = resolved_notes or proj.notes
+            resolved_state = proj.state
+
+        if not isinstance(resolved_state, dict) or not resolved_state:
+            raise HTTPException(
+                status_code=_HTTP_422,
+                detail="Share snapshot requires a non-empty map state.",
+            )
+
+        ttl_hours = effective_share_ttl_hours(
+            ctx.role, limits_config, requested_hours=req.expires_in_hours
+        )
+        try:
+            return shares_store.create_share(
+                db_path,
+                name=resolved_name,
+                notes=resolved_notes,
+                state=resolved_state,
+                source_project_id=source_project_id,
+                owner_id=ctx.owner_id,
+                owner_role=ctx.role,
+                ttl_hours=ttl_hours,
+            )
+        except SharePayloadTooLargeError as exc:
+            raise HTTPException(
+                status_code=getattr(status, "HTTP_413_CONTENT_TOO_LARGE", 413),
+                detail=str(exc),
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=_HTTP_422, detail=str(exc)) from exc
+
+    @application.get("/api/shares/{share_id}", response_model=ShareSnapshotPublic)
+    def api_get_share(
+        share_id: str,
+        response: Response,
+    ) -> ShareSnapshotPublic:
+        if not shares_store.is_valid_share_id(share_id):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid share_id.",
+            )
+        record = shares_store.get_public_share(db_path, share_id, increment_views=True)
+        if record is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Shared map snapshot not found or expired.",
+            )
+        response.headers["Cache-Control"] = "no-cache"
+        return record
+
+    @application.delete("/api/shares/{share_id}")
+    def api_delete_share(
+        share_id: str,
+        request: Request,
+        response: Response,
+    ) -> dict[str, Any]:
+        ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=True)
+        auth_manager.apply_auth_cookies(response, ctx, request)
+        if not shares_store.is_valid_share_id(share_id):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid share_id.",
+            )
+        owner = shares_store.get_share_owner(db_path, share_id)
+        if owner is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Shared map snapshot not found.",
+            )
+        owner_id, _owner_role = owner
+        if (
+            auth_config.auth_mode == "hosted"
+            and ctx.role != "admin"
+            and owner_id != ctx.owner_id
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have permission to delete this shared snapshot.",
+            )
+        deleted = shares_store.delete_share(db_path, share_id)
+        if not deleted:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Shared map snapshot not found.",
+            )
+        return {"deleted": True, "share_id": share_id}
 
     @application.get("/api/geocode", response_model=GeocodeResponse)
     def api_geocode(

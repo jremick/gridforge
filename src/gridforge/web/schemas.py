@@ -45,6 +45,12 @@ from gridforge.web.projects import (
     ProjectsListResponse,
     ProjectUpdateRequest,
 )
+from gridforge.web.shares import (
+    ShareCreateRequest,
+    ShareSnapshotPublic,
+    ShareSnapshotSummary,
+    SharesListResponse,
+)
 
 
 class JobStatus(str, Enum):

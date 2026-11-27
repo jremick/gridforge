@@ -107,6 +107,10 @@ class LimitsConfig:
     friend_hourly_previews: int | None = 60
     guest_rf_link_hourly_limit: int | None = 30
     friend_rf_link_hourly_limit: int | None = 120
+    guest_share_hourly_limit: int | None = 30
+    friend_share_hourly_limit: int | None = 120
+    guest_share_ttl_hours: float = 168.0
+    friend_share_ttl_hours: float = 720.0
     geocode_hourly_limit: int | None = 30
     auth_rate_limit_per_minute: int | None = 20
     max_queue_depth: int | None = 10
@@ -142,6 +146,18 @@ class LimitsConfig:
             ),
             friend_rf_link_hourly_limit=_env_opt_int(
                 "GRIDFORGE_FRIEND_RF_LINK_HOURLY_LIMIT", 120 if is_hosted else None
+            ),
+            guest_share_hourly_limit=_env_opt_int(
+                "GRIDFORGE_SHARE_HOURLY_LIMIT", 30 if is_hosted else None
+            ),
+            friend_share_hourly_limit=_env_opt_int(
+                "GRIDFORGE_FRIEND_SHARE_HOURLY_LIMIT", 120 if is_hosted else None
+            ),
+            guest_share_ttl_hours=max(
+                1.0, float(_env_int("GRIDFORGE_GUEST_SHARE_TTL_HOURS", 168))
+            ),
+            friend_share_ttl_hours=max(
+                1.0, float(_env_int("GRIDFORGE_FRIEND_SHARE_TTL_HOURS", 720))
             ),
             geocode_hourly_limit=_env_opt_int(
                 "GRIDFORGE_GEOCODE_HOURLY_LIMIT", 30 if is_hosted else None
@@ -283,6 +299,28 @@ def effective_geocode_hourly_limit(role: str, cfg: LimitsConfig) -> int | None:
     if cfg.auth_mode != "hosted" or role in {"none", "admin"}:
         return None
     return cfg.geocode_hourly_limit
+
+
+def effective_share_hourly_limit(role: str, cfg: LimitsConfig) -> int | None:
+    if cfg.auth_mode != "hosted" or role in {"none", "admin"}:
+        return None
+    if role == "friend":
+        return cfg.friend_share_hourly_limit
+    return cfg.guest_share_hourly_limit
+
+
+def effective_share_ttl_hours(
+    role: str,
+    cfg: LimitsConfig,
+    requested_hours: int | None = None,
+) -> float | None:
+    """Resolve snapshot TTL in hours, capping guest/friend durations in hosted mode."""
+    if cfg.auth_mode != "hosted" or role in {"none", "admin"}:
+        return float(requested_hours) if requested_hours is not None else None
+    max_ttl = cfg.friend_share_ttl_hours if role == "friend" else cfg.guest_share_ttl_hours
+    if requested_hours is None:
+        return max_ttl
+    return float(min(max_ttl, max(1.0, float(requested_hours))))
 
 
 def get_quotas_snapshot(
@@ -576,6 +614,33 @@ def enforce_and_record_geocode_miss(
             window_seconds=3600,
             by_ip_only=True,
             detail={"q": query[:80]},
+        )
+    except db.QuotaLimitError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+
+def enforce_and_record_share_create(
+    db_path: Path,
+    *,
+    role: str,
+    owner_id: str,
+    client_ip: str,
+    cfg: LimitsConfig,
+) -> None:
+    """Enforce hourly snapshot creation limit in hosted mode and record ``share_create``."""
+    if cfg.auth_mode != "hosted":
+        return
+    limit = effective_share_hourly_limit(role, cfg)
+    try:
+        db.atomic_check_and_record_rate_limit(
+            db_path,
+            event_type="share_create",
+            actor_id=owner_id,
+            actor_role=role,
+            client_ip=client_ip,
+            limit=limit,
+            window_seconds=3600,
+            by_ip_only=(role == "guest"),
         )
     except db.QuotaLimitError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc

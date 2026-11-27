@@ -62,6 +62,7 @@ See [`railway.toml`](../railway.toml) for the Railway build and `/api/health` he
 | `GRIDFORGE_GUEST_DAILY_RENDERS` | `2` | Per-guest daily render quota (`FRIEND=20`, `ADMIN=unlimited`). |
 | `GRIDFORGE_GLOBAL_DAILY_PUBLIC_RENDERS` | `50` | Global daily cap across all Guest renders; Admin can also pause public renders live via the Admin modal. |
 | `GRIDFORGE_GUEST_HOURLY_PREVIEWS` | `5` | Hourly DEM viewshed/ruler preview quota for Guests (`FRIEND=60`). |
+| `GRIDFORGE_SHARE_HOURLY_LIMIT` | `30` | Hourly shareable snapshot link creation cap for Guests (`GRIDFORGE_FRIEND_SHARE_HOURLY_LIMIT=120`, `ADMIN=unlimited`). |
 | `GRIDFORGE_MAX_QUEUE_DEPTH` | `10` | Maximum queued jobs before returning `503 Service Unavailable`. |
 
 ### 5. Storage Retention & LRU Cache Pruning
@@ -72,6 +73,7 @@ See [`railway.toml`](../railway.toml) for the Railway build and `/api/health` he
 | `GRIDFORGE_GUEST_TTL_HOURS` | `24` | Delete completed Guest job artifacts after `24` hours. |
 | `GRIDFORGE_FRIEND_TTL_HOURS` | `336` (`14 days`) | Delete completed Friend job artifacts after `14` days. |
 | `GRIDFORGE_ADMIN_TTL_HOURS` | `720` (`30 days`) | Delete completed Admin job artifacts after `30` days. |
+| `GRIDFORGE_GUEST_SHARE_TTL_HOURS` | `168` (`7 days`) | Expiry TTL for Guest-created `?share=` snapshot links (`GRIDFORGE_FRIEND_SHARE_TTL_HOURS=720` / `30 days`; `ADMIN`/local never expire by default). |
 | `GRIDFORGE_CACHE_MAX_BYTES` | `2147483648` (`2 GB`) | LRU cap on `/data/cache` (Overpass, DEM clips, overlays) to protect small cloud volumes. |
 
 ---

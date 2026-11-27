@@ -856,6 +856,7 @@ def run_pruning_pass(
         guest_ttl_hours=eff_guest_ttl,
         friend_ttl_hours=eff_friend_ttl,
     )
+    pruned_shares = db.prune_expired_shares(db_path)
 
     cache_result: cache_prune.CachePruneResult | None = None
     if cache_dir is not None and cache_max_bytes is not None:
@@ -870,13 +871,15 @@ def run_pruning_pass(
         or auth_pruned["projects"]
         or auth_pruned["sessions"]
         or auth_pruned["invites"]
+        or pruned_shares
         or deleted_cache_files
         or removed_cache_dirs
     ):
         logger.info(
-            "Pruned jobs=%d projects=%d sessions=%d invites=%d cache_files=%d cache_bytes=%d cache_dirs=%d",
+            "Pruned jobs=%d projects=%d shares=%d sessions=%d invites=%d cache_files=%d cache_bytes=%d cache_dirs=%d",
             pruned_jobs,
             auth_pruned["projects"],
+            pruned_shares,
             auth_pruned["sessions"],
             auth_pruned["invites"],
             deleted_cache_files,
@@ -887,6 +890,7 @@ def run_pruning_pass(
     return {
         "jobs": pruned_jobs,
         "projects": auth_pruned["projects"],
+        "shares": pruned_shares,
         "sessions": auth_pruned["sessions"],
         "invites": auth_pruned["invites"],
         "cache_deleted_files": deleted_cache_files,

@@ -242,6 +242,24 @@ def init_db(db_path: Path) -> None:
                 value_json TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS shared_snapshots (
+                share_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL DEFAULT '',
+                notes TEXT NOT NULL DEFAULT '',
+                state_json TEXT NOT NULL,
+                source_project_id TEXT,
+                owner_id TEXT NOT NULL DEFAULT 'local',
+                owner_role TEXT NOT NULL DEFAULT 'none',
+                view_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                expires_at TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_shared_snapshots_owner_created
+                ON shared_snapshots (owner_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_shared_snapshots_expires
+                ON shared_snapshots (expires_at);
             """
         )
         # Lightweight additive migrations for existing SQLite databases.
@@ -843,6 +861,29 @@ def prune_expired_projects_and_auth(
             "sessions": int(cur_sess.rowcount),
             "invites": int(cur_inv.rowcount),
         }
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
+def prune_expired_shares(
+    db_path: Path,
+    *,
+    now: datetime | None = None,
+) -> int:
+    """Delete expired rows from ``shared_snapshots``, preserving permanent shares."""
+    now_iso = _dt_to_iso(_resolve_now(now))
+    conn = _connect(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.execute(
+            "DELETE FROM shared_snapshots WHERE expires_at IS NOT NULL AND expires_at <= ?",
+            (now_iso,),
+        )
+        conn.execute("COMMIT")
+        return int(cur.rowcount)
     except Exception:
         conn.execute("ROLLBACK")
         raise
