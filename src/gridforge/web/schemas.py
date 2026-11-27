@@ -70,6 +70,29 @@ class JobArtifact(BaseModel):
     filename: str
     size_bytes: int
     download_url: str
+    signed_download_url: str | None = Field(
+        default=None,
+        description="Short-lived HMAC-signed download URL allowing direct download without cookie or Bearer auth.",
+    )
+
+
+class JobPageInfo(BaseModel):
+    """Rasterized PNG preview URLs for one page of a rendered PDF map."""
+
+    page: int = Field(..., ge=1, description="1-based page number.")
+    preview_url: str = Field(..., description="Authenticated page PNG preview path.")
+    signed_preview_url: str = Field(
+        ...,
+        description="Short-lived HMAC-signed page PNG preview URL.",
+    )
+
+
+class JobPagesResponse(BaseModel):
+    """Response envelope for ``GET /api/jobs/{job_id}/pages``."""
+
+    job_id: str
+    page_count: int = Field(..., ge=0)
+    pages: list[JobPageInfo] = Field(default_factory=list)
 
 
 class JobRecord(BaseModel):
@@ -108,14 +131,21 @@ class JobsListResponse(BaseModel):
 class FootprintRequest(BaseModel):
     """Request payload for ``POST /api/footprint`` live MapLibre footprint preview."""
 
-    center: str = Field(..., min_length=1, description="Center as 'lat,lon' or MGRS string.")
-    scale: int = 25000
-    paper: PaperSize = PaperSize.A4
-    orientation: Orientation = Orientation.PORTRAIT
-    units: Units = Units.METRIC
-    date_iso: str | None = None
-    grid_cols: int = Field(default=1, ge=1, le=3)
-    grid_rows: int = Field(default=1, ge=1, le=3)
+    center: str = Field(
+        ...,
+        min_length=1,
+        description="Map center as 'lat,lon' decimal degrees (e.g. '-33.732, 150.312') or MGRS string (e.g. '56H KH 510 640').",
+    )
+    scale: int = Field(
+        default=25000,
+        description="True-scale denominator: 10000, 12500, 15000, 24000, 25000, 48000, or 50000.",
+    )
+    paper: PaperSize = Field(default=PaperSize.A4, description="Physical print paper size (a4, letter, legal, a3).")
+    orientation: Orientation = Field(default=Orientation.PORTRAIT, description="Page orientation (portrait or landscape).")
+    units: Units = Field(default=Units.METRIC, description="Elevation and scale bar unit system (metric or imperial).")
+    date_iso: str | None = Field(default=None, description="Optional ISO date (YYYY-MM-DD) for WMM2025 declination calculation.")
+    grid_cols: int = Field(default=1, ge=1, le=3, description="Multi-sheet atlas columns (1–3).")
+    grid_rows: int = Field(default=1, ge=1, le=3, description="Multi-sheet atlas rows (1–3).")
 
     @field_validator("scale")
     @classmethod
@@ -184,13 +214,16 @@ class StripSheetInput(BaseModel):
 class StripPlanRequest(BaseModel):
     """JSON request payload for ``POST /api/strip-plan``."""
 
-    route_geojson: dict[str, Any]
-    scale: int = 25000
-    paper: PaperSize = PaperSize.A4
-    orientation: Orientation = Orientation.PORTRAIT
-    units: Units = Units.METRIC
-    overlap_pct: float = Field(default=10.0, ge=0.0, le=40.0)
-    max_sheets: int = Field(default=12, ge=1, le=24)
+    route_geojson: dict[str, Any] = Field(
+        ...,
+        description="GeoJSON LineString, MultiLineString, Feature, or FeatureCollection representing the route corridor.",
+    )
+    scale: int = Field(default=25000, description="True-scale denominator (10000–50000).")
+    paper: PaperSize = Field(default=PaperSize.A4, description="Physical print paper size.")
+    orientation: Orientation = Field(default=Orientation.PORTRAIT, description="Page orientation.")
+    units: Units = Field(default=Units.METRIC, description="Unit system (metric or imperial).")
+    overlap_pct: float = Field(default=10.0, ge=0.0, le=40.0, description="Overlap percentage between adjacent strip sheets (0–40).")
+    max_sheets: int = Field(default=12, ge=1, le=24, description="Maximum number of strip sheets to plan (1–24).")
 
     @field_validator("scale")
     @classmethod
@@ -207,9 +240,12 @@ StripPlanResponse = StripAtlasPlan
 class RouteMetricsRequest(BaseModel):
     """Request payload for ``POST /api/route-metrics``."""
 
-    waypoints: list[WaypointInput] = Field(default_factory=list)
-    units: Units = Units.METRIC
-    date_iso: str | None = None
+    waypoints: list[WaypointInput] = Field(
+        default_factory=list,
+        description="Ordered list of waypoints to compute leg distances, MGRS coordinates, and True/Grid/Magnetic bearings.",
+    )
+    units: Units = Field(default=Units.METRIC, description="Output distance units (metric or imperial).")
+    date_iso: str | None = Field(default=None, description="Optional ISO date (YYYY-MM-DD) for WMM2025 magnetic bearings.")
 
 
 RouteMetricsResponse = RouteMetrics
@@ -218,9 +254,9 @@ RouteMetricsResponse = RouteMetrics
 class ViewshedPreviewRequest(BaseModel):
     """Request payload for ``POST /api/viewshed-preview`` live terrain-masked RF/LOS preview."""
 
-    observer: ViewshedObserver
-    dem_source: DemSourceKind = DemSourceKind.AUTO
-    pack_id: str | None = None
+    observer: ViewshedObserver = Field(..., description="Observer location, antenna heights, and max viewshed radius.")
+    dem_source: DemSourceKind = Field(default=DemSourceKind.AUTO, description="DEM elevation source (auto, glo30, usgs3dep, au-elvis, nz-linz, ca-hrdem).")
+    pack_id: str | None = Field(default=None, description="Optional installed offline regional pack ID.")
     turnstile_token: str | None = Field(default=None, exclude=True)
 
 
@@ -239,9 +275,9 @@ class ViewshedPreviewResponse(BaseModel):
 class RFLinkProfileRequest(RFLinkSpec):
     """Request payload for ``POST /api/rf-link-profile`` point-to-point Fresnel analysis."""
 
-    dem_source: DemSourceKind = DemSourceKind.AUTO
-    pack_id: str | None = None
-    date_iso: str | None = None
+    dem_source: DemSourceKind = Field(default=DemSourceKind.AUTO, description="DEM elevation source for terrain clearance profiling.")
+    pack_id: str | None = Field(default=None, description="Optional installed offline regional pack ID.")
+    date_iso: str | None = Field(default=None, description="Optional ISO date (YYYY-MM-DD) for WMM2025 magnetic azimuth.")
     turnstile_token: str | None = Field(default=None, exclude=True)
 
 
@@ -293,10 +329,10 @@ class RulerPoint(BaseModel):
 class RulerMetricsRequest(BaseModel):
     """Request payload for ``POST /api/ruler-metrics``."""
 
-    points: list[RulerPoint] = Field(..., min_length=2)
-    dem_source: DemSourceKind | None = None
-    pack_id: str | None = None
-    date_iso: str | None = None
+    points: list[RulerPoint] = Field(..., min_length=2, description="Ordered list of at least two [lat, lon] or {lat, lon} points to measure.")
+    dem_source: DemSourceKind | None = Field(default=None, description="Optional DEM source to compute terrain elevation gain/loss and slope.")
+    pack_id: str | None = Field(default=None, description="Optional installed offline regional pack ID.")
+    date_iso: str | None = Field(default=None, description="Optional ISO date (YYYY-MM-DD) for WMM2025 magnetic bearings.")
     turnstile_token: str | None = Field(default=None, exclude=True)
 
     @model_validator(mode="before")
@@ -317,23 +353,23 @@ class RulerMetricsRequest(BaseModel):
 class OutputOptions(BaseModel):
     """Requested print and offline digital export outputs for a job."""
 
-    pdf: bool = True
-    geopdf: bool = False
-    mbtiles: bool = False
-    mbtiles_format: MBTilesFormat = MBTilesFormat.PNG
-    kmz: bool = False
-    gpkg_tiles: bool = False
-    osmand_sqlitedb: bool = False
-    field_bundle_zip: bool = False
-    garmin_profile: GarminProfile = GarminProfile.STANDARD
-    max_tiles: int | None = Field(default=None, ge=1, le=500)
-    include_grid_on_digital: bool = True
-    export_dpi: int | None = Field(default=None, ge=72, le=600)
-    include_calibration_page: bool = False
-    include_route_card: bool = False
-    include_elevation_profile: bool = False
-    include_atlas_index: bool = False
-    include_rf_link_card: bool = False
+    pdf: bool = Field(default=True, description="Generate a true-scale vector print PDF.")
+    geopdf: bool = Field(default=False, description="Embed ISO 32000 GeoPDF georeferencing inside the PDF (Avenza Maps compatible).")
+    mbtiles: bool = Field(default=False, description="Export an ATAK/offline raster MBTiles archive.")
+    mbtiles_format: MBTilesFormat = Field(default=MBTilesFormat.PNG, description="MBTiles tile encoding (png or jpg).")
+    kmz: bool = Field(default=False, description="Export a Garmin Custom Maps KMZ archive.")
+    gpkg_tiles: bool = Field(default=False, description="Export an OGC GeoPackage raster tiles archive.")
+    osmand_sqlitedb: bool = Field(default=False, description="Export an OsmAnd SQLiteDB offline map.")
+    field_bundle_zip: bool = Field(default=False, description="Bundle selected outputs and metadata into one field-ready ZIP.")
+    garmin_profile: GarminProfile = Field(default=GarminProfile.STANDARD, description="Garmin KMZ tile cap profile (standard=100, modern=500).")
+    max_tiles: int | None = Field(default=None, ge=1, le=500, description="Optional override for maximum Garmin KMZ tiles.")
+    include_grid_on_digital: bool = Field(default=True, description="Render the 1 km MGRS grid onto digital exports.")
+    export_dpi: int | None = Field(default=None, ge=72, le=600, description="Optional raster DPI for digital exports (72–600).")
+    include_calibration_page: bool = Field(default=False, description="Append a 1:1 print scale calibration verification sheet.")
+    include_route_card: bool = Field(default=False, description="Append a tactical waypoint route card page.")
+    include_elevation_profile: bool = Field(default=False, description="Append a route elevation profile page.")
+    include_atlas_index: bool = Field(default=False, description="Prepend a multi-sheet atlas overview index page.")
+    include_rf_link_card: bool = Field(default=False, description="Append a point-to-point RF Fresnel link card page.")
 
     @model_validator(mode="before")
     @classmethod
@@ -363,38 +399,44 @@ class OutputOptions(BaseModel):
 class CreateJobRequest(BaseModel):
     """Request payload for ``POST /api/jobs`` (JSON or multipart ``payload`` field)."""
 
-    center: str | None = None
-    center_lat: float | None = None
-    center_lon: float | None = None
-    scale: int = 25000
-    paper: PaperSize = PaperSize.A4
-    orientation: Orientation = Orientation.PORTRAIT
-    color_mode: ColorMode = ColorMode.COLOR
-    units: Units = Units.METRIC
-    title: str | None = None
-    date_iso: str | None = None
-    dpi: int = Field(default=300, ge=72, le=600)
-    dem_source: DemSourceKind = DemSourceKind.AUTO
-    pack_id: str | None = None
-    us_overlays: list[USOverlayKind] = Field(default_factory=list)
-    au_overlays: list[AUOverlayKind] = Field(default_factory=list)
-    nz_overlays: list[NZOverlayKind] = Field(default_factory=list)
-    ca_overlays: list[CAOverlayKind] = Field(default_factory=list)
-    carto: CartoOptions = Field(default_factory=CartoOptions)
-    outputs: OutputOptions = Field(default_factory=OutputOptions)
-    grid_cols: int = Field(default=1, ge=1, le=3)
-    grid_rows: int = Field(default=1, ge=1, le=3)
-    waypoints: list[WaypointInput] = Field(default_factory=list)
-    viewsheds: list[ViewshedObserver] = Field(default_factory=list)
-    rf_links: list[RFLinkSpec] = Field(default_factory=list)
-    tactical_graphics: list[TacticalGraphic] = Field(default_factory=list)
-    strip_sheets: list[StripSheetInput] = Field(default_factory=list)
-    include_calibration_page: bool = False
-    include_route_card: bool = False
-    include_elevation_profile: bool = False
-    include_atlas_index: bool = False
-    include_rf_link_card: bool = False
-    show_fold_marks: bool = False
+    center: str | None = Field(
+        default=None,
+        description="Sheet center as 'lat,lon' decimal degrees (e.g. '-33.732, 150.312') or MGRS string (e.g. '56H KH 510 640'). Required unless center_lat/center_lon or strip_sheets are provided.",
+    )
+    center_lat: float | None = Field(default=None, description="Alternative WGS84 center latitude (-80.0 to 84.0).")
+    center_lon: float | None = Field(default=None, description="Alternative WGS84 center longitude (-180.0 to 180.0).")
+    scale: int = Field(
+        default=25000,
+        description="True-scale denominator: 10000, 12500, 15000, 24000, 25000, 48000, or 50000.",
+    )
+    paper: PaperSize = Field(default=PaperSize.A4, description="Physical print paper size (a4, letter, legal, a3).")
+    orientation: Orientation = Field(default=Orientation.PORTRAIT, description="Page orientation (portrait or landscape).")
+    color_mode: ColorMode = Field(default=ColorMode.COLOR, description="Cartography theme: color, bw, night-red, or alpine.")
+    units: Units = Field(default=Units.METRIC, description="Elevation and scale bar units (metric or imperial).")
+    title: str | None = Field(default=None, description="Optional map sheet title printed in the collar.")
+    date_iso: str | None = Field(default=None, description="Optional ISO date (YYYY-MM-DD) for WMM2025 declination calculation.")
+    dpi: int = Field(default=300, ge=72, le=600, description="Print PDF raster resolution in DPI (72–600; vectors stay razor-sharp).")
+    dem_source: DemSourceKind = Field(default=DemSourceKind.AUTO, description="DEM elevation source (auto, glo30, usgs3dep, au-elvis, nz-linz, ca-hrdem).")
+    pack_id: str | None = Field(default=None, description="Optional installed offline regional pack ID for air-gapped rendering.")
+    us_overlays: list[USOverlayKind] = Field(default_factory=list, description="Optional US thematic overlays (fema, nhd, towers, enc, us-trails, us-public-lands).")
+    au_overlays: list[AUOverlayKind] = Field(default_factory=list, description="Optional Australian thematic overlays (au-hydro, au-parks, au-infra, au-aviation, au-state-trails, etc.).")
+    nz_overlays: list[NZOverlayKind] = Field(default_factory=list, description="Optional New Zealand overlays (nz-doc-trails).")
+    ca_overlays: list[CAOverlayKind] = Field(default_factory=list, description="Optional Canadian overlays (ca-canvec-trails).")
+    carto: CartoOptions = Field(default_factory=CartoOptions, description="Cartographic density, hillshade, slope shading, and layer visibility options.")
+    outputs: OutputOptions = Field(default_factory=OutputOptions, description="Output print PDF and offline digital device export options.")
+    grid_cols: int = Field(default=1, ge=1, le=3, description="Multi-sheet grid atlas columns (1–3).")
+    grid_rows: int = Field(default=1, ge=1, le=3, description="Multi-sheet grid atlas rows (1–3).")
+    waypoints: list[WaypointInput] = Field(default_factory=list, description="Custom tactical waypoints and route points to plot on the map.")
+    viewsheds: list[ViewshedObserver] = Field(default_factory=list, description="RF / Line-of-Sight viewshed observers to render on the map.")
+    rf_links: list[RFLinkSpec] = Field(default_factory=list, description="Point-to-point RF / Fresnel links to plot and include in RF Link Card.")
+    tactical_graphics: list[TacticalGraphic] = Field(default_factory=list, description="Custom range rings, bearing lines, corridors, or sectors.")
+    strip_sheets: list[StripSheetInput] = Field(default_factory=list, description="Ordered strip-atlas sheet centers from POST /api/strip-plan.")
+    include_calibration_page: bool = Field(default=False, description="Append a 1:1 scale verification calibration page.")
+    include_route_card: bool = Field(default=False, description="Append a waypoint tactical route card page.")
+    include_elevation_profile: bool = Field(default=False, description="Append a route elevation profile page.")
+    include_atlas_index: bool = Field(default=False, description="Prepend a multi-sheet atlas index page.")
+    include_rf_link_card: bool = Field(default=False, description="Append an RF Fresnel link card page.")
+    show_fold_marks: bool = Field(default=False, description="Draw map folding registration ticks on the page margin.")
     turnstile_token: str | None = Field(default=None, exclude=True)
 
     @field_validator("scale")
@@ -666,3 +708,71 @@ class AdminSettingsResponse(BaseModel):
     """Response payload for ``POST /api/admin/settings``."""
 
     public_renders_paused: bool
+
+
+# ---------------------------------------------------------------------------
+# Scoped Bearer API Keys (Personal Access Tokens)
+# ---------------------------------------------------------------------------
+
+
+class ApiKeyRecord(BaseModel):
+    """Public metadata for a user-scoped Bearer API key (never includes secret token)."""
+
+    key_id: str
+    name: str
+    key_prefix: str
+    scopes: list[str] = Field(default_factory=lambda: ["all"])
+    created_at: str
+    expires_at: str | None = None
+    revoked_at: str | None = None
+    last_used_at: str | None = None
+    status: Literal["active", "revoked", "expired"] = "active"
+
+
+class ApiKeysListResponse(BaseModel):
+    """Response envelope for ``GET /api/auth/api-keys``."""
+
+    api_keys: list[ApiKeyRecord] = Field(default_factory=list)
+
+
+class CreateApiKeyRequest(BaseModel):
+    """Request payload for ``POST /api/auth/api-keys``."""
+
+    name: str = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+        description="Human-readable label for the API key (e.g. 'Claude Desktop', 'ChatGPT Actions').",
+    )
+    expires_days: int | None = Field(
+        default=90,
+        ge=1,
+        le=3650,
+        description="Optional lifetime in days (1–3650). Set to null for a non-expiring key.",
+    )
+    scopes: list[str] = Field(
+        default_factory=lambda: ["all"],
+        description="Optional permission scopes (default: ['all']).",
+    )
+
+    @field_validator("name")
+    @classmethod
+    def _validate_name(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("API key name must not be empty.")
+        return cleaned
+
+
+class CreateApiKeyResponse(BaseModel):
+    """Response payload for ``POST /api/auth/api-keys`` (plaintext token returned once)."""
+
+    api_key: ApiKeyRecord
+    token: str = Field(..., description="Plaintext Bearer token ('gf_...'). Store immediately; never shown again.")
+
+
+class RevokeApiKeyResponse(BaseModel):
+    """Response payload for ``DELETE /api/auth/api-keys/{key_id}``."""
+
+    revoked: bool = True
+    key_id: str

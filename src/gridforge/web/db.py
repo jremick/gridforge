@@ -260,6 +260,22 @@ def init_db(db_path: Path) -> None:
                 ON shared_snapshots (owner_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_shared_snapshots_expires
                 ON shared_snapshots (expires_at);
+
+            CREATE TABLE IF NOT EXISTS api_keys (
+                key_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                key_prefix TEXT NOT NULL,
+                token_hash TEXT NOT NULL UNIQUE,
+                scopes TEXT NOT NULL DEFAULT 'all',
+                created_at TEXT NOT NULL,
+                expires_at TEXT,
+                revoked_at TEXT,
+                last_used_at TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_api_keys_user
+                ON api_keys (user_id, created_at DESC);
             """
         )
         # Lightweight additive migrations for existing SQLite databases.
@@ -1457,6 +1473,212 @@ def delete_sessions_for_user(db_path: Path, user_id: str) -> int:
         cur = conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
         conn.execute("COMMIT")
         return int(cur.rowcount)
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
+def _parse_scopes(raw: str | None) -> list[str]:
+    if not raw:
+        return ["all"]
+    parts = [part.strip() for part in str(raw).split(",") if part.strip()]
+    return parts or ["all"]
+
+
+def _row_to_api_key_dict(row: sqlite3.Row, *, now_iso: str | None = None) -> dict[str, Any]:
+    ref_iso = now_iso or _utc_now_iso()
+    if row["revoked_at"] is not None:
+        key_status = "revoked"
+    elif row["expires_at"] is not None and str(row["expires_at"]) <= ref_iso:
+        key_status = "expired"
+    else:
+        key_status = "active"
+    return {
+        "key_id": str(row["key_id"]),
+        "user_id": str(row["user_id"]),
+        "name": str(row["name"]),
+        "key_prefix": str(row["key_prefix"]),
+        "scopes": _parse_scopes(row["scopes"]),
+        "created_at": str(row["created_at"]),
+        "expires_at": str(row["expires_at"]) if row["expires_at"] is not None else None,
+        "revoked_at": str(row["revoked_at"]) if row["revoked_at"] is not None else None,
+        "last_used_at": str(row["last_used_at"]) if row["last_used_at"] is not None else None,
+        "status": key_status,
+    }
+
+
+def create_api_key(
+    db_path: Path,
+    *,
+    key_id: str,
+    user_id: str,
+    name: str,
+    key_prefix: str,
+    token_hash: str,
+    scopes: str | Sequence[str] = "all",
+    expires_at: str | None = None,
+) -> dict[str, Any]:
+    """Insert a new personal access API key record for a user."""
+    now = _utc_now_iso()
+    if isinstance(scopes, str):
+        scopes_str = ",".join(_parse_scopes(scopes))
+    else:
+        cleaned = [str(s).strip() for s in scopes if str(s).strip()]
+        scopes_str = ",".join(cleaned) if cleaned else "all"
+    conn = _connect(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """
+            INSERT INTO api_keys (
+                key_id, user_id, name, key_prefix, token_hash, scopes,
+                created_at, expires_at, revoked_at, last_used_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+            """,
+            (key_id, user_id, name.strip(), key_prefix, token_hash, scopes_str, now, expires_at),
+        )
+        row = conn.execute("SELECT * FROM api_keys WHERE key_id = ?", (key_id,)).fetchone()
+        conn.execute("COMMIT")
+        assert row is not None
+        return _row_to_api_key_dict(row, now_iso=now)
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
+def get_api_key(db_path: Path, key_id: str) -> dict[str, Any] | None:
+    """Fetch a single API key record by ``key_id``, or None if not found."""
+    conn = _connect(db_path)
+    try:
+        row = conn.execute("SELECT * FROM api_keys WHERE key_id = ?", (key_id,)).fetchone()
+        return _row_to_api_key_dict(row) if row is not None else None
+    finally:
+        conn.close()
+
+
+def list_api_keys(
+    db_path: Path,
+    *,
+    user_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """List API keys newest first, optionally filtered by owning ``user_id``."""
+    now = _utc_now_iso()
+    conn = _connect(db_path)
+    try:
+        if user_id is not None:
+            rows = conn.execute(
+                "SELECT * FROM api_keys WHERE user_id = ? ORDER BY created_at DESC, rowid DESC",
+                (user_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM api_keys ORDER BY created_at DESC, rowid DESC"
+            ).fetchall()
+        return [_row_to_api_key_dict(r, now_iso=now) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_api_key_and_user_by_token_hash(
+    db_path: Path,
+    token_hash: str,
+    *,
+    now: datetime | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """Resolve an active, non-revoked, non-expired API key and its owning user by token hash."""
+    now_iso = _dt_to_iso(_resolve_now(now))
+    conn = _connect(db_path)
+    try:
+        row = conn.execute(
+            """
+            SELECT u.*,
+                   k.key_id AS k_key_id,
+                   k.user_id AS k_user_id,
+                   k.name AS k_name,
+                   k.key_prefix AS k_key_prefix,
+                   k.scopes AS k_scopes,
+                   k.created_at AS k_created_at,
+                   k.expires_at AS k_expires_at,
+                   k.revoked_at AS k_revoked_at,
+                   k.last_used_at AS k_last_used_at
+            FROM api_keys k
+            JOIN users u ON u.user_id = k.user_id
+            WHERE k.token_hash = ?
+              AND k.revoked_at IS NULL
+              AND (k.expires_at IS NULL OR k.expires_at > ?)
+            """,
+            (token_hash, now_iso),
+        ).fetchone()
+        if row is None:
+            return None
+        user = _row_to_user_dict(row)
+        api_key = {
+            "key_id": str(row["k_key_id"]),
+            "user_id": str(row["k_user_id"]),
+            "name": str(row["k_name"]),
+            "key_prefix": str(row["k_key_prefix"]),
+            "scopes": _parse_scopes(row["k_scopes"]),
+            "created_at": str(row["k_created_at"]),
+            "expires_at": str(row["k_expires_at"]) if row["k_expires_at"] is not None else None,
+            "revoked_at": str(row["k_revoked_at"]) if row["k_revoked_at"] is not None else None,
+            "last_used_at": str(row["k_last_used_at"]) if row["k_last_used_at"] is not None else None,
+            "status": "active",
+        }
+        return (api_key, user)
+    finally:
+        conn.close()
+
+
+def revoke_api_key(
+    db_path: Path,
+    key_id: str,
+    *,
+    user_id: str | None = None,
+) -> bool:
+    """Revoke an API key by setting ``revoked_at``. Returns True if a matching row existed."""
+    now = _utc_now_iso()
+    conn = _connect(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if user_id is not None:
+            cur = conn.execute(
+                "UPDATE api_keys SET revoked_at = COALESCE(revoked_at, ?) WHERE key_id = ? AND user_id = ?",
+                (now, key_id, user_id),
+            )
+        else:
+            cur = conn.execute(
+                "UPDATE api_keys SET revoked_at = COALESCE(revoked_at, ?) WHERE key_id = ?",
+                (now, key_id),
+            )
+        conn.execute("COMMIT")
+        return cur.rowcount > 0
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
+def touch_api_key_last_used(
+    db_path: Path,
+    key_id: str,
+    *,
+    now: datetime | None = None,
+) -> None:
+    """Update ``last_used_at`` timestamp for an API key."""
+    now_iso = _dt_to_iso(_resolve_now(now))
+    conn = _connect(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "UPDATE api_keys SET last_used_at = ? WHERE key_id = ?",
+            (now_iso, key_id),
+        )
+        conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")
         raise
