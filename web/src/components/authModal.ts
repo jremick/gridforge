@@ -6,6 +6,7 @@ import {
 } from "../api";
 import { TrapFocusHelper } from "../modalFocus";
 import { escapeHtml } from "../presets";
+import { initModalBackdrop } from "./lifecycle";
 import {
   createDefaultNoneSession,
   formatUploadLimitLabel,
@@ -52,10 +53,7 @@ export class AuthModal {
   constructor(container: HTMLElement, callbacks: AuthModalCallbacks) {
     this.root = container;
     this.callbacks = callbacks;
-    this.root.className = "gf-modal-backdrop hidden";
-    this.root.setAttribute("role", "dialog");
-    this.root.setAttribute("aria-modal", "true");
-    this.root.setAttribute("aria-labelledby", "gf-auth-modal-title");
+    initModalBackdrop(this.root, "gf-auth-modal-title");
 
     this.root.innerHTML = `
       <div class="gf-modal-panel gf-modal-panel-sm" data-role="modal-panel">

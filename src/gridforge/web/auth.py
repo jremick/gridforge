@@ -96,6 +96,20 @@ def _pkce_s256(verifier: str) -> str:
     return _b64url_encode(hashlib.sha256(verifier.encode("ascii")).digest())
 
 
+def resolve_auth_mode(explicit: str | None = None) -> Literal["none", "hosted"]:
+    """Return the validated auth mode from an explicit value or ``GRIDFORGE_AUTH_MODE``."""
+    raw_mode = (
+        explicit if explicit is not None else os.environ.get("GRIDFORGE_AUTH_MODE", "none")
+    ).strip().lower()
+    if not raw_mode:
+        return "none"
+    if raw_mode not in {"none", "hosted"}:
+        raise ValueError(
+            f"Invalid GRIDFORGE_AUTH_MODE={raw_mode!r}. Expected 'none' or 'hosted'."
+        )
+    return "hosted" if raw_mode == "hosted" else "none"
+
+
 def _parse_opt_bool_env(name: str) -> bool | None:
     raw = os.environ.get(name)
     if raw is None or not raw.strip():
@@ -294,14 +308,7 @@ class AuthConfig:
 
     @classmethod
     def from_env(cls) -> AuthConfig:
-        raw_mode = os.environ.get("GRIDFORGE_AUTH_MODE", "none").strip().lower()
-        if not raw_mode:
-            raw_mode = "none"
-        if raw_mode not in {"none", "hosted"}:
-            raise ValueError(
-                f"Invalid GRIDFORGE_AUTH_MODE={raw_mode!r}. Expected 'none' or 'hosted'."
-            )
-        auth_mode: Literal["none", "hosted"] = "hosted" if raw_mode == "hosted" else "none"
+        auth_mode = resolve_auth_mode()
         _warn_misnamed_env_vars()
 
         raw_secret = os.environ.get("GRIDFORGE_SESSION_SECRET", "").strip()

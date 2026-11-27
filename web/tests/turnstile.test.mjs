@@ -498,3 +498,54 @@ test("TurnstileController ignores stale callbacks and queued acquires across unm
   capturedCallbacks[1].callback("fresh-token-new-tenant");
   assert.equal(await freshPending, "fresh-token-new-tenant");
 });
+
+test("TurnstileController aborts pending render if unmounted during loadApi and resets on timeout-callback", async () => {
+  const container = makeFakeContainer();
+  let renderCalls = 0;
+  let resetCalls = 0;
+  let lastOpts = null;
+  const api = {
+    render(_container, options) {
+      renderCalls += 1;
+      lastOpts = options;
+      return `widget-race-${renderCalls}`;
+    },
+    reset() {
+      resetCalls += 1;
+    },
+    remove() {},
+    getResponse() {
+      return undefined;
+    },
+  };
+
+  let resolveLoad;
+  const ctrl = new TurnstileController({
+    container,
+    loadApi: () =>
+      new Promise((resolve) => {
+        resolveLoad = resolve;
+      }),
+  });
+
+  // Start syncing while loadApi is pending, then unmount before it resolves
+  // (container remains attached, so only !isCurrent() prevents a stale render).
+  const syncPromise = ctrl.syncSession(guestSession("0xRACE"));
+  ctrl.unmount();
+  resolveLoad(api);
+  await syncPromise;
+  assert.equal(renderCalls, 0);
+
+  // Subsequent active sync renders cleanly and handles timeout-callback reset.
+  const activeCtrl = new TurnstileController({
+    container,
+    loadApi: async () => api,
+  });
+  await activeCtrl.syncSession(guestSession("0xTIMEOUT"));
+  assert.equal(renderCalls, 1);
+  lastOpts.callback("ephemeral-tok");
+  lastOpts["timeout-callback"]();
+  assert.equal(resetCalls, 1);
+  // Timeout cleared the cached token, so acquiring without a fresh solve times out.
+  await assert.rejects(activeCtrl.acquireToken(25), /timed out/);
+});

@@ -53,6 +53,7 @@ from gridforge.pipeline import runner, terrain as terrain_mod
 from gridforge.render.pyqgis_worker import PyQGISRenderer
 from gridforge.sources.overlay_user import UserOverlaySource
 from gridforge.web import cache_prune, db
+from gridforge.web.auth import resolve_auth_mode
 from gridforge.web.schemas import CreateJobRequest, JobArtifact, JobRecord, JobStatus
 
 logger = logging.getLogger(__name__)
@@ -861,11 +862,7 @@ def _env_float(name: str, default: float) -> float:
 
 
 def _resolve_auth_mode(explicit: str | None = None) -> str:
-    raw = explicit if explicit is not None else os.environ.get("GRIDFORGE_AUTH_MODE", "none")
-    mode = raw.strip().lower() or "none"
-    if mode not in {"none", "hosted"}:
-        raise ValueError(f"Invalid GRIDFORGE_AUTH_MODE={mode!r}. Expected 'none' or 'hosted'.")
-    return mode
+    return resolve_auth_mode(explicit)
 
 
 def _parse_cache_max_bytes(raw: str | int) -> int | None:

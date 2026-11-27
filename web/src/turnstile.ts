@@ -281,6 +281,14 @@ export class TurnstileController {
     this.tokenConsumed = false;
     this.lastError = null;
     this.renderedSitekey = expectedSitekey;
+    const resetActiveWidget = () => {
+      if (!isCurrent()) return;
+      this.cachedToken = null;
+      this.tokenConsumed = false;
+      if (this.api && this.widgetId !== null) {
+        this.api.reset(this.widgetId);
+      }
+    };
     this.widgetId = api.render(this.container, {
       sitekey: expectedSitekey,
       theme: "dark",
@@ -302,14 +310,7 @@ export class TurnstileController {
           this.tokenConsumed = false;
         }
       },
-      "expired-callback": () => {
-        if (!isCurrent()) return;
-        this.cachedToken = null;
-        this.tokenConsumed = false;
-        if (this.api && this.widgetId !== null) {
-          this.api.reset(this.widgetId);
-        }
-      },
+      "expired-callback": resetActiveWidget,
       "error-callback": (errorCode?: string) => {
         if (!isCurrent()) return;
         this.cachedToken = null;
@@ -325,14 +326,7 @@ export class TurnstileController {
           waiter.reject(new Error(msg));
         }
       },
-      "timeout-callback": () => {
-        if (!isCurrent()) return;
-        this.cachedToken = null;
-        this.tokenConsumed = false;
-        if (this.api && this.widgetId !== null) {
-          this.api.reset(this.widgetId);
-        }
-      },
+      "timeout-callback": resetActiveWidget,
     });
   }
 

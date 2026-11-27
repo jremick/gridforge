@@ -9,6 +9,7 @@ import {
   hydrateStateFromSearch,
   hydrateStateFromSnapshot,
   serializeStateToParams,
+  stripOneTimeLaunchParams,
 } from "../src/deeplink.ts";
 
 test("URL deep link round-trips full cartography, outputs, view, booklet toggles, and markups", () => {
@@ -352,4 +353,21 @@ test("hydrateStateFromSnapshot normalizes full saved/shared snapshots cleanly", 
   assert.equal(target.viewsheds.length, 1);
   assert.equal(target.rfLinks.length, 1);
   assert.equal(target.tacticalGraphics.length, 1);
+});
+
+test("stripOneTimeLaunchParams removes invite/auth params once and reports unchanged URLs", () => {
+  const dirtyUrl = new URL(
+    "https://gridforge.example/?invite=tok123&auth_error=oauth_denied&share=AbCdEf1234567890&lang=en"
+  );
+  const changed = stripOneTimeLaunchParams(
+    dirtyUrl,
+    "invite=tok123&auth_error=oauth_denied&share=AbCdEf1234567890&lang=en"
+  );
+  assert.equal(changed, true);
+  assert.equal(dirtyUrl.search, "?share=AbCdEf1234567890&lang=en");
+
+  const cleanUrl = new URL("https://gridforge.example/?share=AbCdEf1234567890&lang=en");
+  const unchanged = stripOneTimeLaunchParams(cleanUrl, "share=AbCdEf1234567890&lang=en");
+  assert.equal(unchanged, false);
+  assert.equal(cleanUrl.search, "?share=AbCdEf1234567890&lang=en");
 });

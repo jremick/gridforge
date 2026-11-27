@@ -545,6 +545,7 @@ async function bundleTsModule(relPath) {
     bundle: true,
     format: "esm",
     platform: "browser",
+    loader: { ".css": "empty" },
     write: false,
   });
   const code = res.outputFiles[0].text;
@@ -1112,5 +1113,586 @@ test("AuthModal.clearAccountState closes dialog and clears sensitive draft input
     assert.equal(container.querySelector("[data-role='auth-body']").children.length, 0);
     modal.open({ mode: "invite" });
     assert.equal(container.querySelector("#gf-invite-token").value, "");
+  });
+});
+
+test("AuthModal invite submit normalizes blank optional fields to undefined and preserves values", async () => {
+  const { AuthModal } = await bundleTsModule("src/components/authModal.ts");
+  await withDom(async ({ doc, ShimEvent }) => {
+    const sentPayloads = [];
+    globalThis.fetch = async (url, init) => {
+      if (String(url) === "/api/auth/accept-invite") {
+        sentPayloads.push(JSON.parse(String(init.body)));
+        return new Response(JSON.stringify(makeSession({ authenticated: true, role: "friend" })), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    const container = doc.createElement("div");
+    doc.body.appendChild(container);
+    const modal = new AuthModal(container, {
+      changeSession: (request) => request(),
+      onOpenAdmin: () => {},
+      onToast: () => {},
+    });
+
+    // 1. Blank email & display name must become undefined (omitted from JSON)
+    modal.open({ mode: "invite", inviteToken: "tok-blank-opt" });
+    container.querySelector("#gf-invite-password").value = "LongPassword123!";
+    container.querySelector("[data-role='invite-form']").dispatchEvent(new ShimEvent("submit"));
+    await new Promise((r) => setTimeout(r, 15));
+
+    assert.equal(sentPayloads.length, 1);
+    assert.equal(sentPayloads[0].token, "tok-blank-opt");
+    assert.equal("email" in sentPayloads[0], false);
+    assert.equal("display_name" in sentPayloads[0], false);
+
+    // 2. Non-empty email & display name are preserved verbatim
+    modal.open({ mode: "invite", inviteToken: "tok-full-opt" });
+    container.querySelector("#gf-invite-email").value = "ranger@example.com";
+    container.querySelector("#gf-invite-name").value = "Ranger";
+    container.querySelector("#gf-invite-password").value = "LongPassword123!";
+    container.querySelector("[data-role='invite-form']").dispatchEvent(new ShimEvent("submit"));
+    await new Promise((r) => setTimeout(r, 15));
+
+    assert.equal(sentPayloads.length, 2);
+    assert.equal(sentPayloads[1].email, "ranger@example.com");
+    assert.equal(sentPayloads[1].display_name, "Ranger");
+  });
+});
+
+test("PacksModal respects pre-aborted and live signals, fetches regions on initial open, caches them, and reports action errors", async () => {
+  const { PacksModal } = await bundleTsModule("src/components/packsModal.ts");
+  await withDom(async ({ doc }) => {
+    const calls = [];
+    const toasts = [];
+    const apiErrors = [];
+    const seenSignals = [];
+
+    // 1. Pre-aborted externalSignal must prevent any network calls on open
+    const preAborted = new AbortController();
+    preAborted.abort();
+    globalThis.fetch = async (url) => {
+      calls.push(String(url));
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+    const deadContainer = doc.createElement("div");
+    doc.body.appendChild(deadContainer);
+    const deadModal = new PacksModal(
+      deadContainer,
+      {
+        onPacksUpdated: () => {},
+        onSelectPack: () => {},
+        onBasemapRefresh: () => {},
+        onToast: (msg, kind) => toasts.push({ msg, kind }),
+        getCurrentBBoxString: () => null,
+        onApiError: (err) => apiErrors.push(err),
+      },
+      preAborted.signal
+    );
+    deadModal.open();
+    await new Promise((r) => setTimeout(r, 10));
+    assert.equal(calls.length, 0);
+
+    // 2. Active externalSignal: first open fetches regions, second refresh reuses cache
+    const liveCtrl = new AbortController();
+    globalThis.fetch = async (url, init = {}) => {
+      const sUrl = String(url);
+      calls.push(sUrl);
+      if (init.signal) seenSignals.push(init.signal);
+      if (sUrl === "/api/packs") {
+        return new Response(
+          JSON.stringify({
+            packs: [
+              {
+                pack_id: "au-blue-mountains",
+                name: "Blue Mountains",
+                region: "nsw",
+                utm_zones: ["56S"],
+                vertical_datum: "AHD",
+                size_bytes: 1024,
+                created_at: "2026-11-27T00:00:00Z",
+                has_osm: true,
+                has_dem: true,
+                has_overlays: false,
+                has_basemap: false,
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } }
+        );
+      }
+      if (sUrl === "/api/packs/regions") {
+        return new Response(
+          JSON.stringify({
+            regions: [
+              {
+                region_id: "blue-mountains",
+                name: "Blue Mountains",
+                group: "au_tactical",
+                utm_zones: ["56S"],
+                bbox_wgs84: { min_x: 150.1, min_y: -33.9, max_x: 150.5, max_y: -33.5 },
+                estimated_size_hint: "~120 MB",
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } }
+        );
+      }
+      if (sUrl === "/api/packs/tasks") {
+        return new Response(JSON.stringify({ tasks: [] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (sUrl === "/api/packs/build" || sUrl.startsWith("/api/packs/au-blue-mountains")) {
+        return new Response(JSON.stringify({ detail: "Pack operation denied" }), {
+          status: 403,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    const container = doc.createElement("div");
+    doc.body.appendChild(container);
+    const modal = new PacksModal(
+      container,
+      {
+        onPacksUpdated: () => {},
+        onSelectPack: () => {},
+        onBasemapRefresh: () => {},
+        onToast: (msg, kind) => toasts.push({ msg, kind }),
+        getCurrentBBoxString: () => "150.1,-33.9,150.5,-33.5",
+        onApiError: (err) => apiErrors.push(err),
+      },
+      liveCtrl.signal
+    );
+
+    modal.open();
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(calls.filter((u) => u === "/api/packs/regions").length, 1);
+
+    // Refresh again: regions must now come from cache without re-fetching
+    container.querySelector("[data-role='modal-refresh']").click();
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(calls.filter((u) => u === "/api/packs/regions").length, 1);
+
+    // Build and delete failures report toast + onApiError
+    const buildBtn = container.querySelector("button[data-region-action='build']");
+    assert.ok(buildBtn);
+    buildBtn.click();
+    await new Promise((r) => setTimeout(r, 15));
+
+    const delBtn = container.querySelector("button[data-pack-action='delete']");
+    assert.ok(delBtn);
+    delBtn.click();
+    await new Promise((r) => setTimeout(r, 15));
+
+    assert.equal(toasts.filter((t) => t.kind === "error" && t.msg.includes("Pack operation denied")).length, 2);
+    assert.equal(apiErrors.length, 2);
+
+    // Aborting external signal cascades to linked lifecycle signal
+    liveCtrl.abort();
+    assert.equal(seenSignals.every((s) => s.aborted), true);
+    modal.dispose();
+    assert.equal(container.children.length, 0);
+  });
+});
+
+test("AdminModal respects pre-aborted externalSignal and cascades external abort", async () => {
+  const { AdminModal } = await bundleTsModule("src/components/adminModal.ts");
+  await withDom(async ({ doc }) => {
+    const calls = [];
+    globalThis.fetch = async (url) => {
+      calls.push(String(url));
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    const preAborted = new AbortController();
+    preAborted.abort();
+    const c1 = doc.createElement("div");
+    doc.body.appendChild(c1);
+    const deadModal = new AdminModal(
+      c1,
+      {
+        getCurrentUserId: () => "usr_admin",
+        onSettingsChanged: () => {},
+        onToast: () => {},
+        onCopyText: () => {},
+      },
+      preAborted.signal
+    );
+    await deadModal.refreshAll();
+    assert.equal(calls.length, 0);
+
+    const liveCtrl = new AbortController();
+    const liveSignals = [];
+    globalThis.fetch = (_url, init) => {
+      liveSignals.push(init.signal);
+      return new Promise(() => {});
+    };
+    const c2 = doc.createElement("div");
+    doc.body.appendChild(c2);
+    const liveModal = new AdminModal(
+      c2,
+      {
+        getCurrentUserId: () => "usr_admin",
+        onSettingsChanged: () => {},
+        onToast: () => {},
+        onCopyText: () => {},
+      },
+      liveCtrl.signal
+    );
+    void liveModal.refreshAll();
+    assert.equal(liveSignals.length, 2);
+    assert.equal(liveSignals.every((s) => !s.aborted), true);
+    liveCtrl.abort();
+    assert.equal(liveSignals.every((s) => s.aborted), true);
+  });
+});
+
+test("AdminModal user toggle updates only the target user record and clears busy state", async () => {
+  const { AdminModal } = await bundleTsModule("src/components/adminModal.ts");
+  await withDom(async ({ doc }) => {
+    const users = [
+      {
+        user_id: "usr_1",
+        email: "alpha@example.com",
+        display_name: "Alpha",
+        role: "friend",
+        disabled: false,
+        daily_render_limit: null,
+        hourly_preview_limit: null,
+        created_at: "2026-11-27T00:00:00Z",
+        last_login_at: null,
+        renders_today: 0,
+        previews_today: 0,
+      },
+      {
+        user_id: "usr_2",
+        email: "bravo@example.com",
+        display_name: "Bravo",
+        role: "friend",
+        disabled: false,
+        daily_render_limit: null,
+        hourly_preview_limit: null,
+        created_at: "2026-11-27T00:00:00Z",
+        last_login_at: null,
+        renders_today: 0,
+        previews_today: 0,
+      },
+    ];
+    let settingsChanged = 0;
+    const toasts = [];
+    globalThis.fetch = async (url, init = {}) => {
+      const sUrl = String(url);
+      if (sUrl === "/api/admin/users" && (!init.method || init.method === "GET")) {
+        return new Response(JSON.stringify({ users, invites: [] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (sUrl === "/api/admin/usage") {
+        return new Response(
+          JSON.stringify({
+            summary: {
+              renders_today: 0,
+              renders_7d: 0,
+              previews_today: 0,
+              active_queue_depth: 0,
+              global_daily_public_used: 0,
+              global_daily_public_limit: 50,
+              public_renders_paused: false,
+              avg_elapsed_seconds: 0,
+              max_peak_rss_mb: 0,
+            },
+            by_role: {},
+            recent_events: [],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } }
+        );
+      }
+      if (sUrl === "/api/admin/users/usr_1" && init.method === "PATCH") {
+        return new Response(
+          JSON.stringify({ user: { ...users[0], disabled: true } }),
+          { status: 200, headers: { "content-type": "application/json" } }
+        );
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    const container = doc.createElement("div");
+    doc.body.appendChild(container);
+    const modal = new AdminModal(container, {
+      getCurrentUserId: () => "usr_admin",
+      onSettingsChanged: () => {
+        settingsChanged += 1;
+      },
+      onToast: (msg, kind) => toasts.push({ msg, kind }),
+      onCopyText: () => {},
+    });
+
+    modal.open("users");
+    await modal.refreshAll();
+    const disableBtn = container.querySelector(
+      "button[data-admin-action='toggle-user-disabled'][data-user-id='usr_1']"
+    );
+    assert.ok(disableBtn);
+    disableBtn.click();
+    await new Promise((r) => setTimeout(r, 20));
+
+    assert.equal(settingsChanged, 1);
+    assert.ok(toasts.some((t) => t.msg.includes("alpha@example.com disabled")));
+    // Only usr_1 flipped to Enable (next-disabled=false); usr_2 still offers Disable (next-disabled=true)
+    const u1Btn = container.querySelector(
+      "button[data-admin-action='toggle-user-disabled'][data-user-id='usr_1']"
+    );
+    const u2Btn = container.querySelector(
+      "button[data-admin-action='toggle-user-disabled'][data-user-id='usr_2']"
+    );
+    assert.equal(u1Btn.disabled, false);
+    assert.equal(u1Btn.dataset.nextDisabled, "false");
+    assert.equal(u2Btn.dataset.nextDisabled, "true");
+  });
+});
+
+test("ProjectsDrawer prepareSuggestedName fallback and non-aborted refresh error propagation", async () => {
+  const { ProjectsDrawer } = await bundleTsModule("src/components/projectsDrawer.ts");
+  await withDom(async ({ doc }) => {
+    let suggested = "Ridge Loop";
+    const apiErrors = [];
+    const container = doc.createElement("aside");
+    doc.body.appendChild(container);
+    const drawer = new ProjectsDrawer(container, {
+      onClose: () => {},
+      onLoadProject: () => {},
+      getCurrentSnapshot: () => ({ suggestedName: suggested, state: {}, last_job_id: null }),
+      onToast: () => {},
+      onApiError: (err, ctx) => apiErrors.push({ err, ctx }),
+    });
+
+    const nameInput = container.querySelector("[data-role='proj-name']");
+    drawer.prepareSuggestedName();
+    assert.equal(nameInput.placeholder, "Ridge Loop");
+
+    suggested = "";
+    drawer.prepareSuggestedName();
+    assert.equal(nameInput.placeholder, "Project name (e.g. Kosciuszko Winter Loop)");
+
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify({ detail: "Session expired" }), {
+        status: 401,
+        headers: { "content-type": "application/json" },
+      });
+    await drawer.refresh();
+    assert.equal(apiErrors.length, 1);
+    assert.equal(apiErrors[0].ctx, "projects");
+  });
+});
+
+test("TelemetryBar.resetWorkspace closes account menu, clears share truncation state, and resets footprint", async () => {
+  const { TelemetryBar } = await bundleTsModule("src/components/telemetry.ts");
+  await withDom(({ doc }) => {
+    const container = doc.createElement("header");
+    doc.body.appendChild(container);
+    const bar = new TelemetryBar(container, {
+      onToggleDrawer: () => {},
+      onToggleProjects: () => {},
+      onCopyMgrs: () => {},
+    });
+    bar.updateSession(
+      makeSession({
+        authenticated: true,
+        role: "friend",
+        user: { user_id: "u1", email: "f@example.com", display_name: "Scout", role: "friend" },
+      })
+    );
+    const accountTrigger = container.querySelector("[data-role='auth-account-btn']");
+    const accountMenu = container.querySelector("[data-role='auth-account-menu']");
+    const shareNote = container.querySelector("[data-role='share-note']");
+    const shortBox = container.querySelector("[data-role='share-short-result']");
+
+    accountTrigger.click();
+    assert.equal(accountMenu.hidden, false);
+    bar.setShareSummary({
+      headline: "Alpine",
+      detail: "1:25,000",
+      directTruncated: true,
+      hasLocalOverlayFile: true,
+    });
+    bar.setShortLinkResult({ url: "https://example.com/?share=abc", expiresLabel: "7d" });
+    assert.equal(shareNote.hidden, false);
+    assert.equal(shortBox.hidden, false);
+
+    bar.resetWorkspace();
+    assert.equal(accountMenu.hidden, true);
+    assert.equal(shareNote.hidden, true);
+    assert.equal(shortBox.hidden, true);
+    assert.equal(container.querySelector("[data-role='mgrs']").textContent, "—");
+  });
+});
+
+test("SidebarPanel.resetWorkspace and GridForgeMap.resetWorkspace clear workspace controls and offline layers", async () => {
+  const { SidebarPanel } = await bundleTsModule("src/components/sidebar.ts");
+  const { GridForgeMap } = await bundleTsModule("src/map.ts");
+
+  await withDom(({ doc }) => {
+    const tabsEl = doc.createElement("div");
+    tabsEl.innerHTML = `
+      <button data-preset-tab="nsw-vic">NSW</button>
+      <button data-preset-tab="nz" class="active">NZ</button>
+    `;
+    const dropzoneEl = doc.createElement("div");
+    dropzoneEl.classList.add("dragover");
+    const rulerCalls = [];
+    const sectorCalls = [];
+
+    const fakeSidebar = {
+      closeGeocodeMenu: () => {},
+      fileInput: { value: "route.gpx" },
+      dropzoneEl,
+      ringRadiiInput: { value: "5,10", defaultValue: "1,2,5" },
+      activePresetTab: "nz",
+      activePresetId: "milford",
+      presetTabsEl: tabsEl,
+      renderPresetCards: () => {},
+      setTitlePlaceholder: () => {},
+      setRouteMetrics: () => {},
+      setRulerState: (...args) => rulerCalls.push(args),
+      setSectorDraftCount: (n) => sectorCalls.push(n),
+      setPacks: () => {},
+      setPlanningStrip: () => {},
+      setSubmitting: () => {},
+      setFormError: () => {},
+      syncControlsFromState: () => {},
+    };
+
+    SidebarPanel.prototype.resetWorkspace.call(fakeSidebar);
+    const [nswBtn, nzBtn] = tabsEl.querySelectorAll("[data-preset-tab]");
+    assert.equal(nswBtn.classList.contains("active"), true);
+    assert.equal(nzBtn.classList.contains("active"), false);
+    assert.deepEqual(rulerCalls, [[[], null, false]]);
+    assert.deepEqual(sectorCalls, [0]);
+    assert.equal(fakeSidebar.fileInput.value, "");
+    assert.equal(fakeSidebar.ringRadiiInput.value, "1,2,5");
+
+    // GridForgeMap.resetWorkspace removes offline layer only when isLoaded and suppresses near clicks
+    let removedCount = 0;
+    const makeFakeMap = (isLoaded) => ({
+      marker: {
+        remove() { return this; },
+        setLngLat() { return this; },
+        addTo() { return this; },
+      },
+      map: { jumpTo: () => {} },
+      draggingMarker: true,
+      suppressClickUntil: 0,
+      pendingOfflineBasemap: { id: "p" },
+      lastOfflineBasemap: { id: "p" },
+      reportedExternalTileFail: true,
+      isLoaded,
+      removeOfflineBasemapLayer: () => { removedCount += 1; },
+      clearFootprint: () => {},
+      updateStripRoute: () => {},
+      updateWaypoints: () => {},
+      updateViewsheds: () => {},
+      updateTacticalGraphics: () => {},
+      updateRFLinks: () => {},
+      updateRuler: () => {},
+    });
+
+    const before = performance.now();
+    const loadedMap = makeFakeMap(true);
+    GridForgeMap.prototype.resetWorkspace.call(loadedMap, -33.7, 150.3);
+    assert.equal(removedCount, 1);
+    assert.ok(loadedMap.suppressClickUntil > before);
+
+    const unloadedMap = makeFakeMap(false);
+    GridForgeMap.prototype.resetWorkspace.call(unloadedMap, -33.7, 150.3);
+    assert.equal(removedCount, 1);
+  });
+});
+
+test("mountMapCanvas releases pointer capture on pointerup only when canvas holds capture", async () => {
+  const { mountMapCanvas } = await bundleTsModule("mcp-app/mapCanvas.ts");
+  await withDom(({ doc, win, ShimEvent }) => {
+    const origGetComputedStyle = globalThis.getComputedStyle;
+    win.devicePixelRatio = 1;
+    win.getComputedStyle = () => ({
+      getPropertyValue: () => "",
+    });
+    globalThis.getComputedStyle = win.getComputedStyle;
+    const container = doc.createElement("div");
+    doc.body.appendChild(container);
+    const noopCtx = new Proxy(
+      {},
+      {
+        get(_t, prop) {
+          if (prop === "measureText") return () => ({ width: 20 });
+          return () => {};
+        },
+      }
+    );
+
+    const origCreate = doc.createElement.bind(doc);
+    let hasCapture = false;
+    const released = [];
+    const origSetInner = Object.getOwnPropertyDescriptor(
+      Object.getPrototypeOf(container),
+      "innerHTML"
+    ).set;
+
+    const patchCanvas = (canvas) => {
+      canvas.getContext = () => noopCtx;
+      canvas.getBoundingClientRect = () => ({ left: 0, top: 0, width: 560, height: 280 });
+      canvas.setPointerCapture = () => {};
+      canvas.hasPointerCapture = () => hasCapture;
+      canvas.releasePointerCapture = (id) => released.push(id);
+    };
+
+    // Mount once after letting container parse stage + canvas
+    const stageProto = Object.getPrototypeOf(container);
+    const origQ = stageProto.querySelector;
+    stageProto.querySelector = function (sel) {
+      const found = origQ.call(this, sel);
+      if (found && sel === "[data-map-canvas]") patchCanvas(found);
+      if (found && sel === "[data-map-stage]") {
+        found.getBoundingClientRect = () => ({ left: 0, top: 0, width: 560, height: 280 });
+      }
+      return found;
+    };
+
+    try {
+      const clicks = [];
+      const mounted = mountMapCanvas(
+        container,
+        { center: { lat: -33.7, lon: 150.3 } },
+        { onCenterClick: (lat, lon) => clicks.push({ lat, lon }) }
+      );
+      const canvas = container.querySelector("[data-map-canvas]");
+
+      // 1. Capture NOT held -> releasePointerCapture must not be called
+      hasCapture = false;
+      canvas.dispatchEvent(new ShimEvent("pointerdown", { button: 0, clientX: 100, clientY: 100, pointerId: 7 }));
+      canvas.dispatchEvent(new ShimEvent("pointerup", { clientX: 100, clientY: 100, pointerId: 7 }));
+      assert.deepEqual(released, []);
+      assert.equal(clicks.length, 1);
+
+      // 2. Capture held -> releasePointerCapture must be called with pointerId
+      hasCapture = true;
+      canvas.dispatchEvent(new ShimEvent("pointerdown", { button: 0, clientX: 120, clientY: 120, pointerId: 9 }));
+      canvas.dispatchEvent(new ShimEvent("pointerup", { clientX: 120, clientY: 120, pointerId: 9 }));
+      assert.deepEqual(released, [9]);
+      mounted.destroy();
+    } finally {
+      stageProto.querySelector = origQ;
+      globalThis.getComputedStyle = origGetComputedStyle;
+      void origCreate;
+      void origSetInner;
+    }
   });
 });

@@ -9,6 +9,9 @@ import {
   deleteShareSnapshot,
   fetchAdminUsage,
   fetchAdminUsers,
+  fetchBasemapInfo,
+  fetchHealth,
+  fetchPacks,
   fetchSession,
   fetchShareSnapshot,
   fetchShares,
@@ -397,5 +400,63 @@ test("ApiError preserves non-standard JSON error bodies without stream double-re
         );
       }
     );
+  }
+});
+
+test("fetchBasemapInfo, fetchPacks, and fetchHealth return payloads and attach bounded AbortSignals", async () => {
+  const calls = [];
+  const controller = new AbortController();
+  await withMockFetch(
+    async (url, init = {}) => {
+      calls.push({ url, init });
+      if (url === "/api/health") return jsonResponse({ status: "ok", queue_depth: 0 });
+      if (url.startsWith("/api/basemap/info")) {
+        return jsonResponse({ available: true, pack_id: "nsw-blue" });
+      }
+      return jsonResponse({ packs: [{ pack_id: "nsw-blue", name: "Blue Mountains" }] });
+    },
+    async () => {
+      const health = await fetchHealth();
+      const baseDefault = await fetchBasemapInfo(null, controller.signal);
+      const basePack = await fetchBasemapInfo("pack 1", controller.signal);
+      const packs = await fetchPacks(controller.signal);
+
+      assert.equal(health.status, "ok");
+      assert.equal(baseDefault.available, true);
+      assert.equal(basePack.pack_id, "nsw-blue");
+      assert.equal(packs.packs.length, 1);
+      assert.equal(packs.packs[0].pack_id, "nsw-blue");
+    }
+  );
+
+  assert.equal(calls[0].url, "/api/health");
+  assert.ok(calls[0].init.signal instanceof AbortSignal);
+  assert.equal(calls[0].init.signal.aborted, false);
+
+  assert.equal(calls[1].url, "/api/basemap/info");
+  assert.equal(calls[2].url, "/api/basemap/info?pack_id=pack%201");
+  assert.equal(calls[3].url, "/api/packs");
+  assert.equal(calls[3].init.signal.aborted, false);
+  controller.abort();
+  assert.equal(calls[3].init.signal.aborted, true);
+
+  // Fallback when AbortSignal.any is unavailable: callerSignal is passed directly
+  const origAny = AbortSignal.any;
+  const fallbackCtrl = new AbortController();
+  let seenFallbackSignal = null;
+  try {
+    AbortSignal.any = undefined;
+    await withMockFetch(
+      async (_url, init = {}) => {
+        seenFallbackSignal = init.signal;
+        return jsonResponse({ packs: [] });
+      },
+      async () => {
+        await fetchPacks(fallbackCtrl.signal);
+      }
+    );
+    assert.equal(seenFallbackSignal, fallbackCtrl.signal);
+  } finally {
+    AbortSignal.any = origAny;
   }
 });

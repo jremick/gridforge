@@ -8,6 +8,11 @@ import {
 } from "../api";
 import { TrapFocusHelper } from "../modalFocus";
 import { escapeHtml, formatDuration } from "../presets";
+import {
+  initModalBackdrop,
+  linkAbortSignal,
+  reportAbortAwareError,
+} from "./lifecycle";
 import type {
   AccountRole,
   AdminInviteRecord,
@@ -128,23 +133,10 @@ export class AdminModal {
     callbacks: AdminModalCallbacks,
     externalSignal?: AbortSignal
   ) {
-    this.signal = this.lifecycle.signal;
-    if (externalSignal) {
-      if (externalSignal.aborted) {
-        this.lifecycle.abort();
-      } else {
-        externalSignal.addEventListener("abort", () => this.lifecycle.abort(), {
-          once: true,
-          signal: this.signal,
-        });
-      }
-    }
+    this.signal = linkAbortSignal(this.lifecycle, externalSignal);
     this.root = container;
     this.callbacks = callbacks;
-    this.root.className = "gf-modal-backdrop hidden";
-    this.root.setAttribute("role", "dialog");
-    this.root.setAttribute("aria-modal", "true");
-    this.root.setAttribute("aria-labelledby", "gf-admin-modal-title");
+    initModalBackdrop(this.root, "gf-admin-modal-title");
 
     this.root.innerHTML = `
       <div class="gf-modal-panel gf-modal-panel-lg" data-role="modal-panel">
@@ -392,11 +384,13 @@ export class AdminModal {
         "info"
       );
     } catch (err) {
-      if (this.signal.aborted) return;
-      const msg =
-        err instanceof Error ? err.message : "Failed to update settings";
-      this.callbacks.onToast(msg, "error");
-      this.callbacks.onApiError?.(err);
+      reportAbortAwareError(
+        this.signal,
+        err,
+        "Failed to update settings",
+        this.callbacks.onToast,
+        this.callbacks.onApiError
+      );
     } finally {
       if (!this.signal.aborted) {
         this.savingSettings = false;
@@ -428,11 +422,13 @@ export class AdminModal {
       this.callbacks.onToast("Invite created", "success");
       await this.refreshAll();
     } catch (err) {
-      if (this.signal.aborted) return;
-      const msg =
-        err instanceof Error ? err.message : "Failed to create invite";
-      this.callbacks.onToast(msg, "error");
-      this.callbacks.onApiError?.(err);
+      reportAbortAwareError(
+        this.signal,
+        err,
+        "Failed to create invite",
+        this.callbacks.onToast,
+        this.callbacks.onApiError
+      );
     } finally {
       if (!this.signal.aborted) {
         this.creatingInvite = false;
@@ -452,14 +448,47 @@ export class AdminModal {
       this.callbacks.onToast("Invite revoked", "info");
       await this.refreshAll();
     } catch (err) {
-      if (this.signal.aborted) return;
-      const msg =
-        err instanceof Error ? err.message : "Failed to revoke invite";
-      this.callbacks.onToast(msg, "error");
-      this.callbacks.onApiError?.(err);
+      reportAbortAwareError(
+        this.signal,
+        err,
+        "Failed to revoke invite",
+        this.callbacks.onToast,
+        this.callbacks.onApiError
+      );
     } finally {
       if (!this.signal.aborted) {
         this.busyInviteIds.delete(inviteId);
+        this.renderContent();
+      }
+    }
+  }
+
+  private async mutateUserRecord(
+    userId: string,
+    patch: Parameters<typeof updateAdminUser>[1],
+    formatToast: (user: AdminUserRecord) => { msg: string; kind: "success" | "info" },
+    fallbackError: string
+  ): Promise<void> {
+    this.busyUserIds.add(userId);
+    this.renderContent();
+    try {
+      const res = await updateAdminUser(userId, patch, this.signal);
+      if (this.signal.aborted) return;
+      this.users = this.users.map((u) => (u.user_id === userId ? res.user : u));
+      this.callbacks.onSettingsChanged();
+      const toast = formatToast(res.user);
+      this.callbacks.onToast(toast.msg, toast.kind);
+    } catch (err) {
+      reportAbortAwareError(
+        this.signal,
+        err,
+        fallbackError,
+        this.callbacks.onToast,
+        this.callbacks.onApiError
+      );
+    } finally {
+      if (!this.signal.aborted) {
+        this.busyUserIds.delete(userId);
         this.renderContent();
       }
     }
@@ -487,31 +516,15 @@ export class AdminModal {
       return;
     }
 
-    this.busyUserIds.add(userId);
-    this.renderContent();
-
-    try {
-      const res = await updateAdminUser(userId, {
+    await this.mutateUserRecord(
+      userId,
+      {
         daily_render_limit: dailyParsed,
         hourly_preview_limit: prevParsed,
-      }, this.signal);
-      if (this.signal.aborted) return;
-      this.users = this.users.map((u) =>
-        u.user_id === userId ? res.user : u
-      );
-      this.callbacks.onSettingsChanged();
-      this.callbacks.onToast(`Updated quotas for ${res.user.email}`, "success");
-    } catch (err) {
-      if (this.signal.aborted) return;
-      const msg = err instanceof Error ? err.message : "Failed to update user";
-      this.callbacks.onToast(msg, "error");
-      this.callbacks.onApiError?.(err);
-    } finally {
-      if (!this.signal.aborted) {
-        this.busyUserIds.delete(userId);
-        this.renderContent();
-      }
-    }
+      },
+      (user) => ({ msg: `Updated quotas for ${user.email}`, kind: "success" }),
+      "Failed to update user"
+    );
   }
 
   private async handleToggleUserDisabled(
@@ -519,32 +532,15 @@ export class AdminModal {
     nextDisabled: boolean
   ): Promise<void> {
     if (this.busyUserIds.has(userId)) return;
-    this.busyUserIds.add(userId);
-    this.renderContent();
-
-    try {
-      const res = await updateAdminUser(userId, { disabled: nextDisabled }, this.signal);
-      if (this.signal.aborted) return;
-      this.users = this.users.map((u) =>
-        u.user_id === userId ? res.user : u
-      );
-      this.callbacks.onSettingsChanged();
-      this.callbacks.onToast(
-        `${res.user.email} ${res.user.disabled ? "disabled" : "enabled"}`,
-        "info"
-      );
-    } catch (err) {
-      if (this.signal.aborted) return;
-      const msg =
-        err instanceof Error ? err.message : "Failed to update user status";
-      this.callbacks.onToast(msg, "error");
-      this.callbacks.onApiError?.(err);
-    } finally {
-      if (!this.signal.aborted) {
-        this.busyUserIds.delete(userId);
-        this.renderContent();
-      }
-    }
+    await this.mutateUserRecord(
+      userId,
+      { disabled: nextDisabled },
+      (user) => ({
+        msg: `${user.email} ${user.disabled ? "disabled" : "enabled"}`,
+        kind: "info",
+      }),
+      "Failed to update user status"
+    );
   }
 
   private renderKillSwitch(): void {

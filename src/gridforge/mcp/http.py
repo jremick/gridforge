@@ -26,6 +26,7 @@ from gridforge.mcp.protocol import (
 )
 from gridforge.mcp.server import GridForgeMCPServer
 from gridforge.web.access import get_effective_scheme, origin_proxy_header_name
+from gridforge.web.auth import resolve_auth_mode
 
 _MAX_TRACKED_SESSIONS: int = 1024
 
@@ -43,7 +44,7 @@ def _extract_supplied_api_key(request: Request) -> str | None:
 def _check_single_tenant_api_key(request: Request, target_app: Any) -> JSONResponse | None:
     """When ``auth_mode == 'none'`` and ``GRIDFORGE_API_KEY`` is set, require constant-time key match."""
     auth_cfg = getattr(getattr(target_app, "state", None), "auth_config", None)
-    auth_mode = getattr(auth_cfg, "auth_mode", None) or os.environ.get("GRIDFORGE_AUTH_MODE", "none")
+    auth_mode = getattr(auth_cfg, "auth_mode", None) or resolve_auth_mode()
     if str(auth_mode).strip().lower() != "none":
         return None
     expected_key = os.environ.get("GRIDFORGE_API_KEY", "").strip()

@@ -148,3 +148,78 @@ def test_strip_sheet_input_sanitizes_control_chars_and_traversal():
 
     with pytest.raises(ValidationError):
         StripSheetInput(sheet_id="\r\n\x00\t", center_lat=-33.7, center_lon=150.3)
+
+
+def test_preview_elevation_source_selects_low_res_matching_provider():
+    from gridforge.config import DemSourceKind
+
+    usgs = viewshed._resolve_preview_elevation_source(DemSourceKind.USGS3DEP)
+    assert isinstance(usgs, viewshed.USGS3DEPSource)
+    assert usgs.prefer_1m is False
+
+    au = viewshed._resolve_preview_elevation_source(DemSourceKind.AU_ELVIS)
+    assert isinstance(au, viewshed.AUElvisDEMSource)
+    assert au.prefer_state_lidar is False and au.prefer_5m is False
+
+    nz = viewshed._resolve_preview_elevation_source(DemSourceKind.NZ_LINZ)
+    assert isinstance(nz, viewshed.NZLinzDEMSource)
+    assert nz.prefer_1m is False
+
+    ca = viewshed._resolve_preview_elevation_source(DemSourceKind.CA_HRDEM)
+    assert isinstance(ca, viewshed.CanadaHRDEMSource)
+    assert ca.prefer_hrdem is False
+
+    glo = viewshed._resolve_preview_elevation_source(DemSourceKind.GLO30)
+    assert isinstance(glo, viewshed.CopernicusGLO30Source)
+
+    auto = viewshed._resolve_preview_elevation_source(DemSourceKind.AUTO)
+    assert isinstance(auto, viewshed.AutoDEMSource)
+
+
+def test_worker_rejects_symlinked_atlas_sheet_workspace(tmp_path, monkeypatch):
+    data_dir = tmp_path / "jobs"
+    data_dir.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    db_path = data_dir / "jobs.sqlite3"
+    db.init_db(db_path)
+    job_id = "02f0933f10b34420"
+    db.create_job(
+        db_path,
+        job_id=job_id,
+        title="Symlink test",
+        center="-33.732, 150.312",
+        center_mgrs=None,
+        scale=25000,
+        paper=PaperSize.A4,
+        orientation=Orientation.PORTRAIT,
+        color_mode=ColorMode.COLOR,
+        request_json=json.dumps(
+            {
+                "title": "Symlink test",
+                "strip_sheets": [
+                    {"sheet_id": "S1", "center_lat": -33.732, "center_lon": 150.312},
+                    {"sheet_id": "S2", "center_lat": -33.721, "center_lon": 150.324},
+                ],
+            }
+        ),
+    )
+    claimed = db.claim_next_job(db_path)
+    assert claimed is not None
+
+    # Pre-plant a symlink where the worker expects tmp_work_dir / "sheet_01"
+    work_dir = tmp_path / "seeded_worker_tmp"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    (work_dir / "sheet_01").symlink_to(outside)
+    monkeypatch.setattr(worker.tempfile, "mkdtemp", lambda prefix="": str(work_dir))
+
+    def unexpected_prepare(*args, **kwargs):
+        pytest.fail("Worker should reject a symlinked sheet workspace before preparing")
+
+    monkeypatch.setattr(worker.runner, "prepare_job_workspace", unexpected_prepare)
+    result = worker.process_single_job(
+        claimed, db_path=db_path, data_dir=data_dir, packs_dir=tmp_path / "packs",
+    )
+    assert result is not None
+    assert result.status == JobStatus.FAILED
+    assert "direct child of the job workspace" in (result.error or "")

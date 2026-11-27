@@ -14,7 +14,7 @@ import httpx
 import pytest
 
 from gridforge.config import BBox
-from gridforge.sources import _http, dem_ca_hrdem, overlays_au_states, overlays_au_states_west
+from gridforge.sources import _cog_ranges, _http, dem_ca_hrdem, overlays_au_states, overlays_au_states_west
 from gridforge.sources.osm_overpass import OverpassOSMSource, PRIMARY_OVERPASS_URL
 
 
@@ -323,3 +323,87 @@ def test_bounded_response_chunks_rejects_gzip_encoding():
     resp = httpx.Response(200, headers={"Content-Encoding": "gzip"}, stream=FixtureStream([b"compressed"]))
     with pytest.raises(ValueError, match="identity"):
         list(_http.bounded_response_chunks(resp, max_bytes=1024, deadline=time.monotonic() + 5.0))
+
+
+def test_cog_range_paths_enforces_request_budget(monkeypatch):
+    monkeypatch.setattr(_cog_ranges, "_MAX_READ_REQUESTS", 1, raising=False)
+
+    def handler(request):
+        return httpx.Response(200, headers={"Content-Length": "16", "Accept-Ranges": "bytes"})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as upstream:
+        with _cog_ranges.cog_range_paths([_TRUSTED_COG], upstream, timeout_s=5.0) as paths:
+            proxy_url = paths[0].removeprefix("/vsicurl/")
+            with httpx.Client(timeout=5.0) as local_client:
+                first = local_client.head(proxy_url)
+                second = local_client.head(proxy_url)
+    assert first.status_code == 200
+    assert second.status_code == 502
+
+
+def test_canadian_warp_cogs_rejects_unapproved_or_empty_assets(tmp_path):
+    source = dem_ca_hrdem.CanadaHRDEMSource(cache_dir=tmp_path)
+    with pytest.raises(ValueError, match="Unapproved NRCan GeoTIFF assets"):
+        source._warp_cogs([], ["-ts", "8", "8"], tmp_path / "out.tif", context="empty")
+    with pytest.raises(ValueError, match="Unapproved NRCan GeoTIFF assets"):
+        source._warp_cogs([_OTHER_BUCKET], ["-ts", "8", "8"], tmp_path / "out.tif", context="unapproved")
+
+
+def test_overpass_default_client_disables_redirects(tmp_path, monkeypatch):
+    captured_kwargs: list[dict] = []
+
+    closed_clients: list[bool] = []
+
+    class RecordingClient:
+        def __init__(self, **kwargs):
+            captured_kwargs.append(kwargs)
+
+        def stream(self, *args, **kwargs):
+            raise httpx.ConnectError("offline test stub")
+
+        def close(self) -> None:
+            closed_clients.append(True)
+
+    monkeypatch.setattr(httpx, "Client", RecordingClient)
+    source = OverpassOSMSource(endpoints=[PRIMARY_OVERPASS_URL], max_rounds=1)
+    with pytest.raises(RuntimeError):
+        source._download_with_failover_to_file("[out:xml];out;", tmp_path / "overpass.osm")
+    assert captured_kwargs and captured_kwargs[0]["follow_redirects"] is False
+    assert closed_clients == [True]
+
+
+def test_wfs_and_sa_zip_allow_exact_limit_and_reject_non_list_sa_parks(tmp_path, monkeypatch):
+    # WFS allows exact feature_limit (len(features) == feature_limit)
+    feature_limit = 2
+    exact_features = [_POINT, _POINT]
+    raw = json.dumps({"type": "FeatureCollection", "features": exact_features}).encode()
+
+    def wfs_handler(_request):
+        return httpx.Response(200, stream=FixtureStream([raw]))
+
+    with httpx.Client(transport=httpx.MockTransport(wfs_handler)) as client:
+        got = overlays_au_states.query_wfs_geojson(
+            "https://wfs.example.invalid/query",
+            "trails",
+            _BBOX,
+            cache_path=tmp_path / "exact.json",
+            max_features=feature_limit,
+            retries=1,
+            client=client,
+        )
+    assert len(got) == feature_limit
+
+    # SA trails ZIP allows exact _MAX_SA_TRAILS_ZIP_ENTRIES
+    monkeypatch.setattr(overlays_au_states_west, "_MAX_SA_TRAILS_ZIP_ENTRIES", 2, raising=False)
+    inner = overlays_au_states_west.DEFAULT_SA_TRAILS_ZIP_INNER
+    zip_path = tmp_path / "exact_entries.zip"
+    with zipfile.ZipFile(zip_path, "w") as archive:
+        archive.writestr("README.txt", "notes")
+        archive.writestr(inner, json.dumps({"type": "FeatureCollection", "features": [_POINT]}))
+    assert overlays_au_states_west._sa_trails_zip_member(zip_path) == inner
+
+    # Non-list SA parks JSON is rejected explicitly
+    bad_parks = tmp_path / "bad_parks.json"
+    bad_parks.write_text(json.dumps({"unexpected": "object"}))
+    with pytest.raises(ValueError, match="JSON list"):
+        overlays_au_states_west._sa_parks_data(bad_parks)

@@ -1147,3 +1147,23 @@ def test_hosted_session_emits_distinct_opaque_workspace_scope_per_guest(
     signed_in = _login(g1, "admin@example.com", "AdminPassword123!")
     assert signed_in["workspace_scope"] != scope1
     assert signed_in["user"]["user_id"] not in signed_in["workspace_scope"]
+
+
+def test_limits_default_geocode_budgets_and_resolve_auth_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gridforge.web.auth import resolve_auth_mode
+    from gridforge.web.limits import LimitsConfig
+
+    monkeypatch.delenv("GRIDFORGE_GEOCODE_HOURLY_LIMIT", raising=False)
+    monkeypatch.delenv("GRIDFORGE_GEOCODE_GLOBAL_HOURLY_LIMIT", raising=False)
+    monkeypatch.delenv("GRIDFORGE_AUTH_MODE", raising=False)
+
+    cfg = LimitsConfig.from_env(auth_mode="hosted")
+    assert cfg.geocode_hourly_limit == 30
+    assert cfg.geocode_global_hourly_limit == 300
+    assert resolve_auth_mode() == "none"
+    assert resolve_auth_mode("  ") == "none"
+    assert resolve_auth_mode("HOSTED") == "hosted"
+    with pytest.raises(ValueError, match="Invalid GRIDFORGE_AUTH_MODE"):
+        resolve_auth_mode("bogus")

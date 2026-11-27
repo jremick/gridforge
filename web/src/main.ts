@@ -31,6 +31,7 @@ import {
   buildDirectShareUrl,
   hydrateStateFromSearch,
   hydrateStateFromSnapshot,
+  stripOneTimeLaunchParams,
 } from "./deeplink";
 import { GridForgeMap } from "./map";
 import {
@@ -183,12 +184,7 @@ class GridForgeApp {
       : null;
     const urlHydration = hydrateStateFromSearch(launchUrl.search, this.state);
     // Use inbound map settings and authentication parameters once.
-    const remainingParams = new URLSearchParams(urlHydration.remainingSearch);
-    for (const key of ["invite", "invite_token", "auth_error", "error"]) {
-      remainingParams.delete(key);
-    }
-    if (remainingParams.toString() !== launchUrl.searchParams.toString()) {
-      launchUrl.search = remainingParams.toString();
+    if (stripOneTimeLaunchParams(launchUrl, urlHydration.remainingSearch)) {
       window.history.replaceState(window.history.state, "", launchUrl);
     }
     this.initialFlyToResolved = urlHydration.needsFlyToResolvedCenter;
@@ -1496,8 +1492,8 @@ class GridForgeApp {
         this.pendingOfflineBasemapFromUrl = false;
         this.selectBasemap("offline");
       }
-    } catch {
-      // Offline basemap endpoint optional / unavailable
+    } catch (err) {
+      console.debug("Offline basemap endpoint unavailable:", err);
     }
   }
 
@@ -2873,38 +2869,51 @@ class GridForgeApp {
     }
   }
 
-  private async handleCancelJob(jobId: string): Promise<void> {
+  private async runJobListMutation<T>(
+    jobId: string,
+    request: (signal: AbortSignal) => Promise<T>,
+    applySuccess: (result: T) => { jobs: JobRecord[]; toast: string },
+    fallbackError: string
+  ): Promise<void> {
     const { signal } = this.workspaceRequests;
     try {
-      const updated = await cancelJob(jobId, signal);
+      const result = await request(signal);
       if (signal.aborted) return;
-      this.jobs = this.jobs.map((j) => (j.job_id === jobId ? updated : j));
+      const next = applySuccess(result);
+      this.jobs = next.jobs;
       this.drawer.setJobs(this.jobs);
       this.updateQueueBadge();
-      this.showToast(`Cancelled job #${jobId.slice(0, 8)}`, "info");
+      this.showToast(next.toast, "info");
     } catch (err) {
       if (signal.aborted) return;
       this.drawer.clearBusy(jobId);
-      const msg = this.handleApiError(err, "general", "Failed to cancel job");
+      const msg = this.handleApiError(err, "general", fallbackError);
       this.showToast(msg, "error");
     }
   }
 
-  private async handleDeleteJob(jobId: string): Promise<void> {
-    const { signal } = this.workspaceRequests;
-    try {
-      await deleteJob(jobId, signal);
-      if (signal.aborted) return;
-      this.jobs = this.jobs.filter((j) => j.job_id !== jobId);
-      this.drawer.setJobs(this.jobs);
-      this.updateQueueBadge();
-      this.showToast(`Deleted job #${jobId.slice(0, 8)}`, "info");
-    } catch (err) {
-      if (signal.aborted) return;
-      this.drawer.clearBusy(jobId);
-      const msg = this.handleApiError(err, "general", "Failed to delete job");
-      this.showToast(msg, "error");
-    }
+  private handleCancelJob(jobId: string): Promise<void> {
+    return this.runJobListMutation(
+      jobId,
+      (signal) => cancelJob(jobId, signal),
+      (updated) => ({
+        jobs: this.jobs.map((j) => (j.job_id === jobId ? updated : j)),
+        toast: `Cancelled job #${jobId.slice(0, 8)}`,
+      }),
+      "Failed to cancel job"
+    );
+  }
+
+  private handleDeleteJob(jobId: string): Promise<void> {
+    return this.runJobListMutation(
+      jobId,
+      (signal) => deleteJob(jobId, signal),
+      () => ({
+        jobs: this.jobs.filter((j) => j.job_id !== jobId),
+        toast: `Deleted job #${jobId.slice(0, 8)}`,
+      }),
+      "Failed to delete job"
+    );
   }
 
   private copyText(text: string, label: string): void {

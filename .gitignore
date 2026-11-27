@@ -47,3 +47,7 @@ web/dist/
 # Keep synthetic unit/integration test fixtures tracked
 !tests/fixtures/
 !tests/fixtures/**
+
+# Local anti-slop telemetry and ephemeral verification receipts (keep learned rules tracked)
+.anti-slop/telemetry.jsonl
+.anti-slop/last-verify.json

@@ -120,21 +120,42 @@ async function parseErrorDetail(res: Response): Promise<string> {
   return `HTTP ${res.status} ${res.statusText}`;
 }
 
-async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(url, { credentials: "same-origin", ...init });
+const DEFAULT_API_TIMEOUT_MS = 90_000;
+
+function buildRequestSignal(
+  callerSignal?: AbortSignal | null,
+  timeoutMs = DEFAULT_API_TIMEOUT_MS
+): AbortSignal | undefined {
+  const timeoutSignal =
+    typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function"
+      ? AbortSignal.timeout(timeoutMs)
+      : undefined;
+  if (callerSignal && timeoutSignal) {
+    if (typeof AbortSignal.any === "function") {
+      return AbortSignal.any([callerSignal, timeoutSignal]);
+    }
+    return callerSignal;
+  }
+  return callerSignal ?? timeoutSignal;
+}
+
+async function fetchApi(url: string, init?: RequestInit): Promise<Response> {
+  const signal = buildRequestSignal(init?.signal);
+  const res = await fetch(url, { credentials: "same-origin", ...init, signal });
   if (!res.ok) {
     const detail = await parseErrorDetail(res);
     throw new ApiError(detail, res.status);
   }
+  return res;
+}
+
+async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
+  const res = await fetchApi(url, init);
   return (await res.json()) as T;
 }
 
 async function requestVoid(url: string, init?: RequestInit): Promise<void> {
-  const res = await fetch(url, { credentials: "same-origin", ...init });
-  if (!res.ok) {
-    const detail = await parseErrorDetail(res);
-    throw new ApiError(detail, res.status);
-  }
+  await fetchApi(url, init);
 }
 
 export function fetchHealth(): Promise<HealthResponse> {

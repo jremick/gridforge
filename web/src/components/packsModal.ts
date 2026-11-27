@@ -8,6 +8,11 @@ import {
 import { TrapFocusHelper } from "../modalFocus";
 import { escapeHtml, formatBytes, formatDuration } from "../presets";
 import { classifyApiError } from "../session";
+import {
+  initModalBackdrop,
+  linkAbortSignal,
+  reportAbortAwareError,
+} from "./lifecycle";
 import type {
   PackBuildTask,
   PackDemTier,
@@ -69,23 +74,10 @@ export class PacksModal {
     callbacks: PacksModalCallbacks,
     externalSignal?: AbortSignal
   ) {
-    this.signal = this.lifecycle.signal;
-    if (externalSignal) {
-      if (externalSignal.aborted) {
-        this.lifecycle.abort();
-      } else {
-        externalSignal.addEventListener("abort", () => this.lifecycle.abort(), {
-          once: true,
-          signal: this.signal,
-        });
-      }
-    }
+    this.signal = linkAbortSignal(this.lifecycle, externalSignal);
     this.root = container;
     this.callbacks = callbacks;
-    this.root.className = "gf-modal-backdrop hidden";
-    this.root.setAttribute("role", "dialog");
-    this.root.setAttribute("aria-modal", "true");
-    this.root.setAttribute("aria-labelledby", "gf-packs-modal-title");
+    initModalBackdrop(this.root, "gf-packs-modal-title");
 
     this.root.innerHTML = `
       <div class="gf-modal-panel" data-role="modal-panel">
@@ -458,11 +450,13 @@ export class PacksModal {
       this.callbacks.onToast(`Started pack build: ${task.region}`, "info");
       this.schedulePollIfActive();
     } catch (err) {
-      if (this.signal.aborted) return;
-      const msg =
-        err instanceof Error ? err.message : "Failed to start pack build";
-      this.callbacks.onToast(msg, "error");
-      this.callbacks.onApiError?.(err);
+      reportAbortAwareError(
+        this.signal,
+        err,
+        "Failed to start pack build",
+        this.callbacks.onToast,
+        this.callbacks.onApiError
+      );
     } finally {
       if (!this.signal.aborted) {
         this.submittingRegion = null;
@@ -483,11 +477,13 @@ export class PacksModal {
       this.callbacks.onBasemapRefresh();
       this.callbacks.onToast(`Deleted offline pack "${packId}"`, "info");
     } catch (err) {
-      if (this.signal.aborted) return;
-      const msg =
-        err instanceof Error ? err.message : "Failed to delete offline pack";
-      this.callbacks.onToast(msg, "error");
-      this.callbacks.onApiError?.(err);
+      reportAbortAwareError(
+        this.signal,
+        err,
+        "Failed to delete offline pack",
+        this.callbacks.onToast,
+        this.callbacks.onApiError
+      );
     } finally {
       if (!this.signal.aborted) {
         this.deletingIds.delete(packId);

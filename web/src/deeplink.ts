@@ -1313,3 +1313,30 @@ export function hydrateStateFromSnapshot(
 
   return { basemap, zoom };
 }
+
+const ONE_TIME_LAUNCH_PARAMS = [
+  "invite",
+  "invite_token",
+  "auth_error",
+  "error",
+] as const;
+
+/**
+ * Remove one-time inbound map and authentication query params from a launch URL.
+ * Returns true when the URL search string was modified and should replace history state.
+ */
+export function stripOneTimeLaunchParams(
+  launchUrl: URL,
+  remainingSearch: string
+): boolean {
+  const remainingParams = new URLSearchParams(remainingSearch);
+  for (const key of ONE_TIME_LAUNCH_PARAMS) {
+    remainingParams.delete(key);
+  }
+  const nextSearch = remainingParams.toString();
+  if (nextSearch === launchUrl.searchParams.toString()) {
+    return false;
+  }
+  launchUrl.search = nextSearch;
+  return true;
+}

@@ -1175,3 +1175,55 @@ def test_render_map_forwards_wait_and_timeout_params() -> None:
     assert seen_params[-1]["wait"] == "true"
     assert float(seen_params[-1]["timeout_s"]) == 90.0
 
+
+def test_mcp_http_ignores_empty_client_host_and_resolves_auth_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gridforge.mcp.http import create_mcp_router
+    import httpx
+
+    seen_client_addrs: list[tuple[str, int] | None] = []
+    target_app = FastAPI()
+
+    @target_app.get("/api/capabilities")
+    def _capabilities(request: Request) -> dict[str, Any]:
+        seen_client_addrs.append(
+            (request.client.host, request.client.port) if request.client else None
+        )
+        return {"service": "gridforge", "version": "1.7.1", "auth_mode": "none"}
+
+    monkeypatch.delenv("GRIDFORGE_API_KEY", raising=False)
+    monkeypatch.setenv("GRIDFORGE_AUTH_MODE", "none")
+
+    wrapper = FastAPI()
+    wrapper.include_router(create_mcp_router(get_app=lambda: target_app))
+
+    # Send a POST /mcp with empty client host ("", 0) so `request.client is not None and request.client.host` is False
+    async def _send_empty_host_mcp() -> dict[str, Any]:
+        transport = httpx.ASGITransport(app=wrapper, client=("", 0))
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://localhost:8080",
+            timeout=10.0,
+        ) as client:
+            resp = await client.post(
+                "/mcp",
+                headers={
+                    "Accept": "application/json, text/event-stream",
+                    "Origin": "http://localhost:8080",
+                },
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {"name": "get_capabilities", "arguments": {}},
+                },
+            )
+            assert resp.status_code == 200
+            return resp.json()
+
+    # Check tool call succeeds and empty client host is NOT forwarded as ("", 0)
+    payload = asyncio.run(_send_empty_host_mcp())
+    assert "result" in payload
+    assert seen_client_addrs and ("", 0) not in seen_client_addrs
+

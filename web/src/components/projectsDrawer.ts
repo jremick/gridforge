@@ -6,6 +6,7 @@ import {
 } from "../api";
 import { escapeHtml } from "../presets";
 import type { SavedProject } from "../types";
+import { reportAbortAwareError } from "./lifecycle";
 
 const PROJECT_NAME_PLACEHOLDER = "Project name (e.g. Kosciuszko Winter Loop)";
 
@@ -220,10 +221,13 @@ export class ProjectsDrawer {
       this.renderList();
       this.callbacks.onToast(`Saved project "${created.name}"`, "success");
     } catch (err) {
-      if (signal.aborted) return;
-      const msg = err instanceof Error ? err.message : "Failed to save project";
-      this.callbacks.onToast(msg, "error");
-      this.callbacks.onApiError?.(err, "projects");
+      reportAbortAwareError(
+        signal,
+        err,
+        "Failed to save project",
+        this.callbacks.onToast,
+        (e) => this.callbacks.onApiError?.(e, "projects")
+      );
     } finally {
       if (!signal.aborted) this.setSaving(false);
     }
@@ -262,10 +266,13 @@ export class ProjectsDrawer {
       this.countEl.textContent = String(this.projects.length);
       this.callbacks.onToast(`Cloned "${proj.name}"`, "info");
     } catch (err) {
-      if (signal.aborted) return;
-      const msg = err instanceof Error ? err.message : "Failed to clone project";
-      this.callbacks.onToast(msg, "error");
-      this.callbacks.onApiError?.(err, "projects");
+      reportAbortAwareError(
+        signal,
+        err,
+        "Failed to clone project",
+        this.callbacks.onToast,
+        (e) => this.callbacks.onApiError?.(e, "projects")
+      );
     } finally {
       if (!signal.aborted) {
         this.busyIds.delete(proj.project_id);
@@ -285,10 +292,13 @@ export class ProjectsDrawer {
       this.countEl.textContent = String(this.projects.length);
       this.callbacks.onToast("Deleted saved project", "info");
     } catch (err) {
-      if (signal.aborted) return;
-      const msg = err instanceof Error ? err.message : "Failed to delete project";
-      this.callbacks.onToast(msg, "error");
-      this.callbacks.onApiError?.(err, "projects");
+      reportAbortAwareError(
+        signal,
+        err,
+        "Failed to delete project",
+        this.callbacks.onToast,
+        (e) => this.callbacks.onApiError?.(e, "projects")
+      );
     } finally {
       if (!signal.aborted) {
         this.busyIds.delete(id);
