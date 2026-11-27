@@ -29,7 +29,7 @@ True-scale **local UTM** 300–600 DPI print PDFs (`1:10,000`–`1:50,000`) · *
 Want to explore the Studio before self-hosting? **[GridMaps (`https://gridmaps.net`)](https://gridmaps.net)** is the official live hosted deployment powered by open-source **GridForge**:
 
 - **Zero install required:** Explore all 32 regional presets, compute live true-scale local UTM footprints & WMM2025 declination, run terrain-masked RF viewsheds & curved-Earth Fresnel link profiles, and generate free single-sheet 300 DPI demo PDFs directly in your browser.
-- **Full uncapped workflow:** Self-host in 30 seconds below (unlimited multi-sheet atlases, ATAK/Garmin/OsmAnd/GeoPackage device exports, and 29 air-gapped regional packs) — or deploy your own branded hosted instance using `GRIDFORGE_AUTH_MODE=hosted` and `GRIDFORGE_BRAND_NAME`.
+- **Full uncapped workflow:** Self-host in 30 seconds below (unlimited multi-sheet atlases, ATAK/Garmin/OsmAnd/GeoPackage device exports, and 29 fully offline regional packs) — or deploy your own branded hosted instance using `GRIDFORGE_AUTH_MODE=hosted` and `GRIDFORGE_BRAND_NAME`.
 
 ---
 
@@ -59,7 +59,7 @@ Open **<http://127.0.0.1:8080>** in your browser (`127.0.0.1` loopback by defaul
 | **True Protractor Scale (Local UTM)** | Projects every sheet into its native local **UTM zone (`EPSG:326xx`/`327xx`)** — straight, orthogonal 1 km MGRS grid squares verified within **≤ 0.02 mm** (`0.000 mm` skew) against a physical map protractor. | Renders Web Mercator (`EPSG:3857`) where scale distorts with latitude and grid squares warp. |
 | **4 Purpose-Built Cartographic Themes** | `172` native QGIS 3.40 `.qml` styles across **Color**, **Laser B&W** (cross-hatched monochrome), **Night-Red** (zero red/orange ink for red headlamps), and **Alpine** (glacier-blue contours + avalanche slope bands). | Single web basemap or post-process grayscale that turns contours and trails into gray mud. |
 | **Built-In RF Comms & Tactical Planning** | Multi-observer GDAL **RF Viewsheds**, curved-Earth ($k = 4/3$) **1st Fresnel Link Profiles** & printable **Link Card PDFs** (LoRa/Meshtastic, UHF, VHF), plus live **Ruler**, **Range Rings**, **Sector AOIs**, and **100 mm Romer Calibration** pages. | Disconnected RF tools, manual spreadsheet bearings, and zero print integration. |
-| **Multi-Continent LiDAR + Turnkey Air-Gap** | Streams zero-auth **USGS 3DEP 1 m**, **Canada NRCan HRDEM 1 m/2 m**, **QLD 1 m/2 m / GA 5 m LiDAR**, **NZ LINZ 1 m LiDAR**, & **Copernicus GLO-30** on demand (preserving true **`1.0 m` LiDAR** & **`2 m` / `5 ft` contours** on `1:10k`/`1:12.5k` sheets) — or runs **100% offline** via **29 regional packs** with auto-generated offline terrain `.mbtiles` basemaps. | Multi-terabyte Planet/DEM mirroring upfront or internet-only cloud tile dependencies. |
+| **Multi-Continent LiDAR + 100% Offline Mode** | Streams zero-auth **USGS 3DEP 1 m**, **Canada NRCan HRDEM 1 m/2 m**, **QLD 1 m/2 m / GA 5 m LiDAR**, **NZ LINZ 1 m LiDAR**, & **Copernicus GLO-30** on demand (preserving true **`1.0 m` LiDAR** & **`2 m` / `5 ft` contours** on `1:10k`/`1:12.5k` sheets) — or runs **100% offline (air-gapped)** via **29 regional packs** with auto-generated local terrain `.mbtiles` basemaps. | Multi-terabyte Planet/DEM mirroring upfront or internet-only cloud tile dependencies. |
 | **One Spec → Print + Every Field Device** | Produces **300 / 450 / 600 DPI** vector print PDFs / GeoPDFs (`1:10,000` through `1:50,000`, single sheets, `2×2`–`3×3` Atlases, GPX Strip Atlases), **ATAK `.mbtiles`**, **Garmin `.kmz`**, **OGC GeoPackage `.gpkg`**, **OsmAnd `.sqlitedb`**, and an all-in-one **Field Bundle `.zip`** (with GPX 1.1). | Separate disconnected exporters with mismatched bounds, datums, and grids. |
 | **16 GB Laptop / Homelab Friendly** | Zero Redis, SQLite WAL queue + Saved Trip Projects, **`~150 MiB` combined idle RAM** (`web` `~77 MiB` + `worker` `~73 MiB`), local-first CSRF/Host hardening, and ephemeral PyQGIS subprocesses (`< 2 GB` peak RSS). | Heavy multi-service stacks that leak memory or OOM on consumer hardware. |
 | **100% Open & Cleanly Licensed Data** | GPL-3.0 code using strictly OpenStreetMap (ODbL), US Public Domain (USGS/USFS/NPS/PAD-US/FEMA/FAA/NOAA), OGL-Canada (NRCan/Parks Canada/DataBC/ECCC), Australian Federal & 8-State CC BY, NZ LINZ/DOC CC BY 4.0, and NOAA WMM2025. | Proprietary basemaps, API keys, or restrictive `CC BY-NC` / commercial terms. |
@@ -139,7 +139,7 @@ Inspect true vector contours, crisp MGRS grid labels, military collars, and RF F
 - **100 mm Scale Calibration & MGRS Romer Sheet (`--calibration-page`):** Exact `100.00 mm` H/V verification rulers (`0.000 mm` error/skew), `4.00 in` bar, cut-out `1:24k / 1:25k / 1:50k` MGRS Romers, and `360° / 6400 mil` protractor.
 - **Waypoints, Route Cards & Tactical Graphics (`⌖ WP`, `📏 Ruler`, `◎ Ring`, `⬠ Sector`):** Drop categorized waypoints (`WP`, `Camp`, `Water`, `Hazard`, `LZ`) for a printed **Tactical Route Card**, measure live geodesic distance + True/Grid/Mag azimuth + mils + slope `%` grade (`Pin to PDF`), drop concentric **Range Rings** (`--range-ring`), and draw hatched **Sector AOIs** rendered crisply onto 300 DPI PDFs.
 
-### Air-Gapped Packs, Auto Offline Basemaps & Universal Field Device Exports
+### 100% Offline Packs (Air-Gapped), Local Basemaps & Universal Field Device Exports
 
 - **29 Curated Regional Packs (`gridforge pack` & Studio Manage Packs):** Build streaming `< 300 MB` RAM offline packs across **AU Tactical (7)**, **AU States (8)**, **New Zealand (6)**, **North America (8)**, or any custom BBox. Strict offline enforcement guarantees partial packs never silently fall back online unless explicitly completed with `--offline-dem` / `--offline-pbf`.
 - **Turnkey Pure-GDAL Offline Basemaps (`gridforge basemap-pack`, `include_basemap=true`):** Generates hypsometric color-relief + hillshade `.mbtiles` automatically inside each pack (discovered via `/api/basemap/info?pack_id=` or `GRIDFORGE_BASEMAP_MBTILES=/data/basemap.mbtiles`) so Studio operates with **zero external internet requests**.
@@ -219,7 +219,7 @@ docker run --rm -v "$(pwd)/out:/out" -v "$(pwd)/examples:/examples:ro" ghcr.io/j
     --title "KATOOMBA BUSHWALK STRIP ATLAS" \
     --output /out/katoomba_strip_atlas.pdf
 
-# 6. Build a Turnkey Air-Gapped Regional Pack (with Offline Terrain Basemap .mbtiles) & Render 100% Offline
+# 6. Build a Fully Offline Regional Pack (with Local Terrain Basemap .mbtiles) & Render Without Internet
 docker run --rm ghcr.io/jremick/gridforge:latest gridforge pack list-regions
 docker run --rm -v "$(pwd)/packs:/data/packs" ghcr.io/jremick/gridforge:latest \
   gridforge pack build --region blue-mountains --output /data/packs/blue-mountains
@@ -246,7 +246,7 @@ GridForge binds to IPv4 loopback (`127.0.0.1:8080`) by default, disables wildcar
 - **Private Tailnet:** See [deploy/tailscale-serve.md](deploy/tailscale-serve.md)
 - **Authenticated HTTPS Reverse Proxy:** See [deploy/Caddyfile.example](deploy/Caddyfile.example) and [deploy/traefik-compose.override.yml](deploy/traefik-compose.override.yml) — set `GRIDFORGE_ALLOWED_HOSTS`, preserve original `Host` (with port), set `X-Forwarded-Proto`, and configure `FORWARDED_ALLOW_IPS`.
 - **Public Hosted Multi-Tenant Mode (`GRIDFORGE_AUTH_MODE=hosted`):** See [deploy/hosted-mode.md](deploy/hosted-mode.md) — power a public deployment (like **[GridMaps](https://gridmaps.net)** on single-container Railway + Cloudflare Free) with SQLite-backed `Guest` / invite-only `Friend` / `Admin` roles, email/password + Google OAuth, Cloudflare Turnstile bot protection, per-role quotas & DPI caps, Admin usage dashboard & kill switch, automatic artifact TTL + LRU cache pruning, and custom instance branding via `GRIDFORGE_BRAND_NAME` / `GRIDFORGE_BRAND_SUBTITLE`.
-- **Air-Gapped Studio Basemap:** Building any regional pack with **Include Offline Basemap** automatically enables Studio's **Offline** basemap switcher via `/api/basemap/{z}/{x}/{y}.{ext}?pack_id=...`, or mount a global archive at `GRIDFORGE_BASEMAP_MBTILES=/data/basemap.mbtiles`.
+- **Fully Offline Studio Basemap:** Building any regional pack with **Include Offline Basemap** automatically enables Studio's **Offline** basemap switcher via `/api/basemap/{z}/{x}/{y}.{ext}?pack_id=...`, or mount a global archive at `GRIDFORGE_BASEMAP_MBTILES=/data/basemap.mbtiles`.
 
 ---
 
@@ -283,7 +283,7 @@ src/gridforge/
 ├── export/                # Atomic staged publication: ATAK MBTiles, Garmin KMZ, OGC GeoPackage, OsmAnd, Field Bundle .zip
 └── web/                   # FastAPI server (zero qgis imports), SameOrigin/TrustedHost, Projects & Shares CRUD, Basemap & Pack Manager
 web/                       # TypeScript + Vite + MapLibre GL JS Print Studio SPA + Copy CLI tests
-config/osmconf.ini         # Shared GDAL OSM driver schema for online & air-gapped parity
+config/osmconf.ini         # Shared GDAL OSM driver schema for online & fully offline parity
 assets/
 ├── icons/                 # 22 crisp self-contained military/topo/Outback/alpine/RF-observer SVG symbols
 └── styles/{color,bw,night-red,alpine}/  # 172 native QGIS 3.40 .qml styles across 4 themes

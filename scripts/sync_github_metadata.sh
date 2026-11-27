@@ -9,7 +9,7 @@ set -euo pipefail
 REPO="${1:-jremick/gridforge}"
 
 HOMEPAGE="https://gridmaps.net"
-DESCRIPTION="Live at gridmaps.net (GridMaps) — Open-source tactical & backcountry MGRS topographic map generator: true-scale UTM PDFs, 4 themes (Night-Red/Alpine), RF viewsheds & Fresnel cards, ATAK/Garmin/OsmAnd/GeoPackage, air-gapped packs across US, Canada, AU & NZ."
+DESCRIPTION="Live at gridmaps.net (GridMaps) — Open-source tactical & backcountry MGRS topographic map generator: true-scale UTM PDFs, 4 themes (Night-Red/Alpine), RF viewsheds & Fresnel cards, ATAK/Garmin/OsmAnd/GeoPackage, fully offline packs across US, Canada, AU & NZ."
 
 TOPICS=(
   atak
