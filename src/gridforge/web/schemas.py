@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -719,6 +719,18 @@ class AdminSettingsResponse(BaseModel):
 # Scoped Bearer API Keys (Personal Access Tokens)
 # ---------------------------------------------------------------------------
 
+ApiKeyScope = Literal[
+    "all",
+    "planning",
+    "jobs:read",
+    "jobs:write",
+    "projects:read",
+    "projects:write",
+    "shares:read",
+    "shares:write",
+]
+API_KEY_SCOPES: frozenset[str] = frozenset(get_args(ApiKeyScope))
+
 
 class ApiKeyRecord(BaseModel):
     """Public metadata for a user-scoped Bearer API key (never includes secret token)."""
@@ -726,7 +738,7 @@ class ApiKeyRecord(BaseModel):
     key_id: str
     name: str
     key_prefix: str
-    scopes: list[str] = Field(default_factory=lambda: ["all"])
+    scopes: list[str] = Field(default_factory=list)
     created_at: str
     expires_at: str | None = None
     revoked_at: str | None = None
@@ -755,9 +767,11 @@ class CreateApiKeyRequest(BaseModel):
         le=3650,
         description="Optional lifetime in days (1–3650). Set to null for a non-expiring key.",
     )
-    scopes: list[str] = Field(
+    scopes: list[ApiKeyScope] = Field(
         default_factory=lambda: ["all"],
-        description="Optional permission scopes (default: ['all']).",
+        min_length=1,
+        max_length=len(API_KEY_SCOPES) - 1,
+        description="Allowed Studio operations. Each write scope includes read access for the same resource. Use ['all'] by itself for all Studio operations.",
     )
 
     @field_validator("name")
@@ -767,6 +781,15 @@ class CreateApiKeyRequest(BaseModel):
         if not cleaned:
             raise ValueError("API key name must not be empty.")
         return cleaned
+
+    @field_validator("scopes")
+    @classmethod
+    def _validate_scopes(cls, scopes: list[ApiKeyScope]) -> list[ApiKeyScope]:
+        if "all" in scopes and len(scopes) != 1:
+            raise ValueError("The 'all' scope must be used by itself.")
+        if len(set(scopes)) != len(scopes):
+            raise ValueError("API key scopes must be unique.")
+        return scopes
 
 
 class CreateApiKeyResponse(BaseModel):

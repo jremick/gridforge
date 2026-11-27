@@ -303,30 +303,40 @@ Declared with `_meta.ui.visibility = ["app"]` so MCP hosts hide them from the LL
 
 ### Hosted Multi-Tenant Mode (`GRIDFORGE_AUTH_MODE=hosted`)
 
-Authenticated **Friend** and **Admin** accounts can mint scoped Bearer Personal Access Tokens (`gf_<token>`):
+Use a signed-in **Friend** or **Admin** session cookie to create, list and revoke Bearer Personal Access Tokens (`gf_<token>`).
 
 ```bash
-# 1. Mint a new API key (using an existing authenticated session cookie or API key)
+# 1. Mint a new API key using an authenticated session cookie
 curl -sS -X POST "https://<your-domain>/api/auth/api-keys" \
   -H "Content-Type: application/json" \
   -H "Origin: https://<your-domain>" \
   -b cookies.txt \
-  -d '{"name": "Claude Desktop", "expires_days": 90}'
+  -d '{"name": "Claude Desktop", "expires_days": 90, "scopes": ["planning", "jobs:write"]}'
 
 # 2. List active API keys (shows prefix & last_used_at; never plaintext)
 curl -sS "https://<your-domain>/api/auth/api-keys" \
-  -H "Authorization: Bearer gf_<your-api-key>"
+  -b cookies.txt
 
 # 3. Revoke a key immediately
 curl -sS -X DELETE "https://<your-domain>/api/auth/api-keys/<key_id>" \
-  -H "Authorization: Bearer gf_<your-api-key>"
+  -H "Origin: https://<your-domain>" \
+  -b cookies.txt
 ```
 
-Key security properties:
-- **Returned once, hashed at rest:** The plaintext `gf_...` token is shown only in the `201 Created` response and stored as a SHA-256 hash in SQLite (`api_keys` table).
-- **Header support:** Pass either `Authorization: Bearer gf_...` or `X-API-Key: gf_...` on both `/api/*` and `/mcp`.
-- **Automatic Turnstile bypass with full quota parity:** Valid API keys authenticate directly as the owning `friend` or `admin` user — bypassing guest-only Cloudflare Turnstile checks while enforcing all per-role daily render caps, hourly preview limits, DPI/grid caps, and tenant isolation.
-- **Fail closed:** Invalid, revoked, expired, or disabled-user API keys always return `401 Unauthorized`.
+| Scope | Permitted operations |
+| :--- | :--- |
+| `planning` | Place search, footprint and strip-atlas planning, route and ruler metrics, RF link profiles and viewsheds. |
+| `jobs:read` | List and inspect the account's render jobs and fetch their artifacts and previews. |
+| `jobs:write` | Submit, cancel and delete the account's render jobs. Includes `jobs:read`. |
+| `projects:read` | List and open the account's saved projects. |
+| `projects:write` | Create, edit and delete the account's saved projects. Includes `projects:read`. |
+| `shares:read` | List the account's share snapshots. |
+| `shares:write` | Create and delete the account's share snapshots. Includes `shares:read`. Include `projects:read` to share a saved project. |
+| `all` | All of the scopes above. Omit `scopes` to use this default. Use `all` by itself when supplied explicitly. |
+
+Pass `Authorization: Bearer gf_...` or `X-API-Key: gf_...` on HTTP and MCP requests. Both transports enforce the same scopes, ownership and account quotas. Any valid PAT can read public discovery, public share links and its current authentication status. Key management, account changes, site administration and offline pack management use browser sessions. A valid key without the required permission receives `403`. Invalid, expired, revoked or disabled-account keys receive `401`.
+
+GridForge returns the plaintext token once and stores its SHA-256 hash. Existing `all` keys keep the Studio permissions above, including keys for which the old API converted an empty scope list to `all`. Replace any older key stored with an empty or unrecognized scope through a signed-in session.
 
 ### Single-Tenant Self-Hosted Mode (`GRIDFORGE_AUTH_MODE=none`)
 

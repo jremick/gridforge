@@ -147,11 +147,17 @@ def create_mcp_router(
 
         forwarded_headers = _extract_forwarded_auth_headers(request)
         eff_public_url = _infer_public_url(request, public_url)
+        client_addr = (
+            (str(request.client.host), int(request.client.port))
+            if request.client is not None and request.client.host
+            else None
+        )
 
         result_payload = await server.handle_payload(
             payload,
             request_headers=forwarded_headers,
             public_url=eff_public_url,
+            client_addr=client_addr,
         )
 
         # Resolve protocol version & session lifecycle

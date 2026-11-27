@@ -1625,10 +1625,10 @@ def prune_expired_usage_events(
 
 
 def _parse_scopes(raw: str | None) -> list[str]:
-    if not raw:
-        return ["all"]
-    parts = [part.strip() for part in str(raw).split(",") if part.strip()]
-    return parts or ["all"]
+    # An empty or malformed stored grant must never default to a full-access key.
+    if not isinstance(raw, str) or not raw:
+        return []
+    return [part.strip() for part in raw.split(",")]
 
 
 def _row_to_api_key_dict(row: sqlite3.Row, *, now_iso: str | None = None) -> dict[str, Any]:
@@ -1666,11 +1666,7 @@ def create_api_key(
 ) -> dict[str, Any]:
     """Insert a new personal access API key record for a user."""
     now = _utc_now_iso()
-    if isinstance(scopes, str):
-        scopes_str = ",".join(_parse_scopes(scopes))
-    else:
-        cleaned = [str(s).strip() for s in scopes if str(s).strip()]
-        scopes_str = ",".join(cleaned) if cleaned else "all"
+    scopes_str = scopes if isinstance(scopes, str) else ",".join(scopes)
     conn = _connect(db_path)
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -2081,11 +2077,12 @@ def atomic_check_and_record_rate_limit(
     limit: int | None,
     window_seconds: int = 3600,
     by_ip_only: bool = False,
+    global_limit: int | None = None,
     count_event_types: Sequence[str] | None = None,
     detail: dict[str, Any] | None = None,
     now: datetime | None = None,
 ) -> int:
-    """Atomically enforce a rolling-window rate limit and record the ``usage_events`` row."""
+    """Atomically enforce rolling-window actor and shared limits before recording usage."""
     ref_now = _resolve_now(now)
     now_iso = _dt_to_iso(ref_now)
     since_iso = _dt_to_iso(ref_now - timedelta(seconds=window_seconds))
@@ -2135,6 +2132,18 @@ def atomic_check_and_record_rate_limit(
                 raise QuotaLimitError(
                     429,
                     f"Rate limit ({limit} requests per {window_seconds // 60} min) exceeded.",
+                )
+
+        if global_limit is not None:
+            total = conn.execute(
+                f"SELECT COUNT(*) FROM usage_events WHERE {ev_clause} AND created_at >= ?",
+                (*ev_params, since_iso),
+            ).fetchone()[0]
+            if total >= global_limit:
+                conn.execute("COMMIT")
+                raise QuotaLimitError(
+                    429,
+                    f"Global rate limit ({global_limit} requests per {window_seconds // 60} min) exceeded.",
                 )
 
         conn.execute(

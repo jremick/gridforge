@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import httpx
 from fastapi.testclient import TestClient
 
 from gridforge.web import db, shares as shares_store
@@ -206,6 +209,31 @@ def test_share_size_cap_and_validation(tmp_path: Path) -> None:
             headers=_SAME_ORIGIN,
         )
         assert res.status_code == 413
+
+
+def test_share_streaming_body_cap(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path / "data", packs_dir=tmp_path / "packs")
+    headers = {**_SAME_ORIGIN, "Content-Type": "application/json"}
+    payload = json.dumps({"name": "Map", "state": _sample_state()}).encode()
+
+    async def upload_parts(*, over_limit: bool):
+        yield payload
+        yield b" " * (256 * 1024 - len(payload))
+        if over_limit:
+            yield b" "
+
+    async def check() -> None:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url=_BASE_URL) as client:
+            allowed = await client.post("/api/shares", headers=headers, content=upload_parts(over_limit=False))
+            assert allowed.status_code == 201
+            result = await client.post("/api/shares", headers=headers, content=upload_parts(over_limit=True))
+            assert "content-length" not in result.request.headers
+            assert result.status_code == 413
+            listed = await client.get("/api/shares")
+            assert len(listed.json()["shares"]) == 1
+
+    asyncio.run(check())
 
 
 def test_hosted_mode_share_public_read_tenant_isolation_and_rate_limit(
