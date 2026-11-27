@@ -120,8 +120,25 @@ export class AdminModal {
   private inviteEmailVal = "";
   private inviteRoleVal: AccountRole = "friend";
   private inviteExpiresVal = "72";
+  private readonly lifecycle = new AbortController();
+  private readonly signal: AbortSignal;
 
-  constructor(container: HTMLElement, callbacks: AdminModalCallbacks) {
+  constructor(
+    container: HTMLElement,
+    callbacks: AdminModalCallbacks,
+    externalSignal?: AbortSignal
+  ) {
+    this.signal = this.lifecycle.signal;
+    if (externalSignal) {
+      if (externalSignal.aborted) {
+        this.lifecycle.abort();
+      } else {
+        externalSignal.addEventListener("abort", () => this.lifecycle.abort(), {
+          once: true,
+          signal: this.signal,
+        });
+      }
+    }
     this.root = container;
     this.callbacks = callbacks;
     this.root.className = "gf-modal-backdrop hidden";
@@ -176,7 +193,7 @@ export class AdminModal {
       if (e.target === this.root) {
         this.close();
       }
-    });
+    }, { signal: this.signal });
 
     this.q("[data-role='modal-close']").addEventListener("click", () => {
       this.close();
@@ -291,15 +308,23 @@ export class AdminModal {
     this.focusTrap.deactivate();
   }
 
+  dispose(): void {
+    this.lifecycle.abort();
+    this.close();
+    this.root.replaceChildren();
+  }
+
   async refreshAll(): Promise<void> {
+    if (this.signal.aborted) return;
     this.loading = true;
     this.loadError = null;
     this.renderContent();
 
     const [usageRes, usersRes] = await Promise.allSettled([
-      fetchAdminUsage(),
-      fetchAdminUsers(),
+      fetchAdminUsage(this.signal),
+      fetchAdminUsers(this.signal),
     ]);
+    if (this.signal.aborted) return;
 
     this.loading = false;
 
@@ -347,7 +372,8 @@ export class AdminModal {
     try {
       const res = await updateAdminSettings({
         public_renders_paused: nextPaused,
-      });
+      }, this.signal);
+      if (this.signal.aborted) return;
       this.publicPaused = res.public_renders_paused;
       if (this.usage) {
         this.usage = {
@@ -366,13 +392,16 @@ export class AdminModal {
         "info"
       );
     } catch (err) {
+      if (this.signal.aborted) return;
       const msg =
         err instanceof Error ? err.message : "Failed to update settings";
       this.callbacks.onToast(msg, "error");
       this.callbacks.onApiError?.(err);
     } finally {
-      this.savingSettings = false;
-      this.renderKillSwitch();
+      if (!this.signal.aborted) {
+        this.savingSettings = false;
+        this.renderKillSwitch();
+      }
     }
   }
 
@@ -392,19 +421,23 @@ export class AdminModal {
         email: this.inviteEmailVal.trim() || undefined,
         role: this.inviteRoleVal,
         expires_hours: Math.round(hours),
-      });
+      }, this.signal);
+      if (this.signal.aborted) return;
       this.lastCreatedInvite = res;
       this.inviteEmailVal = "";
       this.callbacks.onToast("Invite created", "success");
       await this.refreshAll();
     } catch (err) {
+      if (this.signal.aborted) return;
       const msg =
         err instanceof Error ? err.message : "Failed to create invite";
       this.callbacks.onToast(msg, "error");
       this.callbacks.onApiError?.(err);
     } finally {
-      this.creatingInvite = false;
-      this.renderContent();
+      if (!this.signal.aborted) {
+        this.creatingInvite = false;
+        this.renderContent();
+      }
     }
   }
 
@@ -414,17 +447,21 @@ export class AdminModal {
     this.renderContent();
 
     try {
-      await revokeAdminInvite(inviteId);
+      await revokeAdminInvite(inviteId, this.signal);
+      if (this.signal.aborted) return;
       this.callbacks.onToast("Invite revoked", "info");
       await this.refreshAll();
     } catch (err) {
+      if (this.signal.aborted) return;
       const msg =
         err instanceof Error ? err.message : "Failed to revoke invite";
       this.callbacks.onToast(msg, "error");
       this.callbacks.onApiError?.(err);
     } finally {
-      this.busyInviteIds.delete(inviteId);
-      this.renderContent();
+      if (!this.signal.aborted) {
+        this.busyInviteIds.delete(inviteId);
+        this.renderContent();
+      }
     }
   }
 
@@ -457,19 +494,23 @@ export class AdminModal {
       const res = await updateAdminUser(userId, {
         daily_render_limit: dailyParsed,
         hourly_preview_limit: prevParsed,
-      });
+      }, this.signal);
+      if (this.signal.aborted) return;
       this.users = this.users.map((u) =>
         u.user_id === userId ? res.user : u
       );
       this.callbacks.onSettingsChanged();
       this.callbacks.onToast(`Updated quotas for ${res.user.email}`, "success");
     } catch (err) {
+      if (this.signal.aborted) return;
       const msg = err instanceof Error ? err.message : "Failed to update user";
       this.callbacks.onToast(msg, "error");
       this.callbacks.onApiError?.(err);
     } finally {
-      this.busyUserIds.delete(userId);
-      this.renderContent();
+      if (!this.signal.aborted) {
+        this.busyUserIds.delete(userId);
+        this.renderContent();
+      }
     }
   }
 
@@ -482,7 +523,8 @@ export class AdminModal {
     this.renderContent();
 
     try {
-      const res = await updateAdminUser(userId, { disabled: nextDisabled });
+      const res = await updateAdminUser(userId, { disabled: nextDisabled }, this.signal);
+      if (this.signal.aborted) return;
       this.users = this.users.map((u) =>
         u.user_id === userId ? res.user : u
       );
@@ -492,13 +534,16 @@ export class AdminModal {
         "info"
       );
     } catch (err) {
+      if (this.signal.aborted) return;
       const msg =
         err instanceof Error ? err.message : "Failed to update user status";
       this.callbacks.onToast(msg, "error");
       this.callbacks.onApiError?.(err);
     } finally {
-      this.busyUserIds.delete(userId);
-      this.renderContent();
+      if (!this.signal.aborted) {
+        this.busyUserIds.delete(userId);
+        this.renderContent();
+      }
     }
   }
 

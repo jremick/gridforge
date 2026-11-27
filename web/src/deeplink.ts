@@ -116,6 +116,7 @@ export interface UrlHydrationResult {
   hasCustomBasemap: boolean;
   zoom: number | null;
   shareId: string | null;
+  remainingSearch: string;
 }
 
 export interface SerializedUrlResult {
@@ -300,6 +301,18 @@ export function hydrateStateFromSearch(
 ): UrlHydrationResult {
   const params = new URLSearchParams(search);
   const shareId = extractShareIdFromSearch(search);
+  if (!shareId) {
+    params.delete("share");
+  } else {
+    params.set("share", shareId);
+  }
+
+  // Consume every supported direct-link parameter, including invalid or repeated values.
+  const take = (name: string): string | null => {
+    const value = params.get(name);
+    params.delete(name);
+    return value;
+  };
 
   let hasCustomCenter = false;
   let needsFlyToResolvedCenter = false;
@@ -307,7 +320,7 @@ export function hydrateStateFromSearch(
   let hasCustomBasemap = false;
   let zoom: number | null = null;
 
-  const centerParam = params.get("center")?.trim();
+  const centerParam = take("center")?.trim();
   if (centerParam) {
     hasCustomCenter = true;
     state.center = centerParam;
@@ -320,13 +333,13 @@ export function hydrateStateFromSearch(
     }
   }
 
-  const bmParam = params.get("bm")?.trim().toLowerCase();
+  const bmParam = take("bm")?.trim().toLowerCase();
   if (bmParam && VALID_BASEMAPS.has(bmParam)) {
     basemap = bmParam as BasemapId;
     hasCustomBasemap = true;
   }
 
-  const zRaw = params.get("z");
+  const zRaw = take("z");
   if (zRaw !== null && zRaw.trim() !== "") {
     const zVal = Number(zRaw);
     if (Number.isFinite(zVal)) {
@@ -334,52 +347,52 @@ export function hydrateStateFromSearch(
     }
   }
 
-  const scaleParam = Number(params.get("scale"));
+  const scaleParam = Number(take("scale"));
   if (VALID_SCALES.has(scaleParam)) {
     state.scale = scaleParam;
   }
 
-  const paperParam = params.get("paper")?.toLowerCase();
+  const paperParam = take("paper")?.toLowerCase();
   if (paperParam && VALID_PAPERS.has(paperParam)) {
     state.paper = paperParam as PaperSize;
   }
 
-  const orientParam = params.get("orientation")?.toLowerCase();
+  const orientParam = take("orientation")?.toLowerCase();
   if (orientParam === "portrait" || orientParam === "landscape") {
     state.orientation = orientParam as Orientation;
   }
 
-  const modeParam = params.get("mode")?.toLowerCase();
+  const modeParam = take("mode")?.toLowerCase();
   if (modeParam && VALID_MODES.has(modeParam)) {
     state.color_mode = modeParam as ColorMode;
   }
 
-  const unitsParam = params.get("units")?.toLowerCase();
+  const unitsParam = take("units")?.toLowerCase();
   if (unitsParam === "metric" || unitsParam === "imperial") {
     state.units = unitsParam as Units;
   }
 
-  const dpiParam = Number(params.get("dpi"));
+  const dpiParam = Number(take("dpi"));
   if (VALID_DPIS.has(dpiParam)) {
     state.dpi = dpiParam;
   }
 
-  const exportDpiParam = Number(params.get("export_dpi"));
+  const exportDpiParam = Number(take("export_dpi"));
   if (VALID_DPIS.has(exportDpiParam)) {
     state.outputs.export_dpi = exportDpiParam;
   }
 
-  const demParam = params.get("dem")?.toLowerCase();
+  const demParam = take("dem")?.toLowerCase();
   if (demParam && VALID_DEMS.has(demParam)) {
     state.dem_source = demParam as DemSourceKind;
   }
 
-  const packParam = params.get("pack")?.trim();
+  const packParam = take("pack")?.trim();
   if (packParam && PACK_ID_RE.test(packParam)) {
     state.pack_id = packParam;
   }
 
-  const gridParam = params.get("grid")?.toLowerCase();
+  const gridParam = take("grid")?.toLowerCase();
   if (gridParam) {
     const match = /^([1-3])x([1-3])$/.exec(gridParam);
     if (match) {
@@ -391,12 +404,12 @@ export function hydrateStateFromSearch(
     }
   }
 
-  const titleParam = params.get("title")?.trim();
+  const titleParam = take("title")?.trim();
   if (titleParam) {
     state.title = titleParam.slice(0, 80);
   }
 
-  const auParam = params.get("au")?.trim();
+  const auParam = take("au")?.trim();
   if (auParam) {
     state.au_overlays = auParam
       .split(",")
@@ -404,7 +417,7 @@ export function hydrateStateFromSearch(
       .filter((s): s is AUOverlayKind => VALID_AU_OV.has(s));
   }
 
-  const nzParam = params.get("nz")?.trim();
+  const nzParam = take("nz")?.trim();
   if (nzParam) {
     state.nz_overlays = nzParam
       .split(",")
@@ -412,7 +425,7 @@ export function hydrateStateFromSearch(
       .filter((s): s is NZOverlayKind => VALID_NZ_OV.has(s));
   }
 
-  const caParam = params.get("ca")?.trim();
+  const caParam = take("ca")?.trim();
   if (caParam) {
     state.ca_overlays = caParam
       .split(",")
@@ -420,7 +433,7 @@ export function hydrateStateFromSearch(
       .filter((s): s is CAOverlayKind => VALID_CA_OV.has(s));
   }
 
-  const usParam = params.get("us")?.trim();
+  const usParam = take("us")?.trim();
   if (usParam) {
     state.us_overlays = usParam
       .split(",")
@@ -429,22 +442,22 @@ export function hydrateStateFromSearch(
   }
 
   // Cartography options
-  const contoursParam = params.get("contours")?.trim().toLowerCase();
+  const contoursParam = take("contours")?.trim().toLowerCase();
   if (contoursParam && VALID_DENSITIES.has(contoursParam)) {
     state.carto.contour_density = contoursParam as DensityLevel;
   }
 
-  const hillshadeParam = params.get("hillshade")?.trim().toLowerCase();
+  const hillshadeParam = take("hillshade")?.trim().toLowerCase();
   if (hillshadeParam && VALID_HILLSHADES.has(hillshadeParam)) {
     state.carto.hillshade_strength = hillshadeParam as HillshadeStrength;
   }
 
-  const labelsParam = params.get("labels")?.trim().toLowerCase();
+  const labelsParam = take("labels")?.trim().toLowerCase();
   if (labelsParam && VALID_DENSITIES.has(labelsParam)) {
     state.carto.label_density = labelsParam as DensityLevel;
   }
 
-  const hideParam = params.get("hide")?.trim();
+  const hideParam = take("hide")?.trim();
   if (hideParam) {
     const hidden = new Set(
       hideParam.split(",").map((s) => s.trim().toLowerCase())
@@ -456,13 +469,13 @@ export function hydrateStateFromSearch(
     }
   }
 
-  const slopeVal = parseBoolParam(params.get("slope"));
+  const slopeVal = parseBoolParam(take("slope"));
   if (slopeVal !== null) {
     state.carto.show_slope_shading = slopeVal;
   }
 
   // Output format options
-  const outParam = params.get("out")?.trim();
+  const outParam = take("out")?.trim();
   if (outParam) {
     const requested = new Set(
       outParam
@@ -493,49 +506,49 @@ export function hydrateStateFromSearch(
     }
   }
 
-  const mbfmtParam = params.get("mbfmt")?.trim().toLowerCase();
+  const mbfmtParam = take("mbfmt")?.trim().toLowerCase();
   if (mbfmtParam === "png" || mbfmtParam === "jpg") {
     state.outputs.mbtiles_format = mbfmtParam as MBTilesFormat;
   }
 
-  const garminParam = params.get("garmin")?.trim().toLowerCase();
+  const garminParam = take("garmin")?.trim().toLowerCase();
   if (garminParam === "standard" || garminParam === "modern") {
     state.outputs.garmin_profile = garminParam as GarminProfile;
   }
 
-  const dgridVal = parseBoolParam(params.get("dgrid"));
+  const dgridVal = parseBoolParam(take("dgrid"));
   if (dgridVal !== null) {
     state.outputs.include_grid_on_digital = dgridVal;
   }
 
   // Booklet / print supplement options
-  const calVal = parseBoolParam(params.get("cal"));
+  const calVal = parseBoolParam(take("cal"));
   if (calVal !== null) {
     state.include_calibration_page = calVal;
   }
-  const foldVal = parseBoolParam(params.get("fold"));
+  const foldVal = parseBoolParam(take("fold"));
   if (foldVal !== null) {
     state.show_fold_marks = foldVal;
   }
-  const indexVal = parseBoolParam(params.get("index"));
+  const indexVal = parseBoolParam(take("index"));
   if (indexVal !== null) {
     state.include_atlas_index = indexVal;
   }
-  const rcVal = parseBoolParam(params.get("rc"));
+  const rcVal = parseBoolParam(take("rc"));
   if (rcVal !== null) {
     state.include_route_card = rcVal;
   }
-  const epVal = parseBoolParam(params.get("ep"));
+  const epVal = parseBoolParam(take("ep"));
   if (epVal !== null) {
     state.include_elevation_profile = epVal;
   }
-  const rfcardVal = parseBoolParam(params.get("rfcard"));
+  const rfcardVal = parseBoolParam(take("rfcard"));
   if (rfcardVal !== null) {
     state.include_rf_link_card = rfcardVal;
   }
 
   // LOS / Viewshed observers
-  const losParam = params.get("los")?.trim();
+  const losParam = take("los")?.trim();
   if (losParam) {
     const parts = losParam.split(";").slice(0, MAX_URL_VIEWSHEDS);
     parts.forEach((raw, idx) => {
@@ -579,7 +592,7 @@ export function hydrateStateFromSearch(
   }
 
   // Waypoints: lat,lon,category,label[,notes]
-  const wpParam = params.get("wp")?.trim();
+  const wpParam = take("wp")?.trim();
   if (wpParam) {
     const parts = wpParam.split(";").slice(0, MAX_URL_WAYPOINTS);
     parts.forEach((raw, idx) => {
@@ -611,7 +624,7 @@ export function hydrateStateFromSearch(
   }
 
   // RF point-to-point links: fromLat,fromLon,toLat,toLon,fromH,toH,freq,k[,fromLabel,toLabel]
-  const rfParam = params.get("rf")?.trim();
+  const rfParam = take("rf")?.trim();
   if (rfParam) {
     const parts = rfParam.split(";").slice(0, MAX_URL_RF_LINKS);
     parts.forEach((raw, idx) => {
@@ -669,7 +682,7 @@ export function hydrateStateFromSearch(
   }
 
   // Tactical graphics (base64url compact JSON)
-  const tacParam = params.get("tac")?.trim();
+  const tacParam = take("tac")?.trim();
   if (tacParam) {
     const decoded = decodeBase64Url(tacParam);
     if (decoded) {
@@ -694,6 +707,7 @@ export function hydrateStateFromSearch(
     hasCustomBasemap,
     zoom,
     shareId,
+    remainingSearch: params.toString(),
   };
 }
 

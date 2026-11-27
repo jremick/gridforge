@@ -3036,6 +3036,30 @@ export class SidebarPanel {
     this.viewshedSectionEl.open = true;
   }
 
+  resetWorkspace(): void {
+    this.closeGeocodeMenu();
+    this.fileInput.value = "";
+    this.dropzoneEl.classList.remove("dragover");
+    this.ringRadiiInput.value = this.ringRadiiInput.defaultValue;
+    this.activePresetTab = "nsw-vic";
+    this.activePresetId = "blue-mountains";
+    this.presetTabsEl
+      .querySelectorAll<HTMLButtonElement>("[data-preset-tab]")
+      .forEach((b) =>
+        b.classList.toggle("active", b.dataset.presetTab === this.activePresetTab)
+      );
+    this.renderPresetCards();
+    this.setTitlePlaceholder("");
+    this.setRouteMetrics(null);
+    this.setRulerState([], null, false);
+    this.setSectorDraftCount(0);
+    this.setPacks([]);
+    this.setPlanningStrip(false);
+    this.setSubmitting(false);
+    this.setFormError(null);
+    this.syncControlsFromState();
+  }
+
   setCenterInput(value: string, clearPreset = false): void {
     if (clearPreset) {
       this.activePresetId = null;

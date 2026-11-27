@@ -31,7 +31,6 @@ import {
   buildDirectShareUrl,
   hydrateStateFromSearch,
   hydrateStateFromSnapshot,
-  serializeStateToParams,
 } from "./deeplink";
 import { GridForgeMap } from "./map";
 import {
@@ -79,10 +78,10 @@ import type {
 
 const FOOTPRINT_DEBOUNCE_MS = 180;
 const ROUTE_METRICS_DEBOUNCE_MS = 150;
-const ZOOM_URL_DEBOUNCE_MS = 260;
 const ACTIVE_JOBS_POLL_MS = 2000;
 const IDLE_JOBS_POLL_MS = 10000;
 const HEALTH_POLL_MS = 20000;
+const DEFAULT_RING_RADII_KM = [1, 3, 5];
 
 const KNOWN_AUTH_ERRORS: Record<string, string> = {
   access_denied: "Google sign-in was cancelled.",
@@ -133,7 +132,12 @@ class GridForgeApp {
   private readonly toolBarButtons: NodeListOf<HTMLButtonElement>;
 
   private session: SessionResponse = createDefaultNoneSession();
-  private sessionRefreshInFlight: Promise<SessionResponse> | null = null;
+  private sessionLoaded = false;
+  private sessionRefreshInFlight: Promise<SessionResponse | null> | null = null;
+  private sessionRefreshAbort: AbortController | null = null;
+  private sessionMutationInFlight: Promise<SessionResponse> | null = null;
+  private sessionChannel: BroadcastChannel | null = null;
+  private workspaceRequests = new AbortController();
   private pendingInviteToken: string | null;
   private pendingAuthError: string | null;
   private sidebarCollapsed = false;
@@ -143,19 +147,16 @@ class GridForgeApp {
   private projectsOpen = false;
   private interactionMode: MapInteractionMode = "pan";
   private activeBasemap: BasemapId = DEFAULT_BASEMAP;
-  private currentMapZoom: number = DEFAULT_MAP_ZOOM;
   private hasExplicitUrlZoom = false;
   private pendingOfflineBasemapFromUrl = false;
   private activeShareId: string | null = null;
-  private suppressZoomSyncUntil = 0;
-  private zoomSyncTimer: number | null = null;
   private latestFootprint: FootprintResponse | null = null;
   private jobs: JobRecord[] = [];
   private readonly initialFlyToResolved: boolean;
 
   private rulerPoints: { lat: number; lon: number }[] = [];
   private rulerMetrics: RulerMetricsResponse | null = null;
-  private defaultRingRadiiKm: number[] = [1, 3, 5];
+  private defaultRingRadiiKm = DEFAULT_RING_RADII_KM;
   private sectorDraft: [number, number][] = [];
   private rfPendingFrom: { lat: number; lon: number; label: string } | null =
     null;
@@ -173,35 +174,26 @@ class GridForgeApp {
   private rfLinkSeq = 1;
 
   constructor(root: HTMLElement) {
-    this.pendingInviteToken = extractInviteTokenFromSearch(
-      window.location.search
-    );
-    const rawAuthError = extractAuthErrorFromSearch(window.location.search);
+    const launchUrl = new URL(window.location.href);
+    this.pendingInviteToken = extractInviteTokenFromSearch(launchUrl.search);
+    const rawAuthError = extractAuthErrorFromSearch(launchUrl.search);
     this.pendingAuthError = rawAuthError
       ? (KNOWN_AUTH_ERRORS[rawAuthError.toLowerCase()] ??
           "Sign-in could not be completed. Please try again.")
       : null;
-    // Strip sensitive invite tokens & auth_error params from address bar / history / Referer immediately.
-    if (this.pendingInviteToken || rawAuthError) {
-      const cleanedParams = new URLSearchParams(window.location.search);
-      cleanedParams.delete("invite");
-      cleanedParams.delete("invite_token");
-      cleanedParams.delete("auth_error");
-      cleanedParams.delete("error");
-      const qs = cleanedParams.toString();
-      const nextUrl = `${window.location.pathname}${qs ? `?${qs}` : ""}${window.location.hash}`;
-      window.history.replaceState(null, "", nextUrl);
+    const urlHydration = hydrateStateFromSearch(launchUrl.search, this.state);
+    // Use inbound map settings and authentication parameters once.
+    const remainingParams = new URLSearchParams(urlHydration.remainingSearch);
+    for (const key of ["invite", "invite_token", "auth_error", "error"]) {
+      remainingParams.delete(key);
     }
-    const urlHydration = hydrateStateFromSearch(
-      window.location.search,
-      this.state
-    );
+    if (remainingParams.toString() !== launchUrl.searchParams.toString()) {
+      launchUrl.search = remainingParams.toString();
+      window.history.replaceState(window.history.state, "", launchUrl);
+    }
     this.initialFlyToResolved = urlHydration.needsFlyToResolvedCenter;
     this.activeShareId = urlHydration.shareId;
-    if (urlHydration.zoom !== null) {
-      this.currentMapZoom = urlHydration.zoom;
-      this.hasExplicitUrlZoom = true;
-    }
+    this.hasExplicitUrlZoom = urlHydration.zoom !== null;
     if (urlHydration.hasCustomBasemap) {
       if (urlHydration.basemap === "offline") {
         this.pendingOfflineBasemapFromUrl = true;
@@ -212,7 +204,6 @@ class GridForgeApp {
     }
     this.viewshedSeq = this.state.viewsheds.length + 1;
     this.rfLinkSeq = this.state.rfLinks.length + 1;
-    this.suppressZoomSyncUntil = performance.now() + 900;
 
     root.innerHTML = `
       <div class="gf-shell" data-role="shell">
@@ -325,9 +316,7 @@ class GridForgeApp {
     this.adminModalEl = this.q(root, "[data-role='admin-modal']");
 
     this.authModal = new AuthModal(this.q(root, "[data-role='auth-modal']"), {
-      onSessionChanged: (nextSession) => {
-        this.applySession(nextSession);
-      },
+      changeSession: (request) => this.changeSession(request),
       onOpenAdmin: () => void this.openAdminModal(),
       onToast: (msg, kind) => this.showToast(msg, kind),
     });
@@ -353,7 +342,7 @@ class GridForgeApp {
         onCenterSubmit: (centerText) => {
           this.clearStripPlanInternal(false);
           this.state.center = centerText;
-          this.syncUrlFromState();
+          this.workspaceEdited();
           this.requestFootprintImmediate({
             flyToResult: true,
             syncMarker: true,
@@ -364,7 +353,7 @@ class GridForgeApp {
           this.showToast(`No place found for "${query}"`, "error"),
         onPresetSelect: (preset) => this.applyPreset(preset),
         onFootprintParamsChange: (opts) => {
-          this.syncUrlFromState();
+          this.workspaceEdited();
           if (this.state.stripPlan && this.state.overlayFile) {
             void this.runStripPlan({ fitAfterLoad: true, silentToast: true });
           } else if (opts?.fitAfterLoad) {
@@ -381,7 +370,7 @@ class GridForgeApp {
           }
         },
         onStateChange: () => {
-          this.syncUrlFromState();
+          this.workspaceEdited();
           if (this.state.stripPlan) {
             this.map.updateFootprint(
               this.state.stripPlan.footprint_geojson,
@@ -404,6 +393,8 @@ class GridForgeApp {
             this.clearStripPlanInternal(true);
           } else if (this.state.stripPlan && file) {
             this.clearStripPlanInternal(true);
+          } else {
+            this.workspaceEdited();
           }
         },
         onAutoStripPlan: () =>
@@ -503,7 +494,7 @@ class GridForgeApp {
           this.state.lon = lon;
           this.state.center = formatCoords(lat, lon);
           this.sidebar.setCenterInput(this.state.center, true);
-          this.syncUrlFromState();
+          this.workspaceEdited();
           this.scheduleFootprint();
         },
         onMapMarkupClick: (lat, lon) => this.handleAddWaypoint(lat, lon),
@@ -516,17 +507,6 @@ class GridForgeApp {
         onCursorMove: (lat, lon) => {
           this.cursorCoordsEl.textContent = `${lat.toFixed(4)}, ${lon.toFixed(4)}`;
         },
-        onViewChange: (zoom) => {
-          this.currentMapZoom = Number(zoom.toFixed(2));
-          if (performance.now() < this.suppressZoomSyncUntil) return;
-          if (this.zoomSyncTimer !== null) {
-            window.clearTimeout(this.zoomSyncTimer);
-          }
-          this.zoomSyncTimer = window.setTimeout(() => {
-            this.zoomSyncTimer = null;
-            this.syncUrlFromState();
-          }, ZOOM_URL_DEBOUNCE_MS);
-        },
         onExternalTileFailure: () => {
           this.offlineReadyBadgeEl.classList.remove("hidden");
         },
@@ -536,7 +516,7 @@ class GridForgeApp {
           )
             ? "offline"
             : "opentopo";
-          this.selectBasemap(fallback, { syncUrl: false });
+          this.selectBasemap(fallback);
           this.showToast(
             "Vector HD tiles unavailable — switched back to raster basemap",
             "info"
@@ -546,7 +526,7 @@ class GridForgeApp {
       {
         initialLat: this.state.lat,
         initialLon: this.state.lon,
-        initialZoom: this.currentMapZoom,
+        initialZoom: urlHydration.zoom ?? DEFAULT_MAP_ZOOM,
         initialBasemap: this.activeBasemap,
       }
     );
@@ -731,10 +711,12 @@ class GridForgeApp {
       if (!btn) return;
       const id = btn.dataset.basemap as BasemapId;
       this.selectBasemap(id);
+      this.workspaceEdited();
     });
 
     this.offlineReadyBadgeEl.addEventListener("click", () => {
       this.selectBasemap("offline");
+      this.workspaceEdited();
       this.offlineReadyBadgeEl.classList.add("hidden");
       this.showToast("Switched to local Offline MBTiles basemap", "info");
     });
@@ -765,6 +747,7 @@ class GridForgeApp {
     });
 
     window.addEventListener("keydown", (e) => {
+      if (this.sessionMutationInFlight) return;
       const target = e.target as HTMLElement | null;
       const tag = target?.tagName;
       const inInput =
@@ -861,10 +844,7 @@ class GridForgeApp {
     });
   }
 
-  private selectBasemap(
-    id: BasemapId,
-    options: { syncUrl?: boolean } = {}
-  ): void {
+  private selectBasemap(id: BasemapId): void {
     this.activeBasemap = id;
     this.map.setBasemap(id);
     if (id === "offline") {
@@ -873,9 +853,6 @@ class GridForgeApp {
     this.basemapSwitcherEl
       .querySelectorAll<HTMLButtonElement>("[data-basemap]")
       .forEach((b) => b.classList.toggle("active", b.dataset.basemap === id));
-    if (options.syncUrl !== false) {
-      this.syncUrlFromState();
-    }
   }
 
   private updateMapHintForMode(): void {
@@ -954,9 +931,10 @@ class GridForgeApp {
   }
 
   private async bootstrap(): Promise<void> {
+    const { signal } = this.workspaceRequests;
     const initialShareId = this.activeShareId;
     const shareFetchPromise = initialShareId
-      ? fetchShareSnapshot(initialShareId).then(
+      ? fetchShareSnapshot(initialShareId, signal).then(
           (snapshot) => ({ ok: true as const, snapshot }),
           (error: unknown) => ({ ok: false as const, error })
         )
@@ -985,41 +963,13 @@ class GridForgeApp {
       void this.loadBasemapInfo(this.state.pack_id || null);
     }
 
-    const session = await this.loadSession();
-    this.applySession(session, { isBootstrap: true });
-
-    const turnstileSyncPromise = this.turnstile
-      .syncSession(session)
-      .catch((err) => {
-        console.warn("Turnstile session sync skipped during bootstrap:", err);
-      });
-
+    const session = await this.refreshSession();
     void this.loadHealth();
     void this.loadPacks(false);
-    void this.pollJobsOnce();
-
-    if (session.auth_mode === "hosted" && this.pendingInviteToken) {
-      const token = this.pendingInviteToken;
-      this.pendingInviteToken = null;
-      const bannerErr = this.pendingAuthError;
-      this.pendingAuthError = null;
-      if (!session.authenticated) {
-        this.authModal.open({
-          mode: "invite",
-          inviteToken: token,
-          bannerError: bannerErr,
-        });
-      }
-    } else if (this.pendingAuthError) {
-      const authErr = this.pendingAuthError;
-      this.pendingAuthError = null;
-      this.showToast(authErr, "error");
-      if (session.auth_mode === "hosted") {
-        this.authModal.open({
-          mode: "signin",
-          bannerError: authErr,
-        });
-      }
+    if (session) {
+      void this.pollJobsOnce({ sessionChecked: true });
+    } else {
+      this.scheduleNextJobsPoll();
     }
 
     window.setInterval(() => {
@@ -1038,24 +988,31 @@ class GridForgeApp {
         void this.pollJobsOnce();
       }
     });
+    window.addEventListener("focus", () => {
+      if (this.session.auth_mode === "hosted" && !document.hidden) {
+        void this.refreshSession();
+      }
+    });
+    window.addEventListener("pageshow", (event) => {
+      if (event.persisted && this.session.auth_mode === "hosted") {
+        void this.refreshSession({ force: true });
+      }
+    });
 
     if (shareFetchPromise) {
       const result = await shareFetchPromise;
+      if (signal.aborted || this.activeShareId !== initialShareId) return;
       if (result.ok) {
-        if (session.capabilities.turnstile_required) {
-          await turnstileSyncPromise;
-        }
         const labelName = result.snapshot.name.trim() || result.snapshot.share_id;
         this.applySnapshotState(result.snapshot.state, {
           toastLabel: `Loaded shared map "${labelName}"`,
           preserveShareId: result.snapshot.share_id,
           flyToCenter: false,
-          autoComputePreviews: false,
         });
         return;
       }
 
-      this.activeShareId = null;
+      this.setShareLocation(null);
       const errMsg =
         result.error instanceof ApiError && result.error.status === 404
           ? "Shared map link not found or expired."
@@ -1087,9 +1044,12 @@ class GridForgeApp {
   }
 
   private async openPacksModal(): Promise<void> {
+    if (!this.session.capabilities.packs_manage_allowed) return;
     if (!this.packsModal) {
+      const { signal } = this.workspaceRequests;
       const { PacksModal } = await import("./components/packsModal");
-      this.packsModal = new PacksModal(this.packsModalEl, {
+      if (signal.aborted || !this.session.capabilities.packs_manage_allowed) return;
+      this.packsModal ??= new PacksModal(this.packsModalEl, {
         onPacksUpdated: (packs) => {
           this.sidebar.setPacks(packs);
           void this.loadHealth();
@@ -1097,7 +1057,7 @@ class GridForgeApp {
         onSelectPack: (packId) => {
           this.state.pack_id = packId;
           this.sidebar.syncControlsFromState();
-          this.syncUrlFromState();
+          this.workspaceEdited();
           void this.loadBasemapInfo(packId);
           this.showToast(`Selected offline pack "${packId}"`, "success");
         },
@@ -1109,16 +1069,19 @@ class GridForgeApp {
         onApiError: (err) => {
           this.handleApiError(err, "packs", "Offline pack request failed");
         },
-      });
+      }, signal);
       this.packsModal.setManageAllowed(this.session.capabilities.packs_manage_allowed);
     }
     this.packsModal.open();
   }
 
   private async openAdminModal(): Promise<void> {
+    if (this.session.role !== "admin") return;
     if (!this.adminModal) {
+      const { signal } = this.workspaceRequests;
       const { AdminModal } = await import("./components/adminModal");
-      this.adminModal = new AdminModal(this.adminModalEl, {
+      if (signal.aborted || this.session.role !== "admin") return;
+      this.adminModal ??= new AdminModal(this.adminModalEl, {
         getCurrentUserId: () => this.session.user?.user_id ?? null,
         onSettingsChanged: () => {
           void this.refreshSession();
@@ -1128,53 +1091,179 @@ class GridForgeApp {
         onApiError: (err) => {
           this.handleApiError(err, "admin", "Admin request failed");
         },
-      });
+      }, signal);
       this.adminModal.syncPublicPaused(this.session.quotas.public_renders_paused);
     }
     this.adminModal.open();
   }
 
-  private async loadSession(): Promise<SessionResponse> {
-    if (this.sessionRefreshInFlight) {
+  private refreshSession(
+    options: { force?: boolean } = {}
+  ): Promise<SessionResponse | null> {
+    if (this.sessionMutationInFlight) {
+      const pending = this.sessionMutationInFlight.catch(() => null);
+      return options.force
+        ? pending.then(() => this.refreshSession(options))
+        : pending;
+    }
+    if (!options.force && this.sessionRefreshInFlight) {
       return this.sessionRefreshInFlight;
     }
-    let currentPromise: Promise<SessionResponse> | null = null;
-    currentPromise = (async (): Promise<SessionResponse> => {
-      try {
-        return await fetchSession();
-      } catch (err) {
-        if (err instanceof ApiError && err.status === 404) {
+    this.sessionRefreshAbort?.abort();
+    const controller = new AbortController();
+    this.sessionRefreshAbort = controller;
+    const refresh = fetchSession(controller.signal)
+      .catch((err: unknown) => {
+        if (controller.signal.aborted) return null;
+        if (!this.sessionLoaded && err instanceof ApiError && err.status === 404) {
           return createDefaultNoneSession();
         }
         console.warn("Failed to load session; keeping current session:", err);
-        return this.session;
-      } finally {
-        if (this.sessionRefreshInFlight === currentPromise) {
+        return null;
+      })
+      .then((next) => {
+        if (!next || controller.signal.aborted) return null;
+        this.applySession(next);
+        return next;
+      })
+      .finally(() => {
+        if (this.sessionRefreshAbort === controller) {
+          this.sessionRefreshAbort = null;
           this.sessionRefreshInFlight = null;
         }
-      }
-    })();
-    this.sessionRefreshInFlight = currentPromise;
-    return currentPromise;
+      });
+    this.sessionRefreshInFlight = refresh;
+    return refresh;
   }
 
-  private async refreshSession(): Promise<SessionResponse> {
-    const next = await this.loadSession();
-    this.applySession(next);
-    return next;
+  private sessionIdentityKey(session: SessionResponse): string {
+    return [
+      session.auth_mode,
+      session.authenticated ? "1" : "0",
+      session.role,
+      session.user?.user_id ?? "",
+      session.workspace_scope ?? "",
+    ].join("|");
   }
 
-  private applySession(
-    next: SessionResponse,
-    options: { isBootstrap?: boolean } = {}
-  ): void {
+  private changeSession(
+    request: () => Promise<SessionResponse>
+  ): Promise<SessionResponse> {
+    if (this.sessionMutationInFlight) {
+      return Promise.reject(new Error("An account change is already in progress."));
+    }
+    this.sessionRefreshAbort?.abort();
+    this.sessionRefreshAbort = null;
+    this.sessionRefreshInFlight = null;
+    this.shellEl.inert = true;
+    const change = Promise.resolve()
+      .then(request)
+      .then((next) => {
+        this.applySession(next);
+        this.sessionChannel?.postMessage({ scope: this.sessionIdentityKey(next) });
+        return next;
+      })
+      .finally(() => {
+        this.sessionMutationInFlight = null;
+        this.shellEl.inert = false;
+      });
+    this.sessionMutationInFlight = change;
+    return change;
+  }
+
+  private resetWorkspace(): void {
+    this.workspaceRequests.abort();
+    this.workspaceRequests = new AbortController();
+
+    for (const timer of [this.footprintTimer, this.metricsTimer, this.jobsPollTimer]) {
+      if (timer !== null) window.clearTimeout(timer);
+    }
+    this.footprintTimer = this.metricsTimer = this.jobsPollTimer = null;
+    this.footprintAbort?.abort();
+    this.stripAbort?.abort();
+    this.metricsAbort?.abort();
+    this.rulerAbort?.abort();
+    this.footprintAbort = this.stripAbort = this.metricsAbort = this.rulerAbort = null;
+    for (const controller of this.viewshedAborts.values()) controller.abort();
+    for (const controller of this.rfLinkAborts.values()) controller.abort();
+    this.viewshedAborts.clear();
+    this.rfLinkAborts.clear();
+    this.turnstile.unmount();
+
+    Object.assign(this.state, createInitialFormState());
+    this.latestFootprint = null;
+    this.rulerPoints = [];
+    this.rulerMetrics = null;
+    this.sectorDraft = [];
+    this.rfPendingFrom = null;
+    this.defaultRingRadiiKm = DEFAULT_RING_RADII_KM;
+    this.viewshedSeq = 1;
+    this.rfLinkSeq = 1;
+    this.pendingOfflineBasemapFromUrl = false;
+    this.pendingInviteToken = this.pendingAuthError = null;
+    this.setShareLocation(null);
+
+    this.setInteractionMode("pan");
+    this.map.resetWorkspace(this.state.lat, this.state.lon);
+    this.selectBasemap(DEFAULT_BASEMAP);
+    this.basemapSwitcherEl.querySelector("[data-basemap='offline']")?.remove();
+    this.offlineReadyBadgeEl.classList.add("hidden");
+    this.sidebar.resetWorkspace();
+    this.telemetry.resetWorkspace();
+    this.cursorCoordsEl.textContent = "—";
+    this.setFootprintError(null);
+
+    this.jobs = [];
+    this.drawer.setJobs([]);
+    this.setDrawerOpen(false);
+    this.projectsDrawer.clear();
+    this.setProjectsOpen(false);
+    this.authModal.clearAccountState();
+    this.packsModal?.dispose();
+    this.packsModal = null;
+    this.adminModal?.dispose();
+    this.adminModal = null;
+    this.toastContainerEl.replaceChildren();
+  }
+
+  private applySession(next: SessionResponse): void {
     const prev = this.session;
+    const isBootstrap = !this.sessionLoaded;
+    // Preserve focus and in-progress form edits during routine session polls.
+    if (!isBootstrap && JSON.stringify(prev) === JSON.stringify(next)) return;
     const tenantChanged =
-      !options.isBootstrap &&
-      (prev.role !== next.role ||
-        (prev.user?.user_id ?? null) !== (next.user?.user_id ?? null));
+      !isBootstrap &&
+      (prev.auth_mode !== next.auth_mode ||
+        prev.authenticated !== next.authenticated ||
+        prev.role !== next.role ||
+        (prev.user?.user_id ?? null) !== (next.user?.user_id ?? null) ||
+        (prev.workspace_scope ?? null) !== (next.workspace_scope ?? null));
 
+    if (tenantChanged) this.resetWorkspace();
     this.session = next;
+    this.sessionLoaded = true;
+    if (
+      next.auth_mode === "hosted" &&
+      !this.sessionChannel &&
+      typeof BroadcastChannel === "function"
+    ) {
+      this.sessionChannel = new BroadcastChannel("gridforge-session");
+      this.sessionChannel.addEventListener("message", (event: MessageEvent) => {
+        const data = event.data as { scope?: string } | string | null;
+        if (
+          data &&
+          typeof data === "object" &&
+          typeof data.scope === "string" &&
+          data.scope === this.sessionIdentityKey(this.session)
+        ) {
+          return;
+        }
+        void this.refreshSession({ force: true });
+      });
+      if (isBootstrap && next.authenticated) {
+        this.sessionChannel.postMessage({ scope: this.sessionIdentityKey(next) });
+      }
+    }
     const nextPrefOwnerId = next.authenticated
       ? (next.user?.user_id ?? null)
       : null;
@@ -1188,7 +1277,12 @@ class GridForgeApp {
     this.adminModal?.syncPublicPaused(next.quotas.public_renders_paused);
     this.syncGlobalStatusBanner(next);
 
-    if (!options.isBootstrap) {
+    if (
+      isBootstrap ||
+      tenantChanged ||
+      prev.capabilities.turnstile_required !== next.capabilities.turnstile_required ||
+      prev.capabilities.turnstile_sitekey !== next.capabilities.turnstile_sitekey
+    ) {
       void this.turnstile.syncSession(next);
     }
 
@@ -1202,22 +1296,19 @@ class GridForgeApp {
       );
       if (clamped.changed) {
         this.sidebar.syncControlsFromState();
-        this.syncUrlFromState({
-          preserveShare: Boolean(options.isBootstrap && this.activeShareId),
-        });
         const footprintChanged =
           prevGridCols !== this.state.grid_cols ||
           prevGridRows !== this.state.grid_rows ||
           prevPdf !== this.state.outputs.pdf ||
           clamped.resetItems.includes("atlas grid");
-        if (!options.isBootstrap || footprintChanged) {
+        if (!tenantChanged && (!isBootstrap || footprintChanged)) {
           this.requestFootprintImmediate({
-            flyToResult: options.isBootstrap ? this.initialFlyToResolved : false,
-            syncMarker: Boolean(options.isBootstrap),
+            flyToResult: isBootstrap && this.initialFlyToResolved,
+            syncMarker: isBootstrap,
             fitAfterLoad: false,
           });
         }
-        if (!options.isBootstrap && clamped.resetItems.length > 0) {
+        if (!isBootstrap && !tenantChanged && clamped.resetItems.length > 0) {
           this.showToast(
             `Adjusted selections for your account tier (${clamped.resetItems.join(", ")})`,
             "info"
@@ -1233,12 +1324,34 @@ class GridForgeApp {
       this.packsModal.close();
     }
 
+    if (isBootstrap) this.handleStartupAuth(next);
+
     if (tenantChanged) {
-      this.projectsDrawer.clear();
-      if (this.projectsOpen) {
-        void this.projectsDrawer.refresh();
+      this.requestFootprintImmediate({ flyToResult: false, syncMarker: true });
+      void this.loadBasemapInfo();
+      void this.loadPacks(false);
+      void this.pollJobsOnce({ sessionChecked: true });
+    }
+  }
+
+  private handleStartupAuth(session: SessionResponse): void {
+    const token = this.pendingInviteToken;
+    const authError = this.pendingAuthError;
+    this.pendingInviteToken = this.pendingAuthError = null;
+
+    if (session.auth_mode === "hosted" && token) {
+      if (!session.authenticated) {
+        this.authModal.open({
+          mode: "invite",
+          inviteToken: token,
+          bannerError: authError,
+        });
       }
-      void this.pollJobsOnce();
+    } else if (authError) {
+      this.showToast(authError, "error");
+      if (session.auth_mode === "hosted") {
+        this.authModal.open({ mode: "signin", bannerError: authError });
+      }
     }
   }
 
@@ -1282,8 +1395,7 @@ class GridForgeApp {
 
   private async handleSignOut(): Promise<void> {
     try {
-      const next = await logoutSession();
-      this.applySession(next);
+      await this.changeSession(logoutSession);
       this.showToast("Signed out", "info");
     } catch (err) {
       const msg = this.handleApiError(err, "general", "Failed to sign out");
@@ -1301,13 +1413,17 @@ class GridForgeApp {
 
     if (info.kind === "auth") {
       const wasAuthenticated = this.session.authenticated;
-      void this.refreshSession();
-      if (context !== "jobs-poll" || wasAuthenticated) {
-        this.authModal.open({
-          mode: "signin",
-          bannerError: msg || "Please sign in to continue.",
-        });
-      }
+      void this.refreshSession({ force: true }).finally(() => {
+        if (
+          !this.session.authenticated &&
+          (context !== "jobs-poll" || wasAuthenticated)
+        ) {
+          this.authModal.open({
+            mode: "signin",
+            bannerError: msg || "Please sign in to continue.",
+          });
+        }
+      });
       return msg;
     }
 
@@ -1340,8 +1456,10 @@ class GridForgeApp {
   }
 
   private async loadBasemapInfo(packId?: string | null): Promise<void> {
+    const { signal } = this.workspaceRequests;
     try {
-      const info = await fetchBasemapInfo(packId);
+      const info = await fetchBasemapInfo(packId, signal);
+      if (signal.aborted || (packId || "") !== this.state.pack_id) return;
       const existingBtn = this.basemapSwitcherEl.querySelector<HTMLButtonElement>(
         "[data-basemap='offline']"
       );
@@ -1351,7 +1469,7 @@ class GridForgeApp {
         if (existingBtn) existingBtn.remove();
         this.pendingOfflineBasemapFromUrl = false;
         if (this.activeBasemap === "offline") {
-          this.selectBasemap("opentopo", { syncUrl: false });
+          this.selectBasemap("opentopo");
         }
         return;
       }
@@ -1376,7 +1494,7 @@ class GridForgeApp {
 
       if (this.pendingOfflineBasemapFromUrl) {
         this.pendingOfflineBasemapFromUrl = false;
-        this.selectBasemap("offline", { syncUrl: false });
+        this.selectBasemap("offline");
       }
     } catch {
       // Offline basemap endpoint optional / unavailable
@@ -1384,34 +1502,32 @@ class GridForgeApp {
   }
 
   private getCurrentUrlViewState(): { basemap: BasemapId; zoom: number } {
-    const zoom = this.map?.getZoom?.() ?? this.currentMapZoom;
-    if (Number.isFinite(zoom)) {
-      this.currentMapZoom = Number(zoom.toFixed(2));
-    }
     return {
       basemap: this.activeBasemap,
-      zoom: this.currentMapZoom,
+      zoom: Number(this.map.getZoom().toFixed(2)),
     };
   }
 
-  private syncUrlFromState(options: { preserveShare?: boolean } = {}): void {
-    if (!options.preserveShare) {
-      this.activeShareId = null;
-      this.telemetry.setShortLinkResult(null);
-    } else if (this.activeShareId) {
+  private setShareLocation(shareId: string | null): void {
+    this.activeShareId = shareId;
+    const url = new URL(window.location.href);
+    if (shareId) {
+      url.searchParams.set("share", shareId);
+    } else if (url.searchParams.has("share")) {
+      url.searchParams.delete("share");
+    } else {
       return;
     }
+    if (url.href !== window.location.href) {
+      window.history.replaceState(window.history.state, "", url);
+    }
+  }
 
-    const originAndPath = `${window.location.origin}${window.location.pathname}`;
-    const serialized = serializeStateToParams(
-      this.state,
-      this.getCurrentUrlViewState(),
-      { basePathLength: originAndPath.length }
-    );
-    const nextUrl = serialized.queryString
-      ? `${window.location.pathname}?${serialized.queryString}`
-      : window.location.pathname;
-    window.history.replaceState(null, "", nextUrl);
+  private workspaceEdited(): void {
+    if (this.activeShareId) {
+      this.setShareLocation(null);
+      this.telemetry.setShortLinkResult(null);
+    }
     if (this.telemetry.isShareMenuOpen()) {
       this.refreshSharePopoverSummary();
     }
@@ -1480,26 +1596,24 @@ class GridForgeApp {
   }
 
   private async handleCreateShortShareLink(): Promise<void> {
+    const { signal } = this.workspaceRequests;
     this.telemetry.setShortLinkBusy(true);
     try {
       const snap = this.buildProjectSnapshot();
-      const created = await createShareSnapshot({
-        name: snap.suggestedName,
-        state: snap.state,
-      });
-      const fullUrl = `${window.location.origin}${window.location.pathname}?share=${encodeURIComponent(created.share_id)}`;
-      this.activeShareId = created.share_id;
-      window.history.replaceState(
-        null,
-        "",
-        `${window.location.pathname}?share=${encodeURIComponent(created.share_id)}`
+      const created = await createShareSnapshot(
+        { name: snap.suggestedName, state: snap.state },
+        signal
       );
+      if (signal.aborted) return;
+      const fullUrl = `${window.location.origin}${window.location.pathname}?share=${encodeURIComponent(created.share_id)}`;
+      this.setShareLocation(created.share_id);
       this.telemetry.setShortLinkResult({
         url: fullUrl,
         expiresLabel: this.formatShareExpiryLabel(created.expires_at),
       });
       this.copyText(fullUrl, "Short share link copied to clipboard");
     } catch (err) {
+      if (signal.aborted) return;
       const msg = this.handleApiError(
         err,
         "shares",
@@ -1507,18 +1621,22 @@ class GridForgeApp {
       );
       this.showToast(msg, "error");
     } finally {
-      this.telemetry.setShortLinkBusy(false);
+      if (!signal.aborted) this.telemetry.setShortLinkBusy(false);
     }
   }
 
   private async handleShareProject(project: SavedProject): Promise<void> {
+    const { signal } = this.workspaceRequests;
     try {
-      const created = await createShareSnapshot({
-        project_id: project.project_id,
-      });
+      const created = await createShareSnapshot(
+        { project_id: project.project_id },
+        signal
+      );
+      if (signal.aborted) return;
       const fullUrl = `${window.location.origin}${window.location.pathname}?share=${encodeURIComponent(created.share_id)}`;
       this.copyText(fullUrl, `Copied share link for "${project.name}"`);
     } catch (err) {
+      if (signal.aborted) return;
       const msg = this.handleApiError(
         err,
         "shares",
@@ -1551,7 +1669,7 @@ class GridForgeApp {
     this.state.center = formatCoords(place.lat, place.lon);
     this.sidebar.setCenterInput(this.state.center, true);
     this.sidebar.setTitlePlaceholder(place.short_name.toUpperCase());
-    this.syncUrlFromState();
+    this.workspaceEdited();
     this.map.setCenter(place.lat, place.lon, { fly: true, zoom: 12 });
     this.requestFootprintImmediate({
       flyToResult: false,
@@ -1573,11 +1691,9 @@ class GridForgeApp {
     this.state.nz_overlays = preset.nz_overlays ? [...preset.nz_overlays] : [];
     this.state.ca_overlays = preset.ca_overlays ? [...preset.ca_overlays] : [];
     this.state.us_overlays = preset.us_overlays ? [...preset.us_overlays] : [];
-    this.currentMapZoom = preset.zoom;
-    this.suppressZoomSyncUntil = performance.now() + 900;
     this.sidebar.setTitlePlaceholder(preset.defaultTitle);
     this.sidebar.syncControlsFromState();
-    this.syncUrlFromState();
+    this.workspaceEdited();
     this.map.setCenter(preset.lat, preset.lon, { fly: true, zoom: preset.zoom });
     this.requestFootprintImmediate({
       flyToResult: false,
@@ -1650,7 +1766,6 @@ class GridForgeApp {
       preserveShareId?: string | null;
       closeProjectsDrawer?: boolean;
       flyToCenter?: boolean;
-      autoComputePreviews?: boolean;
     } = {}
   ): void {
     this.clearStripPlanInternal(false);
@@ -1682,27 +1797,22 @@ class GridForgeApp {
           "[data-basemap='offline']"
         );
         if (offlineBtn) {
-          this.selectBasemap("offline", { syncUrl: false });
+          this.selectBasemap("offline");
         } else {
           this.pendingOfflineBasemapFromUrl = true;
         }
       } else {
-        this.selectBasemap(view.basemap, { syncUrl: false });
+        this.selectBasemap(view.basemap);
       }
     }
 
-    if (view.zoom !== null) {
-      this.currentMapZoom = view.zoom;
-    }
-
-    this.suppressZoomSyncUntil = performance.now() + 900;
     this.sidebar.setFormError(null);
     this.sidebar.syncControlsFromState(true);
 
     if (options.preserveShareId) {
       this.activeShareId = options.preserveShareId;
     } else {
-      this.syncUrlFromState();
+      this.workspaceEdited();
     }
 
     this.map.setCenter(this.state.lat, this.state.lon, {
@@ -1741,30 +1851,10 @@ class GridForgeApp {
 
     if (this.state.viewsheds.length > 0 || this.state.rfLinks.length > 0) {
       this.sidebar.openViewshedSection();
-      this.sidebar.renderViewshedsList();
-      this.sidebar.renderRFLinksList();
-      if (!options.autoComputePreviews) {
-        this.showToast(
-          "Click Compute on any viewshed or RF link in the sidebar to run DEM analysis.",
-          "info"
-        );
-        return;
-      }
-    }
-
-    if (options.autoComputePreviews) {
-      const viewshedsToRun = [...this.state.viewsheds];
-      const rfLinksToRun = [...this.state.rfLinks];
-      void (async () => {
-        for (const vs of viewshedsToRun) {
-          if (!this.state.viewsheds.some((e) => e.id === vs.id)) break;
-          await this.computeViewshedEntry(vs.id);
-        }
-        for (const rf of rfLinksToRun) {
-          if (!this.state.rfLinks.some((e) => e.id === rf.id)) break;
-          await this.computeRFLinkEntry(rf.id);
-        }
-      })();
+      this.showToast(
+        "Click Compute on any viewshed or RF link in the sidebar to run DEM analysis.",
+        "info"
+      );
     }
   }
 
@@ -1824,7 +1914,7 @@ class GridForgeApp {
       this.map.updateStripRoute(plan.route_geojson);
       this.telemetry.updateStripPlan(plan);
       this.sidebar.syncControlsFromState(true);
-      this.syncUrlFromState();
+      this.workspaceEdited();
       this.setFootprintError(null);
 
       if (options.fitAfterLoad) {
@@ -1864,7 +1954,7 @@ class GridForgeApp {
     }
     this.map.updateStripRoute(null);
     this.sidebar.syncControlsFromState();
-    this.syncUrlFromState();
+    this.workspaceEdited();
     if (restoreFootprint) {
       this.requestFootprintImmediate({
         flyToResult: false,
@@ -1890,6 +1980,7 @@ class GridForgeApp {
   }
 
   private async computeRulerMetrics(): Promise<void> {
+    const workspaceSignal = this.workspaceRequests.signal;
     this.rulerAbort?.abort();
     const controller = new AbortController();
     this.rulerAbort = controller;
@@ -1932,7 +2023,7 @@ class GridForgeApp {
       );
       this.showToast(msg, "error");
     } finally {
-      if (usedTurnstile) {
+      if (usedTurnstile && !workspaceSignal.aborted) {
         this.turnstile.reset();
       }
     }
@@ -1961,7 +2052,7 @@ class GridForgeApp {
       this.sectorDraft
     );
     this.sidebar.renderTacticalGraphicsList();
-    this.syncUrlFromState();
+    this.workspaceEdited();
     this.showToast(`Pinned bearing line "${graphic.label}" to PDF`, "success");
   }
 
@@ -1992,7 +2083,7 @@ class GridForgeApp {
     );
     this.sidebar.openWaypointsSection();
     this.sidebar.renderTacticalGraphicsList();
-    this.syncUrlFromState();
+    this.workspaceEdited();
     this.showToast(
       `Placed ${graphic.label} (${graphic.radii_km.join(", ")} km)`,
       "info"
@@ -2030,7 +2121,7 @@ class GridForgeApp {
     this.sidebar.setSectorDraftCount(0);
     this.sidebar.renderTacticalGraphicsList();
     this.map.updateTacticalGraphics(this.state.tacticalGraphics, []);
-    this.syncUrlFromState();
+    this.workspaceEdited();
     this.setInteractionMode("pan");
     this.showToast(`Created sector polygon "${graphic.label}"`, "success");
   }
@@ -2054,7 +2145,7 @@ class GridForgeApp {
       this.state.tacticalGraphics,
       this.sectorDraft
     );
-    this.syncUrlFromState();
+    this.workspaceEdited();
   }
 
   private handleTacticalDelete(index: number): void {
@@ -2066,7 +2157,7 @@ class GridForgeApp {
       this.sectorDraft
     );
     this.sidebar.renderTacticalGraphicsList();
-    this.syncUrlFromState();
+    this.workspaceEdited();
   }
 
   private handleTacticalClear(): void {
@@ -2075,7 +2166,7 @@ class GridForgeApp {
     this.sidebar.setSectorDraftCount(0);
     this.map.updateTacticalGraphics([], []);
     this.sidebar.renderTacticalGraphicsList();
-    this.syncUrlFromState();
+    this.workspaceEdited();
   }
 
   // ---------- RF Point-to-Point Link Profile (A ↔ B) ----------
@@ -2148,7 +2239,7 @@ class GridForgeApp {
     this.sidebar.openViewshedSection();
     this.sidebar.syncControlsFromState();
     this.map.updateRFLinks(this.state.rfLinks, null);
-    this.syncUrlFromState();
+    this.workspaceEdited();
     void this.computeRFLinkEntry(id);
   }
 
@@ -2156,6 +2247,7 @@ class GridForgeApp {
     const entry = this.state.rfLinks.find((e) => e.id === id);
     if (!entry) return;
 
+    const workspaceSignal = this.workspaceRequests.signal;
     this.rfLinkAborts.get(id)?.abort();
     const controller = new AbortController();
     this.rfLinkAborts.set(id, controller);
@@ -2202,7 +2294,7 @@ class GridForgeApp {
       this.map.updateRFLinks(this.state.rfLinks, this.rfPendingFrom);
       this.showToast(`RF link error: ${msg}`, "error");
     } finally {
-      if (usedTurnstile) {
+      if (usedTurnstile && !workspaceSignal.aborted) {
         this.turnstile.reset();
       }
       if (this.rfLinkAborts.get(id) === controller) {
@@ -2220,7 +2312,7 @@ class GridForgeApp {
     }
     this.sidebar.syncControlsFromState();
     this.map.updateRFLinks(this.state.rfLinks, this.rfPendingFrom);
-    this.syncUrlFromState();
+    this.workspaceEdited();
   }
 
   private handleRFLinksClear(): void {
@@ -2231,7 +2323,7 @@ class GridForgeApp {
     this.state.include_rf_link_card = false;
     this.sidebar.syncControlsFromState();
     this.map.updateRFLinks([], null);
-    this.syncUrlFromState();
+    this.workspaceEdited();
   }
 
   // ---------- RF / LOS Viewshed Tool ----------
@@ -2259,7 +2351,7 @@ class GridForgeApp {
     this.sidebar.openViewshedSection();
     this.sidebar.renderViewshedsList();
     this.map.updateViewsheds(this.state.viewsheds);
-    this.syncUrlFromState();
+    this.workspaceEdited();
     void this.computeViewshedEntry(id);
   }
 
@@ -2276,7 +2368,7 @@ class GridForgeApp {
     this.state.viewsheds = this.state.viewsheds.map((e) =>
       e.id === id ? { ...e, observer: { ...e.observer, ...patch } } : e
     );
-    this.syncUrlFromState();
+    this.workspaceEdited();
     if (recompute) {
       void this.computeViewshedEntry(id);
     } else {
@@ -2288,6 +2380,7 @@ class GridForgeApp {
     const entry = this.state.viewsheds.find((e) => e.id === id);
     if (!entry) return;
 
+    const workspaceSignal = this.workspaceRequests.signal;
     this.viewshedAborts.get(id)?.abort();
     const controller = new AbortController();
     this.viewshedAborts.set(id, controller);
@@ -2336,7 +2429,7 @@ class GridForgeApp {
       this.sidebar.renderViewshedsList();
       this.showToast(`Viewshed error: ${msg}`, "error");
     } finally {
-      if (usedTurnstile) {
+      if (usedTurnstile && !workspaceSignal.aborted) {
         this.turnstile.reset();
       }
       if (this.viewshedAborts.get(id) === controller) {
@@ -2351,7 +2444,7 @@ class GridForgeApp {
     this.state.viewsheds = this.state.viewsheds.filter((e) => e.id !== id);
     this.sidebar.renderViewshedsList();
     this.map.updateViewsheds(this.state.viewsheds);
-    this.syncUrlFromState();
+    this.workspaceEdited();
   }
 
   private handleViewshedsClear(): void {
@@ -2360,7 +2453,7 @@ class GridForgeApp {
     this.state.viewsheds = [];
     this.sidebar.renderViewshedsList();
     this.map.updateViewsheds([]);
-    this.syncUrlFromState();
+    this.workspaceEdited();
   }
 
   // ---------- Waypoints & Tactical Route Metrics ----------
@@ -2384,7 +2477,7 @@ class GridForgeApp {
     this.sidebar.setFormError(null);
     this.map.updateWaypoints(this.state.waypoints);
     this.sidebar.syncControlsFromState();
-    this.syncUrlFromState();
+    this.workspaceEdited();
     this.scheduleRouteMetrics();
   }
 
@@ -2403,7 +2496,7 @@ class GridForgeApp {
     };
     this.state.waypoints = updated;
     this.map.updateWaypoints(this.state.waypoints);
-    this.syncUrlFromState();
+    this.workspaceEdited();
     this.scheduleRouteMetrics();
   }
 
@@ -2415,7 +2508,7 @@ class GridForgeApp {
     }
     this.map.updateWaypoints(this.state.waypoints);
     this.sidebar.syncControlsFromState();
-    this.syncUrlFromState();
+    this.workspaceEdited();
     if (this.state.waypoints.length > 0) {
       this.scheduleRouteMetrics();
     }
@@ -2428,7 +2521,7 @@ class GridForgeApp {
     this.map.updateWaypoints([]);
     this.sidebar.setRouteMetrics(null);
     this.sidebar.syncControlsFromState();
-    this.syncUrlFromState();
+    this.workspaceEdited();
   }
 
   private scheduleRouteMetrics(): void {
@@ -2600,8 +2693,10 @@ class GridForgeApp {
   }
 
   private async loadPacks(notify: boolean): Promise<void> {
+    const { signal } = this.workspaceRequests;
     try {
-      const res = await fetchPacks();
+      const res = await fetchPacks(signal);
+      if (signal.aborted) return;
       this.sidebar.setPacks(res.packs);
       if (notify) {
         this.showToast(
@@ -2612,7 +2707,7 @@ class GridForgeApp {
         );
       }
     } catch {
-      if (notify) {
+      if (notify && !signal.aborted) {
         this.showToast(
           "Could not refresh offline packs. Your selection is unchanged.",
           "error"
@@ -2630,26 +2725,40 @@ class GridForgeApp {
     );
     const delay = hasActive ? ACTIVE_JOBS_POLL_MS : IDLE_JOBS_POLL_MS;
     this.jobsPollTimer = window.setTimeout(() => {
+      this.jobsPollTimer = null;
       void this.pollJobsOnce();
     }, delay);
   }
 
-  private async pollJobsOnce(): Promise<void> {
+  private async pollJobsOnce(
+    options: { sessionChecked?: boolean } = {}
+  ): Promise<void> {
     if (document.hidden) {
       this.scheduleNextJobsPoll();
       return;
     }
+    const { signal } = this.workspaceRequests;
     try {
-      const jobs = await fetchJobs();
+      if (
+        !options.sessionChecked &&
+        (!this.sessionLoaded || this.session.auth_mode === "hosted")
+      ) {
+        const next = await this.refreshSession();
+        if (!next) return;
+      }
+      if (signal.aborted) return;
+      const jobs = await fetchJobs(signal);
+      if (signal.aborted) return;
       this.jobs = jobs;
       this.drawer.setJobs(jobs);
       this.updateQueueBadge();
     } catch (err) {
+      if (signal.aborted) return;
       if (err instanceof ApiError && (err.status === 401 || err.status === 503)) {
         this.handleApiError(err, "jobs-poll", "Failed to load jobs");
       }
     } finally {
-      this.scheduleNextJobsPoll();
+      if (!signal.aborted) this.scheduleNextJobsPoll();
     }
   }
 
@@ -2714,6 +2823,7 @@ class GridForgeApp {
   }
 
   private async handleSubmitJob(): Promise<void> {
+    const { signal } = this.workspaceRequests;
     this.sidebar.setSubmitting(true);
     this.sidebar.setFormError(null);
     let usedTurnstile = false;
@@ -2725,12 +2835,15 @@ class GridForgeApp {
         : null;
       usedTurnstile = needsTurnstile && Boolean(turnstileToken);
 
+      if (signal.aborted) return;
       const payload = this.buildJobPayload();
       const job = await submitJob(
         payload,
         this.state.overlayFile,
-        turnstileToken
+        turnstileToken,
+        signal
       );
+      if (signal.aborted) return;
       this.jobs = [job, ...this.jobs.filter((j) => j.job_id !== job.job_id)];
       this.drawer.setJobs(this.jobs);
       this.setDrawerOpen(true);
@@ -2744,6 +2857,7 @@ class GridForgeApp {
       }
       this.scheduleNextJobsPoll();
     } catch (err) {
+      if (signal.aborted) return;
       const msg = this.handleApiError(
         err,
         "job",
@@ -2752,21 +2866,24 @@ class GridForgeApp {
       this.sidebar.setFormError(msg);
       this.showToast(msg, "error");
     } finally {
-      if (usedTurnstile) {
-        this.turnstile.reset();
+      if (!signal.aborted) {
+        if (usedTurnstile) this.turnstile.reset();
+        this.sidebar.setSubmitting(false);
       }
-      this.sidebar.setSubmitting(false);
     }
   }
 
   private async handleCancelJob(jobId: string): Promise<void> {
+    const { signal } = this.workspaceRequests;
     try {
-      const updated = await cancelJob(jobId);
+      const updated = await cancelJob(jobId, signal);
+      if (signal.aborted) return;
       this.jobs = this.jobs.map((j) => (j.job_id === jobId ? updated : j));
       this.drawer.setJobs(this.jobs);
       this.updateQueueBadge();
       this.showToast(`Cancelled job #${jobId.slice(0, 8)}`, "info");
     } catch (err) {
+      if (signal.aborted) return;
       this.drawer.clearBusy(jobId);
       const msg = this.handleApiError(err, "general", "Failed to cancel job");
       this.showToast(msg, "error");
@@ -2774,13 +2891,16 @@ class GridForgeApp {
   }
 
   private async handleDeleteJob(jobId: string): Promise<void> {
+    const { signal } = this.workspaceRequests;
     try {
-      await deleteJob(jobId);
+      await deleteJob(jobId, signal);
+      if (signal.aborted) return;
       this.jobs = this.jobs.filter((j) => j.job_id !== jobId);
       this.drawer.setJobs(this.jobs);
       this.updateQueueBadge();
       this.showToast(`Deleted job #${jobId.slice(0, 8)}`, "info");
     } catch (err) {
+      if (signal.aborted) return;
       this.drawer.clearBusy(jobId);
       const msg = this.handleApiError(err, "general", "Failed to delete job");
       this.showToast(msg, "error");
@@ -2788,11 +2908,16 @@ class GridForgeApp {
   }
 
   private copyText(text: string, label: string): void {
+    const { signal } = this.workspaceRequests;
     if (navigator.clipboard?.writeText) {
       navigator.clipboard
         .writeText(text)
-        .then(() => this.showToast(label, "success"))
-        .catch(() => this.showToast("Clipboard unavailable", "error"));
+        .then(() => {
+          if (!signal.aborted) this.showToast(label, "success");
+        })
+        .catch(() => {
+          if (!signal.aborted) this.showToast("Clipboard unavailable", "error");
+        });
     } else {
       this.showToast("Clipboard unavailable", "error");
     }

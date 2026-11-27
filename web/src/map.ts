@@ -56,7 +56,6 @@ export interface GridForgeMapCallbacks {
   onMapSectorClick?: (lat: number, lon: number) => void;
   onMapSectorFinish?: () => void;
   onCursorMove?: (lat: number, lon: number) => void;
-  onViewChange?: (zoom: number) => void;
   onExternalTileFailure?: () => void;
   onVectorBasemapError?: () => void;
 }
@@ -866,11 +865,9 @@ export class GridForgeMap {
     });
 
     this.map.on("zoomend", () => {
-      const z = this.map.getZoom();
       if (this.currentBasemap === "opentopo" && this.isLoaded) {
         this.applyBasemapVisibility();
       }
-      callbacks.onViewChange?.(z);
     });
 
     this.map.on("error", (ev: maplibregl.ErrorEvent) => {
@@ -1351,6 +1348,32 @@ export class GridForgeMap {
         zoom: options.zoom,
       });
     }
+  }
+
+  resetWorkspace(lat: number, lon: number): void {
+    // Reattach the marker to end any drag that began in the prior workspace.
+    this.marker.remove().setLngLat([lon, lat]).addTo(this.map);
+    this.draggingMarker = false;
+    this.suppressClickUntil = performance.now() + 200;
+    this.map.jumpTo({
+      center: [lon, lat],
+      zoom: DEFAULT_MAP_ZOOM,
+      bearing: 0,
+      pitch: 0,
+    });
+
+    this.pendingOfflineBasemap = null;
+    this.lastOfflineBasemap = null;
+    this.reportedExternalTileFail = false;
+    if (this.isLoaded) this.removeOfflineBasemapLayer();
+
+    this.clearFootprint();
+    this.updateStripRoute(null);
+    this.updateWaypoints([]);
+    this.updateViewsheds([]);
+    this.updateTacticalGraphics([]);
+    this.updateRFLinks([]);
+    this.updateRuler([]);
   }
 
   updateFootprint(

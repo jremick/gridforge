@@ -147,6 +147,7 @@ test("URL deep link round-trips full cartography, outputs, view, booklet toggles
 
   const restored = createInitialFormState();
   const hydration = hydrateStateFromSearch(`?${serialized.queryString}`, restored);
+  assert.equal(hydration.remainingSearch, "");
 
   assert.equal(hydration.hasCustomCenter, true);
   assert.equal(hydration.needsFlyToResolvedCenter, false);
@@ -190,6 +191,19 @@ test("URL deep link round-trips full cartography, outputs, view, booklet toggles
   assert.equal(restored.rfLinks.length, 1);
   assert.deepEqual(restored.rfLinks[0].spec, original.rfLinks[0].spec);
   assert.deepEqual(restored.tacticalGraphics, original.tacticalGraphics);
+});
+
+test("loading a direct link consumes map parameters and retains deliberate short links", () => {
+  const state = createInitialFormState();
+  const hydration = hydrateStateFromSearch(
+    "?center=-35%2C149&title=Field+Exercise&title=Duplicate&z=14&pack=example&share=AbCdEf1234567890&share=ignoredDuplicate&lang=en",
+    state
+  );
+  assert.equal(state.title, "Field Exercise");
+  assert.equal(state.center, "-35,149");
+  assert.equal(hydration.zoom, 14);
+  assert.equal(hydration.shareId, "AbCdEf1234567890");
+  assert.equal(hydration.remainingSearch, "share=AbCdEf1234567890&lang=en");
 });
 
 test("legacy URLs remain backward-compatible and default multi-sheet atlas index to true", () => {
@@ -267,11 +281,12 @@ test("URL length budget drops heavy markups in priority order and signals trunca
 
 test("malformed or malicious URL params are safely sanitized or ignored", () => {
   const state = createInitialFormState();
-  hydrateStateFromSearch(
+  const hydration = hydrateStateFromSearch(
     "?scale=99999&paper=evil&bm=javascript:alert(1)&z=999&pack=../etc/passwd&out=geopdf&wp=999,999,bad,X;-33.7,150.3,evil,OK&tac=not_valid_base64!!!&share=../bad",
     state
   );
 
+  assert.equal(hydration.remainingSearch, "");
   assert.equal(state.scale, 25000);
   assert.equal(state.paper, "a4");
   assert.equal(state.pack_id, "");

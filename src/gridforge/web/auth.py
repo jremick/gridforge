@@ -706,11 +706,22 @@ class AuthManager:
                 role=role_val,
             )
 
+        workspace_scope = (
+            hmac.new(
+                self.config.session_secret,
+                f"workspace-scope:{ctx.owner_id}".encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()[:24]
+            if ctx.auth_mode == "hosted"
+            else "local"
+        )
+
         return AuthSessionResponse(
             auth_mode=ctx.auth_mode,
             authenticated=ctx.authenticated,
             user=user_summary,
             role=ctx.role,
+            workspace_scope=workspace_scope,
             capabilities=caps,
             quotas=quotas,
             brand_name=self.config.brand_name,

@@ -142,14 +142,15 @@ export function fetchHealth(): Promise<HealthResponse> {
 }
 
 export function fetchBasemapInfo(
-  packId?: string | null
+  packId?: string | null,
+  signal?: AbortSignal
 ): Promise<BasemapInfoResponse> {
   const qs = packId ? `?pack_id=${encodeURIComponent(packId)}` : "";
-  return requestJson<BasemapInfoResponse>(`/api/basemap/info${qs}`);
+  return requestJson<BasemapInfoResponse>(`/api/basemap/info${qs}`, { signal });
 }
 
-export function fetchPacks(): Promise<PacksResponse> {
-  return requestJson<PacksResponse>("/api/packs");
+export function fetchPacks(signal?: AbortSignal): Promise<PacksResponse> {
+  return requestJson<PacksResponse>("/api/packs", { signal });
 }
 
 interface RawPackRegion {
@@ -176,10 +177,10 @@ function normalizeRegionGroup(raw: RawPackRegion): PackRegionGroup {
   return raw.kind === "state" ? "au_state" : "au_tactical";
 }
 
-export async function fetchPackRegions(): Promise<PackRegionPreset[]> {
+export async function fetchPackRegions(signal?: AbortSignal): Promise<PackRegionPreset[]> {
   const data = await requestJson<
     RawPackRegion[] | { regions: RawPackRegion[] }
-  >("/api/packs/regions");
+  >("/api/packs/regions", { signal });
   const rawList = Array.isArray(data) ? data : data.regions;
   return rawList.map((r) => ({
     region_id: r.region_id ?? r.id ?? r.name,
@@ -194,25 +195,29 @@ export async function fetchPackRegions(): Promise<PackRegionPreset[]> {
 }
 
 export function startPackBuild(
-  req: PackBuildRequest
+  req: PackBuildRequest,
+  signal?: AbortSignal
 ): Promise<PackBuildTask> {
   return requestJson<PackBuildTask>("/api/packs/build", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(req),
+    signal,
   });
 }
 
-export async function fetchPackTasks(): Promise<PackBuildTask[]> {
+export async function fetchPackTasks(signal?: AbortSignal): Promise<PackBuildTask[]> {
   const data = await requestJson<PackBuildTask[] | { tasks: PackBuildTask[] }>(
-    "/api/packs/tasks"
+    "/api/packs/tasks",
+    { cache: "no-store", signal }
   );
   return Array.isArray(data) ? data : data.tasks;
 }
 
-export async function deletePack(packId: string): Promise<void> {
+export async function deletePack(packId: string, signal?: AbortSignal): Promise<void> {
   return requestVoid(`/api/packs/${encodeURIComponent(packId)}`, {
     method: "DELETE",
+    signal,
   });
 }
 
@@ -394,21 +399,24 @@ function normalizeSavedProject(raw: RawSavedProject): SavedProject {
   };
 }
 
-export async function fetchProjects(): Promise<SavedProject[]> {
+export async function fetchProjects(signal?: AbortSignal): Promise<SavedProject[]> {
   const data = await requestJson<
     RawSavedProject[] | { projects: RawSavedProject[] }
-  >("/api/projects");
+  >("/api/projects", { cache: "no-store", signal });
   const list = Array.isArray(data) ? data : data.projects;
   return list.map(normalizeSavedProject);
 }
 
-export async function createProject(req: {
-  name: string;
-  description?: string | null;
-  notes?: string | null;
-  state: Record<string, unknown>;
-  last_job_id?: string | null;
-}): Promise<SavedProject> {
+export async function createProject(
+  req: {
+    name: string;
+    description?: string | null;
+    notes?: string | null;
+    state: Record<string, unknown>;
+    last_job_id?: string | null;
+  },
+  signal?: AbortSignal
+): Promise<SavedProject> {
   const description = (req.description ?? req.notes ?? "").trim();
   const raw = await requestJson<RawSavedProject>("/api/projects", {
     method: "POST",
@@ -420,23 +428,28 @@ export async function createProject(req: {
       state: req.state,
       last_job_id: req.last_job_id ?? null,
     }),
+    signal,
   });
   return normalizeSavedProject(raw);
 }
 
-export async function deleteProject(projectId: string): Promise<void> {
+export async function deleteProject(projectId: string, signal?: AbortSignal): Promise<void> {
   return requestVoid(`/api/projects/${encodeURIComponent(projectId)}`, {
     method: "DELETE",
+    signal,
   });
 }
 
-export async function createShareSnapshot(req: {
-  name?: string;
-  notes?: string;
-  state?: Record<string, unknown>;
-  project_id?: string;
-  expires_in_hours?: number;
-}): Promise<SharedSnapshot> {
+export async function createShareSnapshot(
+  req: {
+    name?: string;
+    notes?: string;
+    state?: Record<string, unknown>;
+    project_id?: string;
+    expires_in_hours?: number;
+  },
+  signal?: AbortSignal
+): Promise<SharedSnapshot> {
   const body: Record<string, unknown> = {};
   if (req.name !== undefined) body.name = req.name;
   if (req.notes !== undefined) body.notes = req.notes;
@@ -449,33 +462,43 @@ export async function createShareSnapshot(req: {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
+    signal,
   });
 }
 
 export async function fetchShareSnapshot(
-  shareId: string
+  shareId: string,
+  signal?: AbortSignal
 ): Promise<SharedSnapshot> {
   return requestJson<SharedSnapshot>(
-    `/api/shares/${encodeURIComponent(shareId)}`
+    `/api/shares/${encodeURIComponent(shareId)}`,
+    { signal }
   );
 }
 
-export async function fetchShares(): Promise<SharedSnapshotSummary[]> {
+export async function fetchShares(
+  signal?: AbortSignal
+): Promise<SharedSnapshotSummary[]> {
   const data = await requestJson<
     SharedSnapshotSummary[] | { shares: SharedSnapshotSummary[] }
-  >("/api/shares");
+  >("/api/shares", { cache: "no-store", signal });
   return Array.isArray(data) ? data : data.shares;
 }
 
-export async function deleteShareSnapshot(shareId: string): Promise<void> {
+export async function deleteShareSnapshot(
+  shareId: string,
+  signal?: AbortSignal
+): Promise<void> {
   return requestVoid(`/api/shares/${encodeURIComponent(shareId)}`, {
     method: "DELETE",
+    signal,
   });
 }
 
-export async function fetchJobs(): Promise<JobRecord[]> {
+export async function fetchJobs(signal?: AbortSignal): Promise<JobRecord[]> {
   const data = await requestJson<JobRecord[] | { jobs: JobRecord[] }>(
-    "/api/jobs"
+    "/api/jobs",
+    { cache: "no-store", signal }
   );
   return Array.isArray(data) ? data : data.jobs;
 }
@@ -483,7 +506,8 @@ export async function fetchJobs(): Promise<JobRecord[]> {
 export function submitJob(
   payload: CreateJobPayload,
   overlayFile?: File | null,
-  turnstileToken?: string | null
+  turnstileToken?: string | null,
+  signal?: AbortSignal
 ): Promise<JobRecord> {
   const form = new FormData();
   form.append("payload", JSON.stringify(payload));
@@ -498,19 +522,21 @@ export function submitJob(
     method: "POST",
     headers,
     body: form,
+    signal,
   });
 }
 
-export function cancelJob(jobId: string): Promise<JobRecord> {
+export function cancelJob(jobId: string, signal?: AbortSignal): Promise<JobRecord> {
   return requestJson<JobRecord>(
     `/api/jobs/${encodeURIComponent(jobId)}/cancel`,
-    { method: "POST" }
+    { method: "POST", signal }
   );
 }
 
-export async function deleteJob(jobId: string): Promise<void> {
+export async function deleteJob(jobId: string, signal?: AbortSignal): Promise<void> {
   return requestVoid(`/api/jobs/${encodeURIComponent(jobId)}`, {
     method: "DELETE",
+    signal,
   });
 }
 
@@ -540,7 +566,7 @@ export function jobThumbnailUrl(jobId: string): string {
 }
 
 export function fetchSession(signal?: AbortSignal): Promise<SessionResponse> {
-  return requestJson<SessionResponse>("/api/auth/session", { signal });
+  return requestJson<SessionResponse>("/api/auth/session", { cache: "no-store", signal });
 }
 
 export function loginWithPassword(
@@ -577,36 +603,40 @@ export function googleAuthStartUrl(inviteToken?: string | null): string {
   return "/api/auth/google/start";
 }
 
-export function fetchAdminUsage(): Promise<AdminUsageResponse> {
-  return requestJson<AdminUsageResponse>("/api/admin/usage");
+export function fetchAdminUsage(signal?: AbortSignal): Promise<AdminUsageResponse> {
+  return requestJson<AdminUsageResponse>("/api/admin/usage", { cache: "no-store", signal });
 }
 
-export function fetchAdminUsers(): Promise<AdminUsersResponse> {
-  return requestJson<AdminUsersResponse>("/api/admin/users");
+export function fetchAdminUsers(signal?: AbortSignal): Promise<AdminUsersResponse> {
+  return requestJson<AdminUsersResponse>("/api/admin/users", { cache: "no-store", signal });
 }
 
 export function createAdminInvite(
-  req: CreateInviteRequest
+  req: CreateInviteRequest,
+  signal?: AbortSignal
 ): Promise<CreateInviteResponse> {
   return requestJson<CreateInviteResponse>("/api/admin/invites", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(req),
+    signal,
   });
 }
 
 export function revokeAdminInvite(
-  inviteId: string
+  inviteId: string,
+  signal?: AbortSignal
 ): Promise<RevokeInviteResponse> {
   return requestJson<RevokeInviteResponse>(
     `/api/admin/invites/${encodeURIComponent(inviteId)}`,
-    { method: "DELETE" }
+    { method: "DELETE", signal }
   );
 }
 
 export function updateAdminUser(
   userId: string,
-  req: UpdateUserRequest
+  req: UpdateUserRequest,
+  signal?: AbortSignal
 ): Promise<UpdateUserResponse> {
   return requestJson<UpdateUserResponse>(
     `/api/admin/users/${encodeURIComponent(userId)}`,
@@ -614,16 +644,19 @@ export function updateAdminUser(
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(req),
+      signal,
     }
   );
 }
 
 export function updateAdminSettings(
-  req: AdminSettingsRequest
+  req: AdminSettingsRequest,
+  signal?: AbortSignal
 ): Promise<AdminSettingsResponse> {
   return requestJson<AdminSettingsResponse>("/api/admin/settings", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(req),
+    signal,
   });
 }

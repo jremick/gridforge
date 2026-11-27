@@ -15,7 +15,9 @@ import type { SessionResponse } from "../types";
 export type AuthModalMode = "signin" | "invite" | "account";
 
 export interface AuthModalCallbacks {
-  onSessionChanged: (session: SessionResponse) => void;
+  changeSession: (
+    request: () => Promise<SessionResponse>
+  ) => Promise<SessionResponse>;
   onOpenAdmin: () => void;
   onToast: (message: string, kind: "success" | "error" | "info") => void;
 }
@@ -247,6 +249,17 @@ export class AuthModal {
     this.focusTrap.deactivate();
   }
 
+  clearAccountState(): void {
+    this.close();
+    this.signinEmail = "";
+    this.inviteToken = "";
+    this.inviteEmail = "";
+    this.inviteName = "";
+    this.errorMessage = null;
+    this.invalidFieldId = null;
+    this.bodyEl.replaceChildren();
+  }
+
   private getInitialFocusTarget(): HTMLElement | null {
     if (this.mode === "signin") {
       return this.bodyEl.querySelector<HTMLElement>("#gf-auth-email");
@@ -331,9 +344,9 @@ export class AuthModal {
     this.setPendingState(form, true, "Signing in…");
 
     try {
-      const nextSession = await loginWithPassword({ email, password });
-      this.session = nextSession;
-      this.callbacks.onSessionChanged(nextSession);
+      const nextSession = await this.callbacks.changeSession(() =>
+        loginWithPassword({ email, password })
+      );
       const actor =
         nextSession.user?.display_name?.trim() ||
         nextSession.user?.email ||
@@ -343,6 +356,7 @@ export class AuthModal {
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Sign in failed";
       this.setError(msg, "gf-auth-password");
+      pwInput?.focus();
     } finally {
       if (this.isOpen && this.mode === "signin") {
         this.setPendingState(form, false, "Sign In");
@@ -386,23 +400,24 @@ export class AuthModal {
     this.setPendingState(form, true, "Activating…");
 
     try {
-      const nextSession = await acceptInvite({
-        token,
-        email: email || undefined,
-        display_name: displayName || undefined,
-        password,
-      });
-      this.session = nextSession;
+      await this.callbacks.changeSession(() =>
+        acceptInvite({
+          token,
+          email: email || undefined,
+          display_name: displayName || undefined,
+          password,
+        })
+      );
       this.inviteToken = "";
       this.inviteEmail = "";
       this.inviteName = "";
-      this.callbacks.onSessionChanged(nextSession);
       this.callbacks.onToast("Account activated and signed in", "success");
       this.close();
     } catch (err) {
       const msg =
         err instanceof Error ? err.message : "Could not redeem invite";
       this.setError(msg, "gf-invite-token");
+      tokenInput?.focus();
     } finally {
       if (this.isOpen && this.mode === "invite") {
         this.setPendingState(form, false, "Activate Account");
@@ -423,9 +438,7 @@ export class AuthModal {
       btn.textContent = "Signing out…";
     }
     try {
-      const nextSession = await logoutSession();
-      this.session = nextSession;
-      this.callbacks.onSessionChanged(nextSession);
+      await this.callbacks.changeSession(logoutSession);
       this.callbacks.onToast("Signed out", "info");
       this.close();
     } catch (err) {

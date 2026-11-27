@@ -187,6 +187,7 @@ export class TurnstileController {
   } | null = null;
   private activeAcquires = 0;
   private acquireChain: Promise<unknown> = Promise.resolve();
+  private generation = 0;
 
   constructor(options: TurnstileControllerOptions = {}) {
     this.container = options.container ?? null;
@@ -251,9 +252,11 @@ export class TurnstileController {
       this.removeWidgetOnly();
     }
 
+    const generation = this.generation;
     try {
       await this.renderWidgetIfReady(rawKey);
     } catch (err) {
+      if (generation !== this.generation || this.sitekey !== rawKey) return;
       this.lastError =
         err instanceof Error
           ? err.message
@@ -263,8 +266,11 @@ export class TurnstileController {
 
   private async renderWidgetIfReady(expectedSitekey: string): Promise<void> {
     if (!this.container) return;
+    const generation = this.generation;
+    const isCurrent = () =>
+      generation === this.generation && this.active && this.sitekey === expectedSitekey;
     const api = await this.loadApi();
-    if (!this.active || this.sitekey !== expectedSitekey || !this.container) {
+    if (!isCurrent() || !this.container) {
       return;
     }
     if (this.widgetId !== null && this.renderedSitekey === expectedSitekey) {
@@ -282,6 +288,7 @@ export class TurnstileController {
       appearance: "interaction-only",
       execution: "render",
       callback: (token: string) => {
+        if (!isCurrent()) return;
         this.lastError = null;
         if (this.pendingWaiter) {
           const waiter = this.pendingWaiter;
@@ -296,6 +303,7 @@ export class TurnstileController {
         }
       },
       "expired-callback": () => {
+        if (!isCurrent()) return;
         this.cachedToken = null;
         this.tokenConsumed = false;
         if (this.api && this.widgetId !== null) {
@@ -303,6 +311,7 @@ export class TurnstileController {
         }
       },
       "error-callback": (errorCode?: string) => {
+        if (!isCurrent()) return;
         this.cachedToken = null;
         this.tokenConsumed = false;
         const msg = errorCode
@@ -317,6 +326,7 @@ export class TurnstileController {
         }
       },
       "timeout-callback": () => {
+        if (!isCurrent()) return;
         this.cachedToken = null;
         this.tokenConsumed = false;
         if (this.api && this.widgetId !== null) {
@@ -327,19 +337,21 @@ export class TurnstileController {
   }
 
   acquireToken(timeoutMs = 30000): Promise<string | null> {
+    const generation = this.generation;
     this.activeAcquires += 1;
     const run = this.acquireChain.then(() =>
-      this.acquireTokenSerialized(timeoutMs)
+      this.acquireTokenSerialized(timeoutMs, generation)
     );
     this.acquireChain = run.catch(() => undefined);
     return run;
   }
 
   private async acquireTokenSerialized(
-    timeoutMs: number
+    timeoutMs: number,
+    generation: number
   ): Promise<string | null> {
     try {
-      if (!this.active || !this.sitekey) {
+      if (generation !== this.generation || !this.active || !this.sitekey) {
         return null;
       }
 
@@ -347,7 +359,7 @@ export class TurnstileController {
         await this.renderWidgetIfReady(this.sitekey);
       }
 
-      if (!this.active) {
+      if (generation !== this.generation || !this.active) {
         return null;
       }
 
@@ -447,6 +459,7 @@ export class TurnstileController {
   }
 
   unmount(): void {
+    this.generation += 1;
     this.active = false;
     this.sitekey = null;
     this.lastError = null;

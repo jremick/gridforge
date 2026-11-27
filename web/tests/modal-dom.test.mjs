@@ -320,6 +320,17 @@ function createDomShim() {
     remove() {
       this.parentNode?.removeChild(this);
     }
+    replaceChildren(...nodes) {
+      for (const ch of [...this.children]) {
+        ch.parentNode = null;
+      }
+      this.children = [];
+      this._text = "";
+      for (const n of nodes) {
+        if (typeof n === "string") this._text += n;
+        else if (n) this.appendChild(n);
+      }
+    }
 
     contains(node) {
       let cur = node;
@@ -386,9 +397,14 @@ function createDomShim() {
       }
     }
 
-    addEventListener(type, fn) {
+    addEventListener(type, fn, options) {
+      const signal = options && typeof options === "object" ? options.signal : undefined;
+      if (signal?.aborted) return;
       if (!this._listeners.has(type)) this._listeners.set(type, []);
       this._listeners.get(type).push(fn);
+      if (signal) {
+        signal.addEventListener("abort", () => this.removeEventListener(type, fn), { once: true });
+      }
     }
     removeEventListener(type, fn) {
       const list = this._listeners.get(type);
@@ -636,7 +652,7 @@ test("AuthModal.setSession preserves open signin password input and focus when a
     const container = doc.createElement("div");
     doc.body.appendChild(container);
     const modal = new AuthModal(container, {
-      onSessionChanged: () => {},
+      changeSession: (request) => request(),
       onOpenAdmin: () => {},
       onToast: () => {},
     });
@@ -998,4 +1014,103 @@ test("ProjectsDrawer renders Share action per saved project and triggers callbac
   } finally {
     globalThis.fetch = origFetch;
   }
+});
+
+test("ProjectsDrawer resets draft fields and ignores a closed workspace's pending list", async () => {
+  const { ProjectsDrawer } = await bundleTsModule("src/components/projectsDrawer.ts");
+  await withDom(async ({ doc }) => {
+    const container = doc.createElement("aside");
+    doc.body.appendChild(container);
+    const drawer = new ProjectsDrawer(container, {
+      onClose: () => {},
+      onLoadProject: () => {},
+      getCurrentSnapshot: () => ({ suggestedName: "Training draft", state: {}, last_job_id: null }),
+      onToast: () => {},
+    });
+    const name = container.querySelector("[data-role='proj-name']");
+    const notes = container.querySelector("[data-role='proj-notes']");
+    drawer.prepareSuggestedName();
+    name.value = "Field exercise";
+    notes.value = "Draft itinerary";
+
+    let finishRequest;
+    let requestSignal;
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = (_url, init) => {
+      requestSignal = init.signal;
+      return new Promise((resolve) => { finishRequest = resolve; });
+    };
+    try {
+      const pending = drawer.refresh();
+      drawer.clear();
+      finishRequest(new Response(JSON.stringify({ projects: [{
+        project_id: "proj_closed_workspace",
+        name: "Training itinerary",
+        created_at: "2026-11-27T00:00:00Z",
+        updated_at: "2026-11-27T00:00:00Z",
+        state: {},
+      }] })));
+      await pending;
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+
+    assert.equal(requestSignal.aborted, true);
+    assert.equal(name.value, "");
+    assert.equal(notes.value, "");
+    assert.equal(name.placeholder, "Project name (e.g. Kosciuszko Winter Loop)");
+    assert.match(container.querySelector("[data-role='projects-list']").textContent, /No saved trip projects/);
+  });
+});
+
+test("AdminModal.dispose aborts in-flight requests and removes root click listeners without an external signal", async () => {
+  const { AdminModal } = await bundleTsModule("src/components/adminModal.ts");
+  await withDom(async ({ doc }) => {
+    const container = doc.createElement("div");
+    doc.body.appendChild(container);
+    const modal = new AdminModal(container, {
+      getCurrentUserId: () => "usr_admin",
+      onSettingsChanged: () => {},
+      onToast: () => {},
+      onCopyText: () => {},
+    });
+
+    const signals = [];
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = (_url, init) => {
+      signals.push(init.signal);
+      return new Promise(() => {});
+    };
+    try {
+      void modal.refreshAll();
+      assert.equal(signals.length, 2);
+      assert.equal(signals.every((s) => !s.aborted), true);
+      modal.dispose();
+      assert.equal(signals.every((s) => s.aborted), true);
+      assert.equal(container.children.length, 0);
+      assert.equal((container._listeners.get("click") ?? []).length, 0);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+});
+
+test("AuthModal.clearAccountState closes dialog and clears sensitive draft inputs", async () => {
+  const { AuthModal } = await bundleTsModule("src/components/authModal.ts");
+  await withDom(async ({ doc }) => {
+    const container = doc.createElement("div");
+    doc.body.appendChild(container);
+    const modal = new AuthModal(container, {
+      changeSession: (request) => request(),
+      onOpenAdmin: () => {},
+      onToast: () => {},
+    });
+    modal.open({ mode: "invite", inviteToken: "secret-invite-tok", bannerError: "Prior error" });
+    assert.equal(modal.opened, true);
+    modal.clearAccountState();
+    assert.equal(modal.opened, false);
+    assert.equal(container.querySelector("[data-role='auth-body']").children.length, 0);
+    modal.open({ mode: "invite" });
+    assert.equal(container.querySelector("#gf-invite-token").value, "");
+  });
 });
