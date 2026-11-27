@@ -5,6 +5,30 @@ All notable changes to **GridForge** are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0] - 2026-11-27
+
+Deep-linking and shareable trip snapshot release expanding stateless URL permalinks to preserve full Studio views (basemap, zoom, cartography, outputs, booklet toggles, waypoints, RF links, tactical graphics, and custom LOS observer labels), adding a one-click topbar **Share** popover, and introducing SQLite-backed immutable short share links (`?share=<token>`, `/api/shares`) for both live Studio views and Saved Trip Projects.
+
+### Added
+
+- **Expanded Stateless URL Deep Links (`web/src/deeplink.ts`, `web/src/main.ts`, `web/src/map.ts`):**
+  - Preserves backward compatibility with all existing query parameters while adding compact, non-default encoding for **basemap** (`bm`, including deferred `offline` basemap activation), **map zoom** (`z`), **cartography controls** (`contours`, `hillshade`, `labels`, `hide` for disabled layers), **output formats** (`out`, `mbfmt`, `garmin`, `dgrid`), **booklet toggles** (`rc`, `ep`, `rfcard`), custom **LOS observer labels** (`los`), **waypoints** (`wp`), **RF links** (`rf`), and **tactical graphics** (`tac` base64url JSON).
+  - Syncs the browser address bar across every state mutation (including basemap switching, debounced zoom changes, waypoints, RF links, and tactical graphics), auto-hydrates markups/route metrics/viewsheds/RF profiles on load (respecting Cloudflare Turnstile), and enforces strict input sanitization plus a `3800`-character URL budget with graceful markup fallback.
+  - Persists and restores `basemap` and `map_zoom` inside Saved Trip Projects alongside full configuration state.
+- **Topbar Share Button & Accessible Share Popover (`web/src/components/telemetry.ts`, `web/src/styles.css`):**
+  - Added a topbar **Share** trigger next to **Projects** with live sheet/markup summary, **Copy Direct Link**, **Create Short Share Link**, truncation & local GPX/KML notices, keyboard Escape/click-outside dismissal, and responsive icon-only collapse on narrow viewports.
+- **Server-Backed Shareable Snapshots (`/api/shares`, `?share=<token>`, `src/gridforge/web/shares.py`):**
+  - Added SQLite `shared_snapshots` storage with 96-bit URL-safe tokens, allowlisted state keys, collection bounds, and a `64 KB` payload cap (`413` on overflow).
+  - Added `POST /api/shares` (snapshot from current Studio state or an owned `project_id` with tenant ownership `403` and `SameOriginWritesMiddleware` CSRF protection), public read-only `GET /api/shares/{share_id}` (stripping owner/tenant metadata, setting `Cache-Control: no-cache`, and returning `404` once expired or revoked), owner-scoped `GET /api/shares`, and owner/admin `DELETE /api/shares/{share_id}`.
+  - Added role-aware hosted TTL caps (`GRIDFORGE_GUEST_SHARE_TTL_HOURS=168` / 7d, `GRIDFORGE_FRIEND_SHARE_TTL_HOURS=720` / 30d; Admin/local permanent by default), hourly creation rate limits (`GRIDFORGE_SHARE_HOURLY_LIMIT=30`, `GRIDFORGE_FRIEND_SHARE_HOURLY_LIMIT=120`), and automatic expired snapshot pruning in `db.prune_expired_shares()` / `worker.run_pruning_pass()`.
+  - Added a one-click **Share** action on every Saved Trip Project card (`web/src/components/projectsDrawer.ts`) and automatic `?share=<token>` hydration on Studio load with hosted-tier capability clamping.
+- **Automated Verification (`538` offline pytest + `44` frontend tests + `26` live multi-region E2E):**
+  - Added `web/tests/deeplink.test.mjs`, `tests/unit/test_shares_api.py`, and Share API/popover/Projects Drawer tests in `web/tests/api-auth-admin.test.mjs` and `web/tests/modal-dom.test.mjs`, and documented the new hosted share environment variables in [`deploy/hosted-mode.md`](deploy/hosted-mode.md).
+
+### Fixed
+
+- **Multi-Sheet Atlas Index URL Persistence:** Explicitly unchecking **Atlas Index** on `2×2`–`3×3` grids now emits `index=0` in deep-link URLs instead of omitting `index` and re-enabling the cover page on reload.
+
 ## [1.5.0] - 2026-11-27
 
 High-resolution cartography, public hosted multi-tenant deployment, and Studio UX upgrade release adding `1:10,000` / `1:12,500` scales, `300` / `450` / `600 DPI` print and digital tile controls, true `1.0 m` LiDAR terrain & `2 m` / `5 ft` contours, richer OSM backcountry micro-features across all four themes, a zero-key **Vector HD** (OpenFreeMap) Studio basemap, a resizable/collapsible sidebar & redesigned header, and opt-in public hosted mode (`GRIDFORGE_AUTH_MODE=hosted`, powering [GridMaps](https://gridmaps.net)).

@@ -3,7 +3,7 @@
 # and optionally attach them to a GitHub Release as downloadable showcase assets.
 #
 # Usage:
-#   ./scripts/render_release_samples.sh [--image ghcr.io/jremick/gridforge:latest] [--out-dir /tmp/gridforge-samples] [--upload v1.5.0]
+#   ./scripts/render_release_samples.sh [--image ghcr.io/jremick/gridforge:latest] [--out-dir /tmp/gridforge-samples] [--upload v1.6.0]
 set -euo pipefail
 
 IMAGE="ghcr.io/jremick/gridforge:latest"
