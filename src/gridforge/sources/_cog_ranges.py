@@ -83,11 +83,19 @@ def cog_range_paths(
                     if not 0 < end - start + 1 <= min(_MAX_RANGE_BYTES, remaining_bytes):
                         raise ValueError("COG byte budget exceeded")
                     headers["Range"] = requested_range
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ValueError("COG request budget exceeded")
                 with client.stream(
-                    self.command, href, headers=headers, follow_redirects=False
+                    self.command,
+                    href,
+                    headers=headers,
+                    follow_redirects=False,
+                    timeout=httpx.Timeout(remaining, connect=min(8.0, remaining)),
                 ) as response:
                     length = int(response.headers.get("Content-Length", "0"))
-                    if response.headers.get("Content-Encoding", "identity").lower() != "identity":
+                    encoding = (response.headers.get("Content-Encoding") or "").strip().lower() or "identity"
+                    if encoding != "identity":
                         raise ValueError("Unsupported COG content encoding")
                     if is_head:
                         if response.status_code != 200 or length <= 0:
@@ -112,11 +120,16 @@ def cog_range_paths(
                     header_sent = True
                     if not is_head:
                         for chunk in bounded_response_chunks(response, max_bytes=length, deadline=deadline):
+                            if stopped.is_set():
+                                break
                             self.wfile.write(chunk)
-            except (httpx.HTTPError, OSError, ValueError) as exc:
+            except (httpx.HTTPError, OSError, RuntimeError, ValueError) as exc:
                 logger.debug("Canadian DEM range read declined (%s)", exc)
-                if not header_sent:
-                    self.send_error(502)
+                if not header_sent and not stopped.is_set():
+                    try:
+                        self.send_error(502)
+                    except OSError:
+                        pass
 
     with ThreadingHTTPServer(("127.0.0.1", 0), RangeHandler) as server:
         port = server.server_address[1]

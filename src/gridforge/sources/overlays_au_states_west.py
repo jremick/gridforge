@@ -21,6 +21,8 @@ import json
 import logging
 import os
 import re
+import stat
+import struct
 import tempfile
 import time
 import zipfile
@@ -254,6 +256,7 @@ def _stream_download_cached(
     validate: Callable[[Path], _CacheValue],
     timeout_s: float,
     client: httpx.Client | None = None,
+    allowed_redirect_host_suffixes: tuple[str, ...] | None = None,
 ) -> tuple[Path, _CacheValue] | None:
     """Validate the existing cache or publish one complete, bounded provider response."""
     if dest.is_file():
@@ -280,7 +283,12 @@ def _stream_download_cached(
             try:
                 deadline = time.monotonic() + timeout_s
                 with stream_provider_get(
-                    http, url, params=None, user_agent=USER_AGENT, deadline=deadline
+                    http,
+                    url,
+                    params=None,
+                    user_agent=USER_AGENT,
+                    deadline=deadline,
+                    allowed_redirect_host_suffixes=allowed_redirect_host_suffixes,
                 ) as resp:
                     resp.raise_for_status()
                     for chunk in bounded_response_chunks(resp, max_bytes=max_bytes, deadline=deadline):
@@ -307,8 +315,9 @@ def _sa_parks_data(path: Path) -> list[dict[str, Any]]:
 
 
 def _sa_trails_zip_member(path: Path) -> str:
-    """Check the layer name, archive resources, and integrity before opening it with GDAL."""
-    if not 0 < path.stat().st_size <= _MAX_SA_TRAILS_ZIP_BYTES:
+    """Check the layer name, archive resources, and full decompressed stream before GDAL."""
+    archive_size = path.stat().st_size
+    if not 0 < archive_size <= _MAX_SA_TRAILS_ZIP_BYTES:
         raise ValueError("SA trails archive exceeds the byte budget or is empty")
 
     with zipfile.ZipFile(path) as archive:
@@ -330,7 +339,9 @@ def _sa_trails_zip_member(path: Path) -> str:
         name = selected.filename
         member = PurePosixPath(name)
         if (
-            member.is_absolute()
+            selected.is_dir()
+            or stat.S_ISLNK(selected.external_attr >> 16)
+            or member.is_absolute()
             or ".." in member.parts
             or "\\" in name
             or ":" in name
@@ -341,19 +352,89 @@ def _sa_trails_zip_member(path: Path) -> str:
 
         if (
             not 0 < selected.file_size <= _MAX_SA_TRAILS_MEMBER_BYTES
+            or not 0 < selected.compress_size <= archive_size
             or selected.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED)
             or selected.flag_bits & 1
         ):
             raise ValueError("SA trails archive layer exceeds the extraction budget or uses an unsupported format")
+        if selected.compress_type == zipfile.ZIP_STORED and selected.compress_size != selected.file_size:
+            raise ValueError("SA trails stored layer size mismatch")
 
-        # Reading the selected member to EOF lets zipfile verify its CRC while
-        # holding only one small chunk in memory.
-        with archive.open(selected) as source:
-            prefix = source.read(4096).removeprefix(b"\xef\xbb\xbf").lstrip()
+        # Validate the raw compressed member directly so a forged file_size header
+        # cannot hide an oversized deflate stream from Python while expanding in GDAL /vsizip/.
+        with path.open("rb") as raw_file:
+            raw_file.seek(selected.header_offset)
+            lfh = raw_file.read(30)
+            if len(lfh) != 30 or lfh[:4] != b"PK\x03\x04":
+                raise zipfile.BadZipFile("Invalid ZIP local file header")
+            local_flags, local_method, _, _, local_crc, local_csize, local_fsize, fname_len, extra_len = (
+                struct.unpack("<HHHHIIIHH", lfh[6:30])
+            )
+            if local_method != selected.compress_type:
+                raise zipfile.BadZipFile("ZIP local compression method mismatch")
+            if not (local_flags & 0x08) and (
+                local_crc != selected.CRC
+                or local_csize != selected.compress_size
+                or local_fsize != selected.file_size
+            ):
+                raise zipfile.BadZipFile("ZIP local header size/CRC mismatch")
+            raw_file.seek(fname_len + extra_len, 1)
+
+            prefix_buf = bytearray()
+            total_out = 0
+            crc = 0
+            remaining_in = selected.compress_size
+            max_allowed = min(_MAX_SA_TRAILS_MEMBER_BYTES, selected.file_size)
+
+            def _consume_plain(plain: bytes) -> None:
+                nonlocal total_out, crc
+                if not plain:
+                    return
+                total_out += len(plain)
+                if total_out > max_allowed:
+                    raise ValueError("SA trails archive layer exceeds the extraction budget")
+                crc = zlib.crc32(plain, crc)
+                if len(prefix_buf) < 4096:
+                    prefix_buf.extend(plain[: 4096 - len(prefix_buf)])
+
+            if selected.compress_type == zipfile.ZIP_STORED:
+                while remaining_in > 0:
+                    chunk = raw_file.read(min(64 * 1024, remaining_in))
+                    if not chunk:
+                        raise zipfile.BadZipFile("Truncated stored ZIP layer")
+                    remaining_in -= len(chunk)
+                    _consume_plain(chunk)
+            else:
+                decompressor = zlib.decompressobj(-zlib.MAX_WBITS)
+                while remaining_in > 0:
+                    chunk = raw_file.read(min(64 * 1024, remaining_in))
+                    if not chunk:
+                        raise zipfile.BadZipFile("Truncated deflated ZIP layer")
+                    remaining_in -= len(chunk)
+                    data_in = chunk
+                    while data_in:
+                        budget_left = max_allowed - total_out + 1
+                        out = decompressor.decompress(data_in, budget_left)
+                        _consume_plain(out)
+                        data_in = decompressor.unconsumed_tail
+                        if decompressor.eof:
+                            break
+                    if decompressor.eof and remaining_in > 0:
+                        raise zipfile.BadZipFile("Unexpected trailing compressed bytes in ZIP layer")
+                while True:
+                    budget_left = max_allowed - total_out + 1
+                    tail = decompressor.flush(budget_left)
+                    if not tail:
+                        break
+                    _consume_plain(tail)
+                if not decompressor.eof or decompressor.unused_data:
+                    raise zipfile.BadZipFile("Incomplete or trailing deflate stream in ZIP layer")
+
+            if total_out != selected.file_size or (crc & 0xFFFFFFFF) != selected.CRC:
+                raise zipfile.BadZipFile("SA trails archive layer failed integrity verification")
+            prefix = bytes(prefix_buf).removeprefix(b"\xef\xbb\xbf").lstrip()
             if not prefix.startswith(b"{"):
                 raise ValueError("SA trails archive layer is not a GeoJSON object")
-            while source.read(64 * 1024):
-                pass
         return name
 
 
@@ -865,6 +946,7 @@ class SATrailsSource(_BaseAUOverlaySource):
                 validate=_sa_trails_zip_member,
                 timeout_s=max(45.0, self.timeout_s),
                 client=self._injected_client,
+                allowed_redirect_host_suffixes=("waterconnect.sa.gov.au",),
             )
         else:
             try:

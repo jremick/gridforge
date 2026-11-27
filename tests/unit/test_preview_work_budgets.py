@@ -137,3 +137,14 @@ def test_queued_strip_sheet_uses_worker_ordinals_for_paths(tmp_path, monkeypatch
     assert all(label in title for label, title in zip(labels, titles))
     output = data_dir / job_id / "artifacts" / result.artifacts[0].filename
     assert len(PdfReader(output).pages) == 2
+
+
+def test_strip_sheet_input_sanitizes_control_chars_and_traversal():
+    from pydantic import ValidationError
+    from gridforge.web.schemas import StripSheetInput
+
+    cleaned = StripSheetInput(sheet_id="S1\r\n\x00/West", center_lat=-33.7, center_lon=150.3)
+    assert cleaned.sheet_id == "S1/West"
+
+    with pytest.raises(ValidationError):
+        StripSheetInput(sheet_id="\r\n\x00\t", center_lat=-33.7, center_lon=150.3)

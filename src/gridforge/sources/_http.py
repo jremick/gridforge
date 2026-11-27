@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import tempfile
 import time
 from collections.abc import Iterator
@@ -11,22 +12,75 @@ from pathlib import Path
 import httpx
 
 
+def _validate_redirect_url(
+    origin: httpx.URL,
+    target: httpx.URL,
+    *,
+    allowed_host_suffixes: tuple[str, ...] | None = None,
+) -> None:
+    """Block redirect downgrades, private/loopback targets, and unapproved cross-host redirects."""
+    origin_scheme = origin.scheme.lower()
+    target_scheme = target.scheme.lower()
+    if target_scheme != "https" and not (origin_scheme == "http" and target_scheme == "http"):
+        raise ValueError("Provider redirect must use HTTPS")
+    if target.username or target.password:
+        raise ValueError("Provider redirect must not include credentials")
+
+    origin_host = (origin.host or "").lower().rstrip(".")
+    target_host = (target.host or "").lower().rstrip(".")
+    if not target_host or target_host == "localhost" or target_host.endswith(
+        (".localhost", ".local", ".internal")
+    ):
+        raise ValueError("Provider redirect points to a disallowed local host")
+    try:
+        ip = ipaddress.ip_address(target_host)
+    except ValueError:
+        ip = None
+    if ip is not None and not ip.is_global:
+        raise ValueError("Provider redirect points to a non-global IP address")
+
+    if target_host == origin_host:
+        return
+    if allowed_host_suffixes and any(
+        target_host == suffix.lower() or target_host.endswith(f".{suffix.lower()}")
+        for suffix in allowed_host_suffixes
+    ):
+        return
+    raise ValueError("Provider redirect leaves the approved host boundary")
+
+
 @contextmanager
 def stream_provider_get(
-    client: httpx.Client, url: str, *, params: dict[str, str] | None, user_agent: str, deadline: float
+    client: httpx.Client,
+    url: str,
+    *,
+    params: dict[str, str] | None,
+    user_agent: str,
+    deadline: float,
+    allowed_redirect_host_suffixes: tuple[str, ...] | None = None,
 ) -> Iterator[httpx.Response]:
-    """Skip redirect bodies so they cannot bypass a caller's streaming limit."""
+    """Skip redirect bodies and validate redirect hops within the caller's deadline."""
     request = client.build_request(
         "GET", url, params=params, headers={"User-Agent": user_agent, "Accept-Encoding": "identity"}
     )
+    origin_url = request.url
     for _ in range(4):
-        if time.monotonic() > deadline:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             raise ValueError("Provider request exceeds the time budget")
+        request.extensions["timeout"] = httpx.Timeout(
+            remaining, connect=min(8.0, remaining)
+        ).as_dict()
         response = client.send(request, stream=True, follow_redirects=False)
         try:
             if response.next_request is None:
                 yield response
                 return
+            _validate_redirect_url(
+                origin_url,
+                response.next_request.url,
+                allowed_host_suffixes=allowed_redirect_host_suffixes,
+            )
             request = response.next_request
         finally:
             response.close()
@@ -37,7 +91,7 @@ def bounded_response_chunks(
     response: httpx.Response, *, max_bytes: int, deadline: float
 ) -> Iterator[bytes]:
     """Yield an identity-encoded body within a cumulative byte and time budget."""
-    encoding = response.headers.get("Content-Encoding", "identity").lower()
+    encoding = (response.headers.get("Content-Encoding") or "").strip().lower() or "identity"
     if encoding != "identity":
         raise ValueError("Provider response must use identity content encoding")
 

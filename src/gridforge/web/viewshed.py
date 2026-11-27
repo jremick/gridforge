@@ -198,19 +198,19 @@ def _resolve_preview_elevation_source(
 
     # Preview warps use at least 30 m pixels. Skip native LiDAR tiers that
     # would first fetch and clip the entire footprint at 1–5 m resolution.
-    sources = {
-        DemSourceKind.USGS3DEP: USGS3DEPSource(prefer_1m=False),
-        DemSourceKind.AU_ELVIS: AUElvisDEMSource(prefer_state_lidar=False, prefer_5m=False),
-        DemSourceKind.NZ_LINZ: NZLinzDEMSource(prefer_1m=False),
-        DemSourceKind.CA_HRDEM: CanadaHRDEMSource(prefer_hrdem=False),
-    }
-    if dem_source in sources:
-        return sources[dem_source]
+    if dem_source == DemSourceKind.USGS3DEP:
+        return USGS3DEPSource(prefer_1m=False)
+    if dem_source == DemSourceKind.AU_ELVIS:
+        return AUElvisDEMSource(prefer_state_lidar=False, prefer_5m=False)
+    if dem_source == DemSourceKind.NZ_LINZ:
+        return NZLinzDEMSource(prefer_1m=False)
+    if dem_source == DemSourceKind.CA_HRDEM:
+        return CanadaHRDEMSource(prefer_hrdem=False)
     return AutoDEMSource(
-        usgs_source=sources[DemSourceKind.USGS3DEP],
-        au_source=sources[DemSourceKind.AU_ELVIS],
-        nz_source=sources[DemSourceKind.NZ_LINZ],
-        ca_source=sources[DemSourceKind.CA_HRDEM],
+        usgs_source=USGS3DEPSource(prefer_1m=False),
+        au_source=AUElvisDEMSource(prefer_state_lidar=False, prefer_5m=False),
+        nz_source=NZLinzDEMSource(prefer_1m=False),
+        ca_source=CanadaHRDEMSource(prefer_hrdem=False),
     )
 
 

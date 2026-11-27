@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import io
 import json
+import struct
+import time
 import zipfile
+import zlib
 from pathlib import Path
 
 import httpx
 import pytest
 
 from gridforge.config import BBox
-from gridforge.sources import dem_ca_hrdem, overlays_au_states, overlays_au_states_west
+from gridforge.sources import _http, dem_ca_hrdem, overlays_au_states, overlays_au_states_west
 from gridforge.sources.osm_overpass import OverpassOSMSource, PRIMARY_OVERPASS_URL
 
 
@@ -236,3 +239,87 @@ def test_gdal_can_only_use_bounded_direct_cog_ranges(tmp_path, redirect):
             assert output.is_file()
             assert any(request.method == "GET" for request in calls)
     assert calls and all(str(r.url) == _TRUSTED_COG for r in calls)
+
+
+def test_sa_trails_zip_rejects_forged_file_size_deflate_bomb(tmp_path, monkeypatch):
+    monkeypatch.setattr(overlays_au_states_west, "_MAX_SA_TRAILS_MEMBER_BYTES", 100, raising=False)
+    inner = overlays_au_states_west.DEFAULT_SA_TRAILS_ZIP_INNER
+    payload = b'{"type":"FeatureCollection","pad":"' + (b"A" * 2000) + b'"}'
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(inner, payload)
+    raw = buf.getvalue()
+    real_crc = zlib.crc32(payload) & 0xFFFFFFFF
+    fake_size = 10
+    fake_crc = zlib.crc32(payload[:fake_size]) & 0xFFFFFFFF
+    forged = (
+        raw.replace(struct.pack("<I", len(payload)), struct.pack("<I", fake_size))
+        .replace(struct.pack("<I", real_crc), struct.pack("<I", fake_crc))
+    )
+    zip_path = tmp_path / "forged.zip"
+    zip_path.write_bytes(forged)
+
+    with pytest.raises((ValueError, zipfile.BadZipFile)):
+        overlays_au_states_west._sa_trails_zip_member(zip_path)
+
+
+@pytest.mark.parametrize(
+    "redirect_target",
+    [
+        "http://wfs.example.invalid/downgrade",
+        "https://127.0.0.1/secret",
+        "https://169.254.169.254/latest/meta-data/",
+        "https://evil.example.invalid/steal-key",
+        "https://user:pass@wfs.example.invalid/data",
+    ],
+)
+def test_stream_provider_get_blocks_unsafe_redirects(redirect_target):
+    calls: list[str] = []
+
+    def handler(request):
+        calls.append(str(request.url))
+        return httpx.Response(302, headers={"Location": redirect_target})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(ValueError):
+            with _http.stream_provider_get(
+                client,
+                "https://wfs.example.invalid/query",
+                params=None,
+                user_agent="gridforge-test",
+                deadline=time.monotonic() + 5.0,
+            ):
+                pass
+    assert calls == ["https://wfs.example.invalid/query"]
+
+
+def test_stream_provider_get_allows_allowlisted_subdomain_redirect():
+    calls: list[str] = []
+
+    def handler(request):
+        calls.append(str(request.url))
+        if request.url.host == "www.waterconnect.sa.gov.au":
+            return httpx.Response(
+                301,
+                headers={"Location": "https://apps.waterconnect.sa.gov.au/GISDownloads/trails.zip"},
+            )
+        return httpx.Response(200, headers={"Content-Encoding": "  "}, content=b"ok")
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        with _http.stream_provider_get(
+            client,
+            "https://www.waterconnect.sa.gov.au/Content/Downloads/DEWNR/trails.zip",
+            params=None,
+            user_agent="gridforge-test",
+            deadline=time.monotonic() + 5.0,
+            allowed_redirect_host_suffixes=("waterconnect.sa.gov.au",),
+        ) as resp:
+            body = b"".join(_http.bounded_response_chunks(resp, max_bytes=64, deadline=time.monotonic() + 5.0))
+    assert body == b"ok"
+    assert len(calls) == 2
+
+
+def test_bounded_response_chunks_rejects_gzip_encoding():
+    resp = httpx.Response(200, headers={"Content-Encoding": "gzip"}, stream=FixtureStream([b"compressed"]))
+    with pytest.raises(ValueError, match="identity"):
+        list(_http.bounded_response_chunks(resp, max_bytes=1024, deadline=time.monotonic() + 5.0))
