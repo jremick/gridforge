@@ -5,9 +5,13 @@ import {
   ApiError,
   acceptInvite,
   createAdminInvite,
+  createShareSnapshot,
+  deleteShareSnapshot,
   fetchAdminUsage,
   fetchAdminUsers,
   fetchSession,
+  fetchShareSnapshot,
+  fetchShares,
   fetchRFLinkProfile,
   fetchRulerMetrics,
   fetchViewshedPreview,
@@ -250,6 +254,70 @@ test("admin API endpoints hit expected paths, methods, and payloads", async () =
   assert.deepEqual(JSON.parse(calls[5].init.body), {
     public_renders_paused: true,
   });
+});
+
+test("share snapshot API helpers hit expected paths, methods, and payloads", async () => {
+  const calls = [];
+  await withMockFetch(
+    async (url, init = {}) => {
+      calls.push({ url, init });
+      if (url === "/api/shares" && init.method === "POST") {
+        return jsonResponse(
+          {
+            share_id: "AbCdEf1234567890",
+            share_path: "/?share=AbCdEf1234567890",
+            name: "Trip",
+            notes: "",
+            state: { center: "-33.7,150.3" },
+            view_count: 0,
+            created_at: "2026-11-27T00:00:00Z",
+            expires_at: null,
+          },
+          201
+        );
+      }
+      if (url === "/api/shares") {
+        return jsonResponse({ shares: [] });
+      }
+      if (init.method === "DELETE") {
+        return jsonResponse({ deleted: true });
+      }
+      return jsonResponse({
+        share_id: "AbCdEf1234567890",
+        share_path: "/?share=AbCdEf1234567890",
+        name: "Trip",
+        notes: "",
+        state: { center: "-33.7,150.3" },
+        view_count: 1,
+        created_at: "2026-11-27T00:00:00Z",
+        expires_at: null,
+      });
+    },
+    async () => {
+      await createShareSnapshot({ name: "Trip", state: { center: "-33.7,150.3" } });
+      await createShareSnapshot({ project_id: "proj_12345678" });
+      await fetchShareSnapshot("AbCdEf1234567890");
+      await fetchShares();
+      await deleteShareSnapshot("AbCdEf1234567890");
+    }
+  );
+
+  assert.equal(calls[0].url, "/api/shares");
+  assert.equal(calls[0].init.method, "POST");
+  assert.deepEqual(JSON.parse(calls[0].init.body), {
+    name: "Trip",
+    state: { center: "-33.7,150.3" },
+  });
+
+  assert.equal(calls[1].url, "/api/shares");
+  assert.deepEqual(JSON.parse(calls[1].init.body), {
+    project_id: "proj_12345678",
+  });
+
+  assert.equal(calls[2].url, "/api/shares/AbCdEf1234567890");
+  assert.equal(calls[3].url, "/api/shares");
+  assert.equal(calls[4].url, "/api/shares/AbCdEf1234567890");
+  assert.equal(calls[4].init.method, "DELETE");
 });
 
 test("ApiError preserves HTTP status and parses FastAPI JSON and plain-text details", async () => {

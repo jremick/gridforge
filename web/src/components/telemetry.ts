@@ -12,17 +12,35 @@ import type {
   StripPlanResponse,
 } from "../types";
 
+export interface SharePopoverSummary {
+  headline: string;
+  detail: string;
+  directTruncated: boolean;
+  hasLocalOverlayFile: boolean;
+  activeShareUrl?: string | null;
+}
+
+export interface ShortLinkDisplay {
+  url: string;
+  expiresLabel: string;
+}
+
 export interface TelemetryCallbacks {
   onToggleSidebar?: () => void;
   onToggleDrawer: () => void;
   onToggleProjects: () => void;
   onCopyMgrs: (mgrs: string) => void;
+  onShareOpen?: () => void;
+  onCopyDirectLink?: () => void;
+  onCreateShortLink?: () => void;
+  onCopyShareUrl?: (url: string) => void;
   onOpenAuth?: () => void;
   onSignOut?: () => void;
   onOpenAdmin?: () => void;
 }
 
 const ICON_SIDEBAR = `<svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true"><rect x="1.5" y="2.25" width="13" height="11.5" rx="2" stroke="currentColor" stroke-width="1.4"/><line x1="6" y1="2.5" x2="6" y2="13.5" stroke="currentColor" stroke-width="1.4"/></svg>`;
+const ICON_SHARE = `<svg width="13.5" height="13.5" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M6.75 9.25L9.25 6.75" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><path d="M8.8 10.6L7.4 12C6.3 13.1 4.5 13.1 3.4 12C2.3 10.9 2.3 9.1 3.4 8L4.8 6.6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><path d="M7.2 5.4L8.6 4C9.7 2.9 11.5 2.9 12.6 4C13.7 5.1 13.7 6.9 12.6 8L11.2 9.4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>`;
 const ICON_PROJECTS = `<svg width="13.5" height="13.5" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M2 4.25C2 3.42 2.67 2.75 3.5 2.75H6.2L7.55 4.25H12.5C13.33 4.25 14 4.92 14 5.75V11.75C14 12.58 13.33 13.25 12.5 13.25H3.5C2.67 13.25 2 12.58 2 11.75V4.25Z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>`;
 const ICON_ADMIN = `<svg width="13.5" height="13.5" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M2.5 4.5H13.5M2.5 8H13.5M2.5 11.5H13.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><circle cx="5.5" cy="4.5" r="1.4" fill="#0c1116" stroke="currentColor" stroke-width="1.3"/><circle cx="10.5" cy="8" r="1.4" fill="#0c1116" stroke="currentColor" stroke-width="1.3"/><circle cx="6.5" cy="11.5" r="1.4" fill="#0c1116" stroke="currentColor" stroke-width="1.3"/></svg>`;
 const ICON_CHEVRON = `<svg class="gf-menu-chevron" width="11" height="11" viewBox="0 0 12 12" fill="none" aria-hidden="true"><path d="M3 4.5L6 7.5L9 4.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
@@ -44,28 +62,55 @@ export class TelemetryBar {
   private readonly declEl: HTMLElement;
   private readonly statusDotEl: HTMLElement;
   private readonly queueLabelEl: HTMLElement;
+  private readonly shareWrapEl: HTMLElement;
+  private readonly shareToggleBtn: HTMLButtonElement;
+  private readonly sharePopoverEl: HTMLElement;
+  private readonly shareHeadlineEl: HTMLElement;
+  private readonly shareDetailEl: HTMLElement;
+  private readonly shareNoteEl: HTMLElement;
+  private readonly shareCopyDirectBtn: HTMLButtonElement;
+  private readonly shareCreateShortBtn: HTMLButtonElement;
+  private readonly shareShortResultEl: HTMLElement;
+  private readonly shareShortExpiryEl: HTMLElement;
+  private readonly shareShortInput: HTMLInputElement;
+  private readonly shareShortCopyBtn: HTMLButtonElement;
   private readonly projectsToggleBtn: HTMLButtonElement;
   private readonly queueToggleBtn: HTMLButtonElement;
   private readonly queueBadgeEl: HTMLElement;
   private authDividerEl: HTMLElement | null = null;
   private authControlsEl: HTMLElement | null = null;
   private accountMenuOpen = false;
+  private shareMenuOpen = false;
+  private shortLinkBusy = false;
   private latestMgrs = "";
   private workerStatusLabel = "Connecting";
   private workerOffline = false;
   private latestQueueCount = 0;
 
   private readonly handleDocClick = (e: Event): void => {
-    if (!this.accountMenuOpen || !this.authControlsEl) return;
     const target = e.target as Node | null;
-    if (target && !this.authControlsEl.contains(target)) {
+    if (
+      this.accountMenuOpen &&
+      this.authControlsEl &&
+      target &&
+      !this.authControlsEl.contains(target)
+    ) {
       this.setAccountMenuOpen(false, { restoreFocus: false });
+    }
+    if (this.shareMenuOpen && target && !this.shareWrapEl.contains(target)) {
+      this.setShareMenuOpen(false, { restoreFocus: false });
     }
   };
 
   private readonly handleDocKeyDown = (e: KeyboardEvent): void => {
-    if (!this.accountMenuOpen) return;
-    if (e.key === "Escape") {
+    if (e.key !== "Escape") return;
+    if (this.shareMenuOpen) {
+      e.preventDefault();
+      e.stopPropagation();
+      this.setShareMenuOpen(false, { restoreFocus: true });
+      return;
+    }
+    if (this.accountMenuOpen) {
       e.preventDefault();
       e.stopPropagation();
       this.setAccountMenuOpen(false, { restoreFocus: true });
@@ -135,6 +180,77 @@ export class TelemetryBar {
 
       <div class="gf-topbar-right">
         <div class="gf-topbar-group" role="group" aria-label="Workspace panels">
+          <div class="gf-share-wrap" data-role="share-wrap">
+            <button
+              type="button"
+              class="gf-topbar-btn gf-share-toggle"
+              data-role="share-toggle"
+              aria-haspopup="dialog"
+              aria-expanded="false"
+              aria-controls="gf-share-popover"
+              aria-label="Share view or copy deep link"
+              title="Share view or copy deep link"
+            >
+              ${ICON_SHARE}
+              <span class="gf-btn-text">Share</span>
+            </button>
+            <div
+              id="gf-share-popover"
+              class="gf-share-popover"
+              role="dialog"
+              aria-label="Share map view"
+              data-role="share-popover"
+              hidden
+            >
+              <div class="gf-share-header">
+                <div class="gf-share-title">Share Map View</div>
+                <div class="gf-share-headline mono" data-role="share-headline">—</div>
+                <div class="gf-share-detail" data-role="share-detail"></div>
+              </div>
+              <div class="gf-share-body">
+                <div class="gf-share-note" data-role="share-note" hidden></div>
+                <div class="gf-share-actions">
+                  <button
+                    type="button"
+                    class="gf-share-action-btn"
+                    data-role="share-copy-direct"
+                  >
+                    <span class="gf-share-action-title">Copy Direct Link</span>
+                    <span class="gf-share-action-sub">Encodes settings in URL · works offline</span>
+                  </button>
+                  <button
+                    type="button"
+                    class="gf-share-action-btn gf-share-action-primary"
+                    data-role="share-create-short"
+                    ${callbacks.onCreateShortLink ? "" : "hidden"}
+                  >
+                    <span class="gf-share-action-title" data-role="share-create-short-label">Create Short Share Link</span>
+                    <span class="gf-share-action-sub">Saved read-only snapshot · preserves all markups</span>
+                  </button>
+                </div>
+                <div class="gf-share-short-box" data-role="share-short-result" hidden>
+                  <div class="gf-share-short-head">
+                    <span>Share Link Ready</span>
+                    <span class="gf-share-short-expiry" data-role="share-short-expiry"></span>
+                  </div>
+                  <div class="gf-share-short-row">
+                    <input
+                      type="text"
+                      class="gf-input mono"
+                      readonly
+                      data-role="share-short-input"
+                      aria-label="Generated share link"
+                    />
+                    <button
+                      type="button"
+                      class="gf-btn-secondary gf-share-copy-btn"
+                      data-role="share-short-copy"
+                    >Copy</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
           <button
             type="button"
             class="gf-topbar-btn gf-projects-toggle"
@@ -177,6 +293,26 @@ export class TelemetryBar {
     this.declEl = this.q("[data-role='decl']");
     this.statusDotEl = this.q("[data-role='status-dot']");
     this.queueLabelEl = this.q("[data-role='queue-label']");
+    this.shareWrapEl = this.q("[data-role='share-wrap']");
+    this.shareToggleBtn = this.q<HTMLButtonElement>("[data-role='share-toggle']");
+    this.sharePopoverEl = this.q("[data-role='share-popover']");
+    this.shareHeadlineEl = this.q("[data-role='share-headline']");
+    this.shareDetailEl = this.q("[data-role='share-detail']");
+    this.shareNoteEl = this.q("[data-role='share-note']");
+    this.shareCopyDirectBtn = this.q<HTMLButtonElement>(
+      "[data-role='share-copy-direct']"
+    );
+    this.shareCreateShortBtn = this.q<HTMLButtonElement>(
+      "[data-role='share-create-short']"
+    );
+    this.shareShortResultEl = this.q("[data-role='share-short-result']");
+    this.shareShortExpiryEl = this.q("[data-role='share-short-expiry']");
+    this.shareShortInput = this.q<HTMLInputElement>(
+      "[data-role='share-short-input']"
+    );
+    this.shareShortCopyBtn = this.q<HTMLButtonElement>(
+      "[data-role='share-short-copy']"
+    );
     this.projectsToggleBtn = this.q<HTMLButtonElement>(
       "[data-role='projects-toggle']"
     );
@@ -195,11 +331,43 @@ export class TelemetryBar {
       }
     });
 
+    this.shareToggleBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const nextOpen = !this.shareMenuOpen;
+      if (nextOpen) {
+        this.setAccountMenuOpen(false, { restoreFocus: false });
+        this.callbacks.onShareOpen?.();
+      }
+      this.setShareMenuOpen(nextOpen);
+    });
+
+    this.shareCopyDirectBtn.addEventListener("click", () => {
+      this.callbacks.onCopyDirectLink?.();
+    });
+
+    this.shareCreateShortBtn.addEventListener("click", () => {
+      if (this.shortLinkBusy) return;
+      this.callbacks.onCreateShortLink?.();
+    });
+
+    this.shareShortCopyBtn.addEventListener("click", () => {
+      const val = this.shareShortInput.value.trim();
+      if (val) {
+        this.callbacks.onCopyShareUrl?.(val);
+      }
+    });
+
+    this.shareShortInput.addEventListener("focus", () => {
+      this.shareShortInput.select();
+    });
+
     this.projectsToggleBtn.addEventListener("click", () => {
+      this.setShareMenuOpen(false, { restoreFocus: false });
       callbacks.onToggleProjects();
     });
 
     this.queueToggleBtn.addEventListener("click", () => {
+      this.setShareMenuOpen(false, { restoreFocus: false });
       callbacks.onToggleDrawer();
     });
 
@@ -286,6 +454,7 @@ export class TelemetryBar {
     menu.hidden = !open;
 
     if (open) {
+      this.setShareMenuOpen(false, { restoreFocus: false });
       const items = this.getMenuItems();
       const targetItem = options.focusLast
         ? items[items.length - 1]
@@ -296,6 +465,80 @@ export class TelemetryBar {
     } else if (options.restoreFocus) {
       trigger.focus();
     }
+  }
+
+  private setShareMenuOpen(
+    open: boolean,
+    options: { restoreFocus?: boolean } = {}
+  ): void {
+    this.shareMenuOpen = open;
+    this.shareToggleBtn.classList.toggle("active", open);
+    this.shareToggleBtn.setAttribute("aria-expanded", String(open));
+    this.sharePopoverEl.hidden = !open;
+    if (!open && options.restoreFocus) {
+      this.shareToggleBtn.focus();
+    }
+  }
+
+  isShareMenuOpen(): boolean {
+    return this.shareMenuOpen;
+  }
+
+  closeShareMenu(): void {
+    if (this.shareMenuOpen) {
+      this.setShareMenuOpen(false, { restoreFocus: false });
+    }
+  }
+
+  setShareSummary(summary: SharePopoverSummary): void {
+    this.shareHeadlineEl.textContent = summary.headline;
+    this.shareDetailEl.textContent = summary.detail;
+    const notes: string[] = [];
+    if (summary.directTruncated) {
+      notes.push(
+        "Direct URL is compact and omits some markups — use Short Share Link for 100% fidelity."
+      );
+    }
+    if (summary.hasLocalOverlayFile) {
+      notes.push("Local uploaded GPX/KML files are not embedded in links.");
+    }
+    if (notes.length > 0) {
+      this.shareNoteEl.textContent = notes.join(" ");
+      this.shareNoteEl.hidden = false;
+    } else {
+      this.shareNoteEl.textContent = "";
+      this.shareNoteEl.hidden = true;
+    }
+    if (summary.activeShareUrl) {
+      this.shareShortInput.value = summary.activeShareUrl;
+      this.shareShortExpiryEl.textContent = "Active snapshot";
+      this.shareShortResultEl.hidden = false;
+    }
+  }
+
+  setShortLinkBusy(busy: boolean): void {
+    this.shortLinkBusy = busy;
+    this.shareCreateShortBtn.disabled = busy;
+    const labelEl = this.shareCreateShortBtn.querySelector(
+      "[data-role='share-create-short-label']"
+    );
+    if (labelEl) {
+      labelEl.textContent = busy
+        ? "Creating Short Link…"
+        : "Create Short Share Link";
+    }
+  }
+
+  setShortLinkResult(result: ShortLinkDisplay | null): void {
+    if (!result) {
+      this.shareShortInput.value = "";
+      this.shareShortExpiryEl.textContent = "";
+      this.shareShortResultEl.hidden = true;
+      return;
+    }
+    this.shareShortInput.value = result.url;
+    this.shareShortExpiryEl.textContent = result.expiresLabel;
+    this.shareShortResultEl.hidden = false;
   }
 
   updateSidebarCollapsed(collapsed: boolean): void {

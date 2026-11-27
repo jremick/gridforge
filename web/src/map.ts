@@ -56,6 +56,7 @@ export interface GridForgeMapCallbacks {
   onMapSectorClick?: (lat: number, lon: number) => void;
   onMapSectorFinish?: () => void;
   onCursorMove?: (lat: number, lon: number) => void;
+  onViewChange?: (zoom: number) => void;
   onExternalTileFailure?: () => void;
   onVectorBasemapError?: () => void;
 }
@@ -64,6 +65,7 @@ export interface GridForgeMapOptions {
   initialLat?: number;
   initialLon?: number;
   initialZoom?: number;
+  initialBasemap?: BasemapId;
 }
 
 function buildInitialStyle(): maplibregl.StyleSpecification {
@@ -773,6 +775,9 @@ export class GridForgeMap {
     const initLat = options?.initialLat ?? DEFAULT_CENTER_LAT;
     const initLon = options?.initialLon ?? DEFAULT_CENTER_LON;
     const initZoom = options?.initialZoom ?? DEFAULT_MAP_ZOOM;
+    if (options?.initialBasemap && options.initialBasemap !== "offline") {
+      this.currentBasemap = options.initialBasemap;
+    }
 
     this.map = new maplibregl.Map({
       container,
@@ -856,6 +861,10 @@ export class GridForgeMap {
 
     this.map.on("mousemove", (e) => {
       callbacks.onCursorMove?.(e.lngLat.lat, e.lngLat.lng);
+    });
+
+    this.map.on("zoomend", () => {
+      callbacks.onViewChange?.(this.map.getZoom());
     });
 
     this.map.on("error", (ev) => {
@@ -1286,6 +1295,10 @@ export class GridForgeMap {
     return this.draggingMarker;
   }
 
+  getZoom(): number {
+    return this.map.getZoom();
+  }
+
   setCenter(
     lat: number,
     lon: number,
@@ -1298,6 +1311,11 @@ export class GridForgeMap {
         zoom: options.zoom ?? Math.max(this.map.getZoom(), 11.5),
         duration: 650,
         essential: true,
+      });
+    } else if (typeof options?.zoom === "number" && Number.isFinite(options.zoom)) {
+      this.map.jumpTo({
+        center: [lon, lat],
+        zoom: options.zoom,
       });
     }
   }

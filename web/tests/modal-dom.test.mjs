@@ -880,3 +880,122 @@ test("TelemetryBar removes duplicate Admin/Queue pills, exposes keyboard account
     assert.equal(doc.title, "GridMaps — Tactical Topographic Print Studio");
   });
 });
+
+test("TelemetryBar Share popover toggles cleanly, invokes direct/short share callbacks, and escapes text", async () => {
+  const { TelemetryBar } = await bundleTsModule("src/components/telemetry.ts");
+  await withDom(({ doc }) => {
+    const events = [];
+    const container = doc.createElement("header");
+    doc.body.appendChild(container);
+    const bar = new TelemetryBar(container, {
+      onToggleDrawer: () => {},
+      onToggleProjects: () => {},
+      onCopyMgrs: () => {},
+      onShareOpen: () => {
+        events.push("share-open");
+        bar.setShareSummary({
+          headline: '<script>alert(1)</script>Kosciuszko',
+          detail: "1:25,000 · A4 · alpine",
+          directTruncated: true,
+          hasLocalOverlayFile: true,
+        });
+      },
+      onCopyDirectLink: () => events.push("copy-direct"),
+      onCreateShortLink: () => {
+        events.push("create-short");
+        bar.setShortLinkResult({
+          url: "https://gridforge.example/?share=AbCdEf1234567890",
+          expiresLabel: "Expires in 7d",
+        });
+      },
+      onCopyShareUrl: (u) => events.push(`copy-short:${u}`),
+    });
+
+    const toggle = container.querySelector("[data-role='share-toggle']");
+    const popover = container.querySelector("[data-role='share-popover']");
+    const directBtn = container.querySelector("[data-role='share-copy-direct']");
+    const shortBtn = container.querySelector("[data-role='share-create-short']");
+    const shortBox = container.querySelector("[data-role='share-short-result']");
+    const shortCopyBtn = container.querySelector("[data-role='share-short-copy']");
+
+    assert.equal(popover.hidden, true);
+    assert.equal(shortBtn.hidden, false);
+
+    toggle.click();
+    assert.equal(popover.hidden, false);
+    assert.equal(toggle.getAttribute("aria-expanded"), "true");
+    assert.equal(container.querySelectorAll("script").length, 0);
+    assert.equal(
+      container.querySelector("[data-role='share-note']").hidden,
+      false
+    );
+
+    directBtn.click();
+    shortBtn.click();
+    assert.equal(shortBox.hidden, false);
+    shortCopyBtn.click();
+
+    assert.deepEqual(events, [
+      "share-open",
+      "copy-direct",
+      "create-short",
+      "copy-short:https://gridforge.example/?share=AbCdEf1234567890",
+    ]);
+
+    doc.dispatchKeyDown({ key: "Escape" });
+    assert.equal(popover.hidden, true);
+    assert.equal(toggle.getAttribute("aria-expanded"), "false");
+    assert.equal(doc.activeElement, toggle);
+  });
+});
+
+test("ProjectsDrawer renders Share action per saved project and triggers callback", async () => {
+  const { ProjectsDrawer } = await bundleTsModule("src/components/projectsDrawer.ts");
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response(
+      JSON.stringify({
+        projects: [
+          {
+            project_id: "proj_alpha1234",
+            name: "Alpine Traverse",
+            notes: "Winter route",
+            created_at: "2026-11-27T00:00:00Z",
+            updated_at: "2026-11-27T00:00:00Z",
+            state: { center: "-36.45, 148.26", scale: 25000, paper: "a4", color_mode: "alpine" },
+          },
+        ],
+      }),
+      { status: 200, headers: { "content-type": "application/json" } }
+    );
+
+  try {
+    await withDom(async ({ doc }) => {
+      const sharedIds = [];
+      const container = doc.createElement("aside");
+      doc.body.appendChild(container);
+      const drawer = new ProjectsDrawer(container, {
+        onClose: () => {},
+        onLoadProject: () => {},
+        onShareProject: async (proj) => {
+          sharedIds.push(proj.project_id);
+        },
+        getCurrentSnapshot: () => ({
+          suggestedName: "Test",
+          state: {},
+          last_job_id: null,
+        }),
+        onToast: () => {},
+      });
+
+      await drawer.refresh();
+      const shareBtn = container.querySelector("button[data-proj-action='share']");
+      assert.ok(shareBtn);
+      shareBtn.click();
+      await new Promise((r) => setTimeout(r, 10));
+      assert.deepEqual(sharedIds, ["proj_alpha1234"]);
+    });
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});

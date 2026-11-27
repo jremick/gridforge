@@ -353,6 +353,28 @@ export interface SavedProject {
   state: Record<string, unknown>;
 }
 
+export interface SharedSnapshot {
+  share_id: string;
+  share_path: string;
+  name: string;
+  notes: string;
+  state: Record<string, unknown>;
+  view_count: number;
+  created_at: string;
+  expires_at: string | null;
+}
+
+export interface SharedSnapshotSummary {
+  share_id: string;
+  share_path: string;
+  name: string;
+  notes: string;
+  source_project_id: string | null;
+  view_count: number;
+  created_at: string;
+  expires_at: string | null;
+}
+
 export interface GeocodeResult {
   display_name: string;
   short_name: string;

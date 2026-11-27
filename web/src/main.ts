@@ -2,6 +2,7 @@ import "./styles.css";
 import {
   ApiError,
   cancelJob,
+  createShareSnapshot,
   deleteJob,
   fetchBasemapInfo,
   fetchFootprint,
@@ -12,6 +13,7 @@ import {
   fetchRouteMetrics,
   fetchRulerMetrics,
   fetchSession,
+  fetchShareSnapshot,
   fetchStripPlan,
   fetchViewshedPreview,
   logoutSession,
@@ -24,23 +26,21 @@ import { PacksModal } from "./components/packsModal";
 import { ProjectsDrawer } from "./components/projectsDrawer";
 import { SidebarPanel } from "./components/sidebar";
 import { TelemetryBar } from "./components/telemetry";
+import {
+  DEFAULT_BASEMAP,
+  buildDirectShareUrl,
+  hydrateStateFromSearch,
+  hydrateStateFromSnapshot,
+  serializeStateToParams,
+} from "./deeplink";
 import { GridForgeMap } from "./map";
 import {
-  ALL_AU_OVERLAY_KINDS,
   BASEMAP_OPTIONS,
-  CA_OVERLAY_OPTIONS,
-  COLOR_MODE_OPTIONS,
-  DEM_SOURCE_OPTIONS,
-  DPI_OPTIONS,
-  NZ_OVERLAY_OPTIONS,
-  PAPER_OPTIONS,
-  SCALE_OPTIONS,
-  US_OVERLAY_OPTIONS,
+  DEFAULT_MAP_ZOOM,
   buildCliCommand,
   createInitialFormState,
   escapeHtml,
   formatCoords,
-  parseLatLon,
 } from "./presets";
 import {
   clampFormStateToCapabilities,
@@ -60,226 +60,29 @@ import {
 } from "./sidebarPrefs";
 import { TurnstileController } from "./turnstile";
 import type {
-  AUOverlayKind,
-  AppFormState,
   BasemapId,
-  CAOverlayKind,
-  ColorMode,
   CreateJobPayload,
-  DemSourceKind,
   FootprintResponse,
   GeocodeResult,
   JobRecord,
   LocationPreset,
   MapInteractionMode,
-  NZOverlayKind,
-  Orientation,
-  PaperSize,
   RFLinkEntry,
   RFLinkSpec,
   RulerMetricsResponse,
   SavedProject,
   SessionResponse,
   TacticalGraphic,
-  USOverlayKind,
-  Units,
   ViewshedEntry,
-  ViewshedObserver,
   WaypointCategory,
-  WaypointInput,
 } from "./types";
 
 const FOOTPRINT_DEBOUNCE_MS = 180;
 const ROUTE_METRICS_DEBOUNCE_MS = 150;
+const ZOOM_URL_DEBOUNCE_MS = 260;
 const ACTIVE_JOBS_POLL_MS = 2000;
 const IDLE_JOBS_POLL_MS = 10000;
 const HEALTH_POLL_MS = 5000;
-
-const VALID_SCALES = new Set(SCALE_OPTIONS.map((s) => s.value));
-const VALID_DPIS = new Set(DPI_OPTIONS.map((d) => d.value));
-const VALID_PAPERS = new Set<string>(PAPER_OPTIONS.map((p) => p.value));
-const VALID_MODES = new Set<string>(COLOR_MODE_OPTIONS.map((m) => m.value));
-const VALID_DEMS = new Set<string>(DEM_SOURCE_OPTIONS.map((d) => d.value));
-const VALID_AU_OV = new Set<string>(ALL_AU_OVERLAY_KINDS);
-const VALID_NZ_OV = new Set<string>(NZ_OVERLAY_OPTIONS.map((o) => o.value));
-const VALID_CA_OV = new Set<string>(CA_OVERLAY_OPTIONS.map((o) => o.value));
-const VALID_US_OV = new Set<string>(US_OVERLAY_OPTIONS.map((o) => o.value));
-
-function hydrateStateFromUrl(state: AppFormState): {
-  hasCustomCenter: boolean;
-  needsFlyToResolvedCenter: boolean;
-} {
-  const params = new URLSearchParams(window.location.search);
-  let hasCustomCenter = false;
-  let needsFlyToResolvedCenter = false;
-
-  const centerParam = params.get("center")?.trim();
-  if (centerParam) {
-    hasCustomCenter = true;
-    state.center = centerParam;
-    const parsed = parseLatLon(centerParam);
-    if (parsed) {
-      state.lat = parsed.lat;
-      state.lon = parsed.lon;
-    } else {
-      needsFlyToResolvedCenter = true;
-    }
-  }
-
-  const scaleParam = Number(params.get("scale"));
-  if (VALID_SCALES.has(scaleParam)) {
-    state.scale = scaleParam;
-  }
-
-  const paperParam = params.get("paper")?.toLowerCase();
-  if (paperParam && VALID_PAPERS.has(paperParam)) {
-    state.paper = paperParam as PaperSize;
-  }
-
-  const orientParam = params.get("orientation")?.toLowerCase();
-  if (orientParam === "portrait" || orientParam === "landscape") {
-    state.orientation = orientParam as Orientation;
-  }
-
-  const modeParam = params.get("mode")?.toLowerCase();
-  if (modeParam && VALID_MODES.has(modeParam)) {
-    state.color_mode = modeParam as ColorMode;
-  }
-
-  const unitsParam = params.get("units")?.toLowerCase();
-  if (unitsParam === "metric" || unitsParam === "imperial") {
-    state.units = unitsParam as Units;
-  }
-
-  const dpiParam = Number(params.get("dpi"));
-  if (VALID_DPIS.has(dpiParam)) {
-    state.dpi = dpiParam;
-  }
-
-  const exportDpiParam = Number(params.get("export_dpi"));
-  if (VALID_DPIS.has(exportDpiParam)) {
-    state.outputs.export_dpi = exportDpiParam;
-  }
-
-  const demParam = params.get("dem")?.toLowerCase();
-  if (demParam && VALID_DEMS.has(demParam)) {
-    state.dem_source = demParam as DemSourceKind;
-  }
-
-  const packParam = params.get("pack")?.trim();
-  if (packParam && /^[a-zA-Z0-9_-]{1,64}$/.test(packParam)) {
-    state.pack_id = packParam;
-  }
-
-  const gridParam = params.get("grid")?.toLowerCase();
-  if (gridParam) {
-    const match = /^([1-3])x([1-3])$/.exec(gridParam);
-    if (match) {
-      state.grid_cols = Number(match[1]);
-      state.grid_rows = Number(match[2]);
-      if (state.grid_cols * state.grid_rows > 1) {
-        state.include_atlas_index = true;
-      }
-    }
-  }
-
-  const titleParam = params.get("title")?.trim();
-  if (titleParam) {
-    state.title = titleParam.slice(0, 80);
-  }
-
-  const auParam = params.get("au")?.trim();
-  if (auParam) {
-    state.au_overlays = auParam
-      .split(",")
-      .map((s) => s.trim().toLowerCase())
-      .filter((s): s is AUOverlayKind => VALID_AU_OV.has(s));
-  }
-
-  const nzParam = params.get("nz")?.trim();
-  if (nzParam) {
-    state.nz_overlays = nzParam
-      .split(",")
-      .map((s) => s.trim().toLowerCase())
-      .filter((s): s is NZOverlayKind => VALID_NZ_OV.has(s));
-  }
-
-  const caParam = params.get("ca")?.trim();
-  if (caParam) {
-    state.ca_overlays = caParam
-      .split(",")
-      .map((s) => s.trim().toLowerCase())
-      .filter((s): s is CAOverlayKind => VALID_CA_OV.has(s));
-  }
-
-  const usParam = params.get("us")?.trim();
-  if (usParam) {
-    state.us_overlays = usParam
-      .split(",")
-      .map((s) => s.trim().toLowerCase())
-      .filter((s): s is USOverlayKind => VALID_US_OV.has(s));
-  }
-
-  if (params.get("slope") === "1" || params.get("slope") === "true") {
-    state.carto.show_slope_shading = true;
-  }
-  if (params.get("cal") === "1") {
-    state.include_calibration_page = true;
-  }
-  if (params.get("fold") === "1") {
-    state.show_fold_marks = true;
-  }
-  if (params.get("index") === "1") {
-    state.include_atlas_index = true;
-  } else if (params.get("index") === "0") {
-    state.include_atlas_index = false;
-  }
-
-  const losParam = params.get("los")?.trim();
-  if (losParam) {
-    const parts = losParam.split(";").slice(0, 4);
-    parts.forEach((raw, idx) => {
-      const segs = raw.split(",");
-      const lat = Number(segs[0]);
-      const lon = Number(segs[1]);
-      if (
-        !Number.isFinite(lat) ||
-        !Number.isFinite(lon) ||
-        lat < -80 ||
-        lat > 84 ||
-        lon < -180 ||
-        lon > 180
-      ) {
-        return;
-      }
-      const obsH = Number.isFinite(Number(segs[2]))
-        ? Math.min(500, Math.max(0, Number(segs[2])))
-        : 2;
-      const tgtH = Number.isFinite(Number(segs[3]))
-        ? Math.min(500, Math.max(0, Number(segs[3])))
-        : 1.5;
-      const maxKm = Number.isFinite(Number(segs[4]))
-        ? Math.min(25, Math.max(0.25, Number(segs[4])))
-        : 10;
-      state.viewsheds.push({
-        id: `vs-init-${idx + 1}`,
-        observer: {
-          label: `OBS${idx + 1}`,
-          lat,
-          lon,
-          observer_height_m: obsH,
-          target_height_m: tgtH,
-          max_distance_m: maxKm * 1000,
-        },
-        loading: false,
-        error: null,
-        preview: null,
-      });
-    });
-  }
-
-  return { hasCustomCenter, needsFlyToResolvedCenter };
-}
 
 type ApiErrorContext =
   | "job"
@@ -290,6 +93,7 @@ type ApiErrorContext =
   | "ruler"
   | "packs"
   | "projects"
+  | "shares"
   | "jobs-poll"
   | "admin"
   | "general";
@@ -328,7 +132,13 @@ class GridForgeApp {
   private drawerOpen = false;
   private projectsOpen = false;
   private interactionMode: MapInteractionMode = "pan";
-  private activeBasemap: BasemapId = "opentopo";
+  private activeBasemap: BasemapId = DEFAULT_BASEMAP;
+  private currentMapZoom: number = DEFAULT_MAP_ZOOM;
+  private hasExplicitUrlZoom = false;
+  private pendingOfflineBasemapFromUrl = false;
+  private activeShareId: string | null = null;
+  private suppressZoomSyncUntil = 0;
+  private zoomSyncTimer: number | null = null;
   private latestFootprint: FootprintResponse | null = null;
   private jobs: JobRecord[] = [];
   private readonly initialFlyToResolved: boolean;
@@ -357,9 +167,27 @@ class GridForgeApp {
       window.location.search
     );
     this.pendingAuthError = extractAuthErrorFromSearch(window.location.search);
-    const urlHydration = hydrateStateFromUrl(this.state);
+    const urlHydration = hydrateStateFromSearch(
+      window.location.search,
+      this.state
+    );
     this.initialFlyToResolved = urlHydration.needsFlyToResolvedCenter;
+    this.activeShareId = urlHydration.shareId;
+    if (urlHydration.zoom !== null) {
+      this.currentMapZoom = urlHydration.zoom;
+      this.hasExplicitUrlZoom = true;
+    }
+    if (urlHydration.hasCustomBasemap) {
+      if (urlHydration.basemap === "offline") {
+        this.pendingOfflineBasemapFromUrl = true;
+        this.activeBasemap = DEFAULT_BASEMAP;
+      } else {
+        this.activeBasemap = urlHydration.basemap;
+      }
+    }
     this.viewshedSeq = this.state.viewsheds.length + 1;
+    this.rfLinkSeq = this.state.rfLinks.length + 1;
+    this.suppressZoomSyncUntil = performance.now() + 900;
 
     root.innerHTML = `
       <div class="gf-shell" data-role="shell">
@@ -458,6 +286,11 @@ class GridForgeApp {
       onToggleDrawer: () => this.setDrawerOpen(!this.drawerOpen),
       onToggleProjects: () => this.setProjectsOpen(!this.projectsOpen),
       onCopyMgrs: (mgrs) => this.copyText(mgrs, `Copied ${mgrs}`),
+      onShareOpen: () => this.refreshSharePopoverSummary(),
+      onCopyDirectLink: () => this.handleCopyDirectLink(),
+      onCreateShortLink: () => void this.handleCreateShortShareLink(),
+      onCopyShareUrl: (url) =>
+        this.copyText(url, "Share link copied to clipboard"),
       onOpenAuth: () => this.authModal.open(),
       onSignOut: () => void this.handleSignOut(),
       onOpenAdmin: () => this.adminModal.open(),
@@ -513,6 +346,7 @@ class GridForgeApp {
       {
         onClose: () => this.setProjectsOpen(false),
         onLoadProject: (proj) => this.loadProject(proj),
+        onShareProject: (proj) => this.handleShareProject(proj),
         getCurrentSnapshot: () => this.buildProjectSnapshot(),
         onToast: (msg, kind) => this.showToast(msg, kind),
         onApiError: (err) => {
@@ -691,6 +525,17 @@ class GridForgeApp {
         onCursorMove: (lat, lon) => {
           this.cursorCoordsEl.textContent = `${lat.toFixed(4)}, ${lon.toFixed(4)}`;
         },
+        onViewChange: (zoom) => {
+          this.currentMapZoom = Number(zoom.toFixed(2));
+          if (performance.now() < this.suppressZoomSyncUntil) return;
+          if (this.zoomSyncTimer !== null) {
+            window.clearTimeout(this.zoomSyncTimer);
+          }
+          this.zoomSyncTimer = window.setTimeout(() => {
+            this.zoomSyncTimer = null;
+            this.syncUrlFromState();
+          }, ZOOM_URL_DEBOUNCE_MS);
+        },
         onExternalTileFailure: () => {
           this.offlineReadyBadgeEl.classList.remove("hidden");
         },
@@ -700,7 +545,7 @@ class GridForgeApp {
           )
             ? "offline"
             : "opentopo";
-          this.selectBasemap(fallback);
+          this.selectBasemap(fallback, { syncUrl: false });
           this.showToast(
             "Vector HD tiles unavailable — switched back to raster basemap",
             "info"
@@ -710,6 +555,8 @@ class GridForgeApp {
       {
         initialLat: this.state.lat,
         initialLon: this.state.lon,
+        initialZoom: this.currentMapZoom,
+        initialBasemap: this.activeBasemap,
       }
     );
 
@@ -1023,7 +870,10 @@ class GridForgeApp {
     });
   }
 
-  private selectBasemap(id: BasemapId): void {
+  private selectBasemap(
+    id: BasemapId,
+    options: { syncUrl?: boolean } = {}
+  ): void {
     this.activeBasemap = id;
     this.map.setBasemap(id);
     if (id === "offline") {
@@ -1032,6 +882,9 @@ class GridForgeApp {
     this.basemapSwitcherEl
       .querySelectorAll<HTMLButtonElement>("[data-basemap]")
       .forEach((b) => b.classList.toggle("active", b.dataset.basemap === id));
+    if (options.syncUrl !== false) {
+      this.syncUrlFromState();
+    }
   }
 
   private updateMapHintForMode(): void {
@@ -1110,12 +963,36 @@ class GridForgeApp {
   }
 
   private async bootstrap(): Promise<void> {
-    this.requestFootprintImmediate({
-      flyToResult: this.initialFlyToResolved,
-      syncMarker: true,
-      fitAfterLoad: this.state.grid_cols * this.state.grid_rows > 1,
-    });
-    void this.loadBasemapInfo(this.state.pack_id || null);
+    const initialShareId = this.activeShareId;
+    const shareFetchPromise = initialShareId
+      ? fetchShareSnapshot(initialShareId).then(
+          (snapshot) => ({ ok: true as const, snapshot }),
+          (error: unknown) => ({ ok: false as const, error })
+        )
+      : null;
+
+    if (!initialShareId) {
+      this.sidebar.syncControlsFromState();
+      if (this.state.waypoints.length > 0) {
+        this.map.updateWaypoints(this.state.waypoints);
+        this.scheduleRouteMetrics();
+      }
+      if (this.state.tacticalGraphics.length > 0) {
+        this.map.updateTacticalGraphics(this.state.tacticalGraphics, []);
+      }
+      if (this.state.rfLinks.length > 0) {
+        this.map.updateRFLinks(this.state.rfLinks, null);
+      }
+
+      this.requestFootprintImmediate({
+        flyToResult: this.initialFlyToResolved,
+        syncMarker: true,
+        fitAfterLoad:
+          !this.hasExplicitUrlZoom &&
+          this.state.grid_cols * this.state.grid_rows > 1,
+      });
+      void this.loadBasemapInfo(this.state.pack_id || null);
+    }
 
     const session = await this.loadSession();
     this.applySession(session, { isBootstrap: true });
@@ -1157,17 +1034,61 @@ class GridForgeApp {
     window.setInterval(() => void this.loadHealth(), HEALTH_POLL_MS);
     window.setInterval(() => this.drawer.tickElapsed(), 1000);
 
-    if (this.state.viewsheds.length > 0) {
+    if (shareFetchPromise) {
+      const result = await shareFetchPromise;
+      if (result.ok) {
+        if (session.capabilities.turnstile_required) {
+          await turnstileSyncPromise;
+        }
+        const labelName = result.snapshot.name.trim() || result.snapshot.share_id;
+        this.applySnapshotState(result.snapshot.state, {
+          toastLabel: `Loaded shared map "${labelName}"`,
+          preserveShareId: result.snapshot.share_id,
+          flyToCenter: false,
+        });
+        return;
+      }
+
+      this.activeShareId = null;
+      const errMsg =
+        result.error instanceof ApiError && result.error.status === 404
+          ? "Shared map link not found or expired."
+          : result.error instanceof Error
+            ? result.error.message
+            : "Failed to load shared map link.";
+      this.showToast(errMsg, "error");
+      this.sidebar.syncControlsFromState();
+      this.requestFootprintImmediate({
+        flyToResult: false,
+        syncMarker: true,
+        fitAfterLoad: false,
+      });
+      void this.loadBasemapInfo(this.state.pack_id || null);
+      return;
+    }
+
+    if (this.state.viewsheds.length > 0 || this.state.rfLinks.length > 0) {
       this.sidebar.openViewshedSection();
-      this.map.updateViewsheds(this.state.viewsheds);
+      if (this.state.viewsheds.length > 0) {
+        this.map.updateViewsheds(this.state.viewsheds);
+      }
+      if (this.state.rfLinks.length > 0) {
+        this.map.updateRFLinks(this.state.rfLinks, null);
+      }
       if (session.capabilities.turnstile_required) {
         await turnstileSyncPromise;
         for (const vs of this.state.viewsheds) {
           await this.computeViewshedEntry(vs.id);
         }
+        for (const rf of this.state.rfLinks) {
+          await this.computeRFLinkEntry(rf.id);
+        }
       } else {
         for (const vs of this.state.viewsheds) {
           void this.computeViewshedEntry(vs.id);
+        }
+        for (const rf of this.state.rfLinks) {
+          void this.computeRFLinkEntry(rf.id);
         }
       }
     }
@@ -1241,7 +1162,9 @@ class GridForgeApp {
       );
       if (clamped.changed) {
         this.sidebar.syncControlsFromState();
-        this.syncUrlFromState();
+        this.syncUrlFromState({
+          preserveShare: Boolean(options.isBootstrap && this.activeShareId),
+        });
         const footprintChanged =
           prevGridCols !== this.state.grid_cols ||
           prevGridRows !== this.state.grid_rows ||
@@ -1386,8 +1309,9 @@ class GridForgeApp {
       if (!info.available || !info.format) {
         this.map.enableOfflineBasemap(info);
         if (existingBtn) existingBtn.remove();
+        this.pendingOfflineBasemapFromUrl = false;
         if (this.activeBasemap === "offline") {
-          this.selectBasemap("opentopo");
+          this.selectBasemap("opentopo", { syncUrl: false });
         }
         return;
       }
@@ -1409,72 +1333,175 @@ class GridForgeApp {
       } else {
         existingBtn.title = titleText;
       }
+
+      if (this.pendingOfflineBasemapFromUrl) {
+        this.pendingOfflineBasemapFromUrl = false;
+        this.selectBasemap("offline", { syncUrl: false });
+      }
     } catch {
       // Offline basemap endpoint optional / unavailable
     }
   }
 
-  private syncUrlFromState(): void {
-    const params = new URLSearchParams();
-    params.set("center", this.state.center.replace(/\s*,\s*/, ","));
-    params.set("scale", String(this.state.scale));
-    params.set("paper", this.state.paper);
-    params.set("orientation", this.state.orientation);
-    params.set("mode", this.state.color_mode);
-    params.set("units", this.state.units);
-    if (this.state.dpi !== 300) {
-      params.set("dpi", String(this.state.dpi));
+  private getCurrentUrlViewState(): { basemap: BasemapId; zoom: number } {
+    const zoom = this.map?.getZoom?.() ?? this.currentMapZoom;
+    if (Number.isFinite(zoom)) {
+      this.currentMapZoom = Number(zoom.toFixed(2));
     }
-    if (this.state.outputs.export_dpi !== 300) {
-      params.set("export_dpi", String(this.state.outputs.export_dpi));
+    return {
+      basemap: this.activeBasemap,
+      zoom: this.currentMapZoom,
+    };
+  }
+
+  private syncUrlFromState(options: { preserveShare?: boolean } = {}): void {
+    if (!options.preserveShare) {
+      this.activeShareId = null;
+      this.telemetry.setShortLinkResult(null);
+    } else if (this.activeShareId) {
+      return;
     }
-    if (this.state.dem_source !== "auto") {
-      params.set("dem", this.state.dem_source);
+
+    const originAndPath = `${window.location.origin}${window.location.pathname}`;
+    const serialized = serializeStateToParams(
+      this.state,
+      this.getCurrentUrlViewState(),
+      { basePathLength: originAndPath.length }
+    );
+    const nextUrl = serialized.queryString
+      ? `${window.location.pathname}?${serialized.queryString}`
+      : window.location.pathname;
+    window.history.replaceState(null, "", nextUrl);
+    if (this.telemetry.isShareMenuOpen()) {
+      this.refreshSharePopoverSummary();
     }
-    if (this.state.pack_id) {
-      params.set("pack", this.state.pack_id);
-    }
-    if (this.state.grid_cols !== 1 || this.state.grid_rows !== 1) {
-      params.set("grid", `${this.state.grid_cols}x${this.state.grid_rows}`);
-    }
-    if (this.state.title.trim()) {
-      params.set("title", this.state.title.trim());
-    }
-    if (this.state.au_overlays.length > 0) {
-      params.set("au", this.state.au_overlays.join(","));
-    }
-    if (this.state.nz_overlays.length > 0) {
-      params.set("nz", this.state.nz_overlays.join(","));
-    }
-    if (this.state.ca_overlays.length > 0) {
-      params.set("ca", this.state.ca_overlays.join(","));
-    }
-    if (this.state.us_overlays.length > 0) {
-      params.set("us", this.state.us_overlays.join(","));
-    }
-    if (this.state.carto.show_slope_shading) {
-      params.set("slope", "1");
-    }
-    if (this.state.include_calibration_page) {
-      params.set("cal", "1");
-    }
-    if (this.state.show_fold_marks) {
-      params.set("fold", "1");
-    }
-    if (this.state.include_atlas_index) {
-      params.set("index", "1");
+  }
+
+  private refreshSharePopoverSummary(): void {
+    const originAndPath = `${window.location.origin}${window.location.pathname}`;
+    const direct = buildDirectShareUrl(
+      originAndPath,
+      this.state,
+      this.getCurrentUrlViewState()
+    );
+    const headline =
+      this.state.title.trim() ||
+      this.latestFootprint?.center_mgrs_10m ||
+      this.state.center;
+    const gridTag =
+      this.state.grid_cols * this.state.grid_rows > 1
+        ? ` · ${this.state.grid_cols}×${this.state.grid_rows}`
+        : "";
+    const parts: string[] = [
+      `1:${this.state.scale.toLocaleString()}`,
+      `${this.state.paper.toUpperCase()}${gridTag}`,
+      this.state.color_mode,
+    ];
+    const counts: string[] = [];
+    if (this.state.waypoints.length > 0) {
+      counts.push(`${this.state.waypoints.length} WP`);
     }
     if (this.state.viewsheds.length > 0) {
-      const encoded = this.state.viewsheds
-        .map((v) => {
-          const o = v.observer;
-          return `${o.lat.toFixed(5)},${o.lon.toFixed(5)},${o.observer_height_m},${o.target_height_m},${Number((o.max_distance_m / 1000).toFixed(2))}`;
-        })
-        .join(";");
-      params.set("los", encoded);
+      counts.push(`${this.state.viewsheds.length} LOS`);
     }
-    const nextUrl = `${window.location.pathname}?${params.toString()}`;
-    window.history.replaceState(null, "", nextUrl);
+    if (this.state.rfLinks.length > 0) {
+      counts.push(`${this.state.rfLinks.length} RF`);
+    }
+    if (this.state.tacticalGraphics.length > 0) {
+      counts.push(`${this.state.tacticalGraphics.length} Tac`);
+    }
+    if (counts.length > 0) {
+      parts.push(counts.join(", "));
+    }
+
+    this.telemetry.setShareSummary({
+      headline,
+      detail: parts.join(" · "),
+      directTruncated: direct.truncated,
+      hasLocalOverlayFile: Boolean(this.state.overlayFile),
+      activeShareUrl: this.activeShareId
+        ? `${originAndPath}?share=${encodeURIComponent(this.activeShareId)}`
+        : null,
+    });
+  }
+
+  private formatShareExpiryLabel(expiresAt: string | null): string {
+    if (!expiresAt) return "Does not expire";
+    const ms = Date.parse(expiresAt);
+    if (Number.isNaN(ms)) return "Temporary link";
+    const hours = Math.round((ms - Date.now()) / 3600000);
+    if (hours >= 48) {
+      return `Expires in ${Math.round(hours / 24)}d`;
+    }
+    if (hours >= 1) {
+      return `Expires in ${hours}h`;
+    }
+    return "Expires soon";
+  }
+
+  private async handleCreateShortShareLink(): Promise<void> {
+    this.telemetry.setShortLinkBusy(true);
+    try {
+      const snap = this.buildProjectSnapshot();
+      const created = await createShareSnapshot({
+        name: snap.suggestedName,
+        state: snap.state,
+      });
+      const fullUrl = `${window.location.origin}${window.location.pathname}?share=${encodeURIComponent(created.share_id)}`;
+      this.activeShareId = created.share_id;
+      window.history.replaceState(
+        null,
+        "",
+        `${window.location.pathname}?share=${encodeURIComponent(created.share_id)}`
+      );
+      this.telemetry.setShortLinkResult({
+        url: fullUrl,
+        expiresLabel: this.formatShareExpiryLabel(created.expires_at),
+      });
+      this.copyText(fullUrl, "Short share link copied to clipboard");
+    } catch (err) {
+      const msg = this.handleApiError(
+        err,
+        "shares",
+        "Failed to create share link"
+      );
+      this.showToast(msg, "error");
+    } finally {
+      this.telemetry.setShortLinkBusy(false);
+    }
+  }
+
+  private async handleShareProject(project: SavedProject): Promise<void> {
+    try {
+      const created = await createShareSnapshot({
+        project_id: project.project_id,
+      });
+      const fullUrl = `${window.location.origin}${window.location.pathname}?share=${encodeURIComponent(created.share_id)}`;
+      this.copyText(fullUrl, `Copied share link for "${project.name}"`);
+    } catch (err) {
+      const msg = this.handleApiError(
+        err,
+        "shares",
+        "Failed to share project"
+      );
+      this.showToast(msg, "error");
+    }
+  }
+
+  private handleCopyDirectLink(): void {
+    const originAndPath = `${window.location.origin}${window.location.pathname}`;
+    const direct = buildDirectShareUrl(
+      originAndPath,
+      this.state,
+      this.getCurrentUrlViewState()
+    );
+    const toastMsg = direct.truncated
+      ? "Direct link copied (compact URL omitted some markups — use Short Share Link for full fidelity)"
+      : this.state.overlayFile
+        ? "Direct link copied (local uploaded GPX/KML file is not embedded)"
+        : "Direct link copied to clipboard";
+    this.copyText(direct.url, toastMsg);
+    this.telemetry.closeShareMenu();
   }
 
   private applyPlaceResult(place: GeocodeResult): void {
@@ -1506,6 +1533,8 @@ class GridForgeApp {
     this.state.nz_overlays = preset.nz_overlays ? [...preset.nz_overlays] : [];
     this.state.ca_overlays = preset.ca_overlays ? [...preset.ca_overlays] : [];
     this.state.us_overlays = preset.us_overlays ? [...preset.us_overlays] : [];
+    this.currentMapZoom = preset.zoom;
+    this.suppressZoomSyncUntil = performance.now() + 900;
     this.sidebar.setTitlePlaceholder(preset.defaultTitle);
     this.sidebar.syncControlsFromState();
     this.syncUrlFromState();
@@ -1528,6 +1557,7 @@ class GridForgeApp {
       this.state.title.trim() ||
       this.latestFootprint?.center_mgrs_10m ||
       this.state.center;
+    const view = this.getCurrentUrlViewState();
 
     return {
       suggestedName,
@@ -1547,6 +1577,8 @@ class GridForgeApp {
         grid_rows: this.state.grid_rows,
         dem_source: this.state.dem_source,
         pack_id: this.state.pack_id,
+        basemap: view.basemap,
+        map_zoom: view.zoom,
         au_overlays: [...this.state.au_overlays],
         nz_overlays: [...this.state.nz_overlays],
         ca_overlays: [...this.state.ca_overlays],
@@ -1571,133 +1603,71 @@ class GridForgeApp {
     };
   }
 
-  private loadProject(project: SavedProject): void {
-    const s = project.state as Record<string, unknown>;
-    const defaults = createInitialFormState();
-
+  private applySnapshotState(
+    rawState: Record<string, unknown>,
+    options: {
+      toastLabel?: string;
+      preserveShareId?: string | null;
+      closeProjectsDrawer?: boolean;
+      flyToCenter?: boolean;
+    } = {}
+  ): void {
     this.clearStripPlanInternal(false);
     this.handleRulerClear();
     this.setInteractionMode("pan");
 
-    if (typeof s.center === "string" && s.center.trim()) {
-      this.state.center = s.center.trim();
-    }
-    if (typeof s.lat === "number" && Number.isFinite(s.lat)) {
-      this.state.lat = s.lat;
-    }
-    if (typeof s.lon === "number" && Number.isFinite(s.lon)) {
-      this.state.lon = s.lon;
-    }
-    this.state.title = typeof s.title === "string" ? s.title : "";
-    if (typeof s.scale === "number" && VALID_SCALES.has(s.scale)) {
-      this.state.scale = s.scale;
-    }
-    if (typeof s.paper === "string" && VALID_PAPERS.has(s.paper)) {
-      this.state.paper = s.paper as PaperSize;
-    }
-    if (s.orientation === "portrait" || s.orientation === "landscape") {
-      this.state.orientation = s.orientation;
-    }
-    if (typeof s.color_mode === "string" && VALID_MODES.has(s.color_mode)) {
-      this.state.color_mode = s.color_mode as ColorMode;
-    }
-    if (s.units === "metric" || s.units === "imperial") {
-      this.state.units = s.units;
-    }
-    this.state.dpi =
-      typeof s.dpi === "number" && VALID_DPIS.has(s.dpi) ? s.dpi : defaults.dpi;
-    if (typeof s.grid_cols === "number" && s.grid_cols >= 1 && s.grid_cols <= 3) {
-      this.state.grid_cols = s.grid_cols;
-    }
-    if (typeof s.grid_rows === "number" && s.grid_rows >= 1 && s.grid_rows <= 3) {
-      this.state.grid_rows = s.grid_rows;
-    }
-    if (typeof s.dem_source === "string" && VALID_DEMS.has(s.dem_source)) {
-      this.state.dem_source = s.dem_source as DemSourceKind;
-    }
-    this.state.pack_id = typeof s.pack_id === "string" ? s.pack_id : "";
-
-    this.state.au_overlays = Array.isArray(s.au_overlays)
-      ? (s.au_overlays.filter(
-          (x): x is AUOverlayKind => typeof x === "string" && VALID_AU_OV.has(x)
-        ))
-      : [];
-    this.state.nz_overlays = Array.isArray(s.nz_overlays)
-      ? (s.nz_overlays.filter(
-          (x): x is NZOverlayKind => typeof x === "string" && VALID_NZ_OV.has(x)
-        ))
-      : [];
-    this.state.ca_overlays = Array.isArray(s.ca_overlays)
-      ? (s.ca_overlays.filter(
-          (x): x is CAOverlayKind => typeof x === "string" && VALID_CA_OV.has(x)
-        ))
-      : [];
-    this.state.us_overlays = Array.isArray(s.us_overlays)
-      ? (s.us_overlays.filter(
-          (x): x is USOverlayKind => typeof x === "string" && VALID_US_OV.has(x)
-        ))
-      : [];
-
-    if (s.carto && typeof s.carto === "object") {
-      this.state.carto = {
-        ...defaults.carto,
-        ...(s.carto as Partial<AppFormState["carto"]>),
-      };
-    }
-    if (s.outputs && typeof s.outputs === "object") {
-      this.state.outputs = {
-        ...defaults.outputs,
-        ...(s.outputs as Partial<AppFormState["outputs"]>),
-      };
-    }
-
-    this.state.waypoints = Array.isArray(s.waypoints)
-      ? (s.waypoints as WaypointInput[]).map((w) => ({ ...w }))
-      : [];
-
     for (const ctrl of this.viewshedAborts.values()) ctrl.abort();
     this.viewshedAborts.clear();
-    this.state.viewsheds = Array.isArray(s.viewsheds)
-      ? (s.viewsheds as ViewshedObserver[]).map((obs) => ({
-          id: `vs-${this.viewshedSeq++}`,
-          observer: { ...obs },
-          loading: false,
-          error: null,
-          preview: null,
-        }))
-      : [];
-
     for (const ctrl of this.rfLinkAborts.values()) ctrl.abort();
     this.rfLinkAborts.clear();
-    this.state.rfLinks = Array.isArray(s.rf_links)
-      ? (s.rf_links as RFLinkSpec[]).map((spec) => ({
-          id: `rf-${this.rfLinkSeq++}`,
-          spec: { ...spec },
-          loading: false,
-          error: null,
-          profile: null,
-        }))
-      : [];
 
-    this.state.tacticalGraphics = Array.isArray(s.tactical_graphics)
-      ? (s.tactical_graphics as TacticalGraphic[]).map((g) => ({ ...g }))
-      : [];
+    const view = hydrateStateFromSnapshot(rawState, this.state, {
+      nextViewshedId: () => `vs-${this.viewshedSeq++}`,
+      nextRFLinkId: () => `rf-${this.rfLinkSeq++}`,
+    });
 
-    this.state.include_calibration_page = Boolean(s.include_calibration_page);
-    this.state.include_route_card = Boolean(s.include_route_card);
-    this.state.include_elevation_profile = Boolean(s.include_elevation_profile);
-    this.state.include_atlas_index = Boolean(s.include_atlas_index);
-    this.state.include_rf_link_card = Boolean(s.include_rf_link_card);
-    this.state.show_fold_marks = Boolean(s.show_fold_marks);
-
+    let clampedResetItems: string[] = [];
     if (this.session.auth_mode === "hosted") {
-      clampFormStateToCapabilities(this.state, this.session.capabilities);
+      const clamped = clampFormStateToCapabilities(
+        this.state,
+        this.session.capabilities
+      );
+      clampedResetItems = clamped.resetItems;
     }
 
+    if (view.basemap) {
+      if (view.basemap === "offline") {
+        const offlineBtn = this.basemapSwitcherEl.querySelector(
+          "[data-basemap='offline']"
+        );
+        if (offlineBtn) {
+          this.selectBasemap("offline", { syncUrl: false });
+        } else {
+          this.pendingOfflineBasemapFromUrl = true;
+        }
+      } else {
+        this.selectBasemap(view.basemap, { syncUrl: false });
+      }
+    }
+
+    if (view.zoom !== null) {
+      this.currentMapZoom = view.zoom;
+    }
+
+    this.suppressZoomSyncUntil = performance.now() + 900;
     this.sidebar.setFormError(null);
     this.sidebar.syncControlsFromState(true);
-    this.syncUrlFromState();
-    this.map.setCenter(this.state.lat, this.state.lon, { fly: true });
+
+    if (options.preserveShareId) {
+      this.activeShareId = options.preserveShareId;
+    } else {
+      this.syncUrlFromState();
+    }
+
+    this.map.setCenter(this.state.lat, this.state.lon, {
+      fly: options.flyToCenter ?? true,
+      zoom: view.zoom ?? undefined,
+    });
     this.map.updateWaypoints(this.state.waypoints);
     this.map.updateViewsheds(this.state.viewsheds);
     this.map.updateRFLinks(this.state.rfLinks, null);
@@ -1705,7 +1675,8 @@ class GridForgeApp {
     this.requestFootprintImmediate({
       flyToResult: false,
       syncMarker: true,
-      fitAfterLoad: this.state.grid_cols * this.state.grid_rows > 1,
+      fitAfterLoad:
+        view.zoom === null && this.state.grid_cols * this.state.grid_rows > 1,
     });
     void this.loadBasemapInfo(this.state.pack_id || null);
 
@@ -1714,8 +1685,22 @@ class GridForgeApp {
     } else {
       this.sidebar.setRouteMetrics(null);
     }
-    this.setProjectsOpen(false);
-    this.showToast(`Loaded project "${project.name}"`, "success");
+
+    if (options.closeProjectsDrawer) {
+      this.setProjectsOpen(false);
+    }
+
+    if (options.toastLabel) {
+      const tierNote =
+        clampedResetItems.length > 0
+          ? ` (adjusted ${clampedResetItems.join(", ")} for your account tier)`
+          : "";
+      this.showToast(`${options.toastLabel}${tierNote}`, "success");
+    }
+
+    if (this.state.viewsheds.length > 0 || this.state.rfLinks.length > 0) {
+      this.sidebar.openViewshedSection();
+    }
 
     if (this.turnstile.isActive()) {
       const viewshedsToRun = [...this.state.viewsheds];
@@ -1738,6 +1723,14 @@ class GridForgeApp {
         void this.computeRFLinkEntry(rf.id);
       }
     }
+  }
+
+  private loadProject(project: SavedProject): void {
+    this.applySnapshotState(project.state as Record<string, unknown>, {
+      toastLabel: `Loaded project "${project.name}"`,
+      closeProjectsDrawer: true,
+      flyToCenter: true,
+    });
   }
 
   // ---------- Strip Atlas Planner ----------
@@ -1925,6 +1918,7 @@ class GridForgeApp {
       this.sectorDraft
     );
     this.sidebar.renderTacticalGraphicsList();
+    this.syncUrlFromState();
     this.showToast(`Pinned bearing line "${graphic.label}" to PDF`, "success");
   }
 
@@ -1955,6 +1949,7 @@ class GridForgeApp {
     );
     this.sidebar.openWaypointsSection();
     this.sidebar.renderTacticalGraphicsList();
+    this.syncUrlFromState();
     this.showToast(
       `Placed ${graphic.label} (${graphic.radii_km.join(", ")} km)`,
       "info"
@@ -1992,6 +1987,7 @@ class GridForgeApp {
     this.sidebar.setSectorDraftCount(0);
     this.sidebar.renderTacticalGraphicsList();
     this.map.updateTacticalGraphics(this.state.tacticalGraphics, []);
+    this.syncUrlFromState();
     this.setInteractionMode("pan");
     this.showToast(`Created sector polygon "${graphic.label}"`, "success");
   }
@@ -2015,6 +2011,7 @@ class GridForgeApp {
       this.state.tacticalGraphics,
       this.sectorDraft
     );
+    this.syncUrlFromState();
   }
 
   private handleTacticalDelete(index: number): void {
@@ -2026,6 +2023,7 @@ class GridForgeApp {
       this.sectorDraft
     );
     this.sidebar.renderTacticalGraphicsList();
+    this.syncUrlFromState();
   }
 
   private handleTacticalClear(): void {
@@ -2034,6 +2032,7 @@ class GridForgeApp {
     this.sidebar.setSectorDraftCount(0);
     this.map.updateTacticalGraphics([], []);
     this.sidebar.renderTacticalGraphicsList();
+    this.syncUrlFromState();
   }
 
   // ---------- RF Point-to-Point Link Profile (A ↔ B) ----------
@@ -2106,6 +2105,7 @@ class GridForgeApp {
     this.sidebar.openViewshedSection();
     this.sidebar.syncControlsFromState();
     this.map.updateRFLinks(this.state.rfLinks, null);
+    this.syncUrlFromState();
     void this.computeRFLinkEntry(id);
   }
 
@@ -2177,6 +2177,7 @@ class GridForgeApp {
     }
     this.sidebar.syncControlsFromState();
     this.map.updateRFLinks(this.state.rfLinks, this.rfPendingFrom);
+    this.syncUrlFromState();
   }
 
   private handleRFLinksClear(): void {
@@ -2187,6 +2188,7 @@ class GridForgeApp {
     this.state.include_rf_link_card = false;
     this.sidebar.syncControlsFromState();
     this.map.updateRFLinks([], null);
+    this.syncUrlFromState();
   }
 
   // ---------- RF / LOS Viewshed Tool ----------
@@ -2339,6 +2341,7 @@ class GridForgeApp {
     this.sidebar.setFormError(null);
     this.map.updateWaypoints(this.state.waypoints);
     this.sidebar.syncControlsFromState();
+    this.syncUrlFromState();
     this.scheduleRouteMetrics();
   }
 
@@ -2357,6 +2360,7 @@ class GridForgeApp {
     };
     this.state.waypoints = updated;
     this.map.updateWaypoints(this.state.waypoints);
+    this.syncUrlFromState();
     this.scheduleRouteMetrics();
   }
 
@@ -2368,6 +2372,7 @@ class GridForgeApp {
     }
     this.map.updateWaypoints(this.state.waypoints);
     this.sidebar.syncControlsFromState();
+    this.syncUrlFromState();
     if (this.state.waypoints.length > 0) {
       this.scheduleRouteMetrics();
     }
@@ -2380,6 +2385,7 @@ class GridForgeApp {
     this.map.updateWaypoints([]);
     this.sidebar.setRouteMetrics(null);
     this.sidebar.syncControlsFromState();
+    this.syncUrlFromState();
   }
 
   private scheduleRouteMetrics(): void {

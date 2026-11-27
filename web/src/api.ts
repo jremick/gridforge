@@ -29,6 +29,8 @@ import type {
   RulerMetricsResponse,
   SavedProject,
   SessionResponse,
+  SharedSnapshot,
+  SharedSnapshotSummary,
   StripPlanResponse,
   Units,
   UpdateUserRequest,
@@ -424,6 +426,49 @@ export async function createProject(req: {
 
 export async function deleteProject(projectId: string): Promise<void> {
   return requestVoid(`/api/projects/${encodeURIComponent(projectId)}`, {
+    method: "DELETE",
+  });
+}
+
+export async function createShareSnapshot(req: {
+  name?: string;
+  notes?: string;
+  state?: Record<string, unknown>;
+  project_id?: string;
+  expires_in_hours?: number;
+}): Promise<SharedSnapshot> {
+  const body: Record<string, unknown> = {};
+  if (req.name !== undefined) body.name = req.name;
+  if (req.notes !== undefined) body.notes = req.notes;
+  if (req.state !== undefined) body.state = req.state;
+  if (req.project_id !== undefined) body.project_id = req.project_id;
+  if (req.expires_in_hours !== undefined) {
+    body.expires_in_hours = req.expires_in_hours;
+  }
+  return requestJson<SharedSnapshot>("/api/shares", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+export async function fetchShareSnapshot(
+  shareId: string
+): Promise<SharedSnapshot> {
+  return requestJson<SharedSnapshot>(
+    `/api/shares/${encodeURIComponent(shareId)}`
+  );
+}
+
+export async function fetchShares(): Promise<SharedSnapshotSummary[]> {
+  const data = await requestJson<
+    SharedSnapshotSummary[] | { shares: SharedSnapshotSummary[] }
+  >("/api/shares");
+  return Array.isArray(data) ? data : data.shares;
+}
+
+export async function deleteShareSnapshot(shareId: string): Promise<void> {
+  return requestVoid(`/api/shares/${encodeURIComponent(shareId)}`, {
     method: "DELETE",
   });
 }

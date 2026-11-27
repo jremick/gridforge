@@ -10,6 +10,7 @@ import type { SavedProject } from "../types";
 export interface ProjectsDrawerCallbacks {
   onClose: () => void;
   onLoadProject: (project: SavedProject) => void;
+  onShareProject?: (project: SavedProject) => Promise<void> | void;
   getCurrentSnapshot: () => {
     suggestedName: string;
     state: Record<string, unknown>;
@@ -119,6 +120,8 @@ export class ProjectsDrawer {
 
       if (action === "load") {
         this.callbacks.onLoadProject(proj);
+      } else if (action === "share") {
+        void this.handleShare(proj);
       } else if (action === "clone") {
         void this.handleClone(proj);
       } else if (action === "delete") {
@@ -194,6 +197,18 @@ export class ProjectsDrawer {
       this.saving = false;
       this.saveBtn.disabled = false;
       this.saveBtn.textContent = "Save";
+    }
+  }
+
+  private async handleShare(proj: SavedProject): Promise<void> {
+    if (!this.callbacks.onShareProject) return;
+    this.busyIds.add(proj.project_id);
+    this.renderList();
+    try {
+      await this.callbacks.onShareProject(proj);
+    } finally {
+      this.busyIds.delete(proj.project_id);
+      this.renderList();
     }
   }
 
@@ -286,6 +301,11 @@ export class ProjectsDrawer {
               <span class="gf-job-id">${escapeHtml(formatDateLabel(p.updated_at))}</span>
               <div class="gf-job-btn-row">
                 <button type="button" class="gf-mini-btn gf-proj-load-btn" data-proj-action="load" data-proj-id="${escapeHtml(p.project_id)}" ${busy ? "disabled" : ""}>Load</button>
+                ${
+                  this.callbacks.onShareProject
+                    ? `<button type="button" class="gf-mini-btn" data-proj-action="share" data-proj-id="${escapeHtml(p.project_id)}" ${busy ? "disabled" : ""} title="Create a read-only shareable snapshot link">Share</button>`
+                    : ""
+                }
                 <button type="button" class="gf-mini-btn" data-proj-action="clone" data-proj-id="${escapeHtml(p.project_id)}" ${busy ? "disabled" : ""}>Clone</button>
                 <button type="button" class="gf-mini-btn danger" data-proj-action="delete" data-proj-id="${escapeHtml(p.project_id)}" ${busy ? "disabled" : ""}>Delete</button>
               </div>
