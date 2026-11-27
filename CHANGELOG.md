@@ -5,6 +5,41 @@ All notable changes to **GridForge** are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.1] - 2026-11-27
+
+Comprehensive security hardening release enforcing explicit hosted API key scopes across HTTP and MCP, confining atlas worker paths and provider/terrain resource budgets, isolating hosted Studio workspaces across account and guest transitions, keeping private map parameters out of browser URLs, and locking down release workflow supply-chain integrity.
+
+### Security & Hardening
+
+- **Hosted API Key Scope Enforcement, Geocoding Budgets & Body Caps (`src/gridforge/web/{app,auth,db,limits,schemas}.py`, `src/gridforge/mcp/{http,server}.py`, `docs/ai-agents.md`, `deploy/hosted-mode.md`):**
+  - Enforced explicit per-operation PAT scopes (`planning`, `jobs:read`, `jobs:write`, `projects:read`, `projects:write`, `shares:read`, `shares:write`, and standalone `all`) across all `/api/*` routes and `/mcp` tools, keeping account management, API key CRUD, site administration, offline pack management, and cross-tenant share moderation behind browser-session authentication.
+  - Failed closed with `401` on legacy keys carrying empty or unrecognized stored scopes, enforced `projects:read` when sharing saved projects by `project_id`, and forwarded caller `request.client` into in-process MCP `ASGITransport` requests so non-Cloudflare `/mcp` callers retain distinct per-IP rate-limit buckets.
+  - Bounded outbound Nominatim geocoding with a single-flight provider slot (`503` + `Retry-After`), per-IP (`GRIDFORGE_GEOCODE_HOURLY_LIMIT=30`) and shared database-wide (`GRIDFORGE_GEOCODE_GLOBAL_HOURLY_LIMIT=300`, `0` disables misses) hourly miss caps in both hosted and local modes, removed raw search queries from logs/usage details, fixed chunked/streamed body overflow handling to return `413` cleanly, and switched hosted job thumbnails and page previews to `Cache-Control: private, no-store`.
+- **Atlas Worker Confinement, Terrain Preview Budgets & Bounded Open-Data Reads (`src/gridforge/sources/{_cog_ranges,_http,dem_ca_hrdem,osm_overpass,overlays_au_states,overlays_au_states_west}.py`, `src/gridforge/web/{viewshed,worker,schemas}.py`, `docker-compose*.yml`, `docs/DATA_SOURCES.md`):**
+  - Derived atlas worker scratch workspaces, temporary DEM copies, and sheet PDFs strictly from server-owned sheet ordinals (`sheet_01`, ...) under resolved `tmp_work_dir` and stripped ASCII control characters from `StripSheetInput.sheet_id`.
+  - Bounded terrain previews before source selection (`<= 100 km` RF links, `<= 125 km` per side and `<= 8,000 km²` DEM footprints, antimeridian crossing rejection) and routed live previews through regional non-LiDAR tiers while preserving geodesic-only ruler fallback for wide paths.
+  - Added a loopback single-range COG proxy (`_cog_ranges.py`) for NRCan Canadian DEM reads strictly allowlisting NRCan's two AWS Canada Central S3 buckets with redirect refusal, byte/request/time budgets, and clean timeout shutdown.
+  - Bounded Australian/NZ WFS GeoJSON and SA overlay downloads with streaming byte/feature/geometry/time limits, strict redirect validation (HTTPS-only, private/loopback IP rejection, same-host default with explicit `waterconnect.sa.gov.au` subdomain allowlist for SA trails), and direct raw-deflate + local-header/CRC validation of the SA trails ZIP archive to eliminate Python `zipfile` vs GDAL `/vsizip/` forged-`file_size` ZIP-bomb differentials.
+  - Defaulted Overpass to the configured primary endpoint (`OVERPASS_URL`) with no third-party fallback mirrors unless operators explicitly opt in via `OVERPASS_FALLBACK_URLS`, and declined HTTP redirects on Overpass POST queries.
+- **Hosted Studio Workspace Isolation & URL Privacy (`web/src/`, `src/gridforge/web/{auth,schemas}.py`):**
+  - Reset map camera/layers, uploaded overlay files, form drafts, jobs/projects drawers, Turnstile generation, toasts, and open modals on hosted identity changes, aborting all in-flight requests so prior-account responses cannot populate the next workspace.
+  - Added an opaque HMAC-derived `workspace_scope` to `GET /api/auth/session` so even `Guest → Guest` cookie expiry/resets trigger full workspace resets, deferred 401 Sign-In modal opening until session refresh completes, guarded `window` `keydown` shortcuts while `changeSession()` runs, added cross-tab `BroadcastChannel` sync (including after Google OAuth sign-in), and gave `AdminModal`/`PacksModal` self-contained `AbortController` disposal.
+  - Consumed incoming legacy deep-link query parameters once on load and removed private map details from `window.location` while keeping deliberate `?share=` snapshots and explicit sharing intact.
+- **Release Pipeline & Supply-Chain Integrity (`.github/workflows/release.yml`, `examples/render-examples.sh`, `docs/RELEASE_CHECKLIST.md`, `.agents/skills/gridforge-release/SKILL.md`):**
+  - Hardened `.github/workflows/release.yml` to verify SemVer release tags point to commits on the default branch, pin all GitHub Actions by full commit SHA, scope `packages: write` strictly to `build-and-push`, check out immutable commit SHAs, record `org.opencontainers.image.revision`, pull sample-render images by exact published OCI digest, reserve `:vX.Y` and `:latest` for stable tags, and pin `examples/render-examples.sh` to a verified multi-arch GHCR digest.
+
+### Added & Fixed
+
+- **Cloud Dev Workflow & Community Governance (`deploy/cloud-dev.md`, `.devcontainer/`, `SECURITY.md`, `CODE_OF_CONDUCT.md`):**
+  - Added `SECURITY.md` vulnerability disclosure & hardening architecture documentation, `CODE_OF_CONDUCT.md`, and cloud VM / Dev Container / CI offloading documentation and bootstrap scripts.
+  - Narrowed base64 error handling and logged caught errors cleanly in the Studio frontend and interactive MCP App (`web/src/`, `web/mcp-app/`).
+
+### Verification
+
+- **Automated Suites (`610` offline pytest + `54` frontend tests + live multi-region E2E):**
+  - Added `tests/unit/test_preview_work_budgets.py`, `tests/unit/test_source_work_budgets.py`, and expanded `test_agent_api.py`, `test_shares_api.py`, `test_web_api.py`, `test_auth_and_limits.py`, `web/tests/deeplink.test.mjs`, `web/tests/modal-dom.test.mjs`, and `web/tests/turnstile.test.mjs`.
+  - Verified `610` offline PyQGIS pytest tests (`--network none`), `54` frontend tests + production Studio/MCP App builds (`0` `npm audit --omit=dev` vulnerabilities), and live multi-region renders including NRCan HRDEM COG range-proxy reads, SA Trails ZIP redirect/validation, and VIC/NT WFS overlays.
+
 ## [1.7.0] - 2026-11-27
 
 AI-native integration and interactive chat UI release adding a zero-extra-dependency Model Context Protocol (MCP) server (`stdio` + Streamable HTTP `/mcp`), SEP-1865 interactive MCP Apps (`ui://gridforge/app.html` with Antigravity inline, side-pane, and sidebar entrypoints), Pillow PNG visual cards, scoped Bearer Personal Access Tokens (`gf_...`), HMAC-signed artifact/preview URLs, multi-page PDF previews, synchronous render waits (`POST /api/jobs?wait=true`), machine-readable discovery (`/api/capabilities`, `/llms.txt`, complete `/openapi.json`), CLI `--spec-file`, and a reusable Agent Skill + Antigravity plugin.

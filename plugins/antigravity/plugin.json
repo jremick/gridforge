@@ -1,7 +1,7 @@
 {
   "name": "gridforge",
   "displayName": "GridForge",
-  "version": "1.7.0",
+  "version": "1.7.1",
   "description": "True-scale local UTM MGRS topographic map studio, WMM2025 navigation briefings, curved-Earth RF Fresnel link and viewshed analysis, and 300-600 DPI printable PDF / ATAK / Garmin / OsmAnd exports with interactive inline MCP Apps.",
   "author": {
     "name": "GridForge Contributors",
