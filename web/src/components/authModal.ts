@@ -356,6 +356,7 @@ export class AuthModal {
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Sign in failed";
       this.setError(msg, "gf-auth-password");
+      pwInput?.focus();
     } finally {
       if (this.isOpen && this.mode === "signin") {
         this.setPendingState(form, false, "Sign In");
@@ -416,6 +417,7 @@ export class AuthModal {
       const msg =
         err instanceof Error ? err.message : "Could not redeem invite";
       this.setError(msg, "gf-invite-token");
+      tokenInput?.focus();
     } finally {
       if (this.isOpen && this.mode === "invite") {
         this.setPendingState(form, false, "Activate Account");

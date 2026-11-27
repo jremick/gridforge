@@ -120,12 +120,25 @@ export class AdminModal {
   private inviteEmailVal = "";
   private inviteRoleVal: AccountRole = "friend";
   private inviteExpiresVal = "72";
+  private readonly lifecycle = new AbortController();
+  private readonly signal: AbortSignal;
 
   constructor(
     container: HTMLElement,
     callbacks: AdminModalCallbacks,
-    private readonly signal: AbortSignal = new AbortController().signal
+    externalSignal?: AbortSignal
   ) {
+    this.signal = this.lifecycle.signal;
+    if (externalSignal) {
+      if (externalSignal.aborted) {
+        this.lifecycle.abort();
+      } else {
+        externalSignal.addEventListener("abort", () => this.lifecycle.abort(), {
+          once: true,
+          signal: this.signal,
+        });
+      }
+    }
     this.root = container;
     this.callbacks = callbacks;
     this.root.className = "gf-modal-backdrop hidden";
@@ -296,6 +309,7 @@ export class AdminModal {
   }
 
   dispose(): void {
+    this.lifecycle.abort();
     this.close();
     this.root.replaceChildren();
   }

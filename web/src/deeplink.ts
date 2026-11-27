@@ -301,7 +301,11 @@ export function hydrateStateFromSearch(
 ): UrlHydrationResult {
   const params = new URLSearchParams(search);
   const shareId = extractShareIdFromSearch(search);
-  if (!shareId) params.delete("share");
+  if (!shareId) {
+    params.delete("share");
+  } else {
+    params.set("share", shareId);
+  }
 
   // Consume every supported direct-link parameter, including invalid or repeated values.
   const take = (name: string): string | null => {

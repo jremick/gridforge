@@ -620,6 +620,7 @@ export interface SessionResponse {
   authenticated: boolean;
   user: SessionUser | null;
   role: UserRole;
+  workspace_scope?: string | null;
   capabilities: SessionCapabilities;
   quotas: SessionQuotas;
   brand_name?: string;

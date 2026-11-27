@@ -568,6 +568,7 @@ class AuthSessionResponse(BaseModel):
     authenticated: bool
     user: AuthUserSummary | None = None
     role: AuthRole
+    workspace_scope: str | None = None
     capabilities: AuthCapabilities
     quotas: AuthQuotas
     brand_name: str = "GridForge"

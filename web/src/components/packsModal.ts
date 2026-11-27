@@ -61,12 +61,25 @@ export class PacksModal {
   private pollTimer: number | null = null;
   private customBboxVal = "";
   private customNameVal = "";
+  private readonly lifecycle = new AbortController();
+  private readonly signal: AbortSignal;
 
   constructor(
     container: HTMLElement,
     callbacks: PacksModalCallbacks,
-    private readonly signal: AbortSignal
+    externalSignal?: AbortSignal
   ) {
+    this.signal = this.lifecycle.signal;
+    if (externalSignal) {
+      if (externalSignal.aborted) {
+        this.lifecycle.abort();
+      } else {
+        externalSignal.addEventListener("abort", () => this.lifecycle.abort(), {
+          once: true,
+          signal: this.signal,
+        });
+      }
+    }
     this.root = container;
     this.callbacks = callbacks;
     this.root.className = "gf-modal-backdrop hidden";
@@ -289,6 +302,8 @@ export class PacksModal {
   }
 
   dispose(): void {
+    this.lifecycle.abort();
+    this.stopPolling();
     this.close();
     this.root.replaceChildren();
   }
@@ -302,7 +317,7 @@ export class PacksModal {
 
   private schedulePollIfActive(): void {
     this.stopPolling();
-    if (!this.isOpen) return;
+    if (!this.isOpen || this.signal.aborted) return;
     const hasActive = this.tasks.some(
       (t) => t.status === "queued" || t.status === "running"
     );

@@ -454,3 +454,47 @@ test("TurnstileController.reset() does not clobber an active pendingWaiter from 
   assert.equal(t2, "tok-reset-1");
   assert.equal(resetCalls, 1);
 });
+
+test("TurnstileController ignores stale callbacks and queued acquires across unmount and re-sync", async () => {
+  const container = makeFakeContainer();
+  const capturedCallbacks = [];
+  const api = {
+    render(_container, options) {
+      capturedCallbacks.push(options);
+      return `widget-${capturedCallbacks.length}`;
+    },
+    reset() {},
+    remove() {},
+    getResponse() {
+      return undefined;
+    },
+  };
+
+  const ctrl = new TurnstileController({
+    container,
+    loadApi: async () => api,
+  });
+
+  await ctrl.syncSession(guestSession("0xGEN"));
+  const firstOpts = capturedCallbacks[0];
+  const pending = ctrl.acquireToken(500);
+  const queued = ctrl.acquireToken(500);
+
+  // Tenant reset unmounts widget and advances generation, then next guest re-syncs
+  ctrl.unmount();
+  await ctrl.syncSession(guestSession("0xGEN"));
+
+  // Both pre-unmount acquires resolve cleanly to null (not a new guest's token)
+  assert.equal(await pending, null);
+  assert.equal(await queued, null);
+
+  // A delayed callback from the old widget must not populate the new generation's cache or errors
+  firstOpts.callback("stale-token-from-old-tenant");
+  firstOpts["error-callback"]("999999");
+  assert.equal(ctrl.getLastError(), null);
+
+  const freshPending = ctrl.acquireToken(200);
+  await new Promise((r) => setTimeout(r, 10));
+  capturedCallbacks[1].callback("fresh-token-new-tenant");
+  assert.equal(await freshPending, "fresh-token-new-tenant");
+});

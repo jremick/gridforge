@@ -393,6 +393,8 @@ class GridForgeApp {
             this.clearStripPlanInternal(true);
           } else if (this.state.stripPlan && file) {
             this.clearStripPlanInternal(true);
+          } else {
+            this.workspaceEdited();
           }
         },
         onAutoStripPlan: () =>
@@ -745,6 +747,7 @@ class GridForgeApp {
     });
 
     window.addEventListener("keydown", (e) => {
+      if (this.sessionMutationInFlight) return;
       const target = e.target as HTMLElement | null;
       const tag = target?.tagName;
       const inInput =
@@ -1133,6 +1136,16 @@ class GridForgeApp {
     return refresh;
   }
 
+  private sessionIdentityKey(session: SessionResponse): string {
+    return [
+      session.auth_mode,
+      session.authenticated ? "1" : "0",
+      session.role,
+      session.user?.user_id ?? "",
+      session.workspace_scope ?? "",
+    ].join("|");
+  }
+
   private changeSession(
     request: () => Promise<SessionResponse>
   ): Promise<SessionResponse> {
@@ -1143,10 +1156,11 @@ class GridForgeApp {
     this.sessionRefreshAbort = null;
     this.sessionRefreshInFlight = null;
     this.shellEl.inert = true;
-    const change = request()
+    const change = Promise.resolve()
+      .then(request)
       .then((next) => {
         this.applySession(next);
-        this.sessionChannel?.postMessage("changed");
+        this.sessionChannel?.postMessage({ scope: this.sessionIdentityKey(next) });
         return next;
       })
       .finally(() => {
@@ -1222,7 +1236,8 @@ class GridForgeApp {
       (prev.auth_mode !== next.auth_mode ||
         prev.authenticated !== next.authenticated ||
         prev.role !== next.role ||
-        (prev.user?.user_id ?? null) !== (next.user?.user_id ?? null));
+        (prev.user?.user_id ?? null) !== (next.user?.user_id ?? null) ||
+        (prev.workspace_scope ?? null) !== (next.workspace_scope ?? null));
 
     if (tenantChanged) this.resetWorkspace();
     this.session = next;
@@ -1233,9 +1248,21 @@ class GridForgeApp {
       typeof BroadcastChannel === "function"
     ) {
       this.sessionChannel = new BroadcastChannel("gridforge-session");
-      this.sessionChannel.addEventListener("message", () => {
+      this.sessionChannel.addEventListener("message", (event: MessageEvent) => {
+        const data = event.data as { scope?: string } | string | null;
+        if (
+          data &&
+          typeof data === "object" &&
+          typeof data.scope === "string" &&
+          data.scope === this.sessionIdentityKey(this.session)
+        ) {
+          return;
+        }
         void this.refreshSession({ force: true });
       });
+      if (isBootstrap && next.authenticated) {
+        this.sessionChannel.postMessage({ scope: this.sessionIdentityKey(next) });
+      }
     }
     const nextPrefOwnerId = next.authenticated
       ? (next.user?.user_id ?? null)
@@ -1281,7 +1308,7 @@ class GridForgeApp {
             fitAfterLoad: false,
           });
         }
-        if (!isBootstrap && clamped.resetItems.length > 0) {
+        if (!isBootstrap && !tenantChanged && clamped.resetItems.length > 0) {
           this.showToast(
             `Adjusted selections for your account tier (${clamped.resetItems.join(", ")})`,
             "info"
@@ -1386,13 +1413,17 @@ class GridForgeApp {
 
     if (info.kind === "auth") {
       const wasAuthenticated = this.session.authenticated;
-      void this.refreshSession();
-      if (context !== "jobs-poll" || wasAuthenticated) {
-        this.authModal.open({
-          mode: "signin",
-          bannerError: msg || "Please sign in to continue.",
-        });
-      }
+      void this.refreshSession({ force: true }).finally(() => {
+        if (
+          !this.session.authenticated &&
+          (context !== "jobs-poll" || wasAuthenticated)
+        ) {
+          this.authModal.open({
+            mode: "signin",
+            bannerError: msg || "Please sign in to continue.",
+          });
+        }
+      });
       return msg;
     }
 

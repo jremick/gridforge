@@ -3041,7 +3041,14 @@ export class SidebarPanel {
     this.fileInput.value = "";
     this.dropzoneEl.classList.remove("dragover");
     this.ringRadiiInput.value = this.ringRadiiInput.defaultValue;
+    this.activePresetTab = "nsw-vic";
     this.activePresetId = "blue-mountains";
+    this.presetTabsEl
+      .querySelectorAll<HTMLButtonElement>("[data-preset-tab]")
+      .forEach((b) =>
+        b.classList.toggle("active", b.dataset.presetTab === this.activePresetTab)
+      );
+    this.renderPresetCards();
     this.setTitlePlaceholder("");
     this.setRouteMetrics(null);
     this.setRulerState([], null, false);

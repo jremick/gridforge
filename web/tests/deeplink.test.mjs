@@ -196,7 +196,7 @@ test("URL deep link round-trips full cartography, outputs, view, booklet toggles
 test("loading a direct link consumes map parameters and retains deliberate short links", () => {
   const state = createInitialFormState();
   const hydration = hydrateStateFromSearch(
-    "?center=-35%2C149&title=Field+Exercise&title=Duplicate&z=14&pack=example&share=AbCdEf1234567890&lang=en",
+    "?center=-35%2C149&title=Field+Exercise&title=Duplicate&z=14&pack=example&share=AbCdEf1234567890&share=ignoredDuplicate&lang=en",
     state
   );
   assert.equal(state.title, "Field Exercise");
@@ -281,11 +281,12 @@ test("URL length budget drops heavy markups in priority order and signals trunca
 
 test("malformed or malicious URL params are safely sanitized or ignored", () => {
   const state = createInitialFormState();
-  hydrateStateFromSearch(
+  const hydration = hydrateStateFromSearch(
     "?scale=99999&paper=evil&bm=javascript:alert(1)&z=999&pack=../etc/passwd&out=geopdf&wp=999,999,bad,X;-33.7,150.3,evil,OK&tac=not_valid_base64!!!&share=../bad",
     state
   );
 
+  assert.equal(hydration.remainingSearch, "");
   assert.equal(state.scale, 25000);
   assert.equal(state.paper, "a4");
   assert.equal(state.pack_id, "");

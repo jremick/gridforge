@@ -1122,3 +1122,28 @@ class TestResolutionAndDetailCapabilities:
         )
         assert ok_admin.status_code == 202
         assert ok_admin.json()["scale"] == 12500
+
+
+def test_hosted_session_emits_distinct_opaque_workspace_scope_per_guest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, _, _, _ = _make_hosted_app(tmp_path, monkeypatch)
+    g1 = TestClient(app, base_url="http://localhost:8080")
+    g2 = TestClient(app, base_url="http://localhost:8080")
+
+    s1 = g1.get("/api/auth/session")
+    s2 = g2.get("/api/auth/session")
+    assert s1.status_code == 200 and s2.status_code == 200
+    scope1 = s1.json()["workspace_scope"]
+    scope2 = s2.json()["workspace_scope"]
+    assert isinstance(scope1, str) and len(scope1) == 24
+    assert isinstance(scope2, str) and len(scope2) == 24
+    assert scope1 != scope2
+    # Must remain stable for the same guest cookie and never expose raw cookie value
+    assert g1.get("/api/auth/session").json()["workspace_scope"] == scope1
+    raw_cookie = g1.cookies.get("gf_guest", "")
+    assert raw_cookie and raw_cookie not in scope1
+    # Signing in changes workspace_scope to the authenticated account's scope
+    signed_in = _login(g1, "admin@example.com", "AdminPassword123!")
+    assert signed_in["workspace_scope"] != scope1
+    assert signed_in["user"]["user_id"] not in signed_in["workspace_scope"]

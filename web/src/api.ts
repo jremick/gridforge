@@ -476,16 +476,22 @@ export async function fetchShareSnapshot(
   );
 }
 
-export async function fetchShares(): Promise<SharedSnapshotSummary[]> {
+export async function fetchShares(
+  signal?: AbortSignal
+): Promise<SharedSnapshotSummary[]> {
   const data = await requestJson<
     SharedSnapshotSummary[] | { shares: SharedSnapshotSummary[] }
-  >("/api/shares");
+  >("/api/shares", { cache: "no-store", signal });
   return Array.isArray(data) ? data : data.shares;
 }
 
-export async function deleteShareSnapshot(shareId: string): Promise<void> {
+export async function deleteShareSnapshot(
+  shareId: string,
+  signal?: AbortSignal
+): Promise<void> {
   return requestVoid(`/api/shares/${encodeURIComponent(shareId)}`, {
     method: "DELETE",
+    signal,
   });
 }
 
