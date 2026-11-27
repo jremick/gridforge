@@ -1,4 +1,4 @@
-import maplibregl from "maplibre-gl";
+import * as maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 import type {
   Feature,
@@ -128,7 +128,7 @@ function buildInitialStyle(): maplibregl.StyleSpecification {
         id: "basemap-osm-underlay",
         type: "raster",
         source: "osm-standard",
-        layout: { visibility: "visible" },
+        layout: { visibility: "none" },
         paint: { "raster-opacity": 1 },
       },
       {
@@ -136,7 +136,7 @@ function buildInitialStyle(): maplibregl.StyleSpecification {
         type: "raster",
         source: "opentopomap",
         layout: { visibility: "visible" },
-        paint: { "raster-opacity": 0.94 },
+        paint: { "raster-opacity": 1 },
       },
       {
         id: "basemap-satellite",
@@ -759,6 +759,8 @@ export class GridForgeMap {
   private offlineBasemapReady = false;
   private offlineBasemapKey = "";
   private reportedExternalTileFail = false;
+  private openTopoFallbackActive = false;
+  private dynamicIconGroups = new Map<string, Set<string>>();
   private currentFootprint: FeatureCollection | null = null;
   private currentBasemap: BasemapId = "opentopo";
   private suppressClickUntil = 0;
@@ -821,7 +823,7 @@ export class GridForgeMap {
       callbacks.onCenterCommit(pos.lat, pos.lng);
     });
 
-    this.map.on("click", (e) => {
+    this.map.on("click", (e: maplibregl.MapMouseEvent) => {
       if (performance.now() < this.suppressClickUntil) return;
       const { lat, lng } = e.lngLat;
       if (this.interactionMode === "los") {
@@ -852,23 +854,37 @@ export class GridForgeMap {
       callbacks.onCenterCommit(lat, lng);
     });
 
-    this.map.on("dblclick", (e) => {
+    this.map.on("dblclick", (e: maplibregl.MapMouseEvent) => {
       if (this.interactionMode === "sector") {
         e.preventDefault();
         callbacks.onMapSectorFinish?.();
       }
     });
 
-    this.map.on("mousemove", (e) => {
+    this.map.on("mousemove", (e: maplibregl.MapMouseEvent) => {
       callbacks.onCursorMove?.(e.lngLat.lat, e.lngLat.lng);
     });
 
     this.map.on("zoomend", () => {
-      callbacks.onViewChange?.(this.map.getZoom());
+      const z = this.map.getZoom();
+      if (this.currentBasemap === "opentopo" && this.isLoaded) {
+        this.applyBasemapVisibility();
+      }
+      callbacks.onViewChange?.(z);
     });
 
-    this.map.on("error", (ev) => {
+    this.map.on("error", (ev: maplibregl.ErrorEvent) => {
       const srcId = (ev as { sourceId?: string }).sourceId;
+      if (
+        srcId === "opentopomap" &&
+        this.currentBasemap === "opentopo" &&
+        !this.openTopoFallbackActive
+      ) {
+        this.openTopoFallbackActive = true;
+        if (this.isLoaded) {
+          this.applyBasemapVisibility();
+        }
+      }
       if (
         this.offlineBasemapReady &&
         !this.reportedExternalTileFail &&
@@ -1072,7 +1088,7 @@ export class GridForgeMap {
         const showVectorNow = this.currentBasemap === "vector";
         const vecLayerIds: string[] = [];
         const prefixedVectorLayers: maplibregl.LayerSpecification[] =
-          vecStyle.layers.map((rawLayer) => {
+          vecStyle.layers.map((rawLayer: maplibregl.LayerSpecification) => {
             const id = `${VECTOR_LAYER_PREFIX}${rawLayer.id}`;
             vecLayerIds.push(id);
             return {
@@ -1180,8 +1196,10 @@ export class GridForgeMap {
   private applyBasemapVisibility(): void {
     const showVector =
       this.currentBasemap === "vector" && this.vectorStyleMerged;
-    const showOsm =
-      this.currentBasemap === "osm" || this.currentBasemap === "opentopo";
+    const needHighZoomOsm =
+      this.currentBasemap === "opentopo" &&
+      (this.openTopoFallbackActive || this.map.getZoom() >= 16.5);
+    const showOsm = this.currentBasemap === "osm" || needHighZoomOsm;
     const showOpenTopo = this.currentBasemap === "opentopo";
     const showSat = this.currentBasemap === "satellite";
     const showOffline =
@@ -1227,15 +1245,30 @@ export class GridForgeMap {
     }
   }
 
+  private pruneDynamicIcons(group: string, activeIds: Set<string>): void {
+    const prev = this.dynamicIconGroups.get(group);
+    if (prev) {
+      for (const oldId of prev) {
+        if (!activeIds.has(oldId) && this.map.hasImage(oldId)) {
+          this.map.removeImage(oldId);
+        }
+      }
+    }
+    this.dynamicIconGroups.set(group, activeIds);
+  }
+
   private ensureSheetLabelImages(labels: string[]): void {
+    const active = new Set<string>();
     for (const label of labels) {
       const iconId = `sheet-label-${label}`;
+      active.add(iconId);
       if (this.map.hasImage(iconId)) continue;
       const rendered = renderSheetBadgeImage(label);
       if (rendered) {
         this.map.addImage(iconId, rendered, { pixelRatio: 2 });
       }
     }
+    this.pruneDynamicIcons("sheet", active);
   }
 
   private ensureBadgeImage(
@@ -1462,12 +1495,14 @@ export class GridForgeMap {
   private applyWaypoints(waypoints: WaypointInput[]): void {
     const pointFeatures: Feature<Point>[] = [];
     const legCoords: Position[] = [];
+    const activeIcons = new Set<string>();
 
     for (let idx = 0; idx < waypoints.length; idx += 1) {
       const wp = waypoints[idx];
       if (!wp) continue;
       const code = `WP${idx + 1}`;
       const iconId = this.ensureWaypointPinImage(code, wp.category);
+      activeIcons.add(iconId);
       pointFeatures.push({
         type: "Feature",
         properties: { code, label: wp.label, category: wp.category, icon_id: iconId },
@@ -1475,6 +1510,7 @@ export class GridForgeMap {
       });
       legCoords.push([wp.lon, wp.lat]);
     }
+    this.pruneDynamicIcons("wp", activeIcons);
 
     const legsFc: FeatureCollection<LineString> = {
       type: "FeatureCollection",
@@ -1509,12 +1545,14 @@ export class GridForgeMap {
     const coverageFeatures: Feature[] = [];
     const ringFeatures: Feature[] = [];
     const observerFeatures: Feature<Point>[] = [];
+    const activeIcons = new Set<string>();
 
     for (let idx = 0; idx < entries.length; idx += 1) {
       const entry = entries[idx];
       if (!entry) continue;
       const code = `OBS${idx + 1}`;
       const iconId = this.ensureObserverPinImage(code);
+      activeIcons.add(iconId);
       observerFeatures.push({
         type: "Feature",
         properties: { code, label: entry.observer.label, icon_id: iconId },
@@ -1530,6 +1568,7 @@ export class GridForgeMap {
         ringFeatures.push(...entry.preview.range_ring_geojson.features);
       }
     }
+    this.pruneDynamicIcons("obs", activeIcons);
 
     (
       this.map.getSource("viewshed-coverage") as
@@ -1667,6 +1706,13 @@ export class GridForgeMap {
       });
     }
 
+    const activeTacIcons = new Set<string>();
+    for (const f of pinFeatures) {
+      const id = f.properties?.icon_id;
+      if (typeof id === "string") activeTacIcons.add(id);
+    }
+    this.pruneDynamicIcons("tac", activeTacIcons);
+
     (
       this.map.getSource("tactical-sectors") as
         | maplibregl.GeoJSONSource
@@ -1732,6 +1778,13 @@ export class GridForgeMap {
         },
       });
     }
+
+    const activeRfIcons = new Set<string>();
+    for (const f of pinFeatures) {
+      const id = f.properties?.icon_id;
+      if (typeof id === "string") activeRfIcons.add(id);
+    }
+    this.pruneDynamicIcons("rf", activeRfIcons);
 
     (
       this.map.getSource("rf-links-lines") as maplibregl.GeoJSONSource | undefined

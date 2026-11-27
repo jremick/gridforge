@@ -2346,8 +2346,12 @@ export class SidebarPanel {
             : g.kind === "sector"
               ? "AOI"
               : "LINE";
+        const rawColor =
+          typeof g.color === "string" && /^#[0-9a-fA-F]{6}$/.test(g.color.trim())
+            ? g.color.trim()
+            : null;
         const color =
-          g.color ||
+          rawColor ||
           (g.kind === "range_ring"
             ? "#38BDF8"
             : g.kind === "sector"
@@ -2548,7 +2552,7 @@ export class SidebarPanel {
             <span class="gf-wp-mgrs" title="Observer 10m MGRS">${escapeHtml(entry.preview.observer_mgrs_10m)}</span>
           `;
         } else {
-          statusHtml = `<span>${o.lat.toFixed(4)}, ${o.lon.toFixed(4)}</span>`;
+          statusHtml = `<span>${o.lat.toFixed(4)}, ${o.lon.toFixed(4)}</span> <button type="button" class="gf-mini-btn" data-vs-action="recompute" data-vs-id="${escapeHtml(entry.id)}">Compute</button>`;
         }
 
         return `
@@ -2622,6 +2626,8 @@ export class SidebarPanel {
               <span>Mag ${Math.round(p.bearing_mag_deg).toString().padStart(3, "0")}° (${Math.round(p.bearing_mils)}m)</span>
             </div>
           `;
+        } else {
+          bodyHtml = `<div class="gf-wp-meta mono"><span>Ready</span> <button type="button" class="gf-mini-btn" data-rf-action="recompute" data-rf-id="${escapeHtml(entry.id)}">Compute</button></div>`;
         }
 
         return `

@@ -19,10 +19,10 @@ import {
   logoutSession,
   submitJob,
 } from "./api";
-import { AdminModal } from "./components/adminModal";
+import type { AdminModal } from "./components/adminModal";
 import { AuthModal } from "./components/authModal";
 import { JobsDrawer } from "./components/jobsDrawer";
-import { PacksModal } from "./components/packsModal";
+import type { PacksModal } from "./components/packsModal";
 import { ProjectsDrawer } from "./components/projectsDrawer";
 import { SidebarPanel } from "./components/sidebar";
 import { TelemetryBar } from "./components/telemetry";
@@ -82,7 +82,15 @@ const ROUTE_METRICS_DEBOUNCE_MS = 150;
 const ZOOM_URL_DEBOUNCE_MS = 260;
 const ACTIVE_JOBS_POLL_MS = 2000;
 const IDLE_JOBS_POLL_MS = 10000;
-const HEALTH_POLL_MS = 5000;
+const HEALTH_POLL_MS = 20000;
+
+const KNOWN_AUTH_ERRORS: Record<string, string> = {
+  access_denied: "Google sign-in was cancelled.",
+  oauth_failed: "Google sign-in failed. Please try again.",
+  invite_required: "An admin invite link is required to sign in.",
+  account_disabled: "This account has been disabled by an administrator.",
+  session_expired: "Your session expired. Please sign in again.",
+};
 
 type ApiErrorContext =
   | "job"
@@ -105,9 +113,11 @@ class GridForgeApp {
   private readonly sidebar: SidebarPanel;
   private readonly drawer: JobsDrawer;
   private readonly projectsDrawer: ProjectsDrawer;
-  private readonly packsModal: PacksModal;
+  private readonly packsModalEl: HTMLElement;
+  private packsModal: PacksModal | null = null;
   private readonly authModal: AuthModal;
-  private readonly adminModal: AdminModal;
+  private readonly adminModalEl: HTMLElement;
+  private adminModal: AdminModal | null = null;
   private readonly turnstile: TurnstileController;
   private readonly map: GridForgeMap;
   private readonly basemapSwitcherEl: HTMLElement;
@@ -166,7 +176,22 @@ class GridForgeApp {
     this.pendingInviteToken = extractInviteTokenFromSearch(
       window.location.search
     );
-    this.pendingAuthError = extractAuthErrorFromSearch(window.location.search);
+    const rawAuthError = extractAuthErrorFromSearch(window.location.search);
+    this.pendingAuthError = rawAuthError
+      ? (KNOWN_AUTH_ERRORS[rawAuthError.toLowerCase()] ??
+          "Sign-in could not be completed. Please try again.")
+      : null;
+    // Strip sensitive invite tokens & auth_error params from address bar / history / Referer immediately.
+    if (this.pendingInviteToken || rawAuthError) {
+      const cleanedParams = new URLSearchParams(window.location.search);
+      cleanedParams.delete("invite");
+      cleanedParams.delete("invite_token");
+      cleanedParams.delete("auth_error");
+      cleanedParams.delete("error");
+      const qs = cleanedParams.toString();
+      const nextUrl = `${window.location.pathname}${qs ? `?${qs}` : ""}${window.location.hash}`;
+      window.history.replaceState(null, "", nextUrl);
+    }
     const urlHydration = hydrateStateFromSearch(
       window.location.search,
       this.state
@@ -293,53 +318,19 @@ class GridForgeApp {
         this.copyText(url, "Share link copied to clipboard"),
       onOpenAuth: () => this.authModal.open(),
       onSignOut: () => void this.handleSignOut(),
-      onOpenAdmin: () => this.adminModal.open(),
+      onOpenAdmin: () => void this.openAdminModal(),
     });
 
-    this.packsModal = new PacksModal(this.q(root, "[data-role='packs-modal']"), {
-      onPacksUpdated: (packs) => {
-        this.sidebar.setPacks(packs);
-        void this.loadHealth();
-      },
-      onSelectPack: (packId) => {
-        this.state.pack_id = packId;
-        this.sidebar.syncControlsFromState();
-        this.syncUrlFromState();
-        void this.loadBasemapInfo(packId);
-        this.showToast(`Selected offline pack "${packId}"`, "success");
-      },
-      onBasemapRefresh: () => {
-        void this.loadBasemapInfo(this.state.pack_id || null);
-      },
-      onToast: (msg, kind) => this.showToast(msg, kind),
-      getCurrentBBoxString: () => this.map.getFootprintBBoxString(),
-      onApiError: (err) => {
-        this.handleApiError(err, "packs", "Offline pack request failed");
-      },
-    });
+    this.packsModalEl = this.q(root, "[data-role='packs-modal']");
+    this.adminModalEl = this.q(root, "[data-role='admin-modal']");
 
     this.authModal = new AuthModal(this.q(root, "[data-role='auth-modal']"), {
       onSessionChanged: (nextSession) => {
         this.applySession(nextSession);
       },
-      onOpenAdmin: () => this.adminModal.open(),
+      onOpenAdmin: () => void this.openAdminModal(),
       onToast: (msg, kind) => this.showToast(msg, kind),
     });
-
-    this.adminModal = new AdminModal(
-      this.q(root, "[data-role='admin-modal']"),
-      {
-        getCurrentUserId: () => this.session.user?.user_id ?? null,
-        onSettingsChanged: () => {
-          void this.refreshSession();
-        },
-        onCopyText: (text, label) => this.copyText(text, label),
-        onToast: (msg, kind) => this.showToast(msg, kind),
-        onApiError: (err) => {
-          this.handleApiError(err, "admin", "Admin request failed");
-        },
-      }
-    );
 
     this.projectsDrawer = new ProjectsDrawer(
       this.q(root, "[data-role='projects-drawer']"),
@@ -445,7 +436,7 @@ class GridForgeApp {
         onRFLinkRecompute: (id) => void this.computeRFLinkEntry(id),
         onRFLinkDelete: (id) => this.handleRFLinkDelete(id),
         onRFLinksClear: () => this.handleRFLinksClear(),
-        onManagePacks: () => this.packsModal.open(),
+        onManagePacks: () => void this.openPacksModal(),
         onRefreshPacks: () => void this.loadPacks(true),
         onSubmitJob: () => void this.handleSubmitJob(),
         onCopyCli: () => {
@@ -783,11 +774,11 @@ class GridForgeApp {
         Boolean(target?.isContentEditable);
 
       if (e.key === "Escape") {
-        if (this.adminModal.opened) {
+        if (this.adminModal?.opened) {
           this.adminModal.close();
         } else if (this.authModal.opened) {
           this.authModal.close();
-        } else if (this.packsModal.opened) {
+        } else if (this.packsModal?.opened) {
           this.packsModal.close();
         } else if (this.interactionMode !== "pan") {
           this.setInteractionMode("pan");
@@ -800,9 +791,9 @@ class GridForgeApp {
       }
 
       if (
-        this.adminModal.opened ||
+        this.adminModal?.opened ||
         this.authModal.opened ||
-        this.packsModal.opened ||
+        this.packsModal?.opened ||
         inInput
       ) {
         return;
@@ -1031,8 +1022,22 @@ class GridForgeApp {
       }
     }
 
-    window.setInterval(() => void this.loadHealth(), HEALTH_POLL_MS);
-    window.setInterval(() => this.drawer.tickElapsed(), 1000);
+    window.setInterval(() => {
+      if (!document.hidden) {
+        void this.loadHealth();
+      }
+    }, HEALTH_POLL_MS);
+    window.setInterval(() => {
+      if (!document.hidden) {
+        this.drawer.tickElapsed();
+      }
+    }, 1000);
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) {
+        void this.loadHealth();
+        void this.pollJobsOnce();
+      }
+    });
 
     if (shareFetchPromise) {
       const result = await shareFetchPromise;
@@ -1045,6 +1050,7 @@ class GridForgeApp {
           toastLabel: `Loaded shared map "${labelName}"`,
           preserveShareId: result.snapshot.share_id,
           flyToCenter: false,
+          autoComputePreviews: false,
         });
         return;
       }
@@ -1071,27 +1077,61 @@ class GridForgeApp {
       this.sidebar.openViewshedSection();
       if (this.state.viewsheds.length > 0) {
         this.map.updateViewsheds(this.state.viewsheds);
+        this.sidebar.renderViewshedsList();
       }
       if (this.state.rfLinks.length > 0) {
         this.map.updateRFLinks(this.state.rfLinks, null);
-      }
-      if (session.capabilities.turnstile_required) {
-        await turnstileSyncPromise;
-        for (const vs of this.state.viewsheds) {
-          await this.computeViewshedEntry(vs.id);
-        }
-        for (const rf of this.state.rfLinks) {
-          await this.computeRFLinkEntry(rf.id);
-        }
-      } else {
-        for (const vs of this.state.viewsheds) {
-          void this.computeViewshedEntry(vs.id);
-        }
-        for (const rf of this.state.rfLinks) {
-          void this.computeRFLinkEntry(rf.id);
-        }
+        this.sidebar.renderRFLinksList();
       }
     }
+  }
+
+  private async openPacksModal(): Promise<void> {
+    if (!this.packsModal) {
+      const { PacksModal } = await import("./components/packsModal");
+      this.packsModal = new PacksModal(this.packsModalEl, {
+        onPacksUpdated: (packs) => {
+          this.sidebar.setPacks(packs);
+          void this.loadHealth();
+        },
+        onSelectPack: (packId) => {
+          this.state.pack_id = packId;
+          this.sidebar.syncControlsFromState();
+          this.syncUrlFromState();
+          void this.loadBasemapInfo(packId);
+          this.showToast(`Selected offline pack "${packId}"`, "success");
+        },
+        onBasemapRefresh: () => {
+          void this.loadBasemapInfo(this.state.pack_id || null);
+        },
+        onToast: (msg, kind) => this.showToast(msg, kind),
+        getCurrentBBoxString: () => this.map.getFootprintBBoxString(),
+        onApiError: (err) => {
+          this.handleApiError(err, "packs", "Offline pack request failed");
+        },
+      });
+      this.packsModal.setManageAllowed(this.session.capabilities.packs_manage_allowed);
+    }
+    this.packsModal.open();
+  }
+
+  private async openAdminModal(): Promise<void> {
+    if (!this.adminModal) {
+      const { AdminModal } = await import("./components/adminModal");
+      this.adminModal = new AdminModal(this.adminModalEl, {
+        getCurrentUserId: () => this.session.user?.user_id ?? null,
+        onSettingsChanged: () => {
+          void this.refreshSession();
+        },
+        onCopyText: (text, label) => this.copyText(text, label),
+        onToast: (msg, kind) => this.showToast(msg, kind),
+        onApiError: (err) => {
+          this.handleApiError(err, "admin", "Admin request failed");
+        },
+      });
+      this.adminModal.syncPublicPaused(this.session.quotas.public_renders_paused);
+    }
+    this.adminModal.open();
   }
 
   private async loadSession(): Promise<SessionResponse> {
@@ -1143,9 +1183,9 @@ class GridForgeApp {
     }
     this.telemetry.updateSession(next);
     this.sidebar.applySession(next);
-    this.packsModal.setManageAllowed(next.capabilities.packs_manage_allowed);
+    this.packsModal?.setManageAllowed(next.capabilities.packs_manage_allowed);
     this.authModal.setSession(next);
-    this.adminModal.syncPublicPaused(next.quotas.public_renders_paused);
+    this.adminModal?.syncPublicPaused(next.quotas.public_renders_paused);
     this.syncGlobalStatusBanner(next);
 
     if (!options.isBootstrap) {
@@ -1186,10 +1226,10 @@ class GridForgeApp {
       }
     }
 
-    if (next.role !== "admin" && this.adminModal.opened) {
+    if (next.role !== "admin" && this.adminModal?.opened) {
       this.adminModal.close();
     }
-    if (!next.capabilities.packs_manage_allowed && this.packsModal.opened) {
+    if (!next.capabilities.packs_manage_allowed && this.packsModal?.opened) {
       this.packsModal.close();
     }
 
@@ -1610,6 +1650,7 @@ class GridForgeApp {
       preserveShareId?: string | null;
       closeProjectsDrawer?: boolean;
       flyToCenter?: boolean;
+      autoComputePreviews?: boolean;
     } = {}
   ): void {
     this.clearStripPlanInternal(false);
@@ -1700,9 +1741,18 @@ class GridForgeApp {
 
     if (this.state.viewsheds.length > 0 || this.state.rfLinks.length > 0) {
       this.sidebar.openViewshedSection();
+      this.sidebar.renderViewshedsList();
+      this.sidebar.renderRFLinksList();
+      if (!options.autoComputePreviews) {
+        this.showToast(
+          "Click Compute on any viewshed or RF link in the sidebar to run DEM analysis.",
+          "info"
+        );
+        return;
+      }
     }
 
-    if (this.turnstile.isActive()) {
+    if (options.autoComputePreviews) {
       const viewshedsToRun = [...this.state.viewsheds];
       const rfLinksToRun = [...this.state.rfLinks];
       void (async () => {
@@ -1715,13 +1765,6 @@ class GridForgeApp {
           await this.computeRFLinkEntry(rf.id);
         }
       })();
-    } else {
-      for (const vs of this.state.viewsheds) {
-        void this.computeViewshedEntry(vs.id);
-      }
-      for (const rf of this.state.rfLinks) {
-        void this.computeRFLinkEntry(rf.id);
-      }
     }
   }
 
@@ -2592,6 +2635,10 @@ class GridForgeApp {
   }
 
   private async pollJobsOnce(): Promise<void> {
+    if (document.hidden) {
+      this.scheduleNextJobsPoll();
+      return;
+    }
     try {
       const jobs = await fetchJobs();
       this.jobs = jobs;

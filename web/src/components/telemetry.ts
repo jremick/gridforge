@@ -374,8 +374,22 @@ export class TelemetryBar {
     document.addEventListener("click", this.handleDocClick);
     document.addEventListener("keydown", this.handleDocKeyDown, true);
 
-    const injectedBrand =
+    let injectedBrand =
       typeof window !== "undefined" ? window.__GF_BRAND__ : undefined;
+    if (
+      !injectedBrand &&
+      typeof document !== "undefined" &&
+      typeof document.getElementById === "function"
+    ) {
+      const brandEl = document.getElementById("gf-brand");
+      if (brandEl?.textContent) {
+        try {
+          injectedBrand = JSON.parse(brandEl.textContent) as GridForgeBrandConfig;
+        } catch {
+          injectedBrand = undefined;
+        }
+      }
+    }
     if (injectedBrand?.name || injectedBrand?.subtitle || injectedBrand?.tagline) {
       this.updateBrand(
         injectedBrand.name,

@@ -519,7 +519,7 @@ export function artifactDownloadUrl(
   filename: string,
   explicitUrl?: string
 ): string {
-  if (explicitUrl && explicitUrl.startsWith("/")) {
+  if (explicitUrl && explicitUrl.startsWith("/") && !explicitUrl.startsWith("//")) {
     return explicitUrl;
   }
   return `/api/jobs/${encodeURIComponent(jobId)}/artifacts/${encodeURIComponent(filename)}`;

@@ -1,6 +1,6 @@
 {
   "name": "gridforge-web",
-  "version": "1.6.0",
+  "version": "1.6.1",
   "private": true,
   "type": "module",
   "scripts": {
@@ -12,7 +12,7 @@
     "test:compose": "node --experimental-strip-types --test tests/copy-cli.compose.mjs"
   },
   "dependencies": {
-    "maplibre-gl": "^5.2.0"
+    "maplibre-gl": "^6.19.0"
   },
   "devDependencies": {
     "@types/geojson": "^7946.0.16",

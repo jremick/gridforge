@@ -5,6 +5,41 @@ All notable changes to **GridForge** are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.1] - 2026-11-27
+
+Comprehensive security hardening, container least-privilege, and end-to-end GIS/web performance optimization release upgrading MapLibre GL JS to v6, isolating web secrets from GIS subprocesses, hardening proxy/origin verification, bounding hosted storage & DoS vectors, and substantially accelerating terrain derivation, PyQGIS styling, exports, and web/Studio responsiveness.
+
+### Security & Hardening
+
+- **Non-Root Multi-Stage Container & Secret Isolation (`Dockerfile`, `.dockerignore`, `src/gridforge/subprocess_env.py`, `src/gridforge/web/entrypoint.py`):**
+  - Split `Dockerfile` into `test` and lean non-root `runtime` (`USER 10001:10001`, zero `pytest` in production) with `.dockerignore` and automatic root-to-`10001` volume ownership handoff when launched with `RAILWAY_RUN_UID=0`.
+  - Added allowlisted `build_safe_subprocess_env()` stripping web/cloud credentials (`GRIDFORGE_SESSION_SECRET`, admin/OAuth/Turnstile/origin secrets, AWS/GitHub/Railway tokens) from worker, PyQGIS, supplement, and GDAL/OGR subprocesses, and disabling GDAL `/vsicurl/` (`CPL_VSIL_CURL_ALLOWED_EXTENSIONS=.nonexistent`) for untrusted overlay parsing.
+- **Origin-Proxy Auth, Private Proxy Trust & Strict CSP (`src/gridforge/web/{access,app,auth,limits}.py`, `web/src/`):**
+  - Replaced `FORWARDED_ALLOW_IPS=*` defaults with private proxy CIDRs, stopped auto-trusting `RAILWAY_PUBLIC_DOMAIN` when `GRIDFORGE_ALLOWED_HOSTS` is explicitly set, and added `OriginProxyAuthMiddleware` (`GRIDFORGE_ORIGIN_PROXY_SECRET` / `X-GridForge-Origin-Secret`) with constant-time comparison while permitting Railway's internal `/api/health` probe.
+  - Added strict HTTP security headers (`Content-Security-Policy`, HSTS, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy`, `Permissions-Policy`), eliminated inline JS/event handlers across the Studio SPA (`<script id="gf-brand" type="application/json">`), disabled `/docs`/`/redoc`/`/openapi.json` in hosted mode (`404`, opt-in via `GRIDFORGE_ENABLE_DOCS=true`), enforced global request body caps and per-account login throttling, and scrubbed internal paths/tracebacks from hosted errors.
+- **Upload, Injection, Remote Fetch & Dependency Hardening (`web/package.json`, `pyproject.toml`, `src/gridforge/sources/`, `src/gridforge/render/layout.py`):**
+  - Upgraded `maplibre-gl` (`5.24.1` → `^6.19.0`) patching critical XSS `GHSA-jrc7-96c5-q579` (`0` production `npm audit` vulnerabilities) and bumped `pypdf>=7.0.1`, `pillow>=13.0.0`, `fastapi>=0.115.12`, `h11>=0.16.0`, and `python-multipart>=0.0.31`.
+  - Hardened `UserOverlaySource` (`overlay_user.py`) against XXE/billion-laughs XML, KMZ zip bombs, symlink escapes, and `/vsicurl/` SSRF; added QGIS expression/XML escaping in `layout.py` and `declination.py`; added explicit timeouts, HTTPS/hostname allowlists, disk-to-disk streaming caps, and secret-redacted logging across remote DEM/OSM/overlay fetchers; hardened pack builds with 4° custom span caps, atomic staging, and duplicate-build locking.
+- **Hosted Storage Bounds & DoS Prevention (`src/gridforge/web/{projects,worker,db}.py`, `web/src/main.ts`):**
+  - Bounded anonymous Guest saved projects with a `64 KB` payload cap, per-guest cap (`GRIDFORGE_MAX_PROJECTS_PER_GUEST=5`), hourly rate limit (`GRIDFORGE_GUEST_PROJECT_HOURLY_LIMIT=20`), and global cap (`GRIDFORGE_MAX_GUEST_PROJECTS=500`) with automatic expired/oldest eviction on insert.
+  - Wired `GRIDFORGE_ADMIN_TTL_HOURS` (`720` default in hosted mode, `0` disables) into `worker.py` and `db.py` to protect bounded persistent volumes, and stopped auto-firing up to 30 DEM preview requests on `?share=` / deep-link load in Studio (explicit user-triggered Compute buttons).
+  - Extended `scripts/release_preflight.py` privacy scanning to `src/`, `tests/`, and `web/src/`, hardened `scripts/render_release_samples.sh` tar extraction flags, and documented all new env vars in [`deploy/hosted-mode.md`](deploy/hosted-mode.md).
+
+### Performance
+
+- **Web API, SQLite & Studio Frontend (`src/gridforge/web/{db,app}.py`, `src/gridforge/cli.py`, `web/src/`):**
+  - Added thread-local SQLite connection pooling, composite job/usage indexes, and single-query `get_admin_usage_report()` aggregation; added `GZipMiddleware`, immutable `1 yr` caching on content-hashed `/assets/*`, and mtime-fingerprinted pack discovery caching.
+  - Added visibility-aware background polling and lazy-loaded `PacksModal` / `AdminModal` bundles in Studio, plus lazy CLI imports in `cli.py`.
+- **GIS Pipeline, Terrain, PyQGIS & Exports (`src/gridforge/{geo,pipeline,render,export,packs}/`):**
+  - Cached WGS84↔UTM transformers (`src/gridforge/geo/crs.py`), added `PointDeclination` fast path (`src/gridforge/geo/declination.py`), batched DEM elevation sampling in waypoints/tactical overlays, added OGR transaction batching across vector builders, `-spat` R-Tree pre-filtering in AU/US overlay fetchers, `-gt 65536` + attribute indexes in `src/gridforge/pipeline/normalize.py`, and schema-verified `setSubsetString` filters in `src/gridforge/render/styles.py`.
+  - Accelerated `src/gridforge/pipeline/terrain.py` with threaded GDAL, skipped redundant UTM warps, eliminated intermediate `dem_utm_ft.tif`, ran hillshade/contours/slope/viewshed concurrently, and downsampled LiDAR viewsheds to 10 m.
+  - Batched supplement PDF generation into a single subprocess (`src/gridforge/geo/supplements.py`), parallelized fetch/normalize/pack stages (`src/gridforge/pipeline/runner.py`, `src/gridforge/packs/builder.py`, `src/gridforge/packs/basemap_builder.py`), shared `EPSG:3857` warping and MBTiles reuse across MBTiles/GeoPackage/OsmAnd exports, parallelized Garmin KMZ JPEG encoding, and streamed chunked `QImage` → GeoTIFF writes in `src/gridforge/export/raster.py`.
+
+### Verification
+
+- **Automated Suites (`553` offline pytest + `44` frontend tests + `26` live multi-region E2E):**
+  - Added `tests/unit/test_security_and_perf_hardening.py` covering secret isolation, injection/XXE/SSRF defenses, proxy/origin lockdown, bounded guest projects, admin TTL retention, and connection pooling, and verified `553` offline pytest cases + `26` live multi-region open-data E2E renders across US, Canada, Australia, and New Zealand.
+
 ## [1.6.0] - 2026-11-27
 
 Deep-linking and shareable trip snapshot release expanding stateless URL permalinks to preserve full Studio views (basemap, zoom, cartography, outputs, booklet toggles, waypoints, RF links, tactical graphics, and custom LOS observer labels), adding a one-click topbar **Share** popover, and introducing SQLite-backed immutable short share links (`?share=<token>`, `/api/shares`) for both live Studio views and Saved Trip Projects.

@@ -86,6 +86,17 @@ export class JobsDrawer {
       this.callbacks.onRefresh();
     });
 
+    this.bodyEl.addEventListener(
+      "error",
+      (e) => {
+        const target = e.target as HTMLElement | null;
+        if (target instanceof HTMLImageElement && target.classList.contains("gf-job-thumb")) {
+          target.style.display = "none";
+        }
+      },
+      true
+    );
+
     this.bodyEl.addEventListener("click", (e) => {
       const target = e.target as HTMLElement | null;
       const btn = target?.closest<HTMLButtonElement>("button[data-action]");
@@ -114,15 +125,31 @@ export class JobsDrawer {
     return el;
   }
 
+  private lastRenderSig = "";
+
+  private computeJobsSignature(jobs: JobRecord[]): string {
+    return jobs
+      .map(
+        (j) =>
+          `${j.job_id}:${j.status}:${j.stage ?? ""}:${j.progress_pct ?? 0}:${j.artifacts.length}:${j.error ?? ""}:${this.busyJobIds.has(j.job_id) ? 1 : 0}`
+      )
+      .join("|");
+  }
+
   setJobs(jobs: JobRecord[]): void {
     this.jobs = jobs;
     this.busyJobIds.clear();
     this.countEl.textContent = String(jobs.length);
-    this.renderJobs();
+    const sig = this.computeJobsSignature(jobs);
+    if (sig !== this.lastRenderSig) {
+      this.lastRenderSig = sig;
+      this.renderJobs();
+    }
   }
 
   clearBusy(jobId: string): void {
     this.busyJobIds.delete(jobId);
+    this.lastRenderSig = "";
     this.renderJobs();
   }
 
@@ -271,7 +298,7 @@ export class JobsDrawer {
 
     const thumbHtml =
       job.status === "succeeded"
-        ? `<img class="gf-job-thumb" src="${escapeHtml(jobThumbnailUrl(job.job_id))}" alt="" loading="lazy" onerror="this.style.display='none'" />`
+        ? `<img class="gf-job-thumb" src="${escapeHtml(jobThumbnailUrl(job.job_id))}" alt="" loading="lazy" />`
         : "";
 
     return `

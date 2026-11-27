@@ -108,6 +108,17 @@ export class ProjectsDrawer {
       }
     });
 
+    this.listEl.addEventListener(
+      "error",
+      (e) => {
+        const target = e.target as HTMLElement | null;
+        if (target instanceof HTMLImageElement && target.classList.contains("gf-proj-thumb")) {
+          target.style.display = "none";
+        }
+      },
+      true
+    );
+
     this.listEl.addEventListener("click", (e) => {
       const target = e.target as HTMLElement | null;
       const btn = target?.closest<HTMLButtonElement>("button[data-proj-action]");
@@ -283,7 +294,7 @@ export class ProjectsDrawer {
         const thumbSrc =
           p.thumbnail_url || (p.last_job_id ? jobThumbnailUrl(p.last_job_id) : null);
         const thumbHtml = thumbSrc
-          ? `<img class="gf-proj-thumb" src="${escapeHtml(thumbSrc)}" alt="" loading="lazy" onerror="this.style.display='none'" />`
+          ? `<img class="gf-proj-thumb" src="${escapeHtml(thumbSrc)}" alt="" loading="lazy" />`
           : "";
         const notesText = p.description ?? p.notes ?? "";
 
