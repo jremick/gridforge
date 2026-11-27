@@ -13,8 +13,9 @@ Follow this ordered checklist whenever preparing or cutting a `vX.Y.Z` release o
    - Run `gh run list --branch main --limit 3` and verify the latest `CI` run is green.
    - Verify `.github/workflows/ci.yml` mounts the full `tests/` tree (including `tests/unit`, `tests/integration`, and `tests/e2e`) and any new runtime config/data directories read by tests.
 2. **Live Multi-Region Open-Data E2E Check:**
-   - Run live integration tests inside the freshly built container so upstream open-data feeds (USGS 3DEP, NRCan HRDEM, GA ELVIS/QLD, LINZ, Overpass) are verified against real network responses:
+   - Run live integration tests inside the freshly built test image (on your cloud VM or directly on GitHub Actions via `gh workflow run ci.yml -f run_live=true`) so upstream open-data feeds (USGS 3DEP, NRCan HRDEM, GA ELVIS/QLD, LINZ, Overpass) are verified against real network responses:
      ```bash
+     docker build --target test -t gridforge:dev .
      docker run --rm -e GRIDFORGE_RUN_LIVE=1 -v "$(pwd):/app" gridforge:dev \
        pytest -q tests/integration -m live
      ```
@@ -39,7 +40,7 @@ Follow this ordered checklist whenever preparing or cutting a `vX.Y.Z` release o
 3. Run all local gates:
    ```bash
    python3 scripts/release_preflight.py --tag vX.Y.Z
-   npm --prefix web test && npm --prefix web run build
+   npm --prefix web test && npm --prefix web run build && npm --prefix web run build:mcp-app
    ```
    (`release_preflight.py` mechanically checks version parity, `CHANGELOG.md`, `README.md` badges/images/links, sample PDF tag & script parity, `deploy/hosted-mode.md`, CI `tests/e2e` coverage, and privacy path hygiene.)
 
@@ -55,7 +56,7 @@ Follow this ordered checklist whenever preparing or cutting a `vX.Y.Z` release o
    ```bash
    gh release create vX.Y.Z --title "GridForge vX.Y.Z — <headline>" --notes-file <notes.md>
    ```
-4. Render and attach all verified sample PDFs directly from the published `vX.Y.Z` image:
+4. Render and attach all verified sample PDFs directly from the published `vX.Y.Z` image (runs automatically on GitHub Actions in `.github/workflows/release.yml`, can be re-triggered with `gh workflow run release.yml -f tag=vX.Y.Z -f render_samples=true`, or run from a cloud VM):
    ```bash
    ./scripts/render_release_samples.sh --image ghcr.io/jremick/gridforge:vX.Y.Z --upload vX.Y.Z
    ```

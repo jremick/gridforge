@@ -143,6 +143,7 @@ Read the full **[AI Agents & MCP Integration Guide](docs/ai-agents.md)**, instal
 GridForge pairs a lean FastAPI + SQLite WAL `web` server (`zero qgis imports`, `< 100 MiB` RAM) and TypeScript/MapLibre Studio (`web/`) with ephemeral headless PyQGIS 3.40 LTR `worker` subprocesses (`< 2 GB` peak RSS).
 
 - **[CONTRIBUTING.md](CONTRIBUTING.md)** — local Docker/Vite development, offline & live test suites, and engineering guardrails
+- **[deploy/cloud-dev.md](deploy/cloud-dev.md)** — zero-local-Docker cloud dev VM (Tailscale SSH + Antigravity Remote SSH), Dev Container, and GitHub Actions offloading
 - **[docs/ai-agents.md](docs/ai-agents.md)** — MCP (`stdio` + `/mcp`), interactive SEP-1865 MCP Apps, ChatGPT Actions, Bearer API keys, and Agent Skill setup
 - **[docs/STYLING_GUIDE.md](docs/STYLING_GUIDE.md)** — authoring 4-theme QGIS 3.40 `.qml` cartography styles
 - **[docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md)** — release preflight, GHCR publishing, and sample PDF verification

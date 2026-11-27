@@ -37,14 +37,16 @@ gh run list --branch main --limit 3
 # 2. Release & marketing hygiene gate (version parity, README links/badges/images)
 python3 scripts/release_preflight.py --tag vX.Y.Z
 
-# 3. Frontend unit tests & production bundle
-npm --prefix web test && npm --prefix web run build
+# 3. Frontend unit tests & production bundles (Studio SPA + MCP App)
+npm --prefix web test && npm --prefix web run build && npm --prefix web run build:mcp-app
 
-# 4. Full offline PyQGIS test suite inside the rebuilt image
-docker build -t gridforge:dev .
+# 4. Full offline PyQGIS test suite inside the rebuilt test image
+docker build --target test -t gridforge:dev .
 docker run --rm -v "$(pwd):/app" gridforge:dev pytest -q tests/unit tests/integration tests/e2e
 
 # 5. Live multi-region E2E renders & visual inspection (verifies live Overpass/DEM/overlay feeds)
+#    Run locally/on your cloud VM OR trigger directly on GitHub Actions:
+#      gh workflow run ci.yml -f run_live=true
 docker run --rm -e GRIDFORGE_RUN_LIVE=1 -v "$(pwd):/app" gridforge:dev \
   pytest -q tests/integration -m live
 ```
@@ -71,7 +73,7 @@ Verify live Studio UI (`0` console errors, `0 px` topbar clipping at `1440×900`
      --title "GridForge vX.Y.Z — <headline>" \
      --notes-file <release_notes.md>
    ```
-2. Render and attach the verified 300 DPI sample PDFs so visitors can zoom into real vector sheets without running Docker:
+2. Render and attach the verified 300–600 DPI sample PDFs so visitors can zoom into real vector sheets without running Docker (automatically runs on GitHub Actions in `.github/workflows/release.yml`, or re-trigger in the cloud with `gh workflow run release.yml -f tag=vX.Y.Z -f render_samples=true`, or run from a cloud VM):
    ```bash
    ./scripts/render_release_samples.sh --image ghcr.io/jremick/gridforge:vX.Y.Z --upload vX.Y.Z
    ```

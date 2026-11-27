@@ -189,6 +189,7 @@ def check_release(tag: str | None = None) -> list[str]:
         ROOT / "docker-compose.yml",
         ROOT / "docker-compose.ghcr.yml",
         ROOT / "pyproject.toml",
+        ROOT / ".devcontainer/devcontainer.json",
         *(ROOT / "docs").glob("*.md"),
         *(ROOT / "deploy").glob("*.md"),
         *(ROOT / ".github/workflows").glob("*.yml"),
@@ -196,6 +197,7 @@ def check_release(tag: str | None = None) -> list[str]:
         *(ROOT / "scripts").glob("*.py"),
     ]
     for tree in (
+        ROOT / ".agents",
         ROOT / "src",
         ROOT / "tests",
         ROOT / "web" / "src",

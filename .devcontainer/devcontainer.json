@@ -1,0 +1,61 @@
+{
+  "name": "GridForge Cloud Dev (PyQGIS 3.40 + Node 22)",
+  "build": {
+    "dockerfile": "../Dockerfile",
+    "context": "..",
+    "target": "test"
+  },
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {
+      "installZsh": false,
+      "configureZshAsDefaultShell": false,
+      "username": "vscode",
+      "userUid": "automatic",
+      "userGid": "automatic",
+      "upgradePackages": false
+    },
+    "ghcr.io/devcontainers/features/node:1": {
+      "version": "22"
+    },
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {
+      "version": "latest",
+      "moby": false
+    },
+    "ghcr.io/devcontainers/features/github-cli:1": {
+      "version": "latest"
+    }
+  },
+  "remoteUser": "vscode",
+  "containerEnv": {
+    "QT_QPA_PLATFORM": "offscreen",
+    "XDG_RUNTIME_DIR": "/tmp/runtime-dev",
+    "GRIDFORGE_CACHE_DIR": "/tmp/gridforge-cache",
+    "PYTHONPATH": "${containerWorkspaceFolder}/src"
+  },
+  "forwardPorts": [8080, 5173],
+  "portsAttributes": {
+    "8080": {
+      "label": "GridForge Studio / API",
+      "onAutoForward": "notify"
+    },
+    "5173": {
+      "label": "Vite Dev Server",
+      "onAutoForward": "notify"
+    }
+  },
+  "hostRequirements": {
+    "cpus": 4,
+    "memory": "8gb",
+    "storage": "32gb"
+  },
+  "postCreateCommand": "mkdir -p /tmp/runtime-dev /tmp/gridforge-cache && chmod 700 /tmp/runtime-dev && sudo chown -R vscode:vscode /opt/venv /data /tmp/gridforge-cache && /opt/venv/bin/pip install --no-cache-dir --no-deps --no-build-isolation -e . && npm --prefix web ci",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "dbaeumer.vscode-eslint",
+        "ms-azuretools.vscode-docker"
+      ]
+    }
+  }
+}

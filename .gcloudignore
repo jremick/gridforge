@@ -1,5 +1,6 @@
 .gcloudignore
 .git/
+.devcontainer/
 .venv/
 venv/
 __pycache__/

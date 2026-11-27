@@ -8,16 +8,18 @@ Thank you for helping make **GridForge** better! GridForge is licensed under **G
 
 GridForge targets **Python 3.11+** (tested on **Debian Trixie / Python 3.13 + Headless PyQGIS 3.40 LTR + GDAL 3.10**) and a **TypeScript + Vite + MapLibre GL JS** web studio (`web/`). Running tests inside the Docker image guarantees exact PyQGIS, GDAL, PROJ, and font parity across macOS (`arm64`) and Linux (`amd64`/`arm64`).
 
-### 1. Build the Development Image
+> **Zero-local-resource cloud development:** To run Docker, PyQGIS, Vite, and release checks entirely off your laptop on a Linux cloud VM (GCP/Hetzner + Tailscale SSH + Antigravity Remote SSH) or Dev Container / Codespaces, see [deploy/cloud-dev.md](deploy/cloud-dev.md) and [.devcontainer/devcontainer.json](.devcontainer/devcontainer.json).
+
+### 1. Build the Development & Test Image
 
 ```bash
-docker build -t gridforge:dev .
+docker build --target test -t gridforge:dev .
 ```
 
 ### 2. Run the Offline CI Test Suite (No Network Required)
 
 ```bash
-docker run --rm -v "$(pwd):/app" gridforge:dev pytest -q tests/unit tests/integration
+docker run --rm -v "$(pwd):/app" gridforge:dev pytest -q tests/unit tests/integration tests/e2e
 ```
 
 ### 3. Run Live Regional E2E Tests (Optional, Uses Public Open-Data APIs)
@@ -62,8 +64,8 @@ cd web && npm run dev
 
 Before opening a pull request:
 
-1. **Tests pass offline:** `pytest -q tests/unit tests/integration` passes cleanly inside `gridforge:dev`.
-2. **Frontend tests & build pass:** If `web/` changed, `npm --prefix web test && npm --prefix web run build` completes with zero errors.
+1. **Tests pass offline:** `pytest -q tests/unit tests/integration tests/e2e` passes cleanly inside `gridforge:dev` (`--target test`).
+2. **Frontend tests & build pass:** If `web/` changed, `npm --prefix web test && npm --prefix web run build && npm --prefix web run build:mcp-app` completes with zero errors.
 3. **Styles regenerated:** If `src/gridforge/render/styles.py` changed, regenerate `assets/styles/{color,bw,night-red,alpine}/*.qml` via `python3 -m gridforge.render.styles` (see [docs/STYLING_GUIDE.md](docs/STYLING_GUIDE.md)).
 4. **Release & README hygiene:** `python3 scripts/release_preflight.py` passes cleanly. For tagging releases, follow [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md).
 5. **Physical scale verified:** Any change touching CRS, margins, layouts, or grid geometry must keep `tests/integration/verify_pdf.py` within `<= 0.15 mm` scale error and `< 0.05 mm` orthogonality skew.

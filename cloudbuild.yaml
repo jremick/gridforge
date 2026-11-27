@@ -23,13 +23,14 @@ steps:
         CACHE_IMG="${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/gridforge:cache"
         docker pull "$${CACHE_IMG}" || true
         docker build \
+          --target test \
           --build-arg BUILDKIT_INLINE_CACHE=1 \
           --cache-from "$${CACHE_IMG}" \
           -t "gridforge:ci-${BUILD_ID}" \
           -t "$${CACHE_IMG}" \
           .
 
-  # 2. Typecheck and build web SPA in parallel
+  # 2. Test, typecheck, and build web SPA + MCP App in parallel
   - id: test-web
     name: node:22-slim
     waitFor: ['-']
@@ -39,10 +40,12 @@ steps:
       - -euxc
       - |
         if [ -f package-lock.json ]; then npm ci; else npm install; fi
+        npm test
         npm run typecheck
         npm run build
+        npm run build:mcp-app
 
-  # 3. Run offline unit and headless PyQGIS integration tests inside the freshly built image
+  # 3. Run offline unit, integration, and hosted E2E tests inside the freshly built test image
   - id: test-pyqgis
     name: "gridforge:ci-${BUILD_ID}"
     waitFor: ['build-image']
@@ -50,7 +53,7 @@ steps:
     args:
       - -euxc
       - |
-        pytest -m "not live" -v
+        pytest -q tests/unit tests/integration tests/e2e
 
   # 4. Push updated Docker layer cache only after all tests pass
   - id: push-cache

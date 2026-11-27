@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      run_live:
+        description: "Run live multi-region open-data E2E tests (GRIDFORGE_RUN_LIVE=1)"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -38,7 +44,7 @@ jobs:
       - name: Run npm production audit
         run: npm audit --omit=dev
 
-      - name: Run Copy CLI unit tests
+      - name: Run frontend unit tests
         run: npm test
 
       - name: Run release & README hygiene preflight
@@ -80,3 +86,39 @@ jobs:
             -v "${{ github.workspace }}/docker-compose.ghcr.yml:/app/docker-compose.ghcr.yml:ro" \
             gridforge:ci \
             pytest -q tests/unit tests/integration tests/e2e
+
+  live-e2e:
+    name: Live Multi-Region Open-Data E2E (On-Demand)
+    if: github.event_name == 'workflow_dispatch' && inputs.run_live == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build gridforge:ci image (cached)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: test
+          load: true
+          tags: gridforge:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run live multi-region E2E tests (GRIDFORGE_RUN_LIVE=1)
+        run: |
+          docker run --rm \
+            -e GRIDFORGE_RUN_LIVE=1 \
+            -v "${{ github.workspace }}/tests:/app/tests:ro" \
+            -v "${{ github.workspace }}/examples:/app/examples:ro" \
+            -v "${{ github.workspace }}/web/src:/app/web/src:ro" \
+            -v "${{ github.workspace }}/Dockerfile:/app/Dockerfile:ro" \
+            -v "${{ github.workspace }}/railway.toml:/app/railway.toml:ro" \
+            -v "${{ github.workspace }}/docker-compose.yml:/app/docker-compose.yml:ro" \
+            -v "${{ github.workspace }}/docker-compose.ghcr.yml:/app/docker-compose.ghcr.yml:ro" \
+            gridforge:ci \
+            pytest -q tests/integration -m live
