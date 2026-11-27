@@ -472,7 +472,8 @@ def _fit_png_under_budget(png_bytes: bytes, max_bytes: int = _MAX_TRAJECTORY_PNG
             buf = io.BytesIO()
             quant.save(buf, format="PNG", optimize=True)
             return buf.getvalue()
-    except Exception:
+    except (OSError, ValueError) as exc:
+        logger.debug("PNG downscale fallback kept original image: %s", exc)
         return png_bytes
 
 
@@ -536,8 +537,8 @@ def _extract_error_detail(resp: httpx.Response) -> str:
         if isinstance(body, dict) and "detail" in body:
             detail = body["detail"]
             return detail if isinstance(detail, str) else json.dumps(detail)
-    except Exception:
-        pass
+    except (ValueError, TypeError):
+        logger.debug("Response body is not JSON; falling back to plain text error detail")
     text = (resp.text or "").strip()
     return text[:400] if text else f"HTTP {resp.status_code}"
 
@@ -1135,15 +1136,15 @@ class GridForgeMCPServer:
                 data = resp.json()
                 if isinstance(data, dict):
                     return data
-        except Exception:
-            pass
+        except (httpx.HTTPError, ValueError) as exc:
+            logger.debug("GET /api/capabilities unavailable (%s); using fallback", exc)
         packs_count = 0
         try:
             presp = await client.get("/api/packs")
             if presp.status_code == 200:
                 packs_count = len((presp.json() or {}).get("packs") or [])
-        except Exception:
-            pass
+        except (httpx.HTTPError, ValueError) as exc:
+            logger.debug("GET /api/packs unavailable (%s); defaulting packs_count=0", exc)
         return _static_capabilities_fallback(packs_count=packs_count)
 
     async def _fetch_packs_safe(self, client: httpx.AsyncClient) -> list[dict[str, Any]]:
@@ -1151,8 +1152,8 @@ class GridForgeMCPServer:
             resp = await client.get("/api/packs")
             if resp.status_code == 200:
                 return list((resp.json() or {}).get("packs") or [])
-        except Exception:
-            pass
+        except (httpx.HTTPError, ValueError) as exc:
+            logger.debug("GET /api/packs unavailable (%s); returning empty pack list", exc)
         return []
 
     async def _resolve_location_to_center(
@@ -1221,8 +1222,8 @@ class GridForgeMCPServer:
                         item["signed_preview_url"] = _absolutize_url(str(item["signed_preview_url"]), public_url)
                     pages.append(item)
                 return (int(data.get("page_count") or len(pages)), pages)
-        except Exception:
-            pass
+        except (httpx.HTTPError, ValueError) as exc:
+            logger.debug("GET /api/jobs/%s/pages unavailable (%s); falling back to thumbnail", job_id, exc)
 
         has_pdf = any(isinstance(a, dict) and a.get("kind") == "pdf" for a in (job.get("artifacts") or []))
         if has_pdf:
@@ -1552,7 +1553,8 @@ class GridForgeMCPServer:
         if location:
             try:
                 center_str, _ = await self._resolve_location_to_center(client, location)
-            except Exception:
+            except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+                logger.debug("Optional studio location '%s' could not be resolved: %s", location, exc)
                 center_str = None
 
         studio_url = build_studio_url(
@@ -1975,8 +1977,8 @@ class GridForgeMCPServer:
                         "scale": 50000 if observer["max_distance_m"] > 5000 else 25000,
                     },
                 )
-            except Exception:
-                pass
+            except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+                logger.debug("Optional viewshed footprint backdrop unavailable: %s", exc)
             png = render_footprint_card_png(
                 fp_backdrop,
                 title=title,
@@ -2331,8 +2333,8 @@ class GridForgeMCPServer:
                 spath = str((sresp.json() or {}).get("share_path") or "")
                 if spath:
                     share_url = _absolutize_url(spath, public_url)
-        except Exception:
-            pass
+        except (httpx.HTTPError, ValueError) as exc:
+            logger.debug("Optional share snapshot creation skipped for job %s: %s", job_id, exc)
 
         title = str(job.get("title") or job.get("center_mgrs") or f"Job {job_id}")
         summary = (
@@ -2620,8 +2622,8 @@ class GridForgeMCPServer:
         try:
             job_raw = await self._api_json(client, "GET", f"/api/jobs/{quote(job_id, safe='')}")
             page_count, _ = await self._fetch_job_pages_safe(client, job_id, job_raw, public_url)
-        except Exception:
-            pass
+        except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+            logger.debug("Could not refresh page_count for job %s: %s", job_id, exc)
 
         b64 = base64.b64encode(raw_png).decode("ascii")
         return call_tool_result(

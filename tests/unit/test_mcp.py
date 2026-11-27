@@ -9,7 +9,7 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import FastAPI, Request
 from fastapi.responses import Response
@@ -51,7 +51,7 @@ from gridforge.web.schemas import (
 )
 
 
-def _sample_rf_profile(status: str = "CLEAR") -> dict[str, Any]:
+def _sample_rf_profile(status: Literal["CLEAR", "MARGINAL", "OBSTRUCTED"] = "CLEAR") -> dict[str, Any]:
     samples: list[dict[str, Any]] = []
     for i in range(21):
         d = i * 0.5
@@ -76,7 +76,7 @@ def _sample_rf_profile(status: str = "CLEAR") -> dict[str, Any]:
         )
     min_clr = min(s["clearance_m"] for s in samples)
     return RFLinkProfileResponse(
-        status=status,  # type: ignore[arg-type]
+        status=status,
         distance_km=10.0,
         freq_mhz=915.0,
         fspl_db=111.7,

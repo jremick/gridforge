@@ -79,7 +79,7 @@ def _load_font(size: int, bold: bool = False, mono: bool = False) -> ImageFont.F
         if Path(candidate).is_file():
             try:
                 return ImageFont.truetype(candidate, size=size)
-            except Exception:
+            except OSError:
                 continue
     try:
         return ImageFont.load_default(size=size)

@@ -45,6 +45,10 @@ class TestNoneModeTier1:
             "status": "ok",
             "frontend_built": False,
             "docs": "/docs",
+            "openapi": "/openapi.json",
+            "capabilities": "/api/capabilities",
+            "mcp": "/mcp",
+            "llms_txt": "/llms.txt",
         }
 
         health = client.get("/api/health")

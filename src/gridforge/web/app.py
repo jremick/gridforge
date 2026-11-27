@@ -3257,7 +3257,7 @@ def create_app(
         application.openapi_schema = schema
         return application.openapi_schema
 
-    application.openapi = custom_openapi  # type: ignore[method-assign]
+    application.openapi = custom_openapi  # type: ignore[method-assign]  # FastAPI documents overriding app.openapi for custom schema injection
 
     return application
 
