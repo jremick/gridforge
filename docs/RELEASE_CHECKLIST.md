@@ -18,9 +18,10 @@ Keep `README.md` structured as a **product landing page** (not a reverse-chronol
 
 - **Hero & Quickstart Above the Fold:** Keep `docs/images/banner.png`, live GitHub Actions badges (`CI` + `GHCR Multi-Arch`), dynamic `GitHub Release` badge, and the 30-second `docker compose -f docker-compose.ghcr.yml up -d` Quickstart at the top.
 - **Fresh Showcase Visuals:**
-  - If new cartographic themes, overlays, regions, or supplement pages shipped, generate a crisp 4-panel showcase banner under `docs/images/` (like `docs/images/v14-showcase.jpg`, `<= 600 KB`) from real 300–600 DPI renders and visually inspect it.
-  - If Studio UI changed meaningfully, update the Studio screenshot (`<= 300 KB`) and/or regenerate the animated Studio walkthrough GIF (`docs/images/studio-demo.gif`, `<= 2.5 MB`).
-- **Keep Capability Tables, Docs & Metrics Current:** Update the top comparison table, test counts, idle RAM measurement, data attributions table, deployment/env-var guides (e.g., `deploy/hosted-mode.md` whenever new env vars or runtime modes ship), and downloadable sample PDF links to match the new release tag.
+  - If new cartographic themes, overlays, regions, or supplement pages shipped, generate a crisp 4-panel showcase banner under `docs/images/` (like `docs/images/v14-showcase.jpg`, `<= 600 KB`) from real 300–600 DPI renders, visually inspect it, and add detailed screenshots to `docs/GALLERY.md` (keeping `README.md` focused on 1–2 headline visuals).
+  - If Studio UI changed meaningfully, update the Studio screenshot in `docs/GALLERY.md` (`<= 300 KB`) and/or regenerate the animated Studio walkthrough GIF (`docs/images/studio-demo.gif`, `<= 2.5 MB`).
+- **Keep Capability Tables, Docs & Metrics Current:** Keep `README.md` concise and skimmable while updating the comparison table, key metrics, and downloadable sample PDF links to match the new release tag, and keep detailed references current in `docs/DATA_SOURCES.md`, `docs/CLI_COOKBOOK.md`, `docs/GALLERY.md`, and `deploy/hosted-mode.md`.
+- **Keep Planned Roadmap Current:** Prune or check off shipped items in `README.md`'s **Planned Roadmap** section and refresh upcoming high-value priorities whenever features land or a release is cut.
 - **Showcase Headline Features in Sample PDFs:** Update `scripts/render_release_samples.sh` whenever major new scales, DPI tiers, themes, or regions ship so visitors can inspect real vector outputs from the new release.
 - **Use Published Images in User Examples:** Use `ghcr.io/jremick/gridforge:latest` in all Quickstart and CLI Cookbook examples (reserve `gridforge:dev` strictly for local development/testing sections).
 

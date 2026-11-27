@@ -35,7 +35,7 @@ Follow this ordered checklist whenever preparing or cutting a `vX.Y.Z` release o
    - `src/gridforge/__init__.py` (`__version__`)
    - `web/package.json` and `web/package-lock.json`
    - `.github/workflows/release.yml` (default `workflow_dispatch` tag)
-2. Add a dated `## [X.Y.Z] - YYYY-MM-DD` section to `CHANGELOG.md` and update `README.md` sample PDF download links and Roadmap entries to `vX.Y.Z`.
+2. Add a dated `## [X.Y.Z] - YYYY-MM-DD` section to `CHANGELOG.md`, update `README.md` sample PDF download links to `vX.Y.Z`, and prune/refresh `README.md`'s **Planned Roadmap** section for shipped and upcoming high-value work.
 3. Run all local gates:
    ```bash
    python3 scripts/release_preflight.py --tag vX.Y.Z
