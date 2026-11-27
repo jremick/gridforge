@@ -21,8 +21,6 @@ from gridforge.subprocess_env import build_safe_subprocess_env
 logger = logging.getLogger(__name__)
 
 PRIMARY_OVERPASS_URL: Final[str] = "https://overpass-api.de/api/interpreter"
-FALLBACK_OVERPASS_URL: Final[str] = "https://maps.mail.ru/osm/tools/overpass/api/interpreter"
-TERTIARY_OVERPASS_URL: Final[str] = "https://overpass.private.coffee/api/interpreter"
 USER_AGENT: Final[str] = "gridforge/0.2 (+https://github.com/gridforge/gridforge)"
 MAX_OVERPASS_RESPONSE_BYTES: Final[int] = 128 * 1024 * 1024  # 128 MiB hard disk-stream cap
 
@@ -30,17 +28,10 @@ _REMARK_RE = re.compile(rb"<remark\b[^>]*>(.*?)</remark>", flags=re.IGNORECASE |
 
 
 def default_overpass_endpoints() -> list[str]:
-    """Return deduplicated default Overpass planet endpoints honoring ``OVERPASS_URL``."""
-    raw = [
-        os.environ.get("OVERPASS_URL", PRIMARY_OVERPASS_URL).strip() or PRIMARY_OVERPASS_URL,
-        FALLBACK_OVERPASS_URL,
-        TERTIARY_OVERPASS_URL,
-    ]
-    endpoints: list[str] = []
-    for url in raw:
-        if url and url not in endpoints:
-            endpoints.append(url)
-    return endpoints
+    """Use one primary endpoint and only the mirrors explicitly configured by the operator."""
+    primary = os.environ.get("OVERPASS_URL", "").strip() or PRIMARY_OVERPASS_URL
+    configured = os.environ.get("OVERPASS_FALLBACK_URLS", "").split(",")
+    return list(dict.fromkeys([primary, *(url.strip() for url in configured if url.strip())]))
 
 
 def round_enclosing_bbox(bbox: BBox, step_deg: float = 0.001) -> BBox:
@@ -247,7 +238,7 @@ class OverpassOSMSource:
             if self._injected_client is not None
             else httpx.Client(
                 timeout=httpx.Timeout(self.http_timeout_s, connect=min(10.0, self.http_timeout_s)),
-                follow_redirects=True,
+                follow_redirects=False,
                 headers={"User-Agent": USER_AGENT},
             )
         )
@@ -276,18 +267,14 @@ class OverpassOSMSource:
                             url,
                             data={"data": query},
                             headers={"User-Agent": USER_AGENT},
+                            follow_redirects=False,
                         ) as resp:
                             if resp.status_code == 429:
                                 rate_limited_urls.add(url)
                                 retry_after = resp.headers.get("Retry-After", "")
                                 msg = f"{url}: HTTP 429 Too Many Requests (Retry-After={retry_after!r})"
-                                logger.warning("Overpass rate-limited; switching mirror: %s", msg)
+                                logger.warning("Overpass rate-limited: %s", msg)
                                 errors.append(msg)
-                                if len(self.endpoints) == 1 and self.rate_limit_backoff_s > 0:
-                                    delay = self.rate_limit_backoff_s
-                                    if retry_after.isdigit():
-                                        delay = max(delay, float(retry_after))
-                                    time.sleep(delay)
                                 continue
 
                             if resp.status_code in (502, 503, 504):

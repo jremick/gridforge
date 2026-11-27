@@ -66,6 +66,7 @@ _ALLOWED_EXACT_KEYS: frozenset[str] = frozenset(
         "FONTCONFIG_PATH",
         "FONTCONFIG_FILE",
         "OVERPASS_URL",
+        "OVERPASS_FALLBACK_URLS",
         "GRIDFORGE_DATA_DIR",
         "GRIDFORGE_PACKS_DIR",
         "GRIDFORGE_CACHE_DIR",

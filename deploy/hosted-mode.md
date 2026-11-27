@@ -89,6 +89,8 @@ See [`railway.toml`](../railway.toml) for the Railway build and `/api/health` he
 | `GRIDFORGE_GUEST_SHARE_TTL_HOURS` | `168` (`7 days`) | Expiry TTL for Guest-created `?share=` snapshot links (`GRIDFORGE_FRIEND_SHARE_TTL_HOURS=720` / `30 days`). |
 | `GRIDFORGE_USAGE_RETENTION_DAYS` | `30` | Automatically prune metered `usage_events` rows older than `30` days. |
 | `GRIDFORGE_CACHE_MAX_BYTES` | `2147483648` (`2 GB`) | LRU cap on `/data/cache` (Overpass, DEM clips, overlays) to protect small cloud volumes. |
+| `OVERPASS_URL` | `https://overpass-api.de/api/interpreter` | Primary OpenStreetMap endpoint that receives map bounding boxes. |
+| `OVERPASS_FALLBACK_URLS` | *(empty)* | Comma-separated mirror endpoints authorized to receive the same bounding boxes when the primary endpoint fails. |
 
 ### 6. AI Agents, MCP & API Keys
 

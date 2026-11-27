@@ -60,6 +60,7 @@ services:
       - GDAL_CACHEMAX=192
       - OMP_THREAD_LIMIT=1
       - OVERPASS_URL=${OVERPASS_URL:-https://overpass-api.de/api/interpreter}
+      - OVERPASS_FALLBACK_URLS=${OVERPASS_FALLBACK_URLS:-}
     volumes:
       - gridforge-data:/data/jobs
       - gridforge-cache:/tmp/gridforge-cache
@@ -97,6 +98,7 @@ services:
       - GDAL_CACHEMAX=192
       - OMP_THREAD_LIMIT=1
       - OVERPASS_URL=${OVERPASS_URL:-https://overpass-api.de/api/interpreter}
+      - OVERPASS_FALLBACK_URLS=${OVERPASS_FALLBACK_URLS:-}
     volumes:
       - gridforge-single-data:/data
     mem_limit: 3g
@@ -117,6 +119,7 @@ services:
       - GDAL_CACHEMAX=192
       - OMP_THREAD_LIMIT=1
       - OVERPASS_URL=${OVERPASS_URL:-https://overpass-api.de/api/interpreter}
+      - OVERPASS_FALLBACK_URLS=${OVERPASS_FALLBACK_URLS:-}
     mem_limit: 3g
     command: ["gridforge", "--help"]
 
