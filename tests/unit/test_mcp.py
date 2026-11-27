@@ -828,13 +828,17 @@ def test_streamable_http_mcp_router_lifecycle_and_auth(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     seen_auth_headers: list[str | None] = []
+    orig_capabilities = next(
+        r.endpoint for r in web_app.routes if getattr(r, "path", None) == "/api/capabilities"
+    )
+    assert orig_capabilities is not None
 
-    @web_app.get("/api/capabilities")
-    def _mock_caps(request: Request) -> dict[str, Any]:
-        seen_auth_headers.append(request.headers.get("authorization"))
-        return {"version": __version__, "auth_mode": "none", "scales": [25000]}
+    @web_app.middleware("http")
+    async def _capture_caps_auth(request: Request, call_next: Any) -> Any:
+        if request.url.path == "/api/capabilities":
+            seen_auth_headers.append(request.headers.get("authorization"))
+        return await call_next(request)
 
-    web_app.include_router(create_mcp_router(lambda: web_app))
     client = TestClient(web_app, base_url="http://127.0.0.1:8080")
 
     # GET /mcp discovery JSON vs SSE 405

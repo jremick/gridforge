@@ -2548,12 +2548,26 @@ class GridForgeMCPServer:
     ) -> dict[str, Any]:
         _ = (args, public_url)
         caps = await self._fetch_capabilities_safe(client)
+
+        def _extract_ids(items: Any) -> list[str]:
+            out: list[str] = []
+            for item in items or []:
+                if isinstance(item, dict):
+                    val = item.get("id") or item.get("name") or item.get("label")
+                    if val is not None:
+                        out.append(str(val))
+                elif item is not None:
+                    out.append(str(item))
+            return out
+
         scales_str = ", ".join(f"1:{s:,}" for s in (caps.get("scales") or VALID_SCALES))
+        paper_ids = _extract_ids(caps.get("paper_sizes"))
+        output_ids = _extract_ids(caps.get("output_formats") or caps.get("outputs"))
         text = (
             f"GridForge v{caps.get('version', __version__)} (auth_mode=`{caps.get('auth_mode', 'none')}`)\n"
             f"- Scales: {scales_str}\n"
-            f"- Paper sizes: {', '.join(caps.get('paper_sizes') or [])}\n"
-            f"- Outputs: {', '.join(caps.get('outputs') or [])}\n"
+            f"- Paper sizes: {', '.join(paper_ids)}\n"
+            f"- Outputs: {', '.join(output_ids)}\n"
             f"- Installed offline packs: {caps.get('installed_packs_count', 0)}"
         )
         return call_tool_result([text_content(text)], structured_content=caps)

@@ -387,7 +387,7 @@ class TestStaticApiKeyInNoneMode:
         )
         assert ok_header.status_code == 200
 
-        # /mcp calls require matching key (401 without or with wrong key; 404 when unmounted with valid key)
+        # /mcp calls require matching key (401 without or with wrong key; 200 JSON-RPC with valid key)
         assert client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "ping"}).status_code == 401
         assert client.get("/mcp").status_code == 401
         assert (
@@ -398,14 +398,13 @@ class TestStaticApiKeyInNoneMode:
             ).status_code
             == 401
         )
-        assert (
-            client.post(
-                "/mcp",
-                json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
-                headers={"Authorization": "Bearer local-super-secret-key"},
-            ).status_code
-            == 404
+        ok_mcp = client.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
+            headers={"Authorization": "Bearer local-super-secret-key"},
         )
+        assert ok_mcp.status_code == 200
+        assert ok_mcp.json() == {"jsonrpc": "2.0", "id": 1, "result": {}}
 
 
 class TestSignedArtifactAndPagePreviewUrls:
@@ -745,8 +744,10 @@ class TestCapabilitiesLlmsTxtOpenAPIAndMcpFallback:
         for needle in ("/mcp", "/api/capabilities", "/openapi.json", "/docs", "--spec-file", "--json"):
             assert needle in llms.text
 
-        # Unmounted /mcp and /mcp/* return 404 rather than SPA HTML
-        assert guest.get("/mcp").status_code == 404
+        # Mounted /mcp serves Streamable HTTP discovery JSON (not SPA HTML), while unknown /mcp/* returns 404
+        mcp_get = guest.get("/mcp")
+        assert mcp_get.status_code == 200
+        assert mcp_get.json()["transport"] == "streamable-http"
         assert guest.get("/mcp/sse").status_code == 404
         # Ordinary SPA client routes still return index.html
         assert guest.get("/studio/share").status_code == 200
