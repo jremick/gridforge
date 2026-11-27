@@ -13,7 +13,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT_DIR="${REPO_ROOT}/out"
 PACKS_DIR="${REPO_ROOT}/packs"
-IMAGE="${GRIDFORGE_IMAGE:-ghcr.io/jremick/gridforge:v1.7.1@sha256:75c0aac98a8547e9952b2b5910e509ccfc1877fc6653c44a06187553876adc6d}"
+IMAGE="${GRIDFORGE_IMAGE:-ghcr.io/jremick/gridforge:v1.7.2@sha256:d45ba4685acdb01106c5ae282aab4eb3eefe8c71feb1c34140d9c63bca860460}"
 
 mkdir -p "${OUT_DIR}" "${PACKS_DIR}"
 
