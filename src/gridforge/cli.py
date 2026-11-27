@@ -1,4 +1,4 @@
-"""GridForge Typer CLI (``render``, ``export``, ``inspect``, ``pack``, and ``serve``)."""
+"""GridForge Typer CLI (``render``, ``export``, ``inspect``, ``pack``, ``serve``, and ``mcp``)."""
 
 from __future__ import annotations
 
@@ -7,8 +7,10 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Literal, Optional, cast
+import sys
+from typing import Any, Literal, Optional, cast
 
+from pydantic import ValidationError
 import typer
 
 from gridforge.config import (
@@ -379,13 +381,109 @@ def _build_spec(
     )
 
 
+def _load_render_spec_file(spec_file: Path) -> tuple[SheetSpec, dict[str, Any]]:
+    """Load a JSON ``SheetSpec`` or ``CreateJobRequest`` from a file path or ``'-'`` (stdin)."""
+    if str(spec_file) == "-":
+        raw_text = sys.stdin.read()
+    else:
+        if not spec_file.is_file():
+            raise typer.BadParameter(f"Spec file not found: '{spec_file}'.", param_hint="--spec-file")
+        raw_text = spec_file.read_text(encoding="utf-8")
+
+    try:
+        data = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        raise typer.BadParameter(f"Invalid JSON in --spec-file: {exc}", param_hint="--spec-file") from exc
+
+    if not isinstance(data, dict):
+        raise typer.BadParameter("--spec-file JSON must be an object.", param_hint="--spec-file")
+
+    # Detect CreateJobRequest style payloads (e.g. 'center', 'outputs', 'pack_id', 'strip_sheets')
+    create_job_keys = {"center", "outputs", "pack_id", "grid_cols", "grid_rows", "strip_sheets"}
+    is_job_req = bool(create_job_keys.intersection(data.keys())) or (
+        "center_lat" not in data and "center_lon" not in data
+    )
+    extras: dict[str, Any] = {}
+
+    if is_job_req:
+        from gridforge.web.schemas import CreateJobRequest
+
+        try:
+            job_req = CreateJobRequest.model_validate(data)
+        except ValidationError as exc:
+            raise typer.BadParameter(
+                f"Invalid CreateJobRequest in --spec-file: {exc}",
+                param_hint="--spec-file",
+            ) from exc
+
+        assert job_req.center is not None
+        try:
+            lat, lon, canonical_mgrs = parse_center(job_req.center)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc), param_hint="--spec-file") from exc
+
+        spec = SheetSpec(
+            center_lat=lat,
+            center_lon=lon,
+            center_mgrs=canonical_mgrs,
+            scale=job_req.scale,
+            paper=job_req.paper,
+            orientation=job_req.orientation,
+            color_mode=job_req.color_mode,
+            units=job_req.units,
+            title=job_req.title,
+            date_iso=job_req.date_iso,
+            geopdf=job_req.outputs.geopdf,
+            dpi=job_req.dpi,
+            carto=job_req.carto,
+            dem_source=job_req.dem_source,
+            us_overlays=job_req.us_overlays,
+            au_overlays=job_req.au_overlays,
+            nz_overlays=job_req.nz_overlays,
+            ca_overlays=job_req.ca_overlays,
+            waypoints=job_req.waypoints,
+            viewsheds=job_req.viewsheds,
+            rf_links=job_req.rf_links,
+            tactical_graphics=job_req.tactical_graphics,
+            include_calibration_page=job_req.include_calibration_page,
+            include_route_card=job_req.include_route_card,
+            include_elevation_profile=job_req.include_elevation_profile,
+            include_atlas_index=job_req.include_atlas_index,
+            include_rf_link_card=job_req.include_rf_link_card,
+            show_fold_marks=job_req.show_fold_marks,
+        )
+        extras = {
+            "pack_id": job_req.pack_id,
+            "mbtiles_format": job_req.outputs.mbtiles_format,
+            "garmin_profile": job_req.outputs.garmin_profile,
+            "max_tiles": job_req.outputs.max_tiles,
+            "export_include_grid": job_req.carto.show_grid and job_req.outputs.include_grid_on_digital,
+            "export_dpi": job_req.outputs.export_dpi if job_req.outputs.export_dpi is not None else job_req.dpi,
+        }
+        return (spec, extras)
+
+    try:
+        spec = SheetSpec.model_validate(data)
+    except ValidationError as exc:
+        raise typer.BadParameter(
+            f"Invalid SheetSpec in --spec-file: {exc}",
+            param_hint="--spec-file",
+        ) from exc
+    return (spec, extras)
+
+
 @app.command("render")
 def render_cmd(
     center: Optional[str] = typer.Option(
         None,
         "--center",
         "-c",
-        help='Center coordinate as "lat,lon" (e.g. "-33.732,150.312") or MGRS string (omit when using --strip-route).',
+        help='Center coordinate as "lat,lon" (e.g. "-33.732,150.312") or MGRS string (omit when using --strip-route or --spec-file).',
+    ),
+    spec_file: Optional[Path] = typer.Option(
+        None,
+        "--spec-file",
+        help='Path to a JSON SheetSpec or CreateJobRequest file (or "-" to read JSON from stdin).',
     ),
     strip_route: Optional[Path] = typer.Option(
         None,
@@ -690,35 +788,62 @@ def render_cmd(
     """Render a print-ready, physically true-scale MGRS topographic PDF (+ optional strip atlas/supplements/exports)."""
     _configure_logging(verbose)
 
-    if strip_route is None and not center:
-        raise typer.BadParameter("Provide either --center or --strip-route.")
-
-    carto = CartoOptions(
-        contour_density=contour_density,
-        hillshade_strength=hillshade_strength,
-        label_density=label_density,
-        show_buildings=buildings,
-        show_trees=trees,
-        show_power=power,
-        show_pipelines=pipelines,
-        show_grid=grid,
-        show_river_arrows=river_arrows,
-        show_slope_shading=slope_shading,
-    )
-    parsed_waypoints = _parse_waypoints(waypoint)
-    parsed_viewsheds = _parse_viewsheds(viewshed)
-    parsed_rf_links = _parse_rf_links(rf_link)
-    parsed_tactical = [
-        *_parse_range_rings(range_ring),
-        *_parse_tactical_lines(tactical_line),
-    ]
+    if strip_route is not None and spec_file is not None:
+        raise typer.BadParameter("Choose either --spec-file or --strip-route.")
+    if strip_route is None and spec_file is None and not center:
+        raise typer.BadParameter("Provide --center, --strip-route, or --spec-file.")
 
     elev_src: ElevationSource | None = LocalDEMSource(offline_dem) if offline_dem is not None else None
     vec_src: VectorSource | None = LocalPBFSource(offline_pbf) if offline_pbf is not None else None
     overlay_srcs: list[OverlaySource] = [UserOverlaySource(p) for p in (overlay or [])]
-    pack_dir = _cli_pack(pack, pack_id)
 
-    if strip_route is not None:
+    if spec_file is not None:
+        spec, spec_extras = _load_render_spec_file(spec_file)
+        if title is not None:
+            spec = spec.model_copy(update={"title": title})
+        resolved_pack_id = pack_id if pack_id is not None else spec_extras.get("pack_id")
+        pack_dir = _cli_pack(pack, resolved_pack_id if pack is None else None)
+        result = run_render_job(
+            spec,
+            output,
+            elevation_source=elev_src,
+            vector_source=vec_src,
+            overlay_sources=overlay_srcs or None,
+            pack_dir=pack_dir,
+            keep_workspace=keep_workspace,
+            work_dir=work_dir,
+            mbtiles_out=mbtiles,
+            kmz_out=kmz,
+            gpkg_out=gpkg,
+            osmand_out=osmand,
+            field_bundle_out=field_bundle,
+            mbtiles_format=spec_extras.get("mbtiles_format", mbtiles_format),
+            garmin_profile=spec_extras.get("garmin_profile", garmin_profile),
+            max_tiles=max_tiles if max_tiles is not None else spec_extras.get("max_tiles"),
+            export_include_grid=spec_extras.get("export_include_grid", spec.carto.show_grid and export_grid),
+            export_dpi=export_dpi if export_dpi is not None else spec_extras.get("export_dpi", spec.dpi),
+        )
+    elif strip_route is not None:
+        carto = CartoOptions(
+            contour_density=contour_density,
+            hillshade_strength=hillshade_strength,
+            label_density=label_density,
+            show_buildings=buildings,
+            show_trees=trees,
+            show_power=power,
+            show_pipelines=pipelines,
+            show_grid=grid,
+            show_river_arrows=river_arrows,
+            show_slope_shading=slope_shading,
+        )
+        parsed_waypoints = _parse_waypoints(waypoint)
+        parsed_viewsheds = _parse_viewsheds(viewshed)
+        parsed_rf_links = _parse_rf_links(rf_link)
+        parsed_tactical = [
+            *_parse_range_rings(range_ring),
+            *_parse_tactical_lines(tactical_line),
+        ]
+        pack_dir = _cli_pack(pack, pack_id)
         if scale not in VALID_SCALES:
             allowed = ", ".join(str(s) for s in VALID_SCALES)
             raise typer.BadParameter(f"Invalid scale {scale}. Choose one of: {allowed}")
@@ -760,6 +885,26 @@ def render_cmd(
         )
     else:
         assert center is not None
+        carto = CartoOptions(
+            contour_density=contour_density,
+            hillshade_strength=hillshade_strength,
+            label_density=label_density,
+            show_buildings=buildings,
+            show_trees=trees,
+            show_power=power,
+            show_pipelines=pipelines,
+            show_grid=grid,
+            show_river_arrows=river_arrows,
+            show_slope_shading=slope_shading,
+        )
+        parsed_waypoints = _parse_waypoints(waypoint)
+        parsed_viewsheds = _parse_viewsheds(viewshed)
+        parsed_rf_links = _parse_rf_links(rf_link)
+        parsed_tactical = [
+            *_parse_range_rings(range_ring),
+            *_parse_tactical_lines(tactical_line),
+        ]
+        pack_dir = _cli_pack(pack, pack_id)
         spec = _build_spec(
             center=center,
             scale=scale,
@@ -1585,6 +1730,65 @@ def serve_cmd(
         port=port,
         reload=reload,
         log_level=log_level.lower(),
+    )
+
+
+@app.command("mcp")
+def mcp_cmd(
+    url: Optional[str] = typer.Option(
+        None,
+        "--url",
+        envvar="GRIDFORGE_URL",
+        help="Optional remote GridForge/GridMaps base URL (e.g. https://gridmaps.net). Omit to run against an in-process local app.",
+    ),
+    api_key: Optional[str] = typer.Option(
+        None,
+        "--api-key",
+        envvar="GRIDFORGE_API_KEY",
+        help="Optional Bearer API key (gf_...) for authenticating to a remote or key-protected server.",
+    ),
+    public_url: Optional[str] = typer.Option(
+        None,
+        "--public-url",
+        envvar="GRIDFORGE_PUBLIC_URL",
+        help="Optional public Studio base URL for clickable share & deep links.",
+    ),
+    data_dir: Optional[Path] = typer.Option(
+        None,
+        "--data-dir",
+        envvar="GRIDFORGE_DATA_DIR",
+        help="Data directory for local in-process mode.",
+    ),
+    packs_dir: Optional[Path] = typer.Option(
+        None,
+        "--packs-dir",
+        envvar="GRIDFORGE_PACKS_DIR",
+        help="Offline packs directory for local in-process mode.",
+    ),
+    app_html: Optional[Path] = typer.Option(
+        None,
+        "--app-html",
+        envvar="GRIDFORGE_MCP_APP_HTML",
+        help="Override path to single-file SEP-1865 MCP App HTML for live UI iteration.",
+    ),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose",
+        "-v",
+        help="Enable debug logging (strictly to stderr).",
+    ),
+) -> None:
+    """Run the GridForge Model Context Protocol (MCP) server over stdio JSON-RPC 2.0."""
+    from gridforge.mcp.stdio import run_stdio_server
+
+    run_stdio_server(
+        url=url,
+        api_key=api_key,
+        public_url=public_url,
+        data_dir=data_dir,
+        packs_dir=packs_dir,
+        app_html_path=app_html,
+        verbose=verbose,
     )
 
 
