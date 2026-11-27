@@ -60,7 +60,8 @@ Follow this ordered checklist whenever preparing or cutting a `vX.Y.Z` release o
    ```bash
    ./scripts/render_release_samples.sh --image ghcr.io/jremick/gridforge:vX.Y.Z --upload vX.Y.Z
    ```
-5. Sync GitHub repository description/topics and confirm anonymous `HTTP 200` pull access on GHCR:
+5. Update the pinned version and multi-arch OCI index digest (`linux/amd64` + `linux/arm64`) in `examples/render-examples.sh` on `main` (verified via `docker buildx imagetools inspect ghcr.io/jremick/gridforge:vX.Y.Z`).
+6. Sync GitHub repository description/topics and confirm anonymous `HTTP 200` pull access on GHCR:
    ```bash
    ./scripts/sync_github_metadata.sh
    ```

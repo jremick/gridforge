@@ -23,7 +23,7 @@ Keep `README.md` structured as a **product landing page** (not a reverse-chronol
 - **Keep Capability Tables, Docs & Metrics Current:** Keep `README.md` concise and skimmable while updating the comparison table, key metrics, and downloadable sample PDF links to match the new release tag, and keep detailed references current in `docs/DATA_SOURCES.md`, `docs/CLI_COOKBOOK.md`, `docs/GALLERY.md`, and `deploy/hosted-mode.md`.
 - **Keep Planned Roadmap Current:** Prune or check off shipped items in `README.md`'s **Planned Roadmap** section and refresh upcoming high-value priorities whenever features land or a release is cut.
 - **Showcase Headline Features in Sample PDFs:** Update `scripts/render_release_samples.sh` whenever major new scales, DPI tiers, themes, or regions ship so visitors can inspect real vector outputs from the new release.
-- **Use Published Images in User Examples:** Use `ghcr.io/jremick/gridforge:latest` in all Quickstart and CLI Cookbook examples (reserve `gridforge:dev` strictly for local development/testing sections).
+- **Use Published Images in User Examples:** Use `ghcr.io/jremick/gridforge:latest` in Quickstart and CLI Cookbook commands (reserve `GRIDFORGE_IMAGE=gridforge:dev` strictly for local development/testing sections). Update the pinned version and multi-arch digest in `examples/render-examples.sh` right after GHCR publication (Section 6).
 
 ## 3. Automated Verification, CI Mount Parity & Release Preflight
 
@@ -78,9 +78,13 @@ Verify live Studio UI (`0` console errors, `0 px` topbar clipping at `1440×900`
    ./scripts/render_release_samples.sh --image ghcr.io/jremick/gridforge:vX.Y.Z --upload vX.Y.Z
    ```
 
-## 6. Sync GitHub Metadata & Verify Public GHCR Pull
+## 6. Pin Examples Digest, Sync GitHub Metadata & Verify Public GHCR Pull
 
-Run the idempotent metadata & registry check script:
+1. Fetch the newly published multi-architecture OCI index digest (`linux/amd64` + `linux/arm64`) and update `examples/render-examples.sh` on `main`:
+   ```bash
+   docker buildx imagetools inspect ghcr.io/jremick/gridforge:vX.Y.Z
+   ```
+2. Run the idempotent metadata & registry check script:
 
 ```bash
 ./scripts/sync_github_metadata.sh
