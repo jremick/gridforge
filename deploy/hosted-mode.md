@@ -76,11 +76,36 @@ See [`railway.toml`](../railway.toml) for the Railway build and `/api/health` he
 | `GRIDFORGE_GUEST_SHARE_TTL_HOURS` | `168` (`7 days`) | Expiry TTL for Guest-created `?share=` snapshot links (`GRIDFORGE_FRIEND_SHARE_TTL_HOURS=720` / `30 days`; `ADMIN`/local never expire by default). |
 | `GRIDFORGE_CACHE_MAX_BYTES` | `2147483648` (`2 GB`) | LRU cap on `/data/cache` (Overpass, DEM clips, overlays) to protect small cloud volumes. |
 
+### 6. AI Agents, MCP & API Keys
+
+GridForge includes a native Streamable HTTP **MCP server** (`/mcp`), an AI discovery manifest (`/llms.txt`), a machine-readable capability catalog (`/api/capabilities`), complete OpenAPI schemas (`/openapi.json` with `POST /api/jobs?wait=true`), scoped Bearer Personal Access Tokens, and short-lived HMAC-signed artifact/preview URLs.
+
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `GRIDFORGE_API_KEY` | *(unset)* | Optional static Bearer / `X-API-Key` secret for **single-tenant** (`GRIDFORGE_AUTH_MODE=none`) deployments. When unset in `none` mode, zero-login local behavior is preserved; when set, mutating `/api/*` endpoints and `/mcp` require a matching key (`401` otherwise). Ignored in `hosted` mode (which uses per-user PATs below). |
+| `GRIDFORGE_SIGNED_URL_TTL_SECONDS` | `3600` (`1 hour`) | Lifetime in seconds for HMAC-signed artifact download links (`/api/jobs/{job_id}/artifacts/{filename}?sig=...`) and PDF page preview URLs (`/api/jobs/{job_id}/pages/{page}.png?sig=...`). |
+| `GRIDFORGE_PUBLIC_URL` | *(unset)* | Canonical public base URL (e.g. `https://maps.example.com`). Populates `servers` in `/openapi.json` (for Custom GPT Actions), builds Studio deep links / share links in MCP responses, and prints absolute URLs in `/llms.txt`. |
+| `GRIDFORGE_MCP_APP_HTML` | *(bundled)* | Optional path overriding the compiled SEP-1865 MCP App single-file HTML bundle (`src/gridforge/mcp/assets/mcp_app.html`) served at `ui://gridforge/app.html` (useful for live UI development). |
+
+#### Scoped Bearer API Keys (PATs) & Turnstile Bypass (`hosted` Mode)
+
+- **Key Management Endpoints** (authenticated `friend` and `admin` roles only; returns `403` in `GRIDFORGE_AUTH_MODE=none`):
+  - `GET /api/auth/api-keys` — lists active and revoked keys for the signed-in user (`key_prefix`, timestamps; never plaintext).
+  - `POST /api/auth/api-keys` (`{"name": "Claude Desktop", "expires_days": 90}`) — returns `201 Created` with the plaintext `gf_...` token **once** (only its SHA-256 hash is stored in SQLite).
+  - `DELETE /api/auth/api-keys/{key_id}` — immediately revokes a key.
+- **Request Auth & Turnstile Bypass:** Callers authenticate via `Authorization: Bearer gf_...` or `X-API-Key: gf_...` (evaluated before session cookies). Valid tokens resolve to the owning `friend` or `admin` account — automatically bypassing guest-only Cloudflare Turnstile challenges while preserving all per-role daily render caps, hourly preview limits, DPI/grid limits, and strict multi-tenant job/project isolation. Invalid, revoked, expired, or disabled-user keys always fail closed with `401 Unauthorized`.
+- **AI Discovery & MCP Endpoints:**
+  - `POST` / `GET` / `DELETE /mcp` — Streamable HTTP MCP server with interactive SEP-1865 MCP Apps (`ui://gridforge/app.html`), inline PNG visual cards, 14 model-visible tools, 3 app-only tools, 3 resources, and 4 prompts.
+  - `GET /llms.txt` — concise plain-text AI index pointing to `/mcp`, `/api/capabilities`, `/openapi.json`, `/docs`, and CLI `--spec-file` / `--json`.
+  - `GET /api/jobs/{job_id}/pages` & `GET /api/jobs/{job_id}/pages/{page_num}.png?width=1200&sig=...` — cached PDF page previews accessible via short-lived HMAC signatures without exposing cookies or API keys.
+
+See [`docs/ai-agents.md`](../docs/ai-agents.md) and [`plugins/antigravity/README.md`](../plugins/antigravity/README.md) for ready-to-copy client setups (Claude, Codex, Google Antigravity, ChatGPT, Cursor, VS Code).
+
 ---
 
 ## Railway + Cloudflare Checklist
 
 1. Attach a persistent volume mounted at `/data` (e.g. `5 GB`) to the Railway service.
-2. Set `GRIDFORGE_AUTH_MODE=hosted`, `GRIDFORGE_SESSION_SECRET`, `GRIDFORGE_BOOTSTRAP_ADMIN_EMAIL`, `GRIDFORGE_ALLOWED_HOSTS=<your-domain>`, `FORWARDED_ALLOW_IPS=*`, and `GRIDFORGE_CACHE_DIR=/data/cache`.
+2. Set `GRIDFORGE_AUTH_MODE=hosted`, `GRIDFORGE_SESSION_SECRET`, `GRIDFORGE_BOOTSTRAP_ADMIN_EMAIL`, `GRIDFORGE_ALLOWED_HOSTS=<your-domain>`, `GRIDFORGE_PUBLIC_URL=https://<your-domain>`, `FORWARDED_ALLOW_IPS=*`, and `GRIDFORGE_CACHE_DIR=/data/cache`.
 3. Point your domain DNS at Railway via Cloudflare Proxy (`SSL/TLS: Full (Strict)`), keeping the Cloudflare free tier in front of Railway for HTTPS termination, DDoS mitigation, and optional Turnstile.
-4. Sign in with the bootstrap Admin credentials and issue single-use Friend invite links from the Studio **Admin** modal.
+4. Sign in with the bootstrap Admin credentials and issue single-use Friend invite links from the Studio **Admin** modal (or mint `gf_...` API keys via `POST /api/auth/api-keys` for AI assistants).

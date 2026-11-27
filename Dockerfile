@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # Multi-stage, multi-arch (linux/arm64 + linux/amd64) GridForge image:
-#   Stage 1 (frontend): Builds the MapLibre GL JS + Vite SPA (`web/dist`)
+#   Stage 1 (frontend): Builds the MapLibre GL JS + Vite SPA (`web/dist`) and single-file MCP App (`mcp_app.html`)
 #   Stage 2 (runtime):  Headless PyQGIS 3.40 LTR + GDAL + FastAPI/Uvicorn on Debian Trixie
 
 FROM node:22-slim AS frontend
@@ -8,9 +8,12 @@ FROM node:22-slim AS frontend
 WORKDIR /web
 COPY web/package*.json ./
 RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
-COPY web/index.html web/tsconfig.json web/vite.config.ts ./
+COPY web/index.html web/tsconfig.json web/vite.config.ts web/vite.mcp-app.config.ts ./
 COPY web/src/ ./src/
-RUN npm run build
+COPY web/mcp-app/ ./mcp-app/
+RUN mkdir -p /src/gridforge/mcp/assets \
+    && npm run build \
+    && npm run build:mcp-app
 
 FROM debian:trixie-slim AS runtime
 
@@ -79,12 +82,13 @@ RUN mkdir -p /tmp/runtime-root /tmp/gridforge-cache /data/jobs /data/packs /data
 
 WORKDIR /app
 
-# Copy project metadata, config, styles/icons, source, and built SPA
+# Copy project metadata, config, styles/icons, source, built SPA, and single-file MCP App bundle
 COPY pyproject.toml README.md LICENSE ./
 COPY config/ ./config/
 COPY assets/ ./assets/
 COPY src/ ./src/
 COPY --from=frontend /web/dist /app/web/dist
+COPY --from=frontend /src/gridforge/mcp/assets/mcp_app.html /app/src/gridforge/mcp/assets/mcp_app.html
 
 RUN pip install --no-cache-dir --no-deps --no-build-isolation -e .
 
