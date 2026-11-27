@@ -153,7 +153,7 @@ def _b64url_decode(encoded: str) -> bytes | None:
     pad = "=" * (-len(encoded) % 4)
     try:
         return base64.urlsafe_b64decode(encoded + pad)
-    except Exception:
+    except (ValueError, TypeError):
         return None
 
 

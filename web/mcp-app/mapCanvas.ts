@@ -822,9 +822,11 @@ export function mountMapCanvas(
     dragging = false;
     canvas.style.cursor = callbacks.onCenterClick ? "crosshair" : "grab";
     try {
-      canvas.releasePointerCapture(e.pointerId);
-    } catch {
-      // ignore if capture already released
+      if (canvas.hasPointerCapture?.(e.pointerId)) {
+        canvas.releasePointerCapture(e.pointerId);
+      }
+    } catch (err) {
+      console.debug("Pointer capture already released:", err);
     }
     if (!dragMoved && callbacks.onCenterClick) {
       const rect = canvas.getBoundingClientRect();

@@ -173,8 +173,8 @@ function rememberBaseUrlFromPayload(payload: GridForgeViewPayload): void {
       try {
         state.publicBaseUrl = new URL(c).origin;
         return;
-      } catch {
-        // ignore
+      } catch (err) {
+        console.debug("Ignoring malformed base URL candidate:", c, err);
       }
     }
   }
@@ -429,8 +429,9 @@ function startRenderPolling(jobId: string): void {
           renderCurrentView();
         }
       }
-    } catch {
+    } catch (err) {
       // Transient polling error — keep polling next interval
+      console.warn("Transient GridForge job poll error; retrying:", err);
     } finally {
       pollInFlight = false;
     }

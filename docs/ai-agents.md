@@ -198,7 +198,7 @@ For ChatGPT plans supporting remote MCP servers, register `https://<your-domain>
 
 ### 5. Cursor, VS Code & Generic MCP Clients
 
-**Streamable HTTP (`.cursor/mcp.json` or `.vscode/mcp.json`):**
+**Streamable HTTP (Cursor or VS Code MCP config):**
 
 ```json
 {
@@ -225,7 +225,7 @@ With Bearer authentication against a hosted instance:
 }
 ```
 
-**Local Docker `stdio` (`.cursor/mcp.json`):**
+**Local Docker `stdio` (Cursor / generic MCP client config):**
 
 ```json
 {

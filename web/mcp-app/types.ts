@@ -587,8 +587,9 @@ export function extractStructuredPayload(
           try {
             const parsed = JSON.parse(trimmed);
             if (isKnownViewPayload(parsed)) return parsed;
-          } catch {
-            // Plain markdown prose, ignore
+          } catch (err) {
+            // Plain markdown prose rather than JSON payload
+            console.debug("Skipping non-JSON text block:", err);
           }
         }
       }
