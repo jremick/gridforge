@@ -5,6 +5,27 @@ All notable changes to **GridForge** are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.2] - 2026-11-28
+
+Reliability, maintainability, and test-hardening maintenance release consolidating Studio modal/drawer abort lifecycles, bounding browser API requests with explicit timeout signals, centralizing auth-mode configuration lookup, adding repository-level `anti-slop` guardrails, and substantially expanding mutation-verified frontend and backend test coverage.
+
+### Improved & Hardened
+
+- **Bounded Browser API Timeouts & Shared Modal Lifecycle (`web/src/api.ts`, `web/src/components/{lifecycle,adminModal,packsModal,authModal,projectsDrawer}.ts`, `web/src/{turnstile,deeplink,main}.ts`):**
+  - Added a default 90 s `AbortSignal.timeout` fallback composed with caller `AbortSignal`s (`AbortSignal.any`) in `web/src/api.ts` so browser API probes and actions never hang indefinitely while preserving instant workspace-switch cancellation.
+  - Extracted shared `linkAbortSignal`, `initModalBackdrop`, and `reportAbortAwareError` helpers into `web/src/components/lifecycle.ts` and unified `AdminModal` user mutations, `TurnstileController` expiry/timeout widget resets, job cancel/delete list updates, and one-time launch URL parameter stripping (`stripOneTimeLaunchParams` in `web/src/deeplink.ts`).
+  - Logged caught errors at debug level in the Studio offline-basemap availability probe instead of silently swallowing failures.
+- **Centralized Auth-Mode Resolution, CSP & Repository Quality Guardrails (`src/gridforge/web/{app,auth,worker}.py`, `src/gridforge/mcp/http.py`, `.anti-slop/learned/rules.json`):**
+  - Allowed the Cloudflare Web Analytics beacon (`https://static.cloudflareinsights.com`) in `Content-Security-Policy` `script-src` while keeping strict no-`unsafe-inline` script rules intact.
+  - Centralized `GRIDFORGE_AUTH_MODE` parsing and validation into `gridforge.web.auth.resolve_auth_mode()` across the web app, background worker, and `/mcp` Streamable HTTP router to prevent cross-module configuration drift.
+  - Added verified repository-level `anti-slop` learned rules covering subprocess shell safety, safe YAML loading, dynamic `eval`/`exec`, pinned Dockerfile base images, least-privilege file modes, Python HTTP timeouts, and live end-to-end verification discipline.
+
+### Verification
+
+- **Mutation-Hardened Suites (`618` offline pytest + `65` frontend tests + live multi-region E2E):**
+  - Expanded frontend DOM/API/Turnstile/deeplink tests (`web/tests/{modal-dom,api-auth-admin,turnstile,deeplink}.test.mjs`), raising diff-scoped TypeScript mutation kill rate across `v1.7.x` changes from `23.3%` to `80.0%`.
+  - Expanded backend security and budget boundary tests (`tests/unit/test_{source_work_budgets,preview_work_budgets,auth_and_limits,mcp}.py`), covering COG request-count caps, direct NRCan `_warp_cogs` allowlist validation, default Overpass `follow_redirects=False`, exact WFS/SA ZIP limits, low-res preview DEM routing, symlinked sheet-workspace confinement, and empty `/mcp` client host handling (`95.8%` sources / `91.7%` web+MCP mutation kill rates).
+
 ## [1.7.1] - 2026-11-27
 
 Comprehensive security hardening release enforcing explicit hosted API key scopes across HTTP and MCP, confining atlas worker paths and provider/terrain resource budgets, isolating hosted Studio workspaces across account and guest transitions, keeping private map parameters out of browser URLs, and locking down release workflow supply-chain integrity.
