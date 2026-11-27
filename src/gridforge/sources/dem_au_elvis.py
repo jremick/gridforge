@@ -14,11 +14,16 @@ from pathlib import Path
 from typing import Final, Literal
 
 import httpx
+import numpy as np
 
 from gridforge.config import BBox, SheetLayout
 from gridforge.sources.dem_copernicus import GDAL_VSICURL_ENV
+from gridforge.subprocess_env import build_safe_subprocess_env
 
 logger = logging.getLogger(__name__)
+
+MAX_AU_DEM_DOWNLOAD_BYTES: Final[int] = 64 * 1024 * 1024  # 64 MiB hard disk-stream cap
+MAX_AU_JSON_DOWNLOAD_BYTES: Final[int] = 4 * 1024 * 1024  # 4 MiB JSON response cap
 
 # Tier 0: Queensland Spatial Imagery 2 m LiDAR DEM (CC BY 4.0, AHD), gated by completed LiDAR extents
 QLD_LIDAR_EXTENTS_URL: Final[str] = (
@@ -153,63 +158,52 @@ def _inspect_raster_coverage(
         if not raw:
             return (0.0, 1.0, 1.0, 0.0, 0.0)
 
-        vals = array("f")
-        vals.frombytes(raw)
-        total = len(vals)
+        arr = np.frombuffer(raw, dtype=np.float32).reshape((buf_y, buf_x))
+        total = int(arr.size)
         if total == 0:
             return (0.0, 1.0, 1.0, 0.0, 0.0)
 
-        valid = 0
-        exact_zero = 0
-        min_v = math.inf
-        max_v = -math.inf
-        for v in vals:
-            if not math.isfinite(v):
-                continue
-            if nodata is not None and abs(v - nodata) < 1e-3:
-                continue
-            if v < -500.0 or v > 5000.0:
-                continue
-            valid += 1
-            if v == 0.0:
-                exact_zero += 1
-            if v < min_v:
-                min_v = v
-            if v > max_v:
-                max_v = v
+        valid_mask = np.isfinite(arr) & (arr >= -500.0) & (arr <= 5000.0)
+        if nodata is not None:
+            valid_mask &= np.abs(arr - float(nodata)) >= 1e-3
 
+        valid = int(np.count_nonzero(valid_mask))
         if valid == 0:
             return (0.0, 1.0, 1.0, 0.0, 0.0)
 
+        valid_vals = arr[valid_mask]
+        min_v = float(valid_vals.min())
+        max_v = float(valid_vals.max())
+        zero_mask = valid_mask & (arr == 0.0)
+        exact_zero = int(np.count_nonzero(zero_mask))
+
         # Measure fraction of 0.0 -> non-zero transitions that jump above cliff_threshold_m
         zero_cliff_ratio = 0.0
-        if exact_zero > 0 and exact_zero < valid:
+        if 0 < exact_zero < valid:
+            nz_valid = np.isfinite(arr) & (arr != 0.0) & (arr >= -500.0) & (arr <= 5000.0)
             b_edges = 0
             c_edges = 0
-            for r in range(buf_y):
-                row_off = r * buf_x
-                for c in range(buf_x):
-                    if vals[row_off + c] != 0.0:
-                        continue
-                    for nr, nc in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)):
-                        if 0 <= nr < buf_y and 0 <= nc < buf_x:
-                            nv = vals[nr * buf_x + nc]
-                            if nv != 0.0 and math.isfinite(nv) and -500.0 <= nv <= 5000.0:
-                                b_edges += 1
-                                if nv > cliff_threshold_m:
-                                    c_edges += 1
+            for z_sl, nz_sl, v_sl in (
+                (zero_mask[1:, :], nz_valid[:-1, :], arr[:-1, :]),
+                (zero_mask[:-1, :], nz_valid[1:, :], arr[1:, :]),
+                (zero_mask[:, 1:], nz_valid[:, :-1], arr[:, :-1]),
+                (zero_mask[:, :-1], nz_valid[:, 1:], arr[:, 1:]),
+            ):
+                adj = z_sl & nz_sl
+                b_edges += int(np.count_nonzero(adj))
+                c_edges += int(np.count_nonzero(adj & (v_sl > cliff_threshold_m)))
             if b_edges > 0:
                 zero_cliff_ratio = c_edges / b_edges
         elif exact_zero == valid:
             zero_cliff_ratio = 1.0
 
-        return (valid / total, exact_zero / total, zero_cliff_ratio, float(min_v), float(max_v))
+        return (valid / total, exact_zero / total, zero_cliff_ratio, min_v, max_v)
     finally:
         ds = None
 
 
-def _run_subprocess(cmd: list[str], env: dict[str, str], context: str) -> None:
-    proc = subprocess.run(cmd, env=env, capture_output=True, text=True, check=False)
+def _run_subprocess(cmd: list[str], env: dict[str, str], context: str, *, timeout: int = 300) -> None:
+    proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout, check=False)
     if proc.returncode != 0:
         raise RuntimeError(
             f"{context} failed (exit {proc.returncode}):\n"
@@ -265,17 +259,20 @@ class AUElvisDEMSource:
         self.resolved_attribution: str = self.attribution
 
     def _gdal_env(self) -> dict[str, str]:
-        env = os.environ.copy()
-        for key, value in GDAL_VSICURL_ENV.items():
-            env.setdefault(key, value)
-        return env
+        return build_safe_subprocess_env(extra=GDAL_VSICURL_ENV)
 
     def _srtm_cog_url(self) -> str:
         if self.srtm_product == "hydro":
             return DEA_SRTM_1S_HYDRO_COG_URL
         return DEA_SRTM_1S_SMOOTH_COG_URL
 
-    def _http_get_bytes(self, url: str, params: dict[str, str]) -> tuple[int, str, bytes]:
+    def _http_get_bytes(
+        self,
+        url: str,
+        params: dict[str, str],
+        *,
+        max_bytes: int = MAX_AU_JSON_DOWNLOAD_BYTES,
+    ) -> tuple[int, str, bytes]:
         owns_client = self._injected_client is None
         client = (
             self._injected_client
@@ -287,8 +284,63 @@ class AUElvisDEMSource:
             )
         )
         try:
-            resp = client.get(url, params=params, headers={"User-Agent": USER_AGENT})
-            return (resp.status_code, resp.headers.get("content-type", ""), resp.content)
+            with client.stream("GET", url, params=params, headers={"User-Agent": USER_AGENT}) as resp:
+                chunks: list[bytes] = []
+                total = 0
+                for chunk in resp.iter_bytes(chunk_size=65_536):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise RuntimeError(
+                            f"AU DEM metadata response exceeded {max_bytes // (1024 * 1024)} MiB limit"
+                        )
+                    chunks.append(chunk)
+                return (resp.status_code, resp.headers.get("content-type", ""), b"".join(chunks))
+        finally:
+            if owns_client:
+                client.close()
+
+    def _http_stream_to_file(
+        self,
+        url: str,
+        params: dict[str, str],
+        dest_path: Path,
+        *,
+        max_bytes: int = MAX_AU_DEM_DOWNLOAD_BYTES,
+    ) -> tuple[int, str, int]:
+        owns_client = self._injected_client is None
+        client = (
+            self._injected_client
+            if self._injected_client is not None
+            else httpx.Client(
+                timeout=httpx.Timeout(self.timeout_s, connect=min(10.0, self.timeout_s)),
+                follow_redirects=True,
+                headers={"User-Agent": USER_AGENT},
+            )
+        )
+        dest_path.unlink(missing_ok=True)
+        try:
+            with client.stream("GET", url, params=params, headers={"User-Agent": USER_AGENT}) as resp:
+                ct = resp.headers.get("content-type", "")
+                ct_low = ct.lower()
+                if resp.status_code != 200 or "xml" in ct_low or "html" in ct_low or "json" in ct_low:
+                    return (resp.status_code, ct, 0)
+                written = 0
+                with dest_path.open("wb") as fh:
+                    for chunk in resp.iter_bytes(chunk_size=65_536):
+                        if not chunk:
+                            continue
+                        written += len(chunk)
+                        if written > max_bytes:
+                            raise RuntimeError(
+                                f"AU DEM raster response exceeded {max_bytes // (1024 * 1024)} MiB limit"
+                            )
+                        fh.write(chunk)
+                return (resp.status_code, ct, written)
+        except Exception:
+            dest_path.unlink(missing_ok=True)
+            raise
         finally:
             if owns_client:
                 client.close()
@@ -386,24 +438,25 @@ class AUElvisDEMSource:
             "interpolation": "RSP_BilinearInterpolation",
             "f": "image",
         }
+        tmp_qld = work_dir / "dem_au_qld2m_tmp.tif"
         try:
-            status, content_type, body = self._http_get_bytes(QLD_DEM_IMAGESERVER_URL, params)
+            status, content_type, byte_len = self._http_stream_to_file(
+                QLD_DEM_IMAGESERVER_URL, params, tmp_qld
+            )
         except Exception as exc:
             logger.warning("QLD 2m QldDem ImageServer failed (%s); falling back to GA 5m LiDAR", exc)
             return False
 
         ct_low = content_type.lower()
-        if status != 200 or "xml" in ct_low or "html" in ct_low or "json" in ct_low or len(body) < 2048:
+        if status != 200 or "xml" in ct_low or "html" in ct_low or "json" in ct_low or byte_len < 2048:
+            tmp_qld.unlink(missing_ok=True)
             logger.info(
                 "QLD QldDem returned non-DEM payload (status=%s, ct=%s, bytes=%d); falling back to GA 5m LiDAR",
                 status,
                 content_type,
-                len(body),
+                byte_len,
             )
             return False
-
-        tmp_qld = work_dir / "dem_au_qld2m_tmp.tif"
-        tmp_qld.write_bytes(body)
 
         try:
             valid_frac, zero_frac, cliff_ratio, min_v, max_v = _inspect_raster_coverage(tmp_qld)
@@ -470,23 +523,24 @@ class AUElvisDEMSource:
             "RESY": f"{resy:.6f}",
             "FORMAT": "GeoTIFF",
         }
+        tmp_5m = work_dir / "dem_au_5m_tmp.tif"
         try:
-            status, content_type, body = self._http_get_bytes(GA_5M_LIDAR_WCS_URL, params)
+            status, content_type, byte_len = self._http_stream_to_file(
+                GA_5M_LIDAR_WCS_URL, params, tmp_5m
+            )
         except Exception as exc:
             logger.warning("GA 5m LiDAR WCS request failed (%s); falling back to SRTM 1s", exc)
             return False
 
-        if status != 200 or "xml" in content_type.lower() or "html" in content_type.lower() or len(body) < 2048:
+        if status != 200 or "xml" in content_type.lower() or "html" in content_type.lower() or byte_len < 2048:
+            tmp_5m.unlink(missing_ok=True)
             logger.info(
                 "GA 5m LiDAR WCS returned non-DEM payload (status=%s, ct=%s, bytes=%d); falling back to SRTM 1s",
                 status,
                 content_type,
-                len(body),
+                byte_len,
             )
             return False
-
-        tmp_5m = work_dir / "dem_au_5m_tmp.tif"
-        tmp_5m.write_bytes(body)
 
         try:
             valid_frac, zero_frac, cliff_ratio, min_v, max_v = _inspect_raster_coverage(tmp_5m)
@@ -540,15 +594,17 @@ class AUElvisDEMSource:
             "FORMAT": "GeoTIFF",
         }
         try:
-            status, content_type, body = self._http_get_bytes(GA_SRTM_1S_WCS_URL, params)
+            status, content_type, byte_len = self._http_stream_to_file(
+                GA_SRTM_1S_WCS_URL, params, out_tif
+            )
         except Exception as exc:
             logger.warning("GA SRTM 1s backup WCS failed: %s", exc)
             return False
 
-        if status != 200 or "xml" in content_type.lower() or "html" in content_type.lower() or len(body) < 1024:
+        if status != 200 or "xml" in content_type.lower() or "html" in content_type.lower() or byte_len < 1024:
+            out_tif.unlink(missing_ok=True)
             return False
 
-        out_tif.write_bytes(body)
         return True
 
     def _fetch_srtm_1s(self, clip_bbox: BBox, out_tif: Path) -> Path:

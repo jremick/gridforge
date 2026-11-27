@@ -5223,6 +5223,38 @@ def _list_gpkg_layers(gpkg_path: Path) -> list[str]:
         ds = None
 
 
+_ROLE_SQLITE_SUBSET_FILTERS: dict[str, tuple[tuple[str, ...], str]] = {
+    "building_icons": (
+        ("amenity", "emergency", "aeroway", "building"),
+        "\"amenity\" IS NOT NULL OR \"emergency\" IS NOT NULL OR \"aeroway\" = 'helipad' "
+        "OR \"building\" IN ('hospital','school','church','chapel','cathedral','mosque','temple','synagogue','hut')",
+    ),
+    "buildings": (
+        ("building", "power"),
+        "(\"building\" IS NOT NULL AND \"building\" != 'no') OR \"power\" = 'substation'",
+    ),
+    "water_polygons": (
+        ("natural", "water", "waterway", "landuse"),
+        "\"natural\" = 'water' OR \"water\" IS NOT NULL OR \"waterway\" IS NOT NULL "
+        "OR \"landuse\" IN ('reservoir','basin')",
+    ),
+    "landcover": (
+        ("landuse", "natural", "leisure", "aeroway"),
+        "\"landuse\" IS NOT NULL OR \"natural\" IS NOT NULL OR \"leisure\" IS NOT NULL OR \"aeroway\" IS NOT NULL",
+    ),
+    "waterways": (
+        ("waterway",),
+        "\"waterway\" IS NOT NULL",
+    ),
+    "transport": (
+        ("highway", "railway", "aeroway", "power", "man_made", "barrier", "natural", "ford"),
+        "\"highway\" IS NOT NULL OR \"railway\" IS NOT NULL OR \"aeroway\" IS NOT NULL "
+        "OR \"power\" IS NOT NULL OR \"man_made\" IS NOT NULL OR \"barrier\" IS NOT NULL "
+        "OR \"natural\" = 'cliff' OR \"ford\" = 'yes'",
+    ),
+}
+
+
 def _load_vector_layer(
     project: Any,
     gpkg_path: Path,
@@ -5241,6 +5273,13 @@ def _load_vector_layer(
     if not vlayer.isValid():
         logger.debug("Skipping unavailable vector layer %s (%s)", display_name, uri)
         return None
+
+    subset_spec = _ROLE_SQLITE_SUBSET_FILTERS.get(role)
+    if subset_spec is not None:
+        req_cols, subset_expr = subset_spec
+        layer_fields = {vlayer.fields().at(i).name() for i in range(vlayer.fields().count())}
+        if all(col in layer_fields for col in req_cols):
+            vlayer.setSubsetString(subset_expr)
 
     spec = workspace.layout.spec
     apply_layer_style(

@@ -3,7 +3,7 @@
 # and optionally attach them to a GitHub Release as downloadable showcase assets.
 #
 # Usage:
-#   ./scripts/render_release_samples.sh [--image ghcr.io/jremick/gridforge:latest] [--out-dir /tmp/gridforge-samples] [--upload v1.6.0]
+#   ./scripts/render_release_samples.sh [--image ghcr.io/jremick/gridforge:latest] [--out-dir /tmp/gridforge-samples] [--upload v1.6.1]
 set -euo pipefail
 
 IMAGE="ghcr.io/jremick/gridforge:latest"
@@ -72,7 +72,7 @@ docker run --rm "${IMAGE}" bash -ceu '
 
   ls -lh /tmp/samples/*.pdf >&2
   tar -C /tmp/samples -cf - .
-' | tar -C "${OUT_DIR}" -xf -
+' | tar -C "${OUT_DIR}" --no-same-owner --no-same-permissions -xf -
 
 echo
 echo "Rendered sample PDFs in ${OUT_DIR}:"

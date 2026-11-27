@@ -223,10 +223,19 @@ def _clip_and_reproject_local_gpkg(
         out_gpkg.unlink()
 
     b = layout.utm_fetch_bbox
+    wb = layout.wgs84_fetch_bbox
+    pad = 0.01
     cmd = [
         "ogr2ogr",
         "-f",
         "GPKG",
+        "-spat",
+        f"{max(-180.0, wb.min_x - pad):.6f}",
+        f"{max(-85.0, wb.min_y - pad):.6f}",
+        f"{min(180.0, wb.max_x + pad):.6f}",
+        f"{min(85.0, wb.max_y + pad):.6f}",
+        "-spat_srs",
+        "EPSG:4326",
         "-t_srs",
         f"EPSG:{layout.utm_epsg}",
         "-clipdst",
@@ -240,7 +249,16 @@ def _clip_and_reproject_local_gpkg(
         str(out_gpkg),
         str(src_path),
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    from gridforge.subprocess_env import build_safe_subprocess_env
+
+    proc = subprocess.run(
+        cmd,
+        env=build_safe_subprocess_env(allow_network=False),
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
     if proc.returncode != 0:
         raise RuntimeError(
             f"ogr2ogr failed for local AU overlay {src_path} (exit {proc.returncode}): {proc.stderr.strip()}"
@@ -354,41 +372,47 @@ def _write_projected_gpkg_layers(
 
     total_written = 0
     try:
-        for layer_name, geom_type, fields, rows in layer_specs:
-            layer = ds.CreateLayer(layer_name, srs=dst_srs, geom_type=geom_type)
-            for fname, ftype in fields:
-                layer.CreateField(ogr.FieldDefn(fname, ftype))
-            defn = layer.GetLayerDefn()
+        ds.StartTransaction()
+        try:
+            for layer_name, geom_type, fields, rows in layer_specs:
+                layer = ds.CreateLayer(layer_name, srs=dst_srs, geom_type=geom_type)
+                for fname, ftype in fields:
+                    layer.CreateField(ogr.FieldDefn(fname, ftype))
+                defn = layer.GetLayerDefn()
 
-            for gj_geom, attrs in rows:
-                geom = ogr.CreateGeometryFromJson(json.dumps(gj_geom))
-                if geom is None or geom.IsEmpty():
-                    continue
-                geom.FlattenTo2D()
-                if geom.Transform(transform) != 0:
-                    continue
-                if not geom.Intersects(clip_poly):
-                    continue
-                if geom_type != ogr.wkbPoint:
-                    clipped = geom.Intersection(clip_poly)
-                    if clipped is None or clipped.IsEmpty():
+                for gj_geom, attrs in rows:
+                    geom = ogr.CreateGeometryFromJson(json.dumps(gj_geom))
+                    if geom is None or geom.IsEmpty():
                         continue
-                    geom = clipped
+                    geom.FlattenTo2D()
+                    if geom.Transform(transform) != 0:
+                        continue
+                    if not geom.Intersects(clip_poly):
+                        continue
+                    if geom_type != ogr.wkbPoint:
+                        clipped = geom.Intersection(clip_poly)
+                        if clipped is None or clipped.IsEmpty():
+                            continue
+                        geom = clipped
 
-                geom = _coerce_geometry_type(geom, geom_type)
-                if geom is None or geom.IsEmpty():
-                    continue
-                geom.FlattenTo2D()
+                    geom = _coerce_geometry_type(geom, geom_type)
+                    if geom is None or geom.IsEmpty():
+                        continue
+                    geom.FlattenTo2D()
 
-                feat = ogr.Feature(defn)
-                feat.SetGeometry(geom)
-                for fname, _ftype in fields:
-                    val = attrs.get(fname)
-                    if val is not None:
-                        feat.SetField(fname, val)
-                layer.CreateFeature(feat)
-                feat = None
-                total_written += 1
+                    feat = ogr.Feature(defn)
+                    feat.SetGeometry(geom)
+                    for fname, _ftype in fields:
+                        val = attrs.get(fname)
+                        if val is not None:
+                            feat.SetField(fname, val)
+                    layer.CreateFeature(feat)
+                    feat = None
+                    total_written += 1
+            ds.CommitTransaction()
+        except Exception:
+            ds.RollbackTransaction()
+            raise
     finally:
         ds = None
 

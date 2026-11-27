@@ -1031,7 +1031,7 @@ class TestLiveBrandingConfig:
             assert "<title>GridMaps — Tactical Topographic Print Studio</title>" in root_resp.text
             assert 'property="og:title" content="GridMaps — Tactical Topographic Print Studio"' in root_resp.text
             assert 'name="description" content="GridMaps — True-scale UTM print studio."' in root_resp.text
-            assert 'window.__GF_BRAND__={"name":"GridMaps","subtitle":"Studio","tagline":"Tactical Topographic Print Studio"};' in root_resp.text
+            assert '<script id="gf-brand" type="application/json">{"name":"GridMaps","subtitle":"Studio","tagline":"Tactical Topographic Print Studio"}</script>' in root_resp.text
 
             sess = client.get("/api/auth/session")
             assert sess.status_code == 200

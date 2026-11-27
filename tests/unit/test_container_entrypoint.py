@@ -116,7 +116,7 @@ class TestEntrypointConfigAndSupervision:
             volume_root=tmp_path,
             seed_samples_dir=tmp_path / "none",
         )
-        assert env_hosted["FORWARDED_ALLOW_IPS"] == "*"
+        assert env_hosted["FORWARDED_ALLOW_IPS"] == entrypoint.DEFAULT_HOSTED_FORWARDED_ALLOW_IPS
 
         env_explicit, _, _ = entrypoint.configure_environment(
             {"GRIDFORGE_AUTH_MODE": "hosted", "FORWARDED_ALLOW_IPS": "10.0.0.1"},

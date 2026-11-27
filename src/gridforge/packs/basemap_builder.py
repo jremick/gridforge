@@ -15,6 +15,7 @@ import sqlite3
 import subprocess
 import tempfile
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from pathlib import Path
 from typing import Literal
@@ -28,6 +29,7 @@ from gridforge.config import BBox, FrameMarginsMM, SheetLayout, SheetSpec
 from gridforge.export._atomic import staged_archive
 from gridforge.geo.crs import resolve_utm_zone
 from gridforge.packs.regions import resolve_region
+from gridforge.subprocess_env import build_safe_subprocess_env
 
 logger = logging.getLogger(__name__)
 
@@ -66,12 +68,13 @@ def _run_cmd(
     *,
     step: str,
     extra_env: Mapping[str, str] | None = None,
+    timeout: int = 600,
 ) -> None:
-    env = os.environ.copy()
-    env.update(_GDAL_ENV)
+    merged = dict(_GDAL_ENV)
     if extra_env:
-        env.update(extra_env)
-    proc = subprocess.run(cmd, env=env, capture_output=True, text=True, check=False)
+        merged.update(extra_env)
+    env = build_safe_subprocess_env(extra=merged, allow_network=False)
+    proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout, check=False)
     if proc.returncode != 0:
         raise RuntimeError(
             f"{step} failed (exit={proc.returncode}).\n"
@@ -144,7 +147,7 @@ def _blend_relief_and_hillshade_chunked(
             height,
             3,
             gdal.GDT_Byte,
-            options=["COMPRESS=LZW", "TILED=YES", "PHOTOMETRIC=RGB"],
+            options=["COMPRESS=NONE", "TILED=YES", "PHOTOMETRIC=RGB"],
         )
         if ds_out is None:
             raise RuntimeError(f"Failed creating blended basemap GeoTIFF '{out_tif}'.")
@@ -376,6 +379,9 @@ def build_offline_basemap_mbtiles(
             [
                 "gdalwarp",
                 "-overwrite",
+                "-multi",
+                "-wo",
+                "NUM_THREADS=2",
                 "-t_srs",
                 "EPSG:3857",
                 "-te",
@@ -391,7 +397,7 @@ def build_offline_basemap_mbtiles(
                 "-dstnodata",
                 "-9999",
                 "-co",
-                "COMPRESS=DEFLATE",
+                "COMPRESS=NONE",
                 "-co",
                 "TILED=YES",
                 str(dem_src_path),
@@ -404,39 +410,44 @@ def build_offline_basemap_mbtiles(
         ramp_txt.write_text(_HYPSOMETRIC_COLOR_RAMP_TXT, encoding="utf-8")
 
         color_tif = tmp_dir / "color_relief.tif"
-        _run_cmd(
-            [
-                "gdaldem",
-                "color-relief",
-                str(dem_3857),
-                str(ramp_txt),
-                str(color_tif),
-                "-co",
-                "COMPRESS=LZW",
-                "-co",
-                "TILED=YES",
-            ],
-            step="gdaldem color-relief for offline basemap",
-        )
-
         hillshade_tif = tmp_dir / "hillshade.tif"
-        _run_cmd(
-            [
-                "gdaldem",
-                "hillshade",
-                str(dem_3857),
-                str(hillshade_tif),
-                "-multidirectional",
-                "-z",
-                "1.6",
-                "-compute_edges",
-                "-co",
-                "COMPRESS=LZW",
-                "-co",
-                "TILED=YES",
-            ],
-            step="gdaldem hillshade for offline basemap",
-        )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            fut_color = pool.submit(
+                _run_cmd,
+                [
+                    "gdaldem",
+                    "color-relief",
+                    str(dem_3857),
+                    str(ramp_txt),
+                    str(color_tif),
+                    "-co",
+                    "COMPRESS=NONE",
+                    "-co",
+                    "TILED=YES",
+                ],
+                step="gdaldem color-relief for offline basemap",
+            )
+            fut_hs = pool.submit(
+                _run_cmd,
+                [
+                    "gdaldem",
+                    "hillshade",
+                    str(dem_3857),
+                    str(hillshade_tif),
+                    "-multidirectional",
+                    "-z",
+                    "1.6",
+                    "-compute_edges",
+                    "-co",
+                    "COMPRESS=NONE",
+                    "-co",
+                    "TILED=YES",
+                ],
+                step="gdaldem hillshade for offline basemap",
+            )
+            fut_color.result()
+            fut_hs.result()
 
         blended_tif = _blend_relief_and_hillshade_chunked(
             color_tif, hillshade_tif, tmp_dir / "blended_3857.tif"

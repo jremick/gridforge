@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import logging
 import shutil
 import subprocess
@@ -150,6 +151,8 @@ def _resolve_pack_sources(
             manifest.bbox_wgs84.as_tuple(),
         )
 
+    from gridforge.packs.builder import resolve_pack_asset_path
+
     pack_used_dem = False
     resolved_elev = elevation_source
     if resolved_elev is None:
@@ -158,7 +161,7 @@ def _resolve_pack_sources(
                 f"Offline pack '{manifest.pack_id}' has no DEM. "
                 "Choose a pack with elevation data or supply --offline-dem."
             )
-        dem_file = (resolved_pack_dir / manifest.dem_path).resolve()
+        dem_file = resolve_pack_asset_path(resolved_pack_dir, manifest.dem_path)
         if not dem_file.exists():
             raise FileNotFoundError(
                 f"Offline pack '{manifest.pack_id}' DEM not found at '{dem_file}'"
@@ -173,7 +176,7 @@ def _resolve_pack_sources(
                 f"Offline pack '{manifest.pack_id}' has no OSM data. "
                 "Choose a pack with OSM data or supply --offline-pbf."
             )
-        pbf_file = (resolved_pack_dir / manifest.osm_pbf_path).resolve()
+        pbf_file = resolve_pack_asset_path(resolved_pack_dir, manifest.osm_pbf_path)
         if not pbf_file.is_file():
             raise FileNotFoundError(
                 f"Offline pack '{manifest.pack_id}' OSM PBF not found at '{pbf_file}'"
@@ -184,7 +187,7 @@ def _resolve_pack_sources(
     pack_au_kinds: list[AUOverlayKind] = []
     for raw_key, rel_path in manifest.overlays.items():
         norm_key = str(raw_key).lower().replace("_", "-")
-        ov_path = (resolved_pack_dir / rel_path).resolve()
+        ov_path = resolve_pack_asset_path(resolved_pack_dir, rel_path)
         if not ov_path.is_file():
             logger.warning(
                 "Offline pack '%s' overlay '%s' missing at '%s'; skipping",
@@ -291,12 +294,24 @@ def _merge_overlays(
         ds = None
 
         for lname in layer_names:
+            if not lname or lname.startswith("-") or "\x00" in lname:
+                logger.warning("Skipping overlay layer with unsafe name: %r", lname)
+                continue
             target_name = f"ov{idx}_{lname}"
             cmd = ["ogr2ogr", "-f", "GPKG"]
             if merged_gpkg.exists():
                 cmd.append("-update")
             cmd.extend([str(merged_gpkg), str(src_gpkg), lname, "-nln", target_name])
-            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            from gridforge.subprocess_env import build_safe_subprocess_env
+
+            subprocess.run(
+                cmd,
+                env=build_safe_subprocess_env(allow_network=False),
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
 
     return (merged_gpkg if merged_gpkg.is_file() else None), attributions
 
@@ -452,10 +467,59 @@ def prepare_job_workspace(
         f" pack={pack_manifest.pack_id}" if pack_manifest is not None else "",
     )
 
-    # 1. Fetch raw DEM & OSM data
+    nz_kinds_override: list[NZOverlayKind] | None = None
+    ca_kinds_override: list[CAOverlayKind] | None = None
+    if pack_manifest is not None:
+        nz_kinds_override = [
+            k for k in spec.nz_overlays if effective_overrides and k.value in effective_overrides
+        ]
+        ca_kinds_override = [
+            k for k in spec.ca_overlays if effective_overrides and k.value in effective_overrides
+        ]
+
+    # 1. Fetch DEM, OSM, regional/user overlays, and build MGRS grid concurrently
     _report_progress(progress_callback, "fetching_data", 15)
-    dem_raw_path = elev_src.fetch_dem(layout, resolved_dir)
-    osm_raw_path = vec_src.fetch_osm(layout, resolved_dir)
+    mgrs_gpkg = resolved_dir / "mgrs_grid.gpkg"
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        fut_dem = pool.submit(elev_src.fetch_dem, layout, resolved_dir)
+        fut_osm = pool.submit(vec_src.fetch_osm, layout, resolved_dir)
+        fut_mgrs = pool.submit(generate_mgrs_grid, layout, mgrs_gpkg)
+        fut_reg = pool.submit(
+            _fetch_regional_overlays,
+            spec,
+            layout,
+            resolved_dir,
+            local_overrides=effective_overrides,
+            us_kinds_override=us_kinds_override,
+            au_kinds_override=au_kinds_override,
+            nz_kinds_override=nz_kinds_override,
+            ca_kinds_override=ca_kinds_override,
+        )
+        fut_ov = (
+            pool.submit(_merge_overlays, overlay_sources, layout, resolved_dir)
+            if overlay_sources
+            else None
+        )
+
+        dem_raw_path = fut_dem.result()
+        osm_raw_path = fut_osm.result()
+
+        # 2 & 3. Normalize OSM vectors and build UTM terrain products concurrently
+        _report_progress(progress_callback, "normalizing_osm", 24)
+        fut_norm = pool.submit(normalize_osm_to_gpkg, osm_raw_path, layout, resolved_dir / "osm.gpkg")
+        fut_terrain = pool.submit(build_terrain_products, dem_raw_path, layout, resolved_dir)
+
+        osm_gpkg = fut_norm.result()
+        _report_progress(progress_callback, "terrain", 32)
+        terrain = fut_terrain.result()
+        _report_progress(progress_callback, "mgrs_grid", 40)
+        mgrs_meta = fut_mgrs.result()
+        _report_progress(progress_callback, "overlays", 46)
+        regional_overlays, regional_attributions = fut_reg.result()
+        if fut_ov is not None:
+            overlays_gpkg, overlay_attributions = fut_ov.result()
+        else:
+            overlays_gpkg, overlay_attributions = None, []
 
     if pack_used_dem and pack_manifest is not None:
         resolved_dem_name = f"pack:{pack_manifest.pack_id}"
@@ -476,14 +540,6 @@ def prepare_job_workspace(
             getattr(elev_src, "resolved_attribution", None) or getattr(elev_src, "attribution", "")
         )
 
-    # 2. Normalize OSM vectors to sheet UTM GeoPackage
-    _report_progress(progress_callback, "normalizing_osm", 24)
-    osm_gpkg = normalize_osm_to_gpkg(osm_raw_path, layout, resolved_dir / "osm.gpkg")
-
-    # 3. Build UTM DEM, multi-directional hillshade, contours, slope shading, and optional RF viewshed
-    _report_progress(progress_callback, "terrain", 32)
-    terrain = build_terrain_products(dem_raw_path, layout, resolved_dir)
-
     viewshed_tif: Path | None = getattr(terrain, "viewshed_tif", None)
     viewshed_observers_gpkg: Path | None = getattr(terrain, "viewshed_observers_gpkg", None)
     if spec.viewsheds and (viewshed_tif is None or viewshed_observers_gpkg is None):
@@ -496,11 +552,6 @@ def prepare_job_workspace(
             spec.color_mode,
             resolved_dir,
         )
-
-    # 4. Generate MGRS 1 km / 100 km grid & neatline ticks
-    _report_progress(progress_callback, "mgrs_grid", 40)
-    mgrs_gpkg = resolved_dir / "mgrs_grid.gpkg"
-    mgrs_meta = generate_mgrs_grid(layout, mgrs_gpkg)
 
     # 5. Compute WMM2025 declination at sheet center elevation & render collar SVGs
     declination = compute_declination(layout, elevation_m=terrain.center_elev_m)
@@ -515,13 +566,7 @@ def prepare_job_workspace(
         resolved_dir / "grid_ref_box.svg",
     )
 
-    # 6. Process optional user overlays, tactical waypoints/graphics, and US/AU/NZ/CA regional overlays
-    _report_progress(progress_callback, "overlays", 46)
-    overlays_gpkg: Path | None = None
-    overlay_attributions: list[str] = []
-    if overlay_sources:
-        overlays_gpkg, overlay_attributions = _merge_overlays(overlay_sources, layout, resolved_dir)
-
+    # 6. Process optional tactical waypoints and graphics
     waypoints_gpkg: Path | None = None
     if spec.waypoints:
         wp_metrics = compute_route_metrics(
@@ -547,27 +592,6 @@ def prepare_job_workspace(
             rf_links=list(spec.rf_links),
             date_iso=spec.date_iso,
         )
-
-    nz_kinds_override: list[NZOverlayKind] | None = None
-    ca_kinds_override: list[CAOverlayKind] | None = None
-    if pack_manifest is not None:
-        nz_kinds_override = [
-            k for k in spec.nz_overlays if effective_overrides and k.value in effective_overrides
-        ]
-        ca_kinds_override = [
-            k for k in spec.ca_overlays if effective_overrides and k.value in effective_overrides
-        ]
-
-    regional_overlays, regional_attributions = _fetch_regional_overlays(
-        spec,
-        layout,
-        resolved_dir,
-        local_overrides=effective_overrides,
-        us_kinds_override=us_kinds_override,
-        au_kinds_override=au_kinds_override,
-        nz_kinds_override=nz_kinds_override,
-        ca_kinds_override=ca_kinds_override,
-    )
 
     # 7. Assemble mandatory attributions (deduplicated, preserving order)
     attributions: list[str] = []
@@ -634,6 +658,8 @@ def _run_workspace_exports(
     eff_grid = workspace.layout.spec.carto.show_grid if include_grid is None else include_grid
 
     shared_tif: Path | None = None
+    shared_warped_3857: Path | None = None
+    built_mbt_path: Path | None = None
     if len(raster_targets) >= 2:
         _report_progress(progress_callback, "rendering_raster", 82)
         shared_tif = render_collarless_geotiff(
@@ -643,19 +669,32 @@ def _run_workspace_exports(
             include_grid=eff_grid,
         )
 
+    if shared_tif is not None and mbtiles_out is not None and gpkg_out is not None:
+        from gridforge.export.mbtiles import prepare_warped_3857
+
+        shared_warped_3857 = prepare_warped_3857(
+            shared_tif,
+            workspace.job_dir / "shared_warped_3857.tif",
+            tile_format=mbtiles_format,
+            color_mode=workspace.layout.spec.color_mode,
+            tmp_dir=workspace.job_dir,
+            step_label="gdalwarp shared EPSG:3857 for MBTiles & GPKG tiles",
+        )
+
     results: list[ExportResult] = []
     if mbtiles_out is not None:
         _report_progress(progress_callback, "exporting_mbtiles", 85)
-        results.append(
-            export_mbtiles(
-                workspace,
-                Path(mbtiles_out),
-                tile_format=mbtiles_format,
-                dpi=eff_dpi,
-                include_grid=eff_grid,
-                collarless_tif=shared_tif,
-            )
+        mbt_res = export_mbtiles(
+            workspace,
+            Path(mbtiles_out),
+            tile_format=mbtiles_format,
+            dpi=eff_dpi,
+            include_grid=eff_grid,
+            collarless_tif=shared_tif,
+            warped_3857_tif=shared_warped_3857,
         )
+        built_mbt_path = mbt_res.output_path
+        results.append(mbt_res)
     if kmz_out is not None:
         _report_progress(progress_callback, "exporting_kmz", 88)
         results.append(
@@ -680,6 +719,7 @@ def _run_workspace_exports(
             dpi=eff_dpi,
             include_grid=eff_grid,
             collarless_tif=shared_tif,
+            warped_3857_tif=shared_warped_3857,
         )
         workspace.gpkg_tiles_path = gpkg_res.output_path
         results.append(gpkg_res)
@@ -694,6 +734,7 @@ def _run_workspace_exports(
             dpi=eff_dpi,
             include_grid=eff_grid,
             collarless_tif=shared_tif,
+            mbtiles_path=built_mbt_path,
         )
         workspace.osmand_sqlitedb_path = osm_res.output_path
         results.append(osm_res)
@@ -767,6 +808,18 @@ def _assemble_pdf_with_supplements(
         except Exception as exc:
             logger.warning("Could not parse '%s' as route (%s)", route_file, exc)
 
+    from gridforge.geo.supplements import (
+        AtlasIndexSheet,
+        _build_atlas_index_payload,
+        _build_calibration_payload,
+        _build_elevation_profile_payload,
+        _build_rf_link_card_payload,
+        _build_route_card_payload,
+        _spawn_supplement_batch,
+    )
+
+    batch_tasks: list[tuple[str, dict[str, Any], Path]] = []
+
     if spec.include_elevation_profile and dem_paths:
         route_lonlat = parsed_route_lonlat
         if route_lonlat is None and len(spec.waypoints) >= 2:
@@ -776,19 +829,18 @@ def _assemble_pdf_with_supplements(
 
         if route_lonlat is not None and len(route_lonlat) >= 2:
             profile = sample_route_elevation(route_lonlat, dem_paths, anchor_layout.utm_epsg)
-            elev_pdf = render_elevation_profile_pdf(
-                profile,
-                strip_plan,
-                anchor_layout,
-                supp_dir / "elevation_profile.pdf",
-                bw=bw,
+            elev_pdf = supp_dir / "elevation_profile.pdf"
+            batch_tasks.append(
+                (
+                    "elevation-profile",
+                    _build_elevation_profile_payload(profile, strip_plan, anchor_layout, bw=bw),
+                    elev_pdf,
+                )
             )
             front_pages.append(elev_pdf)
 
     if spec.include_atlas_index and strip_plan is not None and strip_plan.sheets:
         from pyproj import Transformer
-
-        from gridforge.geo.supplements import AtlasIndexSheet, render_atlas_index_pdf
 
         first_sheet_page = 2 + len(front_pages)
         index_sheets = [
@@ -813,17 +865,23 @@ def _assemble_pdf_with_supplements(
             )
             route_utm = [(float(x), float(y)) for x, y in zip(rxs, rys)]
 
-        idx_pdf = render_atlas_index_pdf(
-            index_sheets,
-            page_width_mm=anchor_layout.page_width_mm,
-            page_height_mm=anchor_layout.page_height_mm,
-            scale=spec.scale,
-            utm_epsg=strip_plan.utm_epsg,
-            title=(spec.title or "GRIDFORGE STRIP ATLAS"),
-            overlap_pct=overlap_pct,
-            route_utm=route_utm,
-            output_pdf=supp_dir / "atlas_index.pdf",
-            bw=bw,
+        idx_pdf = supp_dir / "atlas_index.pdf"
+        batch_tasks.append(
+            (
+                "atlas-index",
+                _build_atlas_index_payload(
+                    index_sheets,
+                    page_width_mm=anchor_layout.page_width_mm,
+                    page_height_mm=anchor_layout.page_height_mm,
+                    scale=spec.scale,
+                    utm_epsg=strip_plan.utm_epsg,
+                    title=(spec.title or "GRIDFORGE STRIP ATLAS"),
+                    overlap_pct=overlap_pct,
+                    route_utm=route_utm,
+                    bw=bw,
+                ),
+                idx_pdf,
+            )
         )
         front_pages.insert(0, idx_pdf)
 
@@ -835,17 +893,17 @@ def _assemble_pdf_with_supplements(
             date_iso=spec.date_iso,
             dem_path=dem_for_wp,
         )
-        card_pdf = render_route_card_pdf(
-            metrics,
-            anchor_layout,
-            anchor_declination,
-            supp_dir / "route_card.pdf",
-            bw=bw,
+        card_pdf = supp_dir / "route_card.pdf"
+        batch_tasks.append(
+            (
+                "route-card",
+                _build_route_card_payload(metrics, anchor_layout, anchor_declination, bw=bw),
+                card_pdf,
+            )
         )
         back_pages.append(card_pdf)
 
     if spec.include_rf_link_card and spec.rf_links and dem_paths:
-        from gridforge.geo.supplements import render_rf_link_card_pdf
         from gridforge.pipeline.terrain import compute_rf_link_profile
 
         rf_profiles = [
@@ -857,23 +915,34 @@ def _assemble_pdf_with_supplements(
             )
             for lnk in spec.rf_links
         ]
-        rf_pdf = render_rf_link_card_pdf(
-            rf_profiles,
-            anchor_layout,
-            supp_dir / "rf_link_card.pdf",
-            bw=bw,
+        rf_pdf = supp_dir / "rf_link_card.pdf"
+        batch_tasks.append(
+            (
+                "rf-link-card",
+                _build_rf_link_card_payload(rf_profiles, anchor_layout, bw=bw),
+                rf_pdf,
+            )
         )
         back_pages.append(rf_pdf)
 
     if spec.include_calibration_page:
-        cal_pdf = render_calibration_pdf(
-            anchor_layout.page_width_mm,
-            anchor_layout.page_height_mm,
-            spec.scale,
-            supp_dir / "calibration.pdf",
-            bw=bw,
+        cal_pdf = supp_dir / "calibration.pdf"
+        batch_tasks.append(
+            (
+                "calibration",
+                _build_calibration_payload(
+                    anchor_layout.page_width_mm,
+                    anchor_layout.page_height_mm,
+                    spec.scale,
+                    bw=bw,
+                ),
+                cal_pdf,
+            )
         )
         back_pages.append(cal_pdf)
+
+    if batch_tasks:
+        _spawn_supplement_batch(batch_tasks)
 
     all_pages = [*front_pages, *map_pdfs, *back_pages]
     if len(all_pages) == 1 and all_pages[0].resolve() == output_pdf.resolve():
@@ -1152,7 +1221,7 @@ def run_strip_atlas_job(
                     anchor_layout = ws.layout
                 if anchor_declination is None:
                     anchor_declination = ws.declination
-                if include_elevation_profile and ws.dem_utm_tif.is_file():
+                if (include_elevation_profile or (include_rf_link_card and eff_rf_links)) and ws.dem_utm_tif.is_file():
                     dem_copy = saved_dems_dir / f"dem_{idx:02d}_{sh.sheet_id}.tif"
                     shutil.copy2(ws.dem_utm_tif, dem_copy)
                     collected_dem_paths.append(dem_copy)

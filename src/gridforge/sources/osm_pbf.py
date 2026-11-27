@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 
 from gridforge.config import SheetLayout
+from gridforge.subprocess_env import build_safe_subprocess_env
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +46,14 @@ class LocalPBFSource:
             "--overwrite",
         ]
         logger.info("Extracting OSM bbox %s from %s", bbox_str, source_path)
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        proc = subprocess.run(
+            cmd,
+            env=build_safe_subprocess_env(allow_network=False),
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+        )
         if proc.returncode != 0:
             raise RuntimeError(
                 f"osmium extract failed (exit {proc.returncode}):\n"

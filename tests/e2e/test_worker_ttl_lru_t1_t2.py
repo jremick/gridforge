@@ -390,7 +390,7 @@ class TestEntrypointDockerWalTier1:
         assert custom_cache.is_dir()
         assert overridden["GRIDFORGE_PACKS_DIR"] == str((vol_root / "packs").resolve())
         assert overridden["GRIDFORGE_SAMPLES_DIR"] == str((vol_root / "samples").resolve())
-        assert overridden["FORWARDED_ALLOW_IPS"] == "*"
+        assert overridden["FORWARDED_ALLOW_IPS"] == entrypoint.DEFAULT_HOSTED_FORWARDED_ALLOW_IPS
 
         monkeypatch.setenv("FORWARDED_ALLOW_IPS", "10.0.0.1")
         explicit_fwd, _, _ = entrypoint.configure_environment(
@@ -876,6 +876,8 @@ class TestRoleTtlAndLruCacheTier1:
         e2e_env.seed_completed_job_pdf(j_f_new)
         j_a_old = admin.post("/api/jobs", json={"center": "-33.732, 150.312"}, headers=_SAME_ORIGIN).json()["job_id"]
         e2e_env.seed_completed_job_pdf(j_a_old)
+        j_a_fresh = admin.post("/api/jobs", json={"center": "-33.732, 150.312"}, headers=_SAME_ORIGIN).json()["job_id"]
+        e2e_env.seed_completed_job_pdf(j_a_fresh)
 
         p_g_old = guest.post("/api/projects", json={"name": "G Old", "state": {}}, headers=_SAME_ORIGIN).json()["project_id"]
         p_f_new = friend.post("/api/projects", json={"name": "F New", "state": {}}, headers=_SAME_ORIGIN).json()["project_id"]
@@ -884,6 +886,7 @@ class TestRoleTtlAndLruCacheTier1:
         e2e_env.age_sqlite_timestamps(table="jobs", id_col="job_id", row_id=j_f_old, age_hours=360.0)
         e2e_env.age_sqlite_timestamps(table="jobs", id_col="job_id", row_id=j_f_new, age_hours=48.0)
         e2e_env.age_sqlite_timestamps(table="jobs", id_col="job_id", row_id=j_a_old, age_hours=1000.0)
+        e2e_env.age_sqlite_timestamps(table="jobs", id_col="job_id", row_id=j_a_fresh, age_hours=200.0)
         e2e_env.age_sqlite_timestamps(table="projects", id_col="project_id", row_id=p_g_old, age_hours=25.0)
         e2e_env.age_sqlite_timestamps(table="projects", id_col="project_id", row_id=p_f_new, age_hours=48.0)
 
@@ -906,9 +909,30 @@ class TestRoleTtlAndLruCacheTier1:
         assert db.get_job(e2e_env.db_path, j_g_old) is None and not (e2e_env.data_dir / j_g_old).exists()
         assert db.get_job(e2e_env.db_path, j_f_old) is None and not (e2e_env.data_dir / j_f_old).exists()
         assert db.get_job(e2e_env.db_path, j_f_new) is not None
-        assert db.get_job(e2e_env.db_path, j_a_old) is not None
+        # Default hosted GRIDFORGE_ADMIN_TTL_HOURS=720 prunes 1000h admin jobs while keeping 200h ones
+        assert db.get_job(e2e_env.db_path, j_a_old) is None and not (e2e_env.data_dir / j_a_old).exists()
+        assert db.get_job(e2e_env.db_path, j_a_fresh) is not None
         remaining_pids = {p.project_id for p in projects.list_projects(e2e_env.db_path)}
         assert p_g_old not in remaining_pids and p_f_new in remaining_pids
+
+        # Setting GRIDFORGE_ADMIN_TTL_HOURS=0 explicitly disables admin job pruning
+        j_a_keep = admin.post("/api/jobs", json={"center": "-33.732, 150.312"}, headers=_SAME_ORIGIN).json()["job_id"]
+        e2e_env.seed_completed_job_pdf(j_a_keep)
+        e2e_env.age_sqlite_timestamps(table="jobs", id_col="job_id", row_id=j_a_keep, age_hours=2000.0)
+        monkeypatch.setenv("GRIDFORGE_ADMIN_TTL_HOURS", "0")
+        assert (
+            worker_mod.main(
+                [
+                    "--data-dir",
+                    str(e2e_env.data_dir),
+                    "--packs-dir",
+                    str(e2e_env.packs_dir),
+                    "--once",
+                ]
+            )
+            == 0
+        )
+        assert db.get_job(e2e_env.db_path, j_a_keep) is not None
 
     @pytest.mark.m1_contract
     def test_t1_cache_prune_trim_cache_dir_evicts_lru_until_under_cap_m1_contract(

@@ -45,6 +45,54 @@ _DUMMY_PASSWORD_HASH: str = (
 )
 
 
+_LEGACY_ENV_WARNINGS: tuple[tuple[str, str], ...] = (
+    ("GRIDFORGE_TURNSTILE_SITEKEY", "GRIDFORGE_TURNSTILE_SITE_KEY"),
+    ("GRIDFORGE_TURNSTILE_SECRET", "GRIDFORGE_TURNSTILE_SECRET_KEY"),
+    ("GRIDFORGE_BOOTSTRAP_ADMIN_EMAIL", "GRIDFORGE_ADMIN_EMAIL"),
+    ("GRIDFORGE_BOOTSTRAP_ADMIN_PASSWORD", "GRIDFORGE_ADMIN_PASSWORD"),
+)
+
+_AUTH_HTTP_CLIENT: httpx.Client | None = None
+_ORIG_HTTPX_POST = httpx.post
+_ORIG_HTTPX_GET = httpx.get
+
+
+def _get_auth_http_client() -> httpx.Client:
+    global _AUTH_HTTP_CLIENT
+    if _AUTH_HTTP_CLIENT is None or _AUTH_HTTP_CLIENT.is_closed:
+        _AUTH_HTTP_CLIENT = httpx.Client(
+            timeout=httpx.Timeout(10.0, connect=5.0),
+            limits=httpx.Limits(max_connections=16, max_keepalive_connections=8),
+        )
+    return _AUTH_HTTP_CLIENT
+
+
+def _auth_http_post(*args: Any, **kwargs: Any) -> httpx.Response:
+    if httpx.post is not _ORIG_HTTPX_POST:
+        return httpx.post(*args, **kwargs)
+    return _get_auth_http_client().post(*args, **kwargs)
+
+
+def _auth_http_get(*args: Any, **kwargs: Any) -> httpx.Response:
+    if httpx.get is not _ORIG_HTTPX_GET:
+        return httpx.get(*args, **kwargs)
+    return _get_auth_http_client().get(*args, **kwargs)
+
+
+def _warn_misnamed_env_vars() -> None:
+    for wrong, right in _LEGACY_ENV_WARNINGS:
+        if os.environ.get(wrong, "").strip() and not os.environ.get(right, "").strip():
+            logger.warning(
+                "Environment variable %s is set but ignored; use %s instead.",
+                wrong,
+                right,
+            )
+
+
+def _pkce_s256(verifier: str) -> str:
+    return _b64url_encode(hashlib.sha256(verifier.encode("ascii")).digest())
+
+
 def _parse_opt_bool_env(name: str) -> bool | None:
     raw = os.environ.get(name)
     if raw is None or not raw.strip():
@@ -176,11 +224,17 @@ class AuthConfig:
                 f"Invalid GRIDFORGE_AUTH_MODE={raw_mode!r}. Expected 'none' or 'hosted'."
             )
         auth_mode: Literal["none", "hosted"] = "hosted" if raw_mode == "hosted" else "none"
+        _warn_misnamed_env_vars()
 
         raw_secret = os.environ.get("GRIDFORGE_SESSION_SECRET", "").strip()
         ephemeral = False
         if raw_secret:
             secret_bytes = raw_secret.encode("utf-8")
+            if auth_mode == "hosted" and len(secret_bytes) < 32:
+                raise ValueError(
+                    "GRIDFORGE_SESSION_SECRET must be at least 32 bytes in hosted mode "
+                    "(generate with `openssl rand -hex 32`)."
+                )
         else:
             secret_bytes = secrets.token_bytes(32)
             ephemeral = True
@@ -546,7 +600,7 @@ class AuthManager:
 
         assert self.config.turnstile_secret_key is not None
         try:
-            resp = httpx.post(
+            resp = _auth_http_post(
                 "https://challenges.cloudflare.com/turnstile/v0/siteverify",
                 data={
                     "secret": self.config.turnstile_secret_key,
@@ -581,6 +635,22 @@ class AuthManager:
                 detail="Turnstile verification failed; please try again.",
             )
 
+        cf_hostname = str(payload.get("hostname") or "").strip().lower()
+        allowed_hosts_raw = os.environ.get("GRIDFORGE_ALLOWED_HOSTS", "").strip()
+        if cf_hostname and allowed_hosts_raw:
+            allowed_set = {
+                h.strip().lower().split(":", 1)[0]
+                for h in allowed_hosts_raw.split(",")
+                if h.strip()
+            }
+            allowed_set.update({"localhost", "127.0.0.1", "example.com"})
+            if cf_hostname not in allowed_set:
+                logger.warning("Turnstile token hostname mismatch: %s", cf_hostname)
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Turnstile verification failed; please try again.",
+                )
+
     def _resolve_google_redirect_uri(self, request: Request) -> str:
         if self.config.google_redirect_uri:
             return self.config.google_redirect_uri
@@ -606,10 +676,12 @@ class AuthManager:
                 detail="Google sign-in is not configured on this server.",
             )
         state = secrets.token_urlsafe(24)
+        code_verifier = secrets.token_urlsafe(48)
         state_payload = json.dumps(
             {
                 "state": state,
                 "invite_token": (invite_token or "").strip(),
+                "code_verifier": code_verifier,
                 "exp": int(time.time()) + 600,
             },
             separators=(",", ":"),
@@ -623,6 +695,8 @@ class AuthManager:
                 "response_type": "code",
                 "scope": "openid email profile",
                 "state": state,
+                "code_challenge": _pkce_s256(code_verifier),
+                "code_challenge_method": "S256",
                 "prompt": "select_account",
             }
         )
@@ -643,9 +717,10 @@ class AuthManager:
                 detail="Google sign-in is not configured on this server.",
             )
         if error:
+            safe_err = re.sub(r"[^a-zA-Z0-9_-]", "", error)[:40] or "access_denied"
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Google sign-in declined: {error}.",
+                detail=f"Google sign-in declined ({safe_err}).",
             )
         if not code or not state:
             raise HTTPException(
@@ -677,16 +752,20 @@ class AuthManager:
             )
 
         redirect_uri = self._resolve_google_redirect_uri(request)
+        token_data_form: dict[str, Any] = {
+            "code": code,
+            "client_id": self.config.google_client_id,
+            "client_secret": self.config.google_client_secret,
+            "redirect_uri": redirect_uri,
+            "grant_type": "authorization_code",
+        }
+        code_verifier = str(state_obj.get("code_verifier") or "").strip()
+        if code_verifier:
+            token_data_form["code_verifier"] = code_verifier
         try:
-            token_resp = httpx.post(
+            token_resp = _auth_http_post(
                 "https://oauth2.googleapis.com/token",
-                data={
-                    "code": code,
-                    "client_id": self.config.google_client_id,
-                    "client_secret": self.config.google_client_secret,
-                    "redirect_uri": redirect_uri,
-                    "grant_type": "authorization_code",
-                },
+                data=token_data_form,
                 timeout=10.0,
             )
             token_resp.raise_for_status()
@@ -694,7 +773,7 @@ class AuthManager:
             access_token = str(token_data.get("access_token") or "")
             if not access_token:
                 raise ValueError("Missing access_token")
-            info_resp = httpx.get(
+            info_resp = _auth_http_get(
                 "https://openidconnect.googleapis.com/v1/userinfo",
                 headers={"Authorization": f"Bearer {access_token}"},
                 timeout=10.0,

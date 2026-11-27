@@ -163,13 +163,22 @@ def _resolve_preview_elevation_source(
     pack_dir_finder: Any | None = None,
 ) -> Any:
     if pack_id and packs_dir is not None:
-        pack_dir = pack_dir_finder(pack_id) if pack_dir_finder is not None else (packs_dir / pack_id)
-        if pack_dir is not None and Path(pack_dir).is_dir():
-            manifest = load_pack_manifest(Path(pack_dir))
-            if manifest.dem_path:
-                dem_file = (Path(pack_dir) / manifest.dem_path).resolve()
-                if dem_file.is_file():
-                    return LocalDEMSource(dem_file, attribution=manifest.dem_attribution)
+        from gridforge.packs.builder import resolve_pack_asset_path
+
+        resolved_packs_root = Path(packs_dir).resolve()
+        raw_pack_dir = (
+            pack_dir_finder(pack_id)
+            if pack_dir_finder is not None
+            else (resolved_packs_root / pack_id)
+        )
+        if raw_pack_dir is not None:
+            resolved_pack = Path(raw_pack_dir).resolve()
+            if resolved_pack.is_relative_to(resolved_packs_root) and resolved_pack.is_dir():
+                manifest = load_pack_manifest(resolved_pack)
+                if manifest.dem_path:
+                    dem_file = resolve_pack_asset_path(resolved_pack, manifest.dem_path)
+                    if dem_file.is_file():
+                        return LocalDEMSource(dem_file, attribution=manifest.dem_attribution)
 
     if dem_source == DemSourceKind.USGS3DEP:
         return USGS3DEPSource()
@@ -233,7 +242,16 @@ def _warp_dem_fast_utm(
         str(raw_dem_path),
         str(output_tif),
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    from gridforge.subprocess_env import build_safe_subprocess_env
+
+    proc = subprocess.run(
+        cmd,
+        env=build_safe_subprocess_env(allow_network=False),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
     if proc.returncode != 0:
         raise RuntimeError(f"gdalwarp viewshed preview DEM failed: {proc.stderr.strip()}")
     return output_tif

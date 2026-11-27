@@ -222,14 +222,6 @@ def _write_mgrs_gpkg(
         _create_field(lyr_1km, "coord_m", ogr.OFTInteger)
         _create_field(lyr_1km, "is_100km", ogr.OFTInteger)
         defn_1km = lyr_1km.GetLayerDefn()
-        for geom, label, axis, coord_m, is_100km in lines_1km:
-            feat = ogr.Feature(defn_1km)
-            feat.SetGeometry(ogr.CreateGeometryFromWkb(geom.wkb))
-            feat.SetField("label", label)
-            feat.SetField("axis", axis)
-            feat.SetField("coord_m", int(coord_m))
-            feat.SetField("is_100km", int(is_100km))
-            lyr_1km.CreateFeature(feat)
 
         # 2. grid_100km
         lyr_100km = ds.CreateLayer("grid_100km", srs=srs, geom_type=ogr.wkbLineString)
@@ -237,23 +229,11 @@ def _write_mgrs_gpkg(
         _create_field(lyr_100km, "axis", ogr.OFTString, 4)
         _create_field(lyr_100km, "coord_m", ogr.OFTInteger)
         defn_100km = lyr_100km.GetLayerDefn()
-        for geom, label, axis, coord_m in lines_100km:
-            feat = ogr.Feature(defn_100km)
-            feat.SetGeometry(ogr.CreateGeometryFromWkb(geom.wkb))
-            feat.SetField("label", label)
-            feat.SetField("axis", axis)
-            feat.SetField("coord_m", int(coord_m))
-            lyr_100km.CreateFeature(feat)
 
         # 3. zone_boundary
         lyr_zb = ds.CreateLayer("zone_boundary", srs=srs, geom_type=ogr.wkbLineString)
         _create_field(lyr_zb, "label", ogr.OFTString, 64)
         defn_zb = lyr_zb.GetLayerDefn()
-        for geom, label in zone_boundaries:
-            feat = ogr.Feature(defn_zb)
-            feat.SetGeometry(ogr.CreateGeometryFromWkb(geom.wkb))
-            feat.SetField("label", label)
-            lyr_zb.CreateFeature(feat)
 
         # 4. square_labels
         lyr_sq = ds.CreateLayer("square_labels", srs=srs, geom_type=ogr.wkbPoint)
@@ -261,13 +241,44 @@ def _write_mgrs_gpkg(
         _create_field(lyr_sq, "square_id", ogr.OFTString, 8)
         _create_field(lyr_sq, "full_id", ogr.OFTString, 16)
         defn_sq = lyr_sq.GetLayerDefn()
-        for geom, gzd, sq_id, full_id in square_labels:
-            feat = ogr.Feature(defn_sq)
-            feat.SetGeometry(ogr.CreateGeometryFromWkb(geom.wkb))
-            feat.SetField("gzd", gzd)
-            feat.SetField("square_id", sq_id)
-            feat.SetField("full_id", full_id)
-            lyr_sq.CreateFeature(feat)
+
+        ds.StartTransaction()
+        try:
+            for geom, label, axis, coord_m, is_100km in lines_1km:
+                feat = ogr.Feature(defn_1km)
+                feat.SetGeometry(ogr.CreateGeometryFromWkb(geom.wkb))
+                feat.SetField("label", label)
+                feat.SetField("axis", axis)
+                feat.SetField("coord_m", int(coord_m))
+                feat.SetField("is_100km", int(is_100km))
+                lyr_1km.CreateFeature(feat)
+
+            for geom, label, axis, coord_m in lines_100km:
+                feat = ogr.Feature(defn_100km)
+                feat.SetGeometry(ogr.CreateGeometryFromWkb(geom.wkb))
+                feat.SetField("label", label)
+                feat.SetField("axis", axis)
+                feat.SetField("coord_m", int(coord_m))
+                lyr_100km.CreateFeature(feat)
+
+            for geom, label in zone_boundaries:
+                feat = ogr.Feature(defn_zb)
+                feat.SetGeometry(ogr.CreateGeometryFromWkb(geom.wkb))
+                feat.SetField("label", label)
+                lyr_zb.CreateFeature(feat)
+
+            for geom, gzd, sq_id, full_id in square_labels:
+                feat = ogr.Feature(defn_sq)
+                feat.SetGeometry(ogr.CreateGeometryFromWkb(geom.wkb))
+                feat.SetField("gzd", gzd)
+                feat.SetField("square_id", sq_id)
+                feat.SetField("full_id", full_id)
+                lyr_sq.CreateFeature(feat)
+
+            ds.CommitTransaction()
+        except Exception:
+            ds.RollbackTransaction()
+            raise
 
         ds.FlushCache()
     finally:

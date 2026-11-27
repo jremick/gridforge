@@ -20,14 +20,27 @@ from gridforge.config import (
     MBTilesFormat,
 )
 from gridforge.export._atomic import staged_archive
-from gridforge.export.mbtiles import _compute_overview_factors, _paper_bg_rgb, _raster_info_3857
+from gridforge.export.mbtiles import (
+    _compute_overview_factors,
+    _paper_bg_rgb,
+    _raster_info_3857,
+    prepare_warped_3857,
+)
 from gridforge.export.raster import render_collarless_geotiff
+from gridforge.subprocess_env import build_safe_subprocess_env
 
 _VALID_TABLE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 
 
-def _run_cmd(cmd: list[str], *, step: str) -> None:
-    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+def _run_cmd(cmd: list[str], *, step: str, timeout: int = 300) -> None:
+    proc = subprocess.run(
+        cmd,
+        env=build_safe_subprocess_env(allow_network=False),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
     if proc.returncode != 0:
         raise RuntimeError(
             f"{step} failed (exit={proc.returncode}).\n"
@@ -46,6 +59,7 @@ def export_gpkg_tiles(
     dpi: int = 300,
     include_grid: bool = True,
     collarless_tif: Path | None = None,
+    warped_3857_tif: Path | None = None,
     table_name: str = "gridforge_tiles",
 ) -> ExportResult:
     """Export the exact sheet map body to an atomic OGC GeoPackage raster tiles archive."""
@@ -72,66 +86,27 @@ def export_gpkg_tiles(
     ):
         tmp_dir = Path(tmp_dir_str)
 
-        if collarless_tif is not None and Path(collarless_tif).is_file():
-            src_tif = Path(collarless_tif).resolve()
+        if warped_3857_tif is not None and Path(warped_3857_tif).is_file():
+            warped_tif = Path(warped_3857_tif).resolve()
         else:
-            src_tif = render_collarless_geotiff(
-                workspace,
-                tmp_dir / "collarless_utm.tif",
-                dpi=dpi,
-                include_grid=include_grid,
-            ).resolve()
-
-        warped_tif = tmp_dir / "warped_3857.tif"
-        warp_cmd = [
-            "gdalwarp",
-            "-overwrite",
-            "-t_srs",
-            "EPSG:3857",
-            "-r",
-            "lanczos",
-            "-co",
-            "TILED=YES",
-            "-co",
-            "COMPRESS=LZW",
-        ]
-
-        if tile_format == MBTilesFormat.PNG:
-            warp_cmd.append("-dstalpha")
-            warp_input = src_tif
-        else:
-            gdal.UseExceptions()
-            ds_chk = gdal.Open(str(src_tif))
-            band_count = ds_chk.RasterCount if ds_chk is not None else 3
-            ds_chk = None
-
-            if band_count > 3:
-                rgb_only = tmp_dir / "src_rgb.tif"
-                _run_cmd(
-                    [
-                        "gdal_translate",
-                        "-b",
-                        "1",
-                        "-b",
-                        "2",
-                        "-b",
-                        "3",
-                        "-co",
-                        "COMPRESS=LZW",
-                        str(src_tif),
-                        str(rgb_only),
-                    ],
-                    step="gdal_translate RGB strip for JPEG GPKG tiles",
-                )
-                warp_input = rgb_only
+            if collarless_tif is not None and Path(collarless_tif).is_file():
+                src_tif = Path(collarless_tif).resolve()
             else:
-                warp_input = src_tif
+                src_tif = render_collarless_geotiff(
+                    workspace,
+                    tmp_dir / "collarless_utm.tif",
+                    dpi=dpi,
+                    include_grid=include_grid,
+                ).resolve()
 
-            bg_r, bg_g, bg_b = _paper_bg_rgb(spec.color_mode)
-            warp_cmd.extend(["-wo", f"INIT_DEST={bg_r},{bg_g},{bg_b}"])
-
-        warp_cmd.extend([str(warp_input), str(warped_tif)])
-        _run_cmd(warp_cmd, step="gdalwarp EPSG:3857 for GPKG tiles")
+            warped_tif = prepare_warped_3857(
+                src_tif,
+                tmp_dir / "warped_3857.tif",
+                tile_format=tile_format,
+                color_mode=spec.color_mode,
+                tmp_dir=tmp_dir,
+                step_label="gdalwarp EPSG:3857 for GPKG tiles",
+            )
 
         w_3857, h_3857, _ = _raster_info_3857(warped_tif)
 

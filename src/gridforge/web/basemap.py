@@ -6,6 +6,8 @@ import logging
 import os
 import re
 import sqlite3
+import threading
+import time
 from pathlib import Path
 from typing import Literal
 from urllib.parse import quote
@@ -18,6 +20,14 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_CONTAINER_BASEMAP_PATH = Path("/data/basemap.mbtiles")
 _PACK_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+_HTML_TAG_RE = re.compile(r"<[^>]*>")
+_PATH_CACHE_TTL_S: float = 5.0
+
+
+def _strip_html_tags(raw: str | None) -> str:
+    if not raw:
+        return ""
+    return _HTML_TAG_RE.sub("", raw).strip()
 
 _FORMAT_TO_MEDIA_TYPE: dict[str, str] = {
     "png": "image/png",
@@ -107,6 +117,58 @@ class MBTilesBasemapStore:
         self._packs_dir = Path(packs_dir).resolve()
         self._explicit_path = Path(explicit_path).resolve() if explicit_path is not None else None
         self._allow_default_data_path = allow_default_data_path
+        self._cache_lock = threading.Lock()
+        self._path_cache: dict[str | None, tuple[float, tuple[Path, str | None] | None]] = {}
+        self._local = threading.local()
+
+    def invalidate_cache(self) -> None:
+        """Clear cached pack resolutions and close thread-local read-only SQLite handles."""
+        with self._cache_lock:
+            self._path_cache.clear()
+        self._close_thread_conns()
+
+    def _close_thread_conns(self) -> None:
+        conns: dict[str, tuple[tuple[int, int], sqlite3.Connection]] | None = getattr(
+            self._local, "conns", None
+        )
+        if not conns:
+            return
+        for _, conn in conns.values():
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+        conns.clear()
+
+    def _get_cached_connection(self, path: Path) -> sqlite3.Connection:
+        resolved = path.resolve()
+        st = resolved.stat()
+        sig = (st.st_mtime_ns, st.st_ino)
+        key = str(resolved)
+        conns: dict[str, tuple[tuple[int, int], sqlite3.Connection]] = getattr(
+            self._local, "conns", None
+        ) or {}
+        self._local.conns = conns
+        existing = conns.get(key)
+        if existing is not None:
+            cached_sig, conn = existing
+            if cached_sig == sig:
+                return conn
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+            conns.pop(key, None)
+        conn = _open_readonly_sqlite(resolved)
+        if len(conns) >= 8:
+            old_key = next(iter(conns))
+            _, old_conn = conns.pop(old_key)
+            try:
+                old_conn.close()
+            except sqlite3.Error:
+                pass
+        conns[key] = (sig, conn)
+        return conn
 
     def _resolve_pack_basemap(self, pack_id: str) -> Path | None:
         """Resolve ``<pack_dir>/basemap.mbtiles`` (or manifest ``basemap_path``) safely under ``packs_dir``."""
@@ -162,6 +224,22 @@ class MBTilesBasemapStore:
         return resolved[0] if resolved is not None else None
 
     def _resolve_with_source(self, pack_id: str | None = None) -> tuple[Path, str | None] | None:
+        now = time.monotonic()
+        with self._cache_lock:
+            entry = self._path_cache.get(pack_id)
+            if entry is not None:
+                ts, cached = entry
+                if now - ts <= _PATH_CACHE_TTL_S:
+                    if cached is None or cached[0].is_file():
+                        return cached
+                self._path_cache.pop(pack_id, None)
+
+        result = self._resolve_with_source_uncached(pack_id=pack_id)
+        with self._cache_lock:
+            self._path_cache[pack_id] = (now, result)
+        return result
+
+    def _resolve_with_source_uncached(self, pack_id: str | None = None) -> tuple[Path, str | None] | None:
         if pack_id:
             pack_bm = self._resolve_pack_basemap(pack_id)
             if pack_bm is not None:
@@ -235,8 +313,8 @@ class MBTilesBasemapStore:
                     pass
 
             fmt = _normalize_format(meta.get("format"))
-            name = meta.get("name") or path.stem
-            attribution = meta.get("attribution") or "Offline MBTiles Basemap"
+            name = _strip_html_tags(meta.get("name")) or path.stem
+            attribution = _strip_html_tags(meta.get("attribution")) or "Offline MBTiles Basemap"
             bounds = _parse_bounds(meta.get("bounds"))
             qs = f"?pack_id={quote(resolved_pack_id)}" if resolved_pack_id else ""
 
@@ -279,9 +357,8 @@ class MBTilesBasemapStore:
             return None
 
         tms_y = (max_coord - 1) - y
-        conn: sqlite3.Connection | None = None
         try:
-            conn = _open_readonly_sqlite(path)
+            conn = self._get_cached_connection(path)
             row = conn.execute(
                 "SELECT tile_data FROM tiles "
                 "WHERE zoom_level = ? AND tile_column = ? AND tile_row = ? LIMIT 1",
@@ -293,8 +370,6 @@ class MBTilesBasemapStore:
             media_type = _detect_media_type(raw, fallback_ext=requested_ext)
             return (raw, media_type)
         except Exception as exc:
+            self._close_thread_conns()
             logger.debug("MBTiles tile lookup failed at %d/%d/%d (%s)", z, x, y, exc)
             return None
-        finally:
-            if conn is not None:
-                conn.close()

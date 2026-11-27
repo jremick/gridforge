@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 
 from gridforge.config import JobWorkspace, RenderResult
+from gridforge.subprocess_env import build_safe_subprocess_env
 
 logger = logging.getLogger(__name__)
 
@@ -129,14 +130,13 @@ class PyQGISRenderer:
             ]
         )
 
-        env = os.environ.copy()
-        if use_xvfb:
-            env["QT_QPA_PLATFORM"] = "xcb"
-        else:
-            env.setdefault("QT_QPA_PLATFORM", "offscreen")
-
-        runtime_dir = Path(env.setdefault("XDG_RUNTIME_DIR", "/tmp/runtime-root"))
-        runtime_dir.mkdir(parents=True, exist_ok=True)
+        runtime_dir = workspace.job_dir / ".qt_runtime"
+        env = build_safe_subprocess_env(
+            extra={"QT_QPA_PLATFORM": "xcb" if use_xvfb else os.environ.get("QT_QPA_PLATFORM", "offscreen")},
+            include_linz_key=False,
+            allow_network=False,
+            private_runtime_dir=runtime_dir,
+        )
 
         proc = subprocess.run(
             cmd,

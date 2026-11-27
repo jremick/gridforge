@@ -16,6 +16,7 @@ from typing import Final, Sequence
 import httpx
 
 from gridforge.config import BBox, SheetLayout
+from gridforge.subprocess_env import build_safe_subprocess_env
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,7 @@ PRIMARY_OVERPASS_URL: Final[str] = "https://overpass-api.de/api/interpreter"
 FALLBACK_OVERPASS_URL: Final[str] = "https://maps.mail.ru/osm/tools/overpass/api/interpreter"
 TERTIARY_OVERPASS_URL: Final[str] = "https://overpass.private.coffee/api/interpreter"
 USER_AGENT: Final[str] = "gridforge/0.2 (+https://github.com/gridforge/gridforge)"
+MAX_OVERPASS_RESPONSE_BYTES: Final[int] = 128 * 1024 * 1024  # 128 MiB hard disk-stream cap
 
 _REMARK_RE = re.compile(rb"<remark\b[^>]*>(.*?)</remark>", flags=re.IGNORECASE | re.DOTALL)
 
@@ -134,6 +136,36 @@ def validate_osm_xml_payload(xml_bytes: bytes) -> None:
         raise RuntimeError("Overpass response is truncated or not valid OSM XML")
 
 
+def validate_osm_xml_file(path: Path) -> None:
+    """Validate an on-disk Overpass OSM XML file without buffering the whole file in RAM."""
+    size = path.stat().st_size
+    if size <= 0:
+        raise RuntimeError("Overpass response is empty")
+    with path.open("rb") as fh:
+        head = fh.read(4096)
+        if b"<osm" not in head:
+            raise RuntimeError("Overpass response is truncated or not valid OSM XML")
+        if size > 4096:
+            fh.seek(max(0, size - 4096))
+            tail = fh.read(4096)
+        else:
+            tail = head
+        if b"</osm>" not in tail:
+            raise RuntimeError("Overpass response is truncated or not valid OSM XML")
+
+        fh.seek(0)
+        overlap = b""
+        while True:
+            chunk = fh.read(262_144)
+            if not chunk:
+                break
+            window = overlap + chunk
+            remark = extract_overpass_remark(window)
+            if remark is not None:
+                raise RuntimeError(f"Overpass runtime error remark: {remark}")
+            overlap = window[-256:]
+
+
 def sort_osm_xml(input_path: Path, output_path: Path) -> Path:
     """Run ``osmium sort`` when available to guarantee strict nodes -> ways -> relations ID order."""
     osmium_bin = shutil.which("osmium")
@@ -146,7 +178,14 @@ def sort_osm_xml(input_path: Path, output_path: Path) -> Path:
     same_file = input_path.resolve() == output_path.resolve()
     target = output_path.with_suffix(".sorted.osm") if same_file else output_path
     cmd = [osmium_bin, "sort", str(input_path), "-o", str(target), "--overwrite"]
-    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    proc = subprocess.run(
+        cmd,
+        env=build_safe_subprocess_env(allow_network=False),
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
     if proc.returncode != 0:
         raise RuntimeError(
             f"osmium sort failed (exit {proc.returncode}): {proc.stderr.strip()}"
@@ -192,7 +231,13 @@ class OverpassOSMSource:
     def _cache_path(self, bbox: BBox) -> Path:
         return self.cache_dir / f"overpass_{bbox_cache_key(bbox)[:24]}.osm"
 
-    def _download_with_failover(self, query: str) -> bytes:
+    def _download_with_failover_to_file(
+        self,
+        query: str,
+        dest_path: Path,
+        *,
+        max_bytes: int = MAX_OVERPASS_RESPONSE_BYTES,
+    ) -> Path:
         errors: list[str] = []
         rate_limited_urls: set[str] = set()
 
@@ -224,13 +269,69 @@ class OverpassOSMSource:
                         round_idx + 1,
                         self.max_rounds,
                     )
+                    dest_path.unlink(missing_ok=True)
                     try:
-                        resp = client.post(
+                        with client.stream(
+                            "POST",
                             url,
                             data={"data": query},
                             headers={"User-Agent": USER_AGENT},
-                        )
+                        ) as resp:
+                            if resp.status_code == 429:
+                                rate_limited_urls.add(url)
+                                retry_after = resp.headers.get("Retry-After", "")
+                                msg = f"{url}: HTTP 429 Too Many Requests (Retry-After={retry_after!r})"
+                                logger.warning("Overpass rate-limited; switching mirror: %s", msg)
+                                errors.append(msg)
+                                if len(self.endpoints) == 1 and self.rate_limit_backoff_s > 0:
+                                    delay = self.rate_limit_backoff_s
+                                    if retry_after.isdigit():
+                                        delay = max(delay, float(retry_after))
+                                    time.sleep(delay)
+                                continue
+
+                            if resp.status_code in (502, 503, 504):
+                                msg = f"{url}: HTTP {resp.status_code} transient server error"
+                                logger.warning("Overpass transient error; switching mirror: %s", msg)
+                                errors.append(msg)
+                                if self.transient_backoff_s > 0:
+                                    time.sleep(self.transient_backoff_s)
+                                continue
+
+                            if resp.status_code != 200:
+                                snippet_chunks: list[bytes] = []
+                                snippet_len = 0
+                                for chunk in resp.iter_bytes(chunk_size=1024):
+                                    if chunk:
+                                        snippet_chunks.append(chunk[: max(0, 200 - snippet_len)])
+                                        snippet_len += len(chunk)
+                                        if snippet_len >= 200:
+                                            break
+                                snippet = b"".join(snippet_chunks).decode("utf-8", errors="replace").strip()
+                                msg = f"{url}: HTTP {resp.status_code} ({snippet})"
+                                logger.warning("Overpass unexpected status: %s", msg)
+                                errors.append(msg)
+                                continue
+
+                            written = 0
+                            oversize = False
+                            with dest_path.open("wb") as fh:
+                                for chunk in resp.iter_bytes(chunk_size=65_536):
+                                    if not chunk:
+                                        continue
+                                    written += len(chunk)
+                                    if written > max_bytes:
+                                        oversize = True
+                                        break
+                                    fh.write(chunk)
+                            if oversize:
+                                dest_path.unlink(missing_ok=True)
+                                msg = f"{url}: Overpass response exceeded {max_bytes // (1024 * 1024)} MiB cap"
+                                logger.warning("Overpass payload rejected: %s", msg)
+                                errors.append(msg)
+                                continue
                     except httpx.HTTPError as exc:
+                        dest_path.unlink(missing_ok=True)
                         msg = f"{url}: network error ({exc})"
                         logger.warning("Overpass request error: %s", msg)
                         errors.append(msg)
@@ -238,38 +339,10 @@ class OverpassOSMSource:
                             time.sleep(self.transient_backoff_s)
                         continue
 
-                    if resp.status_code == 429:
-                        rate_limited_urls.add(url)
-                        retry_after = resp.headers.get("Retry-After", "")
-                        msg = f"{url}: HTTP 429 Too Many Requests (Retry-After={retry_after!r})"
-                        logger.warning("Overpass rate-limited; switching mirror: %s", msg)
-                        errors.append(msg)
-                        # If there is only a single endpoint, back off immediately before retrying it
-                        if len(self.endpoints) == 1 and self.rate_limit_backoff_s > 0:
-                            delay = self.rate_limit_backoff_s
-                            if retry_after.isdigit():
-                                delay = max(delay, float(retry_after))
-                            time.sleep(delay)
-                        continue
-
-                    if resp.status_code in (502, 503, 504):
-                        msg = f"{url}: HTTP {resp.status_code} transient server error"
-                        logger.warning("Overpass transient error; switching mirror: %s", msg)
-                        errors.append(msg)
-                        if self.transient_backoff_s > 0:
-                            time.sleep(self.transient_backoff_s)
-                        continue
-
-                    if resp.status_code != 200:
-                        msg = f"{url}: HTTP {resp.status_code} ({resp.text[:200].strip()})"
-                        logger.warning("Overpass unexpected status: %s", msg)
-                        errors.append(msg)
-                        continue
-
-                    payload = resp.content
                     try:
-                        validate_osm_xml_payload(payload)
+                        validate_osm_xml_file(dest_path)
                     except RuntimeError as exc:
+                        dest_path.unlink(missing_ok=True)
                         msg = f"{url}: {exc}"
                         logger.warning("Overpass payload validation failed: %s", msg)
                         errors.append(msg)
@@ -277,7 +350,7 @@ class OverpassOSMSource:
                             time.sleep(self.transient_backoff_s)
                         continue
 
-                    return payload
+                    return dest_path
         finally:
             if owns_client:
                 client.close()
@@ -293,9 +366,8 @@ class OverpassOSMSource:
         cache_path = self._cache_path(query_bbox)
 
         if cache_path.is_file() and cache_path.stat().st_size > 0:
-            cached_bytes = cache_path.read_bytes()
             try:
-                validate_osm_xml_payload(cached_bytes)
+                validate_osm_xml_file(cache_path)
             except RuntimeError:
                 logger.warning("Ignoring corrupt cached Overpass file: %s", cache_path)
             else:
@@ -304,10 +376,8 @@ class OverpassOSMSource:
                 return out_osm
 
         query = build_overpass_query(query_bbox, timeout_s=self.query_timeout_s)
-        payload = self._download_with_failover(query)
-
         raw_tmp = work_dir / "osm_overpass_unsorted.osm"
-        raw_tmp.write_bytes(payload)
+        self._download_with_failover_to_file(query, raw_tmp)
         sort_osm_xml(raw_tmp, out_osm)
         if raw_tmp.exists():
             raw_tmp.unlink()

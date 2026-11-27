@@ -127,6 +127,97 @@ def _qimage_to_rgb_bytes(qimg: Any) -> bytes:
     return b"".join(chunks)
 
 
+def _write_qimage_geotiff(
+    output_tif: Path,
+    qimg: Any,
+    *,
+    min_x: float,
+    min_y: float,
+    max_x: float,
+    max_y: float,
+    utm_epsg: int,
+    strip_rows: int = 512,
+) -> Path:
+    """Stream RGB888 scanlines from a Qt QImage directly into a UTM GeoTIFF in bounded strips."""
+    from osgeo import gdal, osr
+    from qgis.PyQt.QtGui import QImage
+
+    gdal.UseExceptions()
+    osr.UseExceptions()
+
+    rgb_img = qimg.convertToFormat(QImage.Format_RGB888)
+    width_px = rgb_img.width()
+    height_px = rgb_img.height()
+    stride = rgb_img.bytesPerLine()
+
+    output_tif.parent.mkdir(parents=True, exist_ok=True)
+    if output_tif.exists():
+        output_tif.unlink()
+
+    driver = gdal.GetDriverByName("GTiff")
+    if driver is None:
+        raise RuntimeError("GDAL GTiff driver is unavailable.")
+
+    ds = driver.Create(
+        str(output_tif),
+        width_px,
+        height_px,
+        3,
+        gdal.GDT_Byte,
+        options=[
+            "COMPRESS=NONE",
+            "TILED=YES",
+            "PHOTOMETRIC=RGB",
+            "INTERLEAVE=PIXEL",
+        ],
+    )
+    if ds is None:
+        raise RuntimeError(f"Failed to create GeoTIFF at '{output_tif}'.")
+
+    try:
+        pixel_w = (max_x - min_x) / width_px
+        pixel_h = (max_y - min_y) / height_px
+        ds.SetGeoTransform((min_x, pixel_w, 0.0, max_y, 0.0, -pixel_h))
+
+        srs = osr.SpatialReference()
+        srs.ImportFromEPSG(utm_epsg)
+        srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        ds.SetProjection(srs.ExportToWkt())
+
+        for band_idx, interp in (
+            (1, gdal.GCI_RedBand),
+            (2, gdal.GCI_GreenBand),
+            (3, gdal.GCI_BlueBand),
+        ):
+            ds.GetRasterBand(band_idx).SetColorInterpretation(interp)
+
+        ptr = rgb_img.constBits()
+        ptr.setsize(stride * height_px)
+        buf_view = memoryview(ptr)
+        for y0 in range(0, height_px, strip_rows):
+            rows = min(strip_rows, height_px - y0)
+            strip_mv = buf_view[y0 * stride : (y0 + rows) * stride]
+            ds.WriteRaster(
+                0,
+                y0,
+                width_px,
+                rows,
+                strip_mv.tobytes(),
+                buf_xsize=width_px,
+                buf_ysize=rows,
+                buf_type=gdal.GDT_Byte,
+                band_list=[1, 2, 3],
+                buf_pixel_space=3,
+                buf_line_space=stride,
+                buf_band_space=1,
+            )
+        ds.FlushCache()
+    finally:
+        ds = None
+
+    return output_tif
+
+
 def _write_rgb_geotiff(
     output_tif: Path,
     rgb_bytes: bytes,
@@ -287,7 +378,15 @@ def render_collarless_geotiff_in_process(
         if rendered_qimg.isNull():
             raise RuntimeError("PyQGIS collarless render produced a null QImage.")
 
-        rgb_bytes = _qimage_to_rgb_bytes(rendered_qimg)
+        out_path = _write_qimage_geotiff(
+            output_tif,
+            rendered_qimg,
+            min_x=float(actual_ext.xMinimum()),
+            min_y=float(actual_ext.yMinimum()),
+            max_x=float(actual_ext.xMaximum()),
+            max_y=float(actual_ext.yMaximum()),
+            utm_epsg=layout.utm_epsg,
+        )
 
         del rendered_qimg
         del job
@@ -296,17 +395,7 @@ def render_collarless_geotiff_in_process(
         del ordered_layers
         project.clear()
 
-        return _write_rgb_geotiff(
-            output_tif,
-            rgb_bytes,
-            width_px,
-            height_px,
-            min_x=float(actual_ext.xMinimum()),
-            min_y=float(actual_ext.yMinimum()),
-            max_x=float(actual_ext.xMaximum()),
-            max_y=float(actual_ext.yMaximum()),
-            utm_epsg=layout.utm_epsg,
-        )
+        return out_path
 
     try:
         return _execute()
@@ -357,14 +446,14 @@ def render_collarless_geotiff(
     if not include_grid:
         cmd.append("--no-grid")
 
-    env = os.environ.copy()
-    if resolved_xvfb:
-        env["QT_QPA_PLATFORM"] = "xcb"
-    else:
-        env.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from gridforge.subprocess_env import build_safe_subprocess_env
 
-    runtime_dir = Path(env.setdefault("XDG_RUNTIME_DIR", "/tmp/runtime-root"))
-    runtime_dir.mkdir(parents=True, exist_ok=True)
+    env = build_safe_subprocess_env(
+        extra={"QT_QPA_PLATFORM": "xcb" if resolved_xvfb else os.environ.get("QT_QPA_PLATFORM", "offscreen")},
+        include_linz_key=False,
+        allow_network=False,
+        private_runtime_dir=workspace.job_dir / ".qt_runtime",
+    )
 
     proc = subprocess.run(
         cmd,

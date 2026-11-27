@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 
 from gridforge.config import SheetLayout
+from gridforge.subprocess_env import build_safe_subprocess_env
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +62,14 @@ class LocalDEMSource:
                 vrt_path.unlink()
             cmd = ["gdalbuildvrt", str(vrt_path), *(str(r) for r in rasters)]
             logger.info("Building local DEM VRT from %d raster(s) in %s", len(rasters), source_path)
-            proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            proc = subprocess.run(
+                cmd,
+                env=build_safe_subprocess_env(allow_network=False),
+                capture_output=True,
+                text=True,
+                timeout=300,
+                check=False,
+            )
             if proc.returncode != 0:
                 raise RuntimeError(
                     f"gdalbuildvrt failed for local DEM directory {source_path} "

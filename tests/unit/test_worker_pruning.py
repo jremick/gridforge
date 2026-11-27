@@ -76,6 +76,7 @@ def _seed_project(
         ProjectCreateRequest(name=name, state={"scale": 25000}),
         owner_id=owner_id,
         owner_role=owner_role,
+        guest_ttl_hours=0.0,
     )
     ts = _iso(datetime.now(timezone.utc) - timedelta(hours=age_hours))
     conn = db._connect(db_path)
@@ -297,6 +298,7 @@ class TestWorkerPruning:
         _seed_job(db_path, job_id="friend_old", owner_id="usr_f1", owner_role="friend", status="failed", age_hours=350.0, data_dir=data_dir)
         _seed_job(db_path, job_id="friend_fresh", owner_id="usr_f2", owner_role="friend", status="succeeded", age_hours=48.0, data_dir=data_dir)
         _seed_job(db_path, job_id="admin_old", owner_id="usr_admin", owner_role="admin", status="succeeded", age_hours=2000.0, data_dir=data_dir)
+        _seed_job(db_path, job_id="admin_fresh", owner_id="usr_admin", owner_role="admin", status="succeeded", age_hours=200.0, data_dir=data_dir)
         _seed_job(db_path, job_id="none_old", owner_id="local", owner_role="none", status="succeeded", age_hours=2000.0, data_dir=data_dir)
 
         # Projects
@@ -348,10 +350,11 @@ class TestWorkerPruning:
             cache_dir=cache_dir,
             guest_ttl_hours=24.0,
             friend_ttl_hours=336.0,
+            admin_ttl_hours=720.0,
             cache_max_bytes=100,
             auth_mode="hosted",
         )
-        assert summary["jobs"] == 2
+        assert summary["jobs"] == 3
         assert summary["projects"] == 2
         assert summary["sessions"] == 1
         assert summary["invites"] == 1
@@ -362,8 +365,24 @@ class TestWorkerPruning:
         assert not (data_dir / "guest_old").exists()
         assert db.get_job(db_path, "friend_old") is None
         assert not (data_dir / "friend_old").exists()
-        for kept in ("guest_fresh", "guest_running", "friend_fresh", "admin_old", "none_old"):
+        assert db.get_job(db_path, "admin_old") is None
+        assert not (data_dir / "admin_old").exists()
+        for kept in ("guest_fresh", "guest_running", "friend_fresh", "admin_fresh", "none_old"):
             assert db.get_job(db_path, kept) is not None
+
+        # Setting admin_ttl_hours=0 preserves even ancient admin jobs
+        _seed_job(db_path, job_id="admin_keep", owner_id="usr_admin", owner_role="admin", status="succeeded", age_hours=5000.0, data_dir=data_dir)
+        summary_keep = worker.run_pruning_pass(
+            db_path,
+            data_dir=data_dir,
+            cache_dir=cache_dir,
+            guest_ttl_hours=24.0,
+            friend_ttl_hours=336.0,
+            admin_ttl_hours=0.0,
+            auth_mode="hosted",
+        )
+        assert summary_keep["jobs"] == 0
+        assert db.get_job(db_path, "admin_keep") is not None
 
         remaining_projects = {p.project_id for p in projects_store.list_projects(db_path)}
         assert remaining_projects == {p_guest_fresh, p_friend_fresh, p_admin_old}

@@ -11,10 +11,10 @@ from pydantic import BaseModel, Field
 from pyproj import Geod, Transformer
 from shapely.geometry import LineString, Polygon
 
-from gridforge.config import RFLinkSpec, SheetSpec, TacticalGraphic
-from gridforge.geo.crs import compute_sheet_layout
-from gridforge.geo.declination import DEG_TO_NATO_MILS, compute_declination
-from gridforge.geo.waypoints import _sample_point_elev_m
+from gridforge.config import RFLinkSpec, TacticalGraphic
+from gridforge.geo.crs import resolve_utm_zone
+from gridforge.geo.declination import DEG_TO_NATO_MILS, compute_point_declination
+from gridforge.geo.waypoints import _sample_points_elev_m
 
 _WGS84_GEOD = Geod(ellps="WGS84")
 
@@ -57,10 +57,14 @@ def _compute_leg_bearings(
 
     mid_lat = 0.5 * (lat1 + lat2)
     mid_lon = 0.5 * (lon1 + lon2)
-    mid_layout = compute_sheet_layout(
-        SheetSpec(center_lat=mid_lat, center_lon=mid_lon, date_iso=date_iso)
+    _, _, mid_epsg, _ = resolve_utm_zone(mid_lat, mid_lon)
+    decl = compute_point_declination(
+        mid_lat,
+        mid_lon,
+        utm_epsg=mid_epsg,
+        date_iso=date_iso,
+        elevation_m=elev_m,
     )
-    decl = compute_declination(mid_layout, elevation_m=elev_m)
     grid_az = (true_az - decl.grid_convergence_deg) % 360.0
     mag_az = (true_az - decl.magnetic_declination_deg) % 360.0
     mag_mils = (mag_az * DEG_TO_NATO_MILS) % 6400.0
@@ -83,10 +87,11 @@ def compute_ruler_metrics(
         if not -180.0 <= float(lon) <= 180.0:
             raise ValueError(f"Longitude {lon} must be within [-180.0, 180.0].")
 
-    elevs: list[float | None] = [
-        _sample_point_elev_m(dem_path, float(lat), float(lon)) if dem_path is not None else None
-        for lat, lon in points
-    ]
+    elevs: list[float | None] = (
+        _sample_points_elev_m(dem_path, [(float(lat), float(lon)) for lat, lon in points])
+        if dem_path is not None
+        else [None] * len(points)
+    )
 
     segments: list[RulerSegment] = []
     total_m = 0.0
@@ -216,154 +221,160 @@ def write_tactical_graphics_gpkg(
         ring_defn = lyr_rings.GetLayerDefn()
         line_defn = lyr_lines.GetLayerDefn()
 
-        def _add_sector(poly: Polygon, label: str, kind: str, color: str, notes: str) -> None:
-            nonlocal total_written
-            if poly.is_empty or not poly.is_valid:
-                poly = poly.buffer(0)
-            if poly.is_empty:
-                return
-            geom = ogr.CreateGeometryFromWkb(poly.wkb)
-            if geom is None:
-                return
-            feat = ogr.Feature(sec_defn)
-            feat.SetGeometry(geom)
-            feat.SetField("label", label)
-            feat.SetField("kind", kind)
-            feat.SetField("area_km2", round(float(poly.area) / 1_000_000.0, 4))
-            feat.SetField("color", color)
-            feat.SetField("notes", notes)
-            lyr_sectors.CreateFeature(feat)
-            total_written += 1
+        ds.StartTransaction()
+        try:
+            def _add_sector(poly: Polygon, label: str, kind: str, color: str, notes: str) -> None:
+                nonlocal total_written
+                if poly.is_empty or not poly.is_valid:
+                    poly = poly.buffer(0)
+                if poly.is_empty:
+                    return
+                geom = ogr.CreateGeometryFromWkb(poly.wkb)
+                if geom is None:
+                    return
+                feat = ogr.Feature(sec_defn)
+                feat.SetGeometry(geom)
+                feat.SetField("label", label)
+                feat.SetField("kind", kind)
+                feat.SetField("area_km2", round(float(poly.area) / 1_000_000.0, 4))
+                feat.SetField("color", color)
+                feat.SetField("notes", notes)
+                lyr_sectors.CreateFeature(feat)
+                total_written += 1
 
-        def _add_line(
-            utm_pts: list[tuple[float, float]],
-            *,
-            label: str,
-            kind: str,
-            distance_km: float,
-            bearing_true: float,
-            bearing_grid: float,
-            bearing_mag: float,
-            bearing_mils: float,
-            color: str,
-            notes: str,
-        ) -> None:
-            nonlocal total_written
-            if len(utm_pts) < 2:
-                return
-            geom = ogr.Geometry(ogr.wkbLineString)
-            for ux, uy in utm_pts:
-                geom.AddPoint_2D(float(ux), float(uy))
-            feat = ogr.Feature(line_defn)
-            feat.SetGeometry(geom)
-            feat.SetField("label", label)
-            feat.SetField("kind", kind)
-            feat.SetField("distance_km", round(distance_km, 3))
-            feat.SetField("bearing_true_deg", round(bearing_true, 1))
-            feat.SetField("bearing_grid_deg", round(bearing_grid, 1))
-            feat.SetField("bearing_mag_deg", round(bearing_mag, 1))
-            feat.SetField("bearing_mils", round(bearing_mils, 0))
-            feat.SetField("color", color)
-            feat.SetField("notes", notes)
-            lyr_lines.CreateFeature(feat)
-            total_written += 1
+            def _add_line(
+                utm_pts: list[tuple[float, float]],
+                *,
+                label: str,
+                kind: str,
+                distance_km: float,
+                bearing_true: float,
+                bearing_grid: float,
+                bearing_mag: float,
+                bearing_mils: float,
+                color: str,
+                notes: str,
+            ) -> None:
+                nonlocal total_written
+                if len(utm_pts) < 2:
+                    return
+                geom = ogr.Geometry(ogr.wkbLineString)
+                for ux, uy in utm_pts:
+                    geom.AddPoint_2D(float(ux), float(uy))
+                feat = ogr.Feature(line_defn)
+                feat.SetGeometry(geom)
+                feat.SetField("label", label)
+                feat.SetField("kind", kind)
+                feat.SetField("distance_km", round(distance_km, 3))
+                feat.SetField("bearing_true_deg", round(bearing_true, 1))
+                feat.SetField("bearing_grid_deg", round(bearing_grid, 1))
+                feat.SetField("bearing_mag_deg", round(bearing_mag, 1))
+                feat.SetField("bearing_mils", round(bearing_mils, 0))
+                feat.SetField("color", color)
+                feat.SetField("notes", notes)
+                lyr_lines.CreateFeature(feat)
+                total_written += 1
 
-        for g in graphics:
-            base_label = (g.label or "").strip()
-            color = (g.color or "").strip()
-            notes = (g.notes or "").strip()
+            for g in graphics:
+                base_label = (g.label or "").strip()
+                color = (g.color or "").strip()
+                notes = (g.notes or "").strip()
 
-            if g.kind == "range_ring":
-                if not g.points:
-                    continue
-                for lat, lon in g.points:
-                    cx, cy = to_utm.transform(float(lon), float(lat))
-                    cx_f, cy_f = float(cx), float(cy)
-                    for r_km in g.radii_km:
-                        r_m = float(r_km) * 1000.0
-                        ring_geom = ogr.Geometry(ogr.wkbLineString)
-                        n_verts = 96
-                        for k in range(n_verts + 1):
-                            ang = 2.0 * math.pi * (k % n_verts) / n_verts
-                            ring_geom.AddPoint_2D(cx_f + r_m * math.cos(ang), cy_f + r_m * math.sin(ang))
-                        ring_lbl = f"{base_label} {r_km:g} km" if base_label else f"{r_km:g} km"
-                        feat = ogr.Feature(ring_defn)
-                        feat.SetGeometry(ring_geom)
-                        feat.SetField("label", ring_lbl)
-                        feat.SetField("base_label", base_label)
-                        feat.SetField("radius_km", float(r_km))
-                        feat.SetField("radius_m", round(r_m, 1))
-                        feat.SetField("color", color)
-                        feat.SetField("notes", notes)
-                        lyr_rings.CreateFeature(feat)
-                        total_written += 1
+                if g.kind == "range_ring":
+                    if not g.points:
+                        continue
+                    for lat, lon in g.points:
+                        cx, cy = to_utm.transform(float(lon), float(lat))
+                        cx_f, cy_f = float(cx), float(cy)
+                        for r_km in g.radii_km:
+                            r_m = float(r_km) * 1000.0
+                            ring_geom = ogr.Geometry(ogr.wkbLineString)
+                            n_verts = 96
+                            for k in range(n_verts + 1):
+                                ang = 2.0 * math.pi * (k % n_verts) / n_verts
+                                ring_geom.AddPoint_2D(cx_f + r_m * math.cos(ang), cy_f + r_m * math.sin(ang))
+                            ring_lbl = f"{base_label} {r_km:g} km" if base_label else f"{r_km:g} km"
+                            feat = ogr.Feature(ring_defn)
+                            feat.SetGeometry(ring_geom)
+                            feat.SetField("label", ring_lbl)
+                            feat.SetField("base_label", base_label)
+                            feat.SetField("radius_km", float(r_km))
+                            feat.SetField("radius_m", round(r_m, 1))
+                            feat.SetField("color", color)
+                            feat.SetField("notes", notes)
+                            lyr_rings.CreateFeature(feat)
+                            total_written += 1
 
-            elif g.kind == "sector":
-                if len(g.points) < 3:
-                    continue
-                utm_pts = [
-                    (float(x), float(y))
-                    for x, y in (to_utm.transform(float(lon), float(lat)) for lat, lon in g.points)
-                ]
-                if utm_pts[0] != utm_pts[-1]:
-                    utm_pts.append(utm_pts[0])
-                poly = Polygon(utm_pts)
-                _add_sector(poly, base_label or "AOI", "sector", color, notes)
+                elif g.kind == "sector":
+                    if len(g.points) < 3:
+                        continue
+                    utm_pts = [
+                        (float(x), float(y))
+                        for x, y in (to_utm.transform(float(lon), float(lat)) for lat, lon in g.points)
+                    ]
+                    if utm_pts[0] != utm_pts[-1]:
+                        utm_pts.append(utm_pts[0])
+                    poly = Polygon(utm_pts)
+                    _add_sector(poly, base_label or "AOI", "sector", color, notes)
 
-            elif g.kind in ("bearing_line", "corridor"):
-                if len(g.points) < 2:
-                    continue
-                utm_pts = [
-                    (float(x), float(y))
-                    for x, y in (to_utm.transform(float(lon), float(lat)) for lat, lon in g.points)
-                ]
-                metrics = compute_ruler_metrics(g.points, date_iso=date_iso)
-                first_seg = metrics.segments[0]
-                dist_km = metrics.total_distance_m / 1000.0
-                if g.kind == "bearing_line":
-                    bearing_summary = f"{dist_km:.2f} km · {first_seg.bearing_mag_deg:05.1f}°M"
-                    line_lbl = f"{base_label} ({bearing_summary})" if base_label else bearing_summary
-                else:
-                    line_lbl = base_label or f"Corridor ({dist_km:.2f} km)"
-                    half_w_m = max(25.0, (g.radii_km[0] if g.radii_km else 0.25) * 1000.0)
-                    buf_geom = LineString(utm_pts).buffer(half_w_m, cap_style=2, join_style=2)
-                    if isinstance(buf_geom, Polygon):
-                        _add_sector(buf_geom, line_lbl, "corridor", color, notes)
+                elif g.kind in ("bearing_line", "corridor"):
+                    if len(g.points) < 2:
+                        continue
+                    utm_pts = [
+                        (float(x), float(y))
+                        for x, y in (to_utm.transform(float(lon), float(lat)) for lat, lon in g.points)
+                    ]
+                    metrics = compute_ruler_metrics(g.points, date_iso=date_iso)
+                    first_seg = metrics.segments[0]
+                    dist_km = metrics.total_distance_m / 1000.0
+                    if g.kind == "bearing_line":
+                        bearing_summary = f"{dist_km:.2f} km · {first_seg.bearing_mag_deg:05.1f}°M"
+                        line_lbl = f"{base_label} ({bearing_summary})" if base_label else bearing_summary
+                    else:
+                        line_lbl = base_label or f"Corridor ({dist_km:.2f} km)"
+                        half_w_m = max(25.0, (g.radii_km[0] if g.radii_km else 0.25) * 1000.0)
+                        buf_geom = LineString(utm_pts).buffer(half_w_m, cap_style=2, join_style=2)
+                        if isinstance(buf_geom, Polygon):
+                            _add_sector(buf_geom, line_lbl, "corridor", color, notes)
 
-                _add_line(
-                    utm_pts,
-                    label=line_lbl,
-                    kind=g.kind,
-                    distance_km=dist_km,
-                    bearing_true=first_seg.bearing_true_deg,
-                    bearing_grid=first_seg.bearing_grid_deg,
-                    bearing_mag=first_seg.bearing_mag_deg,
-                    bearing_mils=first_seg.bearing_mils,
-                    color=color,
-                    notes=notes,
+                    _add_line(
+                        utm_pts,
+                        label=line_lbl,
+                        kind=g.kind,
+                        distance_km=dist_km,
+                        bearing_true=first_seg.bearing_true_deg,
+                        bearing_grid=first_seg.bearing_grid_deg,
+                        bearing_mag=first_seg.bearing_mag_deg,
+                        bearing_mils=first_seg.bearing_mils,
+                        color=color,
+                        notes=notes,
+                    )
+
+            # Optional pinned RF link lines rendered directly onto tactical_lines
+            for link in links:
+                x1, y1 = to_utm.transform(float(link.from_lon), float(link.from_lat))
+                x2, y2 = to_utm.transform(float(link.to_lon), float(link.to_lat))
+                dist_m, true_az, grid_az, mag_az, mag_mils = _compute_leg_bearings(
+                    link.from_lat, link.from_lon, link.to_lat, link.to_lon, date_iso=date_iso
                 )
-
-        # Optional pinned RF link lines rendered directly onto tactical_lines
-        for link in links:
-            x1, y1 = to_utm.transform(float(link.from_lon), float(link.from_lat))
-            x2, y2 = to_utm.transform(float(link.to_lon), float(link.to_lat))
-            dist_m, true_az, grid_az, mag_az, mag_mils = _compute_leg_bearings(
-                link.from_lat, link.from_lon, link.to_lat, link.to_lon, date_iso=date_iso
-            )
-            dist_km = dist_m / 1000.0
-            link_lbl = f"{link.from_label} <-> {link.to_label} ({dist_km:.2f} km · {link.freq_mhz:g} MHz)"
-            _add_line(
-                [(float(x1), float(y1)), (float(x2), float(y2))],
-                label=link_lbl,
-                kind="rf_link",
-                distance_km=dist_km,
-                bearing_true=true_az,
-                bearing_grid=grid_az,
-                bearing_mag=mag_az,
-                bearing_mils=mag_mils,
-                color="",
-                notes=f"{link.from_height_m:g}m/{link.to_height_m:g}m AGL",
-            )
+                dist_km = dist_m / 1000.0
+                link_lbl = f"{link.from_label} <-> {link.to_label} ({dist_km:.2f} km · {link.freq_mhz:g} MHz)"
+                _add_line(
+                    [(float(x1), float(y1)), (float(x2), float(y2))],
+                    label=link_lbl,
+                    kind="rf_link",
+                    distance_km=dist_km,
+                    bearing_true=true_az,
+                    bearing_grid=grid_az,
+                    bearing_mag=mag_az,
+                    bearing_mils=mag_mils,
+                    color="",
+                    notes=f"{link.from_height_m:g}m/{link.to_height_m:g}m AGL",
+                )
+            ds.CommitTransaction()
+        except Exception:
+            ds.RollbackTransaction()
+            raise
 
         ds.FlushCache()
     finally:

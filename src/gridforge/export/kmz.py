@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import io
 import math
+import os
 import subprocess
 import tempfile
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from xml.sax.saxutils import escape
 
@@ -24,10 +26,18 @@ from gridforge.config import (
 )
 from gridforge.export._atomic import staged_archive
 from gridforge.export.raster import render_collarless_geotiff
+from gridforge.subprocess_env import build_safe_subprocess_env
 
 
-def _run_cmd(cmd: list[str], *, step: str) -> None:
-    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+def _run_cmd(cmd: list[str], *, step: str, timeout: int = 300) -> None:
+    proc = subprocess.run(
+        cmd,
+        env=build_safe_subprocess_env(allow_network=False),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
     if proc.returncode != 0:
         raise RuntimeError(
             f"{step} failed (exit={proc.returncode}).\n"
@@ -342,6 +352,9 @@ def export_garmin_kmz(
             [
                 "gdalwarp",
                 "-overwrite",
+                "-multi",
+                "-wo",
+                "NUM_THREADS=2",
                 "-t_srs",
                 "EPSG:4326",
                 "-r",
@@ -349,7 +362,7 @@ def export_garmin_kmz(
                 "-wo",
                 f"INIT_DEST={init_dest}",
                 "-co",
-                "COMPRESS=LZW",
+                "COMPRESS=NONE",
                 str(src_tif),
                 str(warped_4326),
             ],
@@ -395,7 +408,7 @@ def export_garmin_kmz(
                     "-r",
                     "lanczos",
                     "-co",
-                    "COMPRESS=LZW",
+                    "COMPRESS=NONE",
                     str(warped_4326),
                     str(resized_tif),
                 ],
@@ -428,7 +441,9 @@ def export_garmin_kmz(
             raise RuntimeError(f"Failed to open KMZ tile source '{tile_source_tif}'.")
 
         try:
-            with zipfile.ZipFile(staged, mode="w") as zf:
+            tile_jobs: list[tuple[str, str, float, float, float, float, int, int, Any]] = []
+            max_workers = min(4, max(1, os.cpu_count() or 2))
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
                 for r in range(rows):
                     y0, y1 = y_bounds[r], y_bounds[r + 1]
                     th = y1 - y0
@@ -441,17 +456,25 @@ def export_garmin_kmz(
                         tile_west = west + (x0 / target_w) * (east - west)
                         tile_east = west + (x1 / target_w) * (east - west)
 
+                        # Read tile pixels on main thread (GDAL Dataset is not thread-safe)
+                        # and encode baseline JPEG in worker threads (Pillow releases GIL).
                         tile_img = _read_tile_rgb(ds, x0, y0, tw, th, bg_rgb)
-                        jpg_bytes = _encode_baseline_jpeg(
+                        fut = pool.submit(
+                            _encode_baseline_jpeg,
                             tile_img,
                             jpeg_quality=jpeg_quality,
                             max_tile_bytes=max_tile_bytes,
                         )
-
                         href = f"files/tile_r{r:02d}_c{c:02d}.jpg"
                         tile_name = f"Tile r{r:02d} c{c:02d}"
-                        zf.writestr(href, jpg_bytes, compress_type=zipfile.ZIP_STORED)
+                        tile_jobs.append(
+                            (tile_name, href, tile_north, tile_south, tile_east, tile_west, tw, th, fut)
+                        )
 
+                with zipfile.ZipFile(staged, mode="w") as zf:
+                    for tile_name, href, tile_north, tile_south, tile_east, tile_west, tw, th, fut in tile_jobs:
+                        jpg_bytes = fut.result()
+                        zf.writestr(href, jpg_bytes, compress_type=zipfile.ZIP_STORED)
                         overlays.append(
                             (tile_name, href, tile_north, tile_south, tile_east, tile_west)
                         )
@@ -459,12 +482,12 @@ def export_garmin_kmz(
                         max_h_seen = max(max_h_seen, th)
                         max_bytes_seen = max(max_bytes_seen, len(jpg_bytes))
 
-                kml_text = _build_kml(folder_name, description, draw_order, overlays)
-                zf.writestr(
-                    "doc.kml",
-                    kml_text.encode("utf-8"),
-                    compress_type=zipfile.ZIP_DEFLATED,
-                )
+                    kml_text = _build_kml(folder_name, description, draw_order, overlays)
+                    zf.writestr(
+                        "doc.kml",
+                        kml_text.encode("utf-8"),
+                        compress_type=zipfile.ZIP_DEFLATED,
+                    )
         finally:
             ds = None
 

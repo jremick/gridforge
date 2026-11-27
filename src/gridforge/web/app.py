@@ -11,11 +11,12 @@ import re
 import secrets
 import shutil
 import subprocess
+import threading
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import Callable
-from contextlib import aclosing
+from collections.abc import Callable, Iterator
+from contextlib import aclosing, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -25,12 +26,13 @@ import httpx
 import mgrs
 from fastapi import FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.encoders import jsonable_encoder
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
-from pyproj import Transformer
 from starlette.formparsers import MultiPartException, MultiPartParser
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from gridforge import __version__
 from gridforge.config import BBox, Orientation, PaperSize, SheetSpec, Units
@@ -39,6 +41,7 @@ from gridforge.geo.crs import (
     MIN_UTM_LAT,
     compute_atlas_layouts,
     compute_sheet_layout,
+    get_utm_to_wgs84_transformer,
     parse_center,
 )
 from gridforge.geo.declination import compute_declination
@@ -51,7 +54,12 @@ from gridforge.geo.tactical import RulerMetricsResponse
 from gridforge.geo.waypoints import compute_route_metrics
 from gridforge.packs.builder import discover_packs
 from gridforge.web import db, projects as projects_store, shares as shares_store
-from gridforge.web.access import SameOriginWritesMiddleware, get_client_ip
+from gridforge.web.access import (
+    OriginProxyAuthMiddleware,
+    SameOriginWritesMiddleware,
+    get_client_ip,
+    get_effective_scheme,
+)
 from gridforge.web.auth import (
     OAUTH_STATE_COOKIE_NAME,
     AuthConfig,
@@ -67,6 +75,7 @@ from gridforge.web.limits import (
     enforce_and_record_auth_attempt,
     enforce_and_record_geocode_miss,
     enforce_and_record_preview,
+    enforce_and_record_project_create,
     enforce_and_record_share_create,
     enforce_pre_upload_job_limits,
     get_capabilities,
@@ -83,6 +92,7 @@ from gridforge.web.pack_tasks import (
 )
 from gridforge.web.projects import (
     ProjectCreateRequest,
+    ProjectPayloadTooLargeError,
     ProjectRecord,
     ProjectsListResponse,
     ProjectUpdateRequest,
@@ -150,7 +160,230 @@ NOMINATIM_URL: str = "https://nominatim.openstreetmap.org/search"
 NOMINATIM_USER_AGENT: str = "gridforge/0.1 (+https://github.com/jremick/gridforge)"
 _GEOCODE_CACHE_TTL_S: float = 300.0
 _GEOCODE_CACHE_MAX: int = 256
+_geocode_lock = threading.Lock()
 _geocode_cache: OrderedDict[tuple[str, int], tuple[float, list[GeocodeResult]]] = OrderedDict()
+
+_ORIG_HTTPX_GET = httpx.get
+_NOMINATIM_HTTP_CLIENT: httpx.Client | None = None
+
+_MGRS_LOCAL = threading.local()
+
+_HEAVY_PREVIEW_SEM = threading.Semaphore(2)
+_THUMB_LOCKS_GUARD = threading.Lock()
+_THUMB_LOCKS: dict[str, threading.Lock] = {}
+
+_PACKS_CACHE_LOCK = threading.Lock()
+_PACKS_CACHE: dict[str, tuple[float, Any, list[Any]]] = {}
+_PACKS_CACHE_TTL_S: float = 5.0
+
+_DEFAULT_MAX_JSON_BODY_BYTES: int = 256 * 1024
+_UPLOAD_EXEMPT_PATHS: frozenset[str] = frozenset({"/api/jobs", "/api/strip-plan"})
+
+_CONTENT_SECURITY_POLICY: str = (
+    "default-src 'self'; "
+    "script-src 'self' https://challenges.cloudflare.com; "
+    "style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data: blob: https:; "
+    "font-src 'self' data: https:; "
+    "connect-src 'self' https:; "
+    "worker-src 'self' blob:; "
+    "child-src 'self' blob:; "
+    "frame-src https://challenges.cloudflare.com; "
+    "frame-ancestors 'none'; "
+    "base-uri 'self'; "
+    "object-src 'none'"
+)
+
+
+def _get_mgrs_converter() -> mgrs.MGRS:
+    conv = getattr(_MGRS_LOCAL, "converter", None)
+    if conv is None:
+        conv = mgrs.MGRS()
+        _MGRS_LOCAL.converter = conv
+    return conv
+
+
+def _nominatim_http_get(*args: Any, **kwargs: Any) -> httpx.Response:
+    global _NOMINATIM_HTTP_CLIENT
+    if httpx.get is not _ORIG_HTTPX_GET:
+        return httpx.get(*args, **kwargs)
+    if _NOMINATIM_HTTP_CLIENT is None or _NOMINATIM_HTTP_CLIENT.is_closed:
+        _NOMINATIM_HTTP_CLIENT = httpx.Client(
+            timeout=httpx.Timeout(5.0, connect=4.0),
+            limits=httpx.Limits(max_connections=8, max_keepalive_connections=4),
+        )
+    return _NOMINATIM_HTTP_CLIENT.get(*args, **kwargs)
+
+
+@contextmanager
+def _acquire_preview_slot(timeout_s: float = 2.0) -> Iterator[None]:
+    """Bound concurrent heavy GDAL/Poppler executions inside the 512 MB web process."""
+    acquired = _HEAVY_PREVIEW_SEM.acquire(timeout=timeout_s)
+    if not acquired:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Terrain preview worker is busy; please retry in a few seconds.",
+            headers={"Retry-After": "5"},
+        )
+    try:
+        yield
+    finally:
+        _HEAVY_PREVIEW_SEM.release()
+
+
+def _get_thumb_lock(job_id: str) -> threading.Lock:
+    with _THUMB_LOCKS_GUARD:
+        lock = _THUMB_LOCKS.get(job_id)
+        if lock is None:
+            if len(_THUMB_LOCKS) > 512:
+                _THUMB_LOCKS.clear()
+            lock = threading.Lock()
+            _THUMB_LOCKS[job_id] = lock
+        return lock
+
+
+def _packs_dir_fingerprint(packs_dir: Path) -> tuple[int, tuple[tuple[str, int], ...]] | None:
+    try:
+        dir_stat = packs_dir.stat()
+    except OSError:
+        return None
+    children: list[tuple[str, int]] = []
+    try:
+        with os.scandir(packs_dir) as it:
+            for entry in it:
+                if entry.is_dir(follow_symlinks=False):
+                    try:
+                        manifest_mtime = (packs_dir / entry.name / "pack.json").stat().st_mtime_ns
+                    except OSError:
+                        manifest_mtime = -1
+                    children.append((entry.name, manifest_mtime))
+    except OSError:
+        return None
+    children.sort()
+    return (dir_stat.st_mtime_ns, tuple(children))
+
+
+def _discover_packs_cached(packs_dir: Path) -> list[Any]:
+    key = str(packs_dir.resolve())
+    fp = _packs_dir_fingerprint(packs_dir)
+    now = time.monotonic()
+    with _PACKS_CACHE_LOCK:
+        entry = _PACKS_CACHE.get(key)
+        if entry is not None and entry[1] == fp and (now - entry[0]) <= _PACKS_CACHE_TTL_S:
+            return list(entry[2])
+    packs = discover_packs(packs_dir)
+    with _PACKS_CACHE_LOCK:
+        _PACKS_CACHE[key] = (now, fp, packs)
+    return list(packs)
+
+
+def _invalidate_packs_cache(packs_dir: Path | None = None) -> None:
+    with _PACKS_CACHE_LOCK:
+        if packs_dir is None:
+            _PACKS_CACHE.clear()
+        else:
+            _PACKS_CACHE.pop(str(packs_dir.resolve()), None)
+
+
+class _SecurityHeadersMiddleware:
+    """Attach hardened HTTP security headers and strict CSP to every response."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        is_https = get_effective_scheme(scope) == "https"
+
+        async def _send_with_headers(message: Any) -> None:
+            if message["type"] == "http.response.start":
+                raw_headers = list(message.get("headers", []))
+                existing = {k.lower() for k, _ in raw_headers}
+                additions = [
+                    (b"x-content-type-options", b"nosniff"),
+                    (b"x-frame-options", b"DENY"),
+                    (b"referrer-policy", b"strict-origin-when-cross-origin"),
+                    (b"permissions-policy", b"camera=(), microphone=(), geolocation=()"),
+                    (b"content-security-policy", _CONTENT_SECURITY_POLICY.encode("ascii")),
+                ]
+                if is_https:
+                    additions.append(
+                        (b"strict-transport-security", b"max-age=31536000; includeSubDomains")
+                    )
+                for k, v in additions:
+                    if k not in existing:
+                        raw_headers.append((k, v))
+                message = {**message, "headers": raw_headers}
+            await send(message)
+
+        await self.app(scope, receive, _send_with_headers)
+
+
+class _MaxBodySizeMiddleware:
+    """Enforce a global streaming body size limit on non-upload endpoints."""
+
+    def __init__(self, app: ASGIApp, *, max_bytes: int = _DEFAULT_MAX_JSON_BODY_BYTES) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or scope["method"] in {"GET", "HEAD", "OPTIONS"}:
+            await self.app(scope, receive, send)
+            return
+
+        path = str(scope.get("path") or "")
+        if path in _UPLOAD_EXEMPT_PATHS:
+            await self.app(scope, receive, send)
+            return
+
+        for k, v in scope.get("headers", ()):
+            if k.lower() == b"content-length":
+                try:
+                    if int(v.decode("ascii").strip()) > self.max_bytes:
+                        resp = PlainTextResponse("Request body too large", status_code=_HTTP_413)
+                        await resp(scope, receive, send)
+                        return
+                except ValueError:
+                    pass
+                break
+
+        received = 0
+        too_large = False
+
+        async def _bounded_receive() -> Any:
+            nonlocal received, too_large
+            msg = await receive()
+            if msg["type"] == "http.request":
+                body = msg.get("body", b"")
+                received += len(body)
+                if received > self.max_bytes:
+                    too_large = True
+                    raise _BodyLimitExceededError()
+            return msg
+
+        try:
+            await self.app(scope, _bounded_receive, send)
+        except _BodyLimitExceededError:
+            if too_large:
+                resp = PlainTextResponse("Request body too large", status_code=_HTTP_413)
+                await resp(scope, receive, send)
+
+
+class _BodyLimitExceededError(Exception):
+    pass
+
+
+class _ImmutableAssetsStaticFiles(StaticFiles):
+    """Serve Vite content-hashed ``/assets/*`` files with immutable long-term caching."""
+
+    async def get_response(self, path: str, scope: Scope) -> Response:
+        resp = await super().get_response(path, scope)
+        if resp.status_code == 200 and "cache-control" not in {k.lower() for k in resp.headers.keys()}:
+            resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        return resp
 
 _MEDIA_TYPES: dict[str, str] = {
     ".pdf": "application/pdf",
@@ -175,20 +408,21 @@ def _search_nominatim(
 
     cache_key = (cleaned.lower(), limit)
     now = time.monotonic()
-    cached = _geocode_cache.get(cache_key)
-    if cached is not None:
-        ts, items = cached
-        if now - ts <= _GEOCODE_CACHE_TTL_S:
-            _geocode_cache.move_to_end(cache_key)
-            return list(items)
-        _geocode_cache.pop(cache_key, None)
+    with _geocode_lock:
+        cached = _geocode_cache.get(cache_key)
+        if cached is not None:
+            ts, items = cached
+            if now - ts <= _GEOCODE_CACHE_TTL_S:
+                _geocode_cache.move_to_end(cache_key)
+                return list(items)
+            _geocode_cache.pop(cache_key, None)
 
     if on_cache_miss is not None:
         on_cache_miss()
 
     url = os.environ.get("GRIDFORGE_NOMINATIM_URL", NOMINATIM_URL).strip()
     try:
-        resp = httpx.get(
+        resp = _nominatim_http_get(
             url,
             params={"format": "jsonv2", "limit": str(limit), "q": cleaned},
             headers={"User-Agent": NOMINATIM_USER_AGENT, "Accept": "application/json"},
@@ -229,9 +463,10 @@ def _search_nominatim(
             )
         )
 
-    _geocode_cache[cache_key] = (now, results)
-    while len(_geocode_cache) > _GEOCODE_CACHE_MAX:
-        _geocode_cache.popitem(last=False)
+    with _geocode_lock:
+        _geocode_cache[cache_key] = (now, results)
+        while len(_geocode_cache) > _GEOCODE_CACHE_MAX:
+            _geocode_cache.popitem(last=False)
     return list(results)
 
 
@@ -417,7 +652,7 @@ def _build_footprint_preview(req: FootprintRequest) -> FootprintResponse:
     except ValueError as exc:
         raise HTTPException(status_code=_HTTP_422, detail=str(exc)) from exc
 
-    to_wgs84 = Transformer.from_crs(f"EPSG:{layout.utm_epsg}", "EPSG:4326", always_xy=True)
+    to_wgs84 = get_utm_to_wgs84_transformer(layout.utm_epsg)
     ground_w = layout.utm_bbox.width
     ground_h = layout.utm_bbox.height
     cols = req.grid_cols
@@ -465,7 +700,7 @@ def _build_footprint_preview(req: FootprintRequest) -> FootprintResponse:
         max_y=layout.center_northing + (rows * ground_h) / 2.0,
     )
 
-    # 2. Pure in-memory 1 km MGRS Easting & Northing preview lines across full atlas extent
+    # 2. Pure in-memory 1 km MGRS Easting & Northing preview lines across full atlas extent (single batched PROJ call)
     e_start = int(math.ceil(atlas_bbox.min_x / 1000.0)) * 1000
     e_end = int(math.floor(atlas_bbox.max_x / 1000.0)) * 1000
     n_start = int(math.ceil(atlas_bbox.min_y / 1000.0)) * 1000
@@ -474,13 +709,35 @@ def _build_footprint_preview(req: FootprintRequest) -> FootprintResponse:
     grid_features: list[dict[str, Any]] = []
     line_samples = max(6, 4 * max(cols, rows))
 
-    for e in range(e_start, e_end + 1, 1000):
-        xs = [float(e)] * line_samples
-        ys = [
-            atlas_bbox.min_y + atlas_bbox.height * i / (line_samples - 1)
-            for i in range(line_samples)
-        ]
-        lons, lats = to_wgs84.transform(xs, ys)
+    e_vals = list(range(e_start, e_end + 1, 1000))
+    n_vals = list(range(n_start, n_end + 1, 1000))
+    batch_xs: list[float] = []
+    batch_ys: list[float] = []
+    y_steps = [
+        atlas_bbox.min_y + atlas_bbox.height * i / (line_samples - 1)
+        for i in range(line_samples)
+    ]
+    x_steps = [
+        atlas_bbox.min_x + atlas_bbox.width * i / (line_samples - 1)
+        for i in range(line_samples)
+    ]
+    for e in e_vals:
+        batch_xs.extend([float(e)] * line_samples)
+        batch_ys.extend(y_steps)
+    for n in n_vals:
+        batch_xs.extend(x_steps)
+        batch_ys.extend([float(n)] * line_samples)
+
+    if batch_xs:
+        all_lons, all_lats = to_wgs84.transform(batch_xs, batch_ys)
+    else:
+        all_lons, all_lats = [], []
+
+    offset = 0
+    for e in e_vals:
+        seg_lons = all_lons[offset : offset + line_samples]
+        seg_lats = all_lats[offset : offset + line_samples]
+        offset += line_samples
         principal = f"{(e // 1000) % 100:02d}"
         grid_features.append(
             {
@@ -496,19 +753,16 @@ def _build_footprint_preview(req: FootprintRequest) -> FootprintResponse:
                     "type": "LineString",
                     "coordinates": [
                         [round(float(lo), 7), round(float(la), 7)]
-                        for lo, la in zip(lons, lats)
+                        for lo, la in zip(seg_lons, seg_lats)
                     ],
                 },
             }
         )
 
-    for n in range(n_start, n_end + 1, 1000):
-        xs = [
-            atlas_bbox.min_x + atlas_bbox.width * i / (line_samples - 1)
-            for i in range(line_samples)
-        ]
-        ys = [float(n)] * line_samples
-        lons, lats = to_wgs84.transform(xs, ys)
+    for n in n_vals:
+        seg_lons = all_lons[offset : offset + line_samples]
+        seg_lats = all_lats[offset : offset + line_samples]
+        offset += line_samples
         eff_n = n if n >= 0 else 10_000_000 + n
         principal = f"{(eff_n // 1000) % 100:02d}"
         grid_features.append(
@@ -525,7 +779,7 @@ def _build_footprint_preview(req: FootprintRequest) -> FootprintResponse:
                     "type": "LineString",
                     "coordinates": [
                         [round(float(lo), 7), round(float(la), 7)]
-                        for lo, la in zip(lons, lats)
+                        for lo, la in zip(seg_lons, seg_lats)
                     ],
                 },
             }
@@ -537,7 +791,7 @@ def _build_footprint_preview(req: FootprintRequest) -> FootprintResponse:
     }
 
     # 3. Center 10 m MGRS & visible 100 km square IDs across the full atlas extent
-    converter = mgrs.MGRS()
+    converter = _get_mgrs_converter()
     c_gzd, c_sq, c_digits = _split_mgrs(
         _decode_mgrs(converter.toMGRS(lat, lon, MGRSPrecision=4))
     )
@@ -670,11 +924,19 @@ def create_app(
     pack_manager = PackTaskManager(
         resolved_packs_dir,
         pack_builder=pack_builder,
+        hosted_mode=(auth_config.auth_mode == "hosted"),
     )
 
+    enable_docs = (
+        auth_config.auth_mode != "hosted"
+        or os.environ.get("GRIDFORGE_ENABLE_DOCS", "").strip().lower() in {"1", "true", "yes"}
+    )
     application = FastAPI(
         title=f"{auth_config.brand_name} Map Studio API",
         version=__version__,
+        docs_url="/docs" if enable_docs else None,
+        redoc_url="/redoc" if enable_docs else None,
+        openapi_url="/openapi.json" if enable_docs else None,
         description=(
             f"{auth_config.brand_name} — true-scale local UTM MGRS topographic map generator & print studio "
             "(powered by open-source GridForge)."
@@ -682,7 +944,11 @@ def create_app(
             else "Self-hosted military-style MGRS topographic map generator & offline pack studio."
         ),
     )
+    application.add_middleware(GZipMiddleware, minimum_size=500)
+    application.add_middleware(_SecurityHeadersMiddleware)
+    application.add_middleware(_MaxBodySizeMiddleware, max_bytes=_DEFAULT_MAX_JSON_BODY_BYTES)
     application.add_middleware(SameOriginWritesMiddleware)
+    application.add_middleware(OriginProxyAuthMiddleware)
     allowed_hosts = ["localhost", "127.0.0.1", "[::1]"]
     extra_hosts = os.environ.get("GRIDFORGE_ALLOWED_HOSTS", "").split(",")
     allowed_hosts.extend(host.strip() for host in extra_hosts if host.strip())
@@ -723,7 +989,7 @@ def create_app(
     def api_health() -> HealthResponse:
         worker_alive, last_seen = db.get_heartbeat(db_path)
         queue_depth = db.get_queue_depth(db_path)
-        packs = discover_packs(resolved_packs_dir)
+        packs = _discover_packs_cached(resolved_packs_dir)
         return HealthResponse(
             status="ok",
             queue_depth=queue_depth,
@@ -753,6 +1019,7 @@ def create_app(
                 event_type="auth_login",
                 client_ip=client_ip,
                 cfg=limits_config,
+                account_key=req.email,
             )
         user, raw_session_token = auth_manager.authenticate_password(req.email, req.password)
         auth_manager.set_session_cookie(response, raw_session_token, request)
@@ -1076,7 +1343,7 @@ def create_app(
 
     @application.get("/api/packs", response_model=PacksResponse)
     def api_packs() -> PacksResponse:
-        manifests = discover_packs(resolved_packs_dir)
+        manifests = _discover_packs_cached(resolved_packs_dir)
         summaries = [
             PackSummary(
                 pack_id=m.pack_id,
@@ -1114,7 +1381,12 @@ def create_app(
                 detail="Admin role required to manage offline packs.",
             )
         try:
-            return pack_manager.enqueue_build(req)
+            rec = pack_manager.enqueue_build(req)
+            _invalidate_packs_cache(resolved_packs_dir)
+            basemap_store.invalidate_cache()
+            return rec
+        except RuntimeError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=_HTTP_422, detail=str(exc)) from exc
 
@@ -1162,6 +1434,8 @@ def create_app(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Offline pack '{pack_id}' is not installed.",
             )
+        _invalidate_packs_cache(resolved_packs_dir)
+        basemap_store.invalidate_cache()
         return {"deleted": True, "pack_id": pack_id}
 
     @application.post("/api/viewshed-preview", response_model=ViewshedPreviewResponse)
@@ -1182,7 +1456,7 @@ def create_app(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"Invalid pack_id '{req.pack_id}'.",
                 )
-            installed_ids = {p.pack_id for p in discover_packs(resolved_packs_dir)}
+            installed_ids = {p.pack_id for p in _discover_packs_cached(resolved_packs_dir)}
             if req.pack_id not in installed_ids:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
@@ -1200,18 +1474,26 @@ def create_app(
                 detail={"pack_id": req.pack_id},
             )
         try:
-            return compute_viewshed_preview(
-                req,
-                packs_dir=resolved_packs_dir,
-                pack_dir_finder=pack_manager.find_pack_dir,
-            )
+            with _acquire_preview_slot():
+                return compute_viewshed_preview(
+                    req,
+                    packs_dir=resolved_packs_dir,
+                    pack_dir_finder=pack_manager.find_pack_dir,
+                )
+        except HTTPException:
+            raise
         except ValueError as exc:
             raise HTTPException(status_code=_HTTP_422, detail=str(exc)) from exc
         except Exception as exc:
             logger.exception("Viewshed preview failed: %s", exc)
+            detail = (
+                "Viewshed preview failed due to an internal terrain processing error."
+                if auth_config.auth_mode == "hosted"
+                else f"Viewshed preview failed: {exc}"
+            )
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Viewshed preview failed: {exc}",
+                detail=detail,
             ) from exc
 
     @application.post("/api/rf-link-profile", response_model=RFLinkProfileResponse)
@@ -1232,7 +1514,7 @@ def create_app(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"Invalid pack_id '{req.pack_id}'.",
                 )
-            installed_ids = {p.pack_id for p in discover_packs(resolved_packs_dir)}
+            installed_ids = {p.pack_id for p in _discover_packs_cached(resolved_packs_dir)}
             if req.pack_id not in installed_ids:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
@@ -1250,18 +1532,26 @@ def create_app(
                 detail={"pack_id": req.pack_id},
             )
         try:
-            return compute_rf_link_preview(
-                req,
-                packs_dir=resolved_packs_dir,
-                pack_dir_finder=pack_manager.find_pack_dir,
-            )
+            with _acquire_preview_slot():
+                return compute_rf_link_preview(
+                    req,
+                    packs_dir=resolved_packs_dir,
+                    pack_dir_finder=pack_manager.find_pack_dir,
+                )
+        except HTTPException:
+            raise
         except ValueError as exc:
             raise HTTPException(status_code=_HTTP_422, detail=str(exc)) from exc
         except Exception as exc:
             logger.exception("RF link profile failed: %s", exc)
+            detail = (
+                "RF link profile failed due to an internal terrain processing error."
+                if auth_config.auth_mode == "hosted"
+                else f"RF link profile failed: {exc}"
+            )
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"RF link profile failed: {exc}",
+                detail=detail,
             ) from exc
 
     @application.post("/api/ruler-metrics", response_model=RulerMetricsResponse)
@@ -1284,7 +1574,7 @@ def create_app(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"Invalid pack_id '{req.pack_id}'.",
                 )
-            installed_ids = {p.pack_id for p in discover_packs(resolved_packs_dir)}
+            installed_ids = {p.pack_id for p in _discover_packs_cached(resolved_packs_dir)}
             if req.pack_id not in installed_ids:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
@@ -1306,11 +1596,20 @@ def create_app(
                 },
             )
         try:
+            if wants_dem:
+                with _acquire_preview_slot():
+                    return compute_ruler_preview(
+                        req,
+                        packs_dir=resolved_packs_dir,
+                        pack_dir_finder=pack_manager.find_pack_dir,
+                    )
             return compute_ruler_preview(
                 req,
                 packs_dir=resolved_packs_dir,
                 pack_dir_finder=pack_manager.find_pack_dir,
             )
+        except HTTPException:
+            raise
         except ValueError as exc:
             raise HTTPException(status_code=_HTTP_422, detail=str(exc)) from exc
 
@@ -1349,9 +1648,22 @@ def create_app(
                         status_code=status.HTTP_403_FORBIDDEN,
                         detail="Cannot link a job owned by another account.",
                     )
-        return projects_store.create_project(
-            db_path, req, owner_id=ctx.owner_id, owner_role=ctx.role
-        )
+        if auth_config.auth_mode == "hosted":
+            enforce_and_record_project_create(
+                db_path,
+                role=ctx.role,
+                owner_id=ctx.owner_id,
+                client_ip=ctx.client_ip,
+                cfg=limits_config,
+            )
+        try:
+            return projects_store.create_project(
+                db_path, req, owner_id=ctx.owner_id, owner_role=ctx.role
+            )
+        except ProjectPayloadTooLargeError as exc:
+            raise HTTPException(status_code=_HTTP_413, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=_HTTP_422, detail=str(exc)) from exc
 
     @application.get("/api/projects/{project_id}", response_model=ProjectRecord)
     def api_get_project(
@@ -1402,7 +1714,12 @@ def create_app(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="You do not have permission to modify this project.",
             )
-        record = projects_store.update_project(db_path, project_id, req)
+        try:
+            record = projects_store.update_project(db_path, project_id, req)
+        except ProjectPayloadTooLargeError as exc:
+            raise HTTPException(status_code=_HTTP_413, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=_HTTP_422, detail=str(exc)) from exc
         if record is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found.")
         return record
@@ -1455,13 +1772,24 @@ def create_app(
     ) -> ShareSnapshotPublic:
         ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=True)
         auth_manager.apply_auth_cookies(response, ctx, request)
-        enforce_and_record_share_create(
-            db_path,
-            role=ctx.role,
-            owner_id=ctx.owner_id,
-            client_ip=ctx.client_ip,
-            cfg=limits_config,
-        )
+        if auth_config.auth_mode == "hosted":
+            auth_manager.verify_turnstile_if_required(request, ctx)
+            # Pre-validate explicit state payload size before burning quota; still rate-limit
+            # project_id share attempts so cross-tenant project_id probing is throttled.
+            if req.project_id is None and isinstance(req.state, dict) and req.state:
+                try:
+                    shares_store.sanitize_share_state(req.state)
+                except SharePayloadTooLargeError as exc:
+                    raise HTTPException(status_code=_HTTP_413, detail=str(exc)) from exc
+                except ValueError as exc:
+                    raise HTTPException(status_code=_HTTP_422, detail=str(exc)) from exc
+            enforce_and_record_share_create(
+                db_path,
+                role=ctx.role,
+                owner_id=ctx.owner_id,
+                client_ip=ctx.client_ip,
+                cfg=limits_config,
+            )
 
         resolved_name = req.name
         resolved_notes = req.notes
@@ -1511,10 +1839,7 @@ def create_app(
                 ttl_hours=ttl_hours,
             )
         except SharePayloadTooLargeError as exc:
-            raise HTTPException(
-                status_code=getattr(status, "HTTP_413_CONTENT_TOO_LARGE", 413),
-                detail=str(exc),
-            ) from exc
+            raise HTTPException(status_code=_HTTP_413, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=_HTTP_422, detail=str(exc)) from exc
 
@@ -1670,15 +1995,19 @@ def create_app(
                             status_code=status.HTTP_403_FORBIDDEN,
                             detail=f"Requested strip sheet count ({max_sheets}) exceeds your limit ({caps.max_strip_sheets}).",
                         )
-                    route_lonlat = parse_route_bytes(raw_bytes, filename)
-                    return plan_strip_atlas(
-                        route_lonlat,
-                        scale=scale,
-                        paper=paper,
-                        orientation=orientation,
-                        units=units,
-                        overlap_pct=overlap_pct,
-                        max_sheets=max_sheets,
+                    route_lonlat = await anyio.to_thread.run_sync(
+                        parse_route_bytes, raw_bytes, filename
+                    )
+                    return await anyio.to_thread.run_sync(
+                        lambda: plan_strip_atlas(
+                            route_lonlat,
+                            scale=scale,
+                            paper=paper,
+                            orientation=orientation,
+                            units=units,
+                            overlap_pct=overlap_pct,
+                            max_sheets=max_sheets,
+                        )
                     )
                 except HTTPException:
                     raise
@@ -1695,15 +2024,19 @@ def create_app(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail=f"Requested strip sheet count ({plan_req.max_sheets}) exceeds your limit ({caps.max_strip_sheets}).",
                 )
-            route_lonlat = parse_route_geojson(plan_req.route_geojson)
-            return plan_strip_atlas(
-                route_lonlat,
-                scale=plan_req.scale,
-                paper=plan_req.paper,
-                orientation=plan_req.orientation,
-                units=plan_req.units,
-                overlap_pct=plan_req.overlap_pct,
-                max_sheets=plan_req.max_sheets,
+            route_lonlat = await anyio.to_thread.run_sync(
+                parse_route_geojson, plan_req.route_geojson
+            )
+            return await anyio.to_thread.run_sync(
+                lambda: plan_strip_atlas(
+                    route_lonlat,
+                    scale=plan_req.scale,
+                    paper=plan_req.paper,
+                    orientation=plan_req.orientation,
+                    units=plan_req.units,
+                    overlap_pct=plan_req.overlap_pct,
+                    max_sheets=plan_req.max_sheets,
+                )
             )
         except HTTPException:
             raise
@@ -1740,7 +2073,7 @@ def create_app(
         max_body_bytes = (
             caps.max_upload_bytes + 512 * 1024
             if is_form
-            else max(256 * 1024, caps.max_upload_bytes)
+            else 512 * 1024
         )
         oversize_detail = (
             f"Overlay file exceeds maximum size of "
@@ -1916,7 +2249,12 @@ def create_app(
                         status_code=status.HTTP_400_BAD_REQUEST,
                         detail=f"Invalid pack_id '{job_req.pack_id}'.",
                     )
-                installed_ids = {p.pack_id for p in discover_packs(resolved_packs_dir)}
+                installed_ids = {
+                    p.pack_id
+                    for p in await anyio.to_thread.run_sync(
+                        _discover_packs_cached, resolved_packs_dir
+                    )
+                }
                 if job_req.pack_id not in installed_ids:
                     raise HTTPException(
                         status_code=status.HTTP_404_NOT_FOUND,
@@ -1925,7 +2263,7 @@ def create_app(
 
             # Compute 10 m MGRS label for job card display
             c_gzd, c_sq, c_digits = _split_mgrs(
-                _decode_mgrs(mgrs.MGRS().toMGRS(lat, lon, MGRSPrecision=4))
+                _decode_mgrs(_get_mgrs_converter().toMGRS(lat, lon, MGRSPrecision=4))
             )
             center_mgrs_10m = f"{c_gzd} {c_sq} {c_digits[:4]} {c_digits[4:]}"
 
@@ -2156,55 +2494,62 @@ def create_app(
 
         thumb_path = (job_root / "thumbnail.png").resolve()
         if not thumb_path.is_file():
-            artifacts_dir = (job_root / "artifacts").resolve()
-            pdf_candidates = [
-                artifacts_dir / a.filename for a in record.artifacts if a.kind == "pdf"
-            ]
-            if not pdf_candidates and artifacts_dir.is_dir():
-                pdf_candidates = sorted(artifacts_dir.glob("*.pdf"))
-            source_pdf = next((p.resolve() for p in pdf_candidates if p.is_file()), None)
-            if source_pdf is None or not source_pdf.is_relative_to(artifacts_dir):
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="No PDF artifact available for thumbnail.",
-                )
+            with _get_thumb_lock(job_id):
+                if not thumb_path.is_file():
+                    artifacts_dir = (job_root / "artifacts").resolve()
+                    pdf_candidates = [
+                        artifacts_dir / a.filename for a in record.artifacts if a.kind == "pdf"
+                    ]
+                    if not pdf_candidates and artifacts_dir.is_dir():
+                        pdf_candidates = sorted(artifacts_dir.glob("*.pdf"))
+                    source_pdf = next((p.resolve() for p in pdf_candidates if p.is_file()), None)
+                    if source_pdf is None or not source_pdf.is_relative_to(artifacts_dir):
+                        raise HTTPException(
+                            status_code=status.HTTP_404_NOT_FOUND,
+                            detail="No PDF artifact available for thumbnail.",
+                        )
 
-            job_root.mkdir(parents=True, exist_ok=True)
-            tmp_prefix = job_root / f".thumb_{uuid.uuid4().hex[:8]}"
-            proc = subprocess.run(
-                [
-                    "pdftoppm",
-                    "-png",
-                    "-f",
-                    "1",
-                    "-l",
-                    "1",
-                    "-scale-to",
-                    "480",
-                    "-singlefile",
-                    str(source_pdf),
-                    str(tmp_prefix),
-                ],
-                capture_output=True,
-                text=True,
-                timeout=30,
-                check=False,
-            )
-            rendered_png = tmp_prefix.with_suffix(".png")
-            if proc.returncode != 0 or not rendered_png.is_file():
-                rendered_png.unlink(missing_ok=True)
-                if db.get_job(db_path, job_id) is None:
-                    shutil.rmtree(job_root, ignore_errors=True)
-                    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found.")
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail="Failed to rasterize PDF thumbnail.",
-                )
-            if db.get_job(db_path, job_id) is None:
-                rendered_png.unlink(missing_ok=True)
-                shutil.rmtree(job_root, ignore_errors=True)
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found.")
-            rendered_png.replace(thumb_path)
+                    job_root.mkdir(parents=True, exist_ok=True)
+                    tmp_prefix = job_root / f".thumb_{uuid.uuid4().hex[:8]}"
+                    with _acquire_preview_slot():
+                        proc = subprocess.run(
+                            [
+                                "pdftoppm",
+                                "-png",
+                                "-f",
+                                "1",
+                                "-l",
+                                "1",
+                                "-scale-to",
+                                "480",
+                                "-singlefile",
+                                str(source_pdf),
+                                str(tmp_prefix),
+                            ],
+                            capture_output=True,
+                            text=True,
+                            timeout=30,
+                            check=False,
+                        )
+                    rendered_png = tmp_prefix.with_suffix(".png")
+                    if proc.returncode != 0 or not rendered_png.is_file():
+                        rendered_png.unlink(missing_ok=True)
+                        if db.get_job(db_path, job_id) is None:
+                            shutil.rmtree(job_root, ignore_errors=True)
+                            raise HTTPException(
+                                status_code=status.HTTP_404_NOT_FOUND, detail="Job not found."
+                            )
+                        raise HTTPException(
+                            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                            detail="Failed to rasterize PDF thumbnail.",
+                        )
+                    if db.get_job(db_path, job_id) is None:
+                        rendered_png.unlink(missing_ok=True)
+                        shutil.rmtree(job_root, ignore_errors=True)
+                        raise HTTPException(
+                            status_code=status.HTTP_404_NOT_FOUND, detail="Job not found."
+                        )
+                    rendered_png.replace(thumb_path)
 
         cache_header = (
             "private, max-age=3600"
@@ -2253,7 +2598,11 @@ def create_app(
     if index_html.is_file():
         assets_dir = resolved_web_dist / "assets"
         if assets_dir.is_dir():
-            application.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
+            application.mount(
+                "/assets",
+                _ImmutableAssetsStaticFiles(directory=str(assets_dir)),
+                name="assets",
+            )
 
         def _render_branded_index_html() -> str:
             raw_html = index_html.read_text(encoding="utf-8")
@@ -2297,21 +2646,31 @@ def create_app(
                 .replace(">", "\\u003e")
                 .replace("&", "\\u0026")
             )
-            brand_script = f"<script>window.__GF_BRAND__={brand_json};</script>"
+            brand_script = f'<script id="gf-brand" type="application/json">{brand_json}</script>'
             if "</head>" in rendered:
                 rendered = rendered.replace("</head>", f"    {brand_script}\n  </head>", 1)
             return rendered
 
+        cached_index_html = _render_branded_index_html()
+
         @application.get("/", include_in_schema=False)
         def serve_spa_root() -> HTMLResponse:
             return HTMLResponse(
-                content=_render_branded_index_html(),
+                content=cached_index_html,
                 headers={"Cache-Control": "no-cache"},
             )
 
         @application.get("/{full_path:path}", include_in_schema=False)
         def serve_spa_fallback(full_path: str) -> Response:
-            if full_path.startswith("api/") or full_path == "samples" or full_path.startswith("samples/"):
+            if (
+                full_path.startswith("api/")
+                or full_path == "samples"
+                or full_path.startswith("samples/")
+                or (
+                    not enable_docs
+                    and full_path in ("docs", "docs/", "redoc", "redoc/", "openapi.json")
+                )
+            ):
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found.")
             candidate = (resolved_web_dist / full_path).resolve()
             if (
@@ -2321,7 +2680,7 @@ def create_app(
             ):
                 return FileResponse(path=candidate)
             return HTMLResponse(
-                content=_render_branded_index_html(),
+                content=cached_index_html,
                 headers={"Cache-Control": "no-cache"},
             )
     else:

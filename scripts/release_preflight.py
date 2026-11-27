@@ -170,23 +170,36 @@ def check_release(tag: str | None = None) -> list[str]:
                 ".github/workflows/ci.yml appears to omit tests/e2e; mount the full tests/ directory."
             )
 
-    # Lightweight repository privacy hygiene check across docs, workflows, scripts, and AGENTS.md
+    # Repository privacy hygiene check across docs, workflows, scripts, source, tests, and web UI
     privacy_patterns = [
         ("macOS home path", re.compile(r"/" + "Users/[A-Za-z0-9._-]+/")),
         ("Linux home path", re.compile(r"/" + "home/[A-Za-z0-9._-]+/")),
         ("Windows user path", re.compile(r"C:\\\\" + r"Users\\[A-Za-z0-9._-]+\\")),
     ]
-    scan_paths = [
+    _text_suffixes = {
+        ".py", ".ts", ".tsx", ".js", ".mjs", ".cjs", ".json", ".css", ".html",
+        ".md", ".yml", ".yaml", ".sh", ".toml", ".txt", ".qml", ".ini", ".cfg",
+    }
+    scan_paths: list[Path] = [
         ROOT / "AGENTS.md",
         ROOT / "README.md",
         ROOT / "CHANGELOG.md",
         ROOT / "CONTRIBUTING.md",
+        ROOT / "Dockerfile",
+        ROOT / "docker-compose.yml",
+        ROOT / "docker-compose.ghcr.yml",
+        ROOT / "pyproject.toml",
         *(ROOT / "docs").glob("*.md"),
         *(ROOT / "deploy").glob("*.md"),
         *(ROOT / ".github/workflows").glob("*.yml"),
         *(ROOT / "scripts").glob("*.sh"),
         *(ROOT / "scripts").glob("*.py"),
     ]
+    for tree in (ROOT / "src", ROOT / "tests", ROOT / "web" / "src"):
+        if tree.is_dir():
+            for p in tree.rglob("*"):
+                if p.is_file() and p.suffix.lower() in _text_suffixes:
+                    scan_paths.append(p)
     for path in scan_paths:
         if not path.is_file() or path.resolve() == Path(__file__).resolve():
             continue

@@ -217,6 +217,16 @@ def _get_transformer(src_crs: str, dst_crs: str) -> Transformer:
     return Transformer.from_crs(src_crs, dst_crs, always_xy=True)
 
 
+def get_wgs84_to_utm_transformer(utm_epsg: int) -> Transformer:
+    """Return a cached WGS84 (EPSG:4326) -> UTM (EPSG:{utm_epsg}) Transformer."""
+    return _get_transformer("EPSG:4326", f"EPSG:{int(utm_epsg)}")
+
+
+def get_utm_to_wgs84_transformer(utm_epsg: int) -> Transformer:
+    """Return a cached UTM (EPSG:{utm_epsg}) -> WGS84 (EPSG:4326) Transformer."""
+    return _get_transformer(f"EPSG:{int(utm_epsg)}", "EPSG:4326")
+
+
 def _utm_bbox_to_wgs84(utm_bbox: BBox, utm_epsg: int, samples_per_edge: int = 5) -> BBox:
     """Project corners and edge samples of a UTM bbox to an enclosing WGS84 bbox."""
     to_wgs84 = _get_transformer(f"EPSG:{utm_epsg}", "EPSG:4326")

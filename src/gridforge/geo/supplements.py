@@ -84,10 +84,14 @@ def _spawn_supplement_worker(mode: str, payload: dict[str, Any], output_pdf: Pat
         spec_path = Path(tmp_dir_s) / "supplement_spec.json"
         spec_path.write_text(json.dumps(payload), encoding="utf-8")
 
-        env = os.environ.copy()
-        env.setdefault("QT_QPA_PLATFORM", "offscreen")
-        runtime_dir = Path(env.setdefault("XDG_RUNTIME_DIR", "/tmp/runtime-root"))
-        runtime_dir.mkdir(parents=True, exist_ok=True)
+        from gridforge.subprocess_env import build_safe_subprocess_env
+
+        env = build_safe_subprocess_env(
+            extra={"QT_QPA_PLATFORM": os.environ.get("QT_QPA_PLATFORM", "offscreen")},
+            include_linz_key=False,
+            allow_network=False,
+            private_runtime_dir=Path(tmp_dir_s) / ".qt_runtime",
+        )
 
         cmd = [
             sys.executable,
@@ -109,6 +113,177 @@ def _spawn_supplement_worker(mode: str, payload: dict[str, Any], output_pdf: Pat
     return caller_out
 
 
+def _spawn_supplement_batch(
+    tasks: Sequence[tuple[str, dict[str, Any], Path]],
+) -> list[Path]:
+    """Render one or more supplemental PDF pages in a single PyQt5 subprocess."""
+    if not tasks:
+        return []
+    if len(tasks) == 1:
+        mode, payload, out = tasks[0]
+        return [_spawn_supplement_worker(mode, payload, out)]
+
+    resolved_items: list[dict[str, Any]] = []
+    caller_outs: list[Path] = []
+    for mode, payload, out_pdf in tasks:
+        caller_out = Path(out_pdf)
+        resolved_out = caller_out.resolve()
+        resolved_out.parent.mkdir(parents=True, exist_ok=True)
+        caller_outs.append(caller_out)
+        resolved_items.append(
+            {
+                "mode": mode,
+                "payload": payload,
+                "output_pdf": str(resolved_out),
+            }
+        )
+
+    with tempfile.TemporaryDirectory(prefix="gf_supp_batch_") as tmp_dir_s:
+        spec_path = Path(tmp_dir_s) / "supplement_batch.json"
+        spec_path.write_text(json.dumps({"tasks": resolved_items}), encoding="utf-8")
+
+        from gridforge.subprocess_env import build_safe_subprocess_env
+
+        env = build_safe_subprocess_env(
+            extra={"QT_QPA_PLATFORM": os.environ.get("QT_QPA_PLATFORM", "offscreen")},
+            include_linz_key=False,
+            allow_network=False,
+            private_runtime_dir=Path(tmp_dir_s) / ".qt_runtime",
+        )
+
+        cmd = [
+            sys.executable,
+            "-m",
+            "gridforge.geo.supplements",
+            "batch",
+            str(spec_path),
+            str(Path(tmp_dir_s) / "batch_sentinel.pdf"),
+        ]
+        proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=180, check=False)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"Supplemental PDF batch render failed (exit={proc.returncode}).\n"
+                f"STDERR:\n{proc.stderr[-2500:]}\nSTDOUT:\n{proc.stdout[-1500:]}"
+            )
+
+    for item, caller_out in zip(resolved_items, caller_outs):
+        if not Path(item["output_pdf"]).is_file():
+            raise RuntimeError(
+                f"Supplemental PDF batch render ({item['mode']}) did not create '{item['output_pdf']}'."
+            )
+    return caller_outs
+
+
+def _build_calibration_payload(
+    page_width_mm: float,
+    page_height_mm: float,
+    scale: int,
+    *,
+    bw: bool = False,
+) -> dict[str, Any]:
+    return {
+        "page_width_mm": float(page_width_mm),
+        "page_height_mm": float(page_height_mm),
+        "scale": int(scale),
+        "bw": bool(bw),
+    }
+
+
+def _build_route_card_payload(
+    metrics: RouteMetrics,
+    layout: SheetLayout,
+    declination: DeclinationInfo,
+    *,
+    bw: bool = False,
+) -> dict[str, Any]:
+    return {
+        "metrics": json.loads(metrics.model_dump_json()),
+        "layout": json.loads(layout.model_dump_json()),
+        "declination": json.loads(declination.model_dump_json()),
+        "bw": bool(bw),
+    }
+
+
+def _build_elevation_profile_payload(
+    profile: ElevationProfileData,
+    strip_plan: StripAtlasPlan | None,
+    layout: SheetLayout,
+    *,
+    bw: bool = False,
+) -> dict[str, Any]:
+    return {
+        "profile": json.loads(profile.model_dump_json()),
+        "strip_plan": json.loads(strip_plan.model_dump_json()) if strip_plan is not None else None,
+        "layout": json.loads(layout.model_dump_json()),
+        "bw": bool(bw),
+    }
+
+
+def _build_atlas_index_payload(
+    sheets: Sequence[AtlasIndexSheet | StripSheetPlan],
+    *,
+    page_width_mm: float,
+    page_height_mm: float,
+    scale: int,
+    utm_epsg: int,
+    title: str,
+    overlap_pct: float = 0.0,
+    route_utm: list[tuple[float, float]] | None = None,
+    bw: bool = False,
+) -> dict[str, Any]:
+    if not sheets:
+        raise ValueError("render_atlas_index_pdf() requires at least one sheet.")
+    normalized: list[AtlasIndexSheet] = []
+    for idx, sh in enumerate(sheets, start=1):
+        if isinstance(sh, AtlasIndexSheet):
+            normalized.append(sh)
+        else:
+            normalized.append(
+                AtlasIndexSheet(
+                    sheet_id=sh.sheet_id,
+                    page_number=int(getattr(sh, "index", idx)) + 1,
+                    center_lat=float(sh.center_lat),
+                    center_lon=float(sh.center_lon),
+                    center_mgrs_10m=str(sh.center_mgrs_10m),
+                    utm_bbox=sh.utm_bbox,
+                )
+            )
+    return {
+        "sheets": [json.loads(s.model_dump_json()) for s in normalized],
+        "page_width_mm": float(page_width_mm),
+        "page_height_mm": float(page_height_mm),
+        "scale": int(scale),
+        "utm_epsg": int(utm_epsg),
+        "title": str(title or "GRIDFORGE ATLAS"),
+        "overlap_pct": float(overlap_pct),
+        "route_utm": [[float(x), float(y)] for x, y in route_utm] if route_utm else None,
+        "bw": bool(bw),
+    }
+
+
+def _build_rf_link_card_payload(
+    profiles: Sequence[dict[str, Any] | BaseModel],
+    layout: SheetLayout,
+    *,
+    bw: bool = False,
+) -> dict[str, Any]:
+    if not profiles:
+        raise ValueError("render_rf_link_card_pdf() requires at least one RF link profile.")
+    serialized: list[dict[str, Any]] = []
+    for p in profiles:
+        if isinstance(p, BaseModel):
+            serialized.append(json.loads(p.model_dump_json()))
+        elif isinstance(p, dict):
+            serialized.append(dict(p))
+        else:
+            raise TypeError(f"Unsupported RF link profile entry: {type(p)!r}")
+    return {
+        "profiles": serialized,
+        "layout": json.loads(layout.model_dump_json()),
+        "bw": bool(bw),
+    }
+
+
 def render_calibration_pdf(
     page_width_mm: float,
     page_height_mm: float,
@@ -118,13 +293,11 @@ def render_calibration_pdf(
     bw: bool = False,
 ) -> Path:
     """Render an exact 100.00 mm / 4.00 in Scale Calibration & MGRS Romer PDF page."""
-    payload = {
-        "page_width_mm": float(page_width_mm),
-        "page_height_mm": float(page_height_mm),
-        "scale": int(scale),
-        "bw": bool(bw),
-    }
-    return _spawn_supplement_worker("calibration", payload, output_pdf)
+    return _spawn_supplement_worker(
+        "calibration",
+        _build_calibration_payload(page_width_mm, page_height_mm, scale, bw=bw),
+        output_pdf,
+    )
 
 
 def render_route_card_pdf(
@@ -2296,11 +2469,43 @@ def _set_exact_mediabox_mm(pdf_path: Path, page_width_mm: float, page_height_mm:
     tmp_path.replace(pdf_path)
 
 
+def _dispatch_single_supplement(mode: str, spec: dict[str, Any], output_pdf: Path) -> None:
+    if mode == "calibration":
+        _render_calibration_in_process(spec, output_pdf)
+        _set_exact_mediabox_mm(output_pdf, spec["page_width_mm"], spec["page_height_mm"])
+    elif mode == "route-card":
+        _render_route_card_in_process(spec, output_pdf)
+        _set_exact_mediabox_mm(
+            output_pdf,
+            spec["layout"]["page_width_mm"],
+            spec["layout"]["page_height_mm"],
+        )
+    elif mode == "elevation-profile":
+        _render_elevation_profile_in_process(spec, output_pdf)
+        _set_exact_mediabox_mm(
+            output_pdf,
+            spec["layout"]["page_width_mm"],
+            spec["layout"]["page_height_mm"],
+        )
+    elif mode == "atlas-index":
+        _render_atlas_index_in_process(spec, output_pdf)
+        _set_exact_mediabox_mm(output_pdf, spec["page_width_mm"], spec["page_height_mm"])
+    elif mode == "rf-link-card":
+        _render_rf_link_card_in_process(spec, output_pdf)
+        _set_exact_mediabox_mm(
+            output_pdf,
+            spec["layout"]["page_width_mm"],
+            spec["layout"]["page_height_mm"],
+        )
+    else:
+        raise ValueError(f"Unsupported supplement mode: {mode!r}")
+
+
 def _worker_main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="GridForge supplemental vector PDF generator")
     parser.add_argument(
         "mode",
-        choices=["calibration", "route-card", "elevation-profile", "atlas-index", "rf-link-card"],
+        choices=["calibration", "route-card", "elevation-profile", "atlas-index", "rf-link-card", "batch"],
     )
     parser.add_argument("spec_json", type=Path)
     parser.add_argument("output_pdf", type=Path)
@@ -2312,33 +2517,15 @@ def _worker_main(argv: list[str] | None = None) -> int:
     qt_app = QGuiApplication([])
     try:
         spec = json.loads(args.spec_json.read_text(encoding="utf-8"))
-        if args.mode == "calibration":
-            _render_calibration_in_process(spec, args.output_pdf)
-            _set_exact_mediabox_mm(args.output_pdf, spec["page_width_mm"], spec["page_height_mm"])
-        elif args.mode == "route-card":
-            _render_route_card_in_process(spec, args.output_pdf)
-            _set_exact_mediabox_mm(
-                args.output_pdf,
-                spec["layout"]["page_width_mm"],
-                spec["layout"]["page_height_mm"],
-            )
-        elif args.mode == "elevation-profile":
-            _render_elevation_profile_in_process(spec, args.output_pdf)
-            _set_exact_mediabox_mm(
-                args.output_pdf,
-                spec["layout"]["page_width_mm"],
-                spec["layout"]["page_height_mm"],
-            )
-        elif args.mode == "atlas-index":
-            _render_atlas_index_in_process(spec, args.output_pdf)
-            _set_exact_mediabox_mm(args.output_pdf, spec["page_width_mm"], spec["page_height_mm"])
-        elif args.mode == "rf-link-card":
-            _render_rf_link_card_in_process(spec, args.output_pdf)
-            _set_exact_mediabox_mm(
-                args.output_pdf,
-                spec["layout"]["page_width_mm"],
-                spec["layout"]["page_height_mm"],
-            )
+        if args.mode == "batch":
+            for item in spec.get("tasks", []):
+                _dispatch_single_supplement(
+                    str(item["mode"]),
+                    dict(item["payload"]),
+                    Path(item["output_pdf"]),
+                )
+        else:
+            _dispatch_single_supplement(args.mode, spec, args.output_pdf)
     finally:
         qt_app.quit()
         del qt_app

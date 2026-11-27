@@ -370,7 +370,7 @@ def _read_sa_trails_from_vsizip(
 
     Never loads the 18 MB statewide JSON file into Python memory (< 20 MB RSS).
     """
-    from osgeo import ogr  # type: ignore[import-untyped]
+    from osgeo import gdal  # type: ignore[import-untyped]  # system python3-gdal ships untyped osgeo bindings
 
     resolved = zip_path.resolve()
     if not resolved.is_file():
@@ -396,9 +396,14 @@ def _read_sa_trails_from_vsizip(
         logger.warning("No GeoJSON layer found inside SA trails archive %s", resolved)
         return []
 
-    vsi_path = f"/vsizip/{resolved}/{inner_name}"
-    ogr.UseExceptions()
-    ds = ogr.Open(vsi_path)
+    norm_inner = inner_name.replace("\\", "/")
+    if norm_inner.startswith("/") or ".." in norm_inner.split("/"):
+        logger.warning("Rejected unsafe archive member '%s' in %s", inner_name, resolved)
+        return []
+
+    vsi_path = f"/vsizip/{resolved}/{norm_inner}"
+    gdal.UseExceptions()
+    ds = gdal.OpenEx(vsi_path, gdal.OF_VECTOR, allowed_drivers=["GeoJSON"])
     if ds is None:
         logger.warning("GDAL failed to open %s", vsi_path)
         return []

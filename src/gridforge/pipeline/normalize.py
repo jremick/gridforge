@@ -4,13 +4,30 @@ from __future__ import annotations
 
 import logging
 import os
+import sqlite3
 import subprocess
 from pathlib import Path
 from typing import Final
 
 from gridforge.config import SheetLayout
+from gridforge.subprocess_env import build_safe_subprocess_env
 
 logger = logging.getLogger(__name__)
+
+_GPKG_ATTR_INDEXES: Final[tuple[tuple[str, str], ...]] = (
+    ("multipolygons", "building"),
+    ("multipolygons", "natural"),
+    ("multipolygons", "landuse"),
+    ("multipolygons", "waterway"),
+    ("multipolygons", "amenity"),
+    ("multipolygons", "aeroway"),
+    ("lines", "highway"),
+    ("lines", "waterway"),
+    ("lines", "railway"),
+    ("points", "natural"),
+    ("points", "place"),
+    ("points", "amenity"),
+)
 
 CORE_OSM_LAYERS: Final[tuple[str, ...]] = (
     "points",
@@ -199,6 +216,27 @@ def _ensure_core_layers_and_columns(gpkg_path: Path, utm_epsg: int) -> None:
         ds = None
 
 
+def _create_gpkg_attribute_indexes(gpkg_path: Path) -> None:
+    """Create lightweight SQLite attribute indexes accelerating PyQGIS subset filtering."""
+    conn = sqlite3.connect(str(gpkg_path))
+    try:
+        conn.execute("PRAGMA synchronous=OFF;")
+        for table, col in _GPKG_ATTR_INDEXES:
+            cols = {
+                str(r[1])
+                for r in conn.execute(f'PRAGMA table_info("{table}")').fetchall()
+            }
+            if col in cols:
+                conn.execute(
+                    f'CREATE INDEX IF NOT EXISTS "idx_{table}_{col}" ON "{table}" ("{col}")'
+                )
+        conn.commit()
+    except sqlite3.Error as exc:
+        logger.debug("Skipping optional GeoPackage attribute indexes for %s: %s", gpkg_path, exc)
+    finally:
+        conn.close()
+
+
 def normalize_osm_to_gpkg(
     osm_path: Path,
     layout: SheetLayout,
@@ -227,6 +265,8 @@ def normalize_osm_to_gpkg(
         "ogr2ogr",
         "-f",
         "GPKG",
+        "-gt",
+        "65536",
         "-t_srs",
         f"EPSG:{layout.utm_epsg}",
         "-clipdst",
@@ -243,12 +283,17 @@ def normalize_osm_to_gpkg(
         *CORE_OSM_LAYERS,
     ]
 
-    env = os.environ.copy()
-    env["OSM_CONFIG_FILE"] = str(osmconf)
-    env["OSM_USE_CUSTOM_INDEXING"] = "NO"
+    env = build_safe_subprocess_env(
+        extra={
+            "OSM_CONFIG_FILE": str(osmconf),
+            "OSM_USE_CUSTOM_INDEXING": "NO",
+            "OGR_SQLITE_SYNCHRONOUS": "OFF",
+        },
+        allow_network=False,
+    )
 
     logger.info("Normalizing OSM %s -> %s (EPSG:%d)", src_path.name, out_path, layout.utm_epsg)
-    proc = subprocess.run(cmd, env=env, capture_output=True, text=True, check=False)
+    proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=300, check=False)
     if proc.returncode != 0:
         raise RuntimeError(
             f"ogr2ogr OSM normalization failed (exit {proc.returncode}):\n"
@@ -257,4 +302,5 @@ def normalize_osm_to_gpkg(
         )
 
     _ensure_core_layers_and_columns(out_path, layout.utm_epsg)
+    _create_gpkg_attribute_indexes(out_path)
     return out_path

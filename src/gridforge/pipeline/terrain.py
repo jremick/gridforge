@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from array import array
+from concurrent.futures import ThreadPoolExecutor
 import logging
 import math
+import shutil
 import struct
 import subprocess
 from pathlib import Path
@@ -21,6 +23,7 @@ from gridforge.config import (
     Units,
     ViewshedObserver,
 )
+from gridforge.subprocess_env import build_safe_subprocess_env
 
 logger = logging.getLogger(__name__)
 
@@ -331,7 +334,12 @@ def _scale_dem_meters_to_feet(dem_utm_m: Path, dem_utm_ft: Path) -> Path:
     return dem_utm_ft
 
 
-def _postprocess_contours_gpkg(terrain_gpkg: Path, index_interval: float) -> None:
+def _postprocess_contours_gpkg(
+    terrain_gpkg: Path,
+    index_interval: float,
+    *,
+    elev_scale: float = 1.0,
+) -> None:
     """Add ``is_index`` (0/1) and integer ``elev_label`` columns to the ``contours`` table.
 
     Executes through GDAL/OGR's native GeoPackage SQLite connection rather than bare
@@ -357,6 +365,14 @@ def _postprocess_contours_gpkg(terrain_gpkg: Path, index_interval: float) -> Non
             layer.CreateField(ogr.FieldDefn("elev_label", ogr.OFTString))
 
         idx = float(index_interval)
+        scale_f = float(elev_scale)
+        if abs(scale_f - 1.0) > 1e-9:
+            ds.ExecuteSQL(
+                f"""
+                UPDATE contours
+                SET elev = ROUND(elev * {scale_f:.15g}, 4)
+                """
+            )
         ds.ExecuteSQL(
             f"""
             UPDATE contours
@@ -534,29 +550,35 @@ def _write_viewshed_observers_gpkg(
         obs_defn = obs_layer.GetLayerDefn()
         ring_defn = ring_layer.GetLayerDefn()
 
-        for obs, ox, oy, elev_m in observers_meta:
-            pt = ogr.Geometry(ogr.wkbPoint)
-            pt.AddPoint_2D(ox, oy)
-            pt.FlattenTo2D()
-            feat = ogr.Feature(obs_defn)
-            feat.SetGeometry(pt)
-            feat.SetField("label", obs.label)
-            feat.SetField("observer_height_m", float(obs.observer_height_m))
-            feat.SetField("target_height_m", float(obs.target_height_m))
-            feat.SetField("max_distance_m", float(obs.max_distance_m))
-            if elev_m is not None:
-                feat.SetField("elev_m", round(float(elev_m), 2))
-            obs_layer.CreateFeature(feat)
-            feat = None
+        ds.StartTransaction()
+        try:
+            for obs, ox, oy, elev_m in observers_meta:
+                pt = ogr.Geometry(ogr.wkbPoint)
+                pt.AddPoint_2D(ox, oy)
+                pt.FlattenTo2D()
+                feat = ogr.Feature(obs_defn)
+                feat.SetGeometry(pt)
+                feat.SetField("label", obs.label)
+                feat.SetField("observer_height_m", float(obs.observer_height_m))
+                feat.SetField("target_height_m", float(obs.target_height_m))
+                feat.SetField("max_distance_m", float(obs.max_distance_m))
+                if elev_m is not None:
+                    feat.SetField("elev_m", round(float(elev_m), 2))
+                obs_layer.CreateFeature(feat)
+                feat = None
 
-            raw_ring = _make_ring_linestring(ox, oy, float(obs.max_distance_m))
-            for part in _clip_line_to_extent(raw_ring, min_x, min_y, max_x, max_y):
-                rfeat = ogr.Feature(ring_defn)
-                rfeat.SetGeometry(part)
-                rfeat.SetField("label", obs.label)
-                rfeat.SetField("max_distance_m", float(obs.max_distance_m))
-                ring_layer.CreateFeature(rfeat)
-                rfeat = None
+                raw_ring = _make_ring_linestring(ox, oy, float(obs.max_distance_m))
+                for part in _clip_line_to_extent(raw_ring, min_x, min_y, max_x, max_y):
+                    rfeat = ogr.Feature(ring_defn)
+                    rfeat.SetGeometry(part)
+                    rfeat.SetField("label", obs.label)
+                    rfeat.SetField("max_distance_m", float(obs.max_distance_m))
+                    ring_layer.CreateFeature(rfeat)
+                    rfeat = None
+            ds.CommitTransaction()
+        except Exception:
+            ds.RollbackTransaction()
+            raise
 
         ds.FlushCache()
     finally:
@@ -614,7 +636,48 @@ def build_viewshed_products(
 
         import numpy as np  # type: ignore[import-not-found]
 
-        combined_mask = np.zeros((rows, cols), dtype=np.uint8)
+        # On 1–2 m LiDAR DEMs (up to 4096x4096), downsample viewshed input to 10 m so
+        # gdal_viewshed completes in < 1s while retaining sub-mm print accuracy.
+        vs_dem_path = dem_utm_tif
+        vs_ds = src_ds
+        if min(px_w, px_h) < 9.5:
+            vs_res = 10.0
+            tmp_vs_dem = work_dir / "_viewshed_dem_10m.tif"
+            temp_files.append(tmp_vs_dem)
+            _run_subprocess(
+                [
+                    "gdalwarp",
+                    "-overwrite",
+                    "-multi",
+                    "-wo",
+                    "NUM_THREADS=2",
+                    "-tr",
+                    f"{vs_res:g}",
+                    f"{vs_res:g}",
+                    "-r",
+                    "bilinear",
+                    "-dstnodata",
+                    str(DEM_NODATA),
+                    "-ot",
+                    "Float32",
+                    "-co",
+                    "COMPRESS=NONE",
+                    "-co",
+                    "TILED=YES",
+                    str(dem_utm_tif),
+                    str(tmp_vs_dem),
+                ],
+                context="gdalwarp (viewshed 10m downsample)",
+            )
+            vs_dem_path = tmp_vs_dem
+            vs_ds = gdal.Open(str(tmp_vs_dem), gdal.GA_ReadOnly) or src_ds
+
+        vs_cols = vs_ds.RasterXSize
+        vs_rows = vs_ds.RasterYSize
+        vs_gt = vs_ds.GetGeoTransform()
+        vs_px_w = abs(vs_gt[1])
+        vs_px_h = abs(vs_gt[5])
+        combined_mask = np.zeros((vs_rows, vs_cols), dtype=np.uint8)
 
         for idx, obs in enumerate(observers):
             ox, oy = to_utm.transform(float(obs.lon), float(obs.lat))
@@ -668,7 +731,7 @@ def build_viewshed_products(
                 "0",
                 "-f",
                 "GTiff",
-                str(dem_utm_tif),
+                str(vs_dem_path),
                 str(tmp_obs_tif),
             ]
             logger.info(
@@ -689,16 +752,16 @@ def build_viewshed_products(
                 if obs_arr is None:
                     continue
                 obs_rows, obs_cols = obs_arr.shape
-                x_off = int(round((obs_gt[0] - gt[0]) / gt[1]))
-                y_off = int(round((obs_gt[3] - gt[3]) / gt[5]))
+                x_off = int(round((obs_gt[0] - vs_gt[0]) / vs_gt[1]))
+                y_off = int(round((obs_gt[3] - vs_gt[3]) / vs_gt[5]))
 
                 src_x0 = max(0, -x_off)
                 src_y0 = max(0, -y_off)
                 dst_x0 = max(0, x_off)
                 dst_y0 = max(0, y_off)
 
-                copy_w = min(obs_cols - src_x0, cols - dst_x0)
-                copy_h = min(obs_rows - src_y0, rows - dst_y0)
+                copy_w = min(obs_cols - src_x0, vs_cols - dst_x0)
+                copy_h = min(obs_rows - src_y0, vs_rows - dst_y0)
                 if copy_w > 0 and copy_h > 0:
                     sub = obs_arr[src_y0 : src_y0 + copy_h, src_x0 : src_x0 + copy_w]
                     np.maximum(
@@ -709,7 +772,10 @@ def build_viewshed_products(
             finally:
                 obs_ds = None
 
-        # Emit 4-band RGBA Byte GeoTIFF aligned 1:1 with dem_utm_tif
+        if vs_ds is not src_ds:
+            vs_ds = None
+
+        # Emit 4-band RGBA Byte GeoTIFF covering the DEM extent
         if color_mode == ColorMode.BW:
             r_val, g_val, b_val, a_val = VIEWSHED_RGBA_BW
         elif color_mode == ColorMode.NIGHT_RED:
@@ -720,16 +786,16 @@ def build_viewshed_products(
         driver = gdal.GetDriverByName("GTiff")
         dst_ds = driver.Create(
             str(viewshed_tif),
-            cols,
-            rows,
+            vs_cols,
+            vs_rows,
             4,
             gdal.GDT_Byte,
-            options=["COMPRESS=DEFLATE", "TILED=YES", "PHOTOMETRIC=RGB", "ALPHA=YES"],
+            options=["COMPRESS=NONE", "TILED=YES", "PHOTOMETRIC=RGB", "ALPHA=YES"],
         )
         if dst_ds is None:
             raise RuntimeError(f"Could not create viewshed RGBA GeoTIFF at {viewshed_tif}")
         try:
-            dst_ds.SetGeoTransform(gt)
+            dst_ds.SetGeoTransform(vs_gt)
             dst_ds.SetProjection(proj)
             interps = (
                 gdal.GCI_RedBand,
@@ -756,7 +822,7 @@ def build_viewshed_products(
         logger.info(
             "Built viewshed products (%d observer(s), visible=%.2f km²) -> %s",
             len(observers),
-            float(np.count_nonzero(visible_bool)) * px_w * px_h / 1_000_000.0,
+            float(np.count_nonzero(visible_bool)) * vs_px_w * vs_px_h / 1_000_000.0,
             viewshed_tif,
         )
     finally:
@@ -1080,22 +1146,18 @@ def compute_rf_link_profile(
     from_elev_m = elevs[0]
     to_elev_m = elevs[-1]
 
-    # True -> Grid & WMM2025 Magnetic bearings + NATO mils
-    proj = pyproj.Proj(f"EPSG:{int(utm_epsg)}")
-    gamma = float(proj.get_factors(float(link.from_lon), float(link.from_lat)).meridian_convergence)
-    bearing_grid_deg = (bearing_true_deg - gamma) % 360.0
+    # True -> Grid & WMM2025 Magnetic bearings + NATO mils (uses cached WMM/Proj helpers)
+    from gridforge.geo.declination import compute_point_declination
 
-    dec_year = _parse_date_to_decimal_year(date_iso)
-    clamped_year = min(WMM2025_MAX_YEAR, max(WMM2025_MIN_YEAR, dec_year))
-    mag_decl = float(
-        GeoMag().calculate(
-            glat=float(link.from_lat),
-            glon=float(link.from_lon),
-            alt=from_elev_m / 1000.0,
-            time=clamped_year,
-        ).d
+    decl_info = compute_point_declination(
+        float(link.from_lat),
+        float(link.from_lon),
+        utm_epsg=int(utm_epsg),
+        date_iso=date_iso,
+        elevation_m=from_elev_m,
     )
-    bearing_mag_deg = (bearing_true_deg - mag_decl) % 360.0
+    bearing_grid_deg = (bearing_true_deg - decl_info.grid_convergence_deg) % 360.0
+    bearing_mag_deg = (bearing_true_deg - decl_info.magnetic_declination_deg) % 360.0
     bearing_mils = (bearing_mag_deg * DEG_TO_NATO_MILS) % 6400.0
 
     # Wavelength (m) and effective curved-Earth radius (m)
@@ -1223,7 +1285,7 @@ def build_slope_shading(
             "-of",
             "GTiff",
             "-co",
-            "COMPRESS=DEFLATE",
+            "COMPRESS=NONE",
             "-co",
             "TILED=YES",
             str(dem_utm_tif),
@@ -1240,7 +1302,7 @@ def build_slope_shading(
             "-of",
             "GTiff",
             "-co",
-            "COMPRESS=DEFLATE",
+            "COMPRESS=NONE",
             "-co",
             "TILED=YES",
             str(slope_deg_tif),
@@ -1256,14 +1318,69 @@ def build_slope_shading(
     return slope_tif
 
 
-def _run_subprocess(cmd: list[str], context: str) -> None:
-    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+def _run_subprocess(cmd: list[str], context: str, *, timeout: int = 300) -> None:
+    env = build_safe_subprocess_env(
+        extra={"GDAL_NUM_THREADS": "2"},
+        allow_network=False,
+    )
+    proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout, check=False)
     if proc.returncode != 0:
         raise RuntimeError(
             f"{context} failed (exit {proc.returncode}):\n"
             f"cmd: {' '.join(cmd)}\n"
             f"stderr: {proc.stderr.strip()}"
         )
+
+
+def _dem_matches_utm_target(
+    src_dem: Path,
+    *,
+    utm_epsg: int,
+    bbox_min_x: float,
+    bbox_min_y: float,
+    bbox_max_x: float,
+    bbox_max_y: float,
+    target_res: float,
+) -> bool:
+    """Return True if ``src_dem`` is already in exact target UTM EPSG, resolution, and extent."""
+    from osgeo import gdal, osr  # type: ignore[import-untyped]  # GDAL system bindings lack stubs
+
+    gdal.UseExceptions()
+    ds = gdal.Open(str(src_dem), gdal.GA_ReadOnly)
+    if ds is None:
+        return False
+    try:
+        wkt = ds.GetProjection()
+        if not wkt:
+            return False
+        src_srs = osr.SpatialReference(wkt=wkt)
+        dst_srs = osr.SpatialReference()
+        dst_srs.ImportFromEPSG(int(utm_epsg))
+        if not src_srs.IsSame(dst_srs):
+            return False
+        gt = ds.GetGeoTransform()
+        if abs(gt[2]) > 1e-9 or abs(gt[4]) > 1e-9:
+            return False
+        px_w = abs(gt[1])
+        px_h = abs(gt[5])
+        if abs(px_w - target_res) > max(0.05, target_res * 0.05) or abs(px_h - target_res) > max(0.05, target_res * 0.05):
+            return False
+        min_x = gt[0]
+        max_x = gt[0] + ds.RasterXSize * gt[1]
+        max_y = gt[3]
+        min_y = gt[3] + ds.RasterYSize * gt[5]
+        tol = max(2.0 * target_res, 5.0)
+        return (
+            abs(min_x - bbox_min_x) <= tol
+            and abs(max_x - bbox_max_x) <= tol
+            and abs(min_y - bbox_min_y) <= tol
+            and abs(max_y - bbox_max_y) <= tol
+        )
+    except (RuntimeError, ValueError, OSError) as exc:
+        logger.debug("Could not inspect DEM target match for %s: %s", src_dem, exc)
+        return False
+    finally:
+        ds = None
 
 
 def build_terrain_products(
@@ -1294,41 +1411,57 @@ def build_terrain_products(
         max_extent_m=max(b.width, b.height),
     )
 
-    # 1. Warp raw DEM to exact sheet UTM CRS with smooth cubic resampling
-    warp_cmd = [
-        "gdalwarp",
-        "-overwrite",
-        "-t_srs",
-        f"EPSG:{layout.utm_epsg}",
-        "-te",
-        f"{b.min_x}",
-        f"{b.min_y}",
-        f"{b.max_x}",
-        f"{b.max_y}",
-        "-tr",
-        f"{target_res}",
-        f"{target_res}",
-        "-r",
-        "cubic",
-        "-dstnodata",
-        str(DEM_NODATA),
-        "-ot",
-        "Float32",
-        "-co",
-        "COMPRESS=DEFLATE",
-        "-co",
-        "TILED=YES",
-        str(src_dem),
-        str(dem_utm_tif),
-    ]
-    logger.info(
-        "Warping DEM (native %.2f m) to EPSG:%d at %.2f m resolution -> %s",
-        native_res_m,
-        layout.utm_epsg,
-        target_res,
-        dem_utm_tif,
-    )
-    _run_subprocess(warp_cmd, context="gdalwarp (DEM -> UTM)")
+    # 1. Warp raw DEM to exact sheet UTM CRS (skip redundant warp if input already matches)
+    if _dem_matches_utm_target(
+        src_dem,
+        utm_epsg=layout.utm_epsg,
+        bbox_min_x=b.min_x,
+        bbox_min_y=b.min_y,
+        bbox_max_x=b.max_x,
+        bbox_max_y=b.max_y,
+        target_res=target_res,
+    ):
+        logger.info("Input DEM already matches EPSG:%d at %.2f m; reusing directly", layout.utm_epsg, target_res)
+        if src_dem != dem_utm_tif.resolve():
+            shutil.copy2(src_dem, dem_utm_tif)
+    else:
+        warp_cmd = [
+            "gdalwarp",
+            "-overwrite",
+            "-multi",
+            "-wo",
+            "NUM_THREADS=2",
+            "-t_srs",
+            f"EPSG:{layout.utm_epsg}",
+            "-te",
+            f"{b.min_x}",
+            f"{b.min_y}",
+            f"{b.max_x}",
+            f"{b.max_y}",
+            "-tr",
+            f"{target_res}",
+            f"{target_res}",
+            "-r",
+            "cubic",
+            "-dstnodata",
+            str(DEM_NODATA),
+            "-ot",
+            "Float32",
+            "-co",
+            "COMPRESS=NONE",
+            "-co",
+            "TILED=YES",
+            str(src_dem),
+            str(dem_utm_tif),
+        ]
+        logger.info(
+            "Warping DEM (native %.2f m) to EPSG:%d at %.2f m resolution -> %s",
+            native_res_m,
+            layout.utm_epsg,
+            target_res,
+            dem_utm_tif,
+        )
+        _run_subprocess(warp_cmd, context="gdalwarp (DEM -> UTM)")
 
     # 2. Extract terrain elevation statistics and sheet-center altitude for WMM
     min_elev, max_elev, center_elev_m = _compute_dem_stats_and_center(
@@ -1338,11 +1471,21 @@ def build_terrain_products(
     )
     relief_m = max(0.0, max_elev - min_elev)
 
-    # 3. Multi-directional hillshade (skip cleanly with flat-white neutral raster when OFF)
-    if layout.spec.carto.hillshade_strength == HillshadeStrength.OFF:
-        logger.info("Hillshade strength is OFF; writing neutral white raster -> %s", hillshade_tif)
-        _write_neutral_hillshade(dem_utm_tif, hillshade_tif)
-    else:
+    # 3. Choose contour interval and prepare read-only derivative tasks (run concurrently, bounded to 2 workers)
+    interval, index_mult, interval_display = choose_contour_interval(
+        layout.spec.scale,
+        layout.spec.units,
+        relief_m,
+        density=layout.spec.carto.contour_density,
+        native_res_m=native_res_m,
+    )
+    index_interval = interval * index_mult
+
+    def _build_hillshade() -> None:
+        if layout.spec.carto.hillshade_strength == HillshadeStrength.OFF:
+            logger.info("Hillshade strength is OFF; writing neutral white raster -> %s", hillshade_tif)
+            _write_neutral_hillshade(dem_utm_tif, hillshade_tif)
+            return
         hillshade_cmd = [
             "gdaldem",
             "hillshade",
@@ -1353,75 +1496,78 @@ def build_terrain_products(
             "-of",
             "GTiff",
             "-co",
-            "COMPRESS=DEFLATE",
+            "COMPRESS=NONE",
             "-co",
             "TILED=YES",
             str(dem_utm_tif),
             str(hillshade_tif),
         ]
-        logger.info(
-            "Generating multi-directional hillshade (z=%g) -> %s",
-            z_factor,
-            hillshade_tif,
-        )
+        logger.info("Generating multi-directional hillshade (z=%g) -> %s", z_factor, hillshade_tif)
         _run_subprocess(hillshade_cmd, context="gdaldem hillshade")
 
-    # 4. Generate contours honoring units + carto.contour_density + DEM resolution
-    interval, index_mult, interval_display = choose_contour_interval(
-        layout.spec.scale,
-        layout.spec.units,
-        relief_m,
-        density=layout.spec.carto.contour_density,
-        native_res_m=native_res_m,
-    )
-    index_interval = interval * index_mult
+    def _build_contours() -> None:
+        if terrain_gpkg.exists():
+            terrain_gpkg.unlink()
+        if layout.spec.units == Units.IMPERIAL:
+            contour_step_m = interval / FEET_PER_METER
+            elev_scale = FEET_PER_METER
+        else:
+            contour_step_m = interval
+            elev_scale = 1.0
 
-    dem_for_contours = dem_utm_tif
-    if layout.spec.units == Units.IMPERIAL:
-        dem_for_contours = _scale_dem_meters_to_feet(dem_utm_tif, work_dir / "dem_utm_ft.tif")
+        contour_cmd = [
+            "gdal_contour",
+            "-a",
+            "elev",
+            "-i",
+            f"{contour_step_m:.12g}",
+            "-f",
+            "GPKG",
+            "-nln",
+            "contours",
+            str(dem_utm_tif),
+            str(terrain_gpkg),
+        ]
+        logger.info("Generating contours (%s) -> %s", interval_display, terrain_gpkg)
+        _run_subprocess(contour_cmd, context="gdal_contour")
+        _postprocess_contours_gpkg(terrain_gpkg, index_interval=index_interval, elev_scale=elev_scale)
 
-    if terrain_gpkg.exists():
-        terrain_gpkg.unlink()
-
-    contour_cmd = [
-        "gdal_contour",
-        "-a",
-        "elev",
-        "-i",
-        f"{interval:g}",
-        "-f",
-        "GPKG",
-        "-nln",
-        "contours",
-        str(dem_for_contours),
-        str(terrain_gpkg),
-    ]
-    logger.info("Generating contours (%s) -> %s", interval_display, terrain_gpkg)
-    _run_subprocess(contour_cmd, context="gdal_contour")
-
-    # 5. Tag index contours (is_index) and clean integer labels (elev_label)
-    _postprocess_contours_gpkg(terrain_gpkg, index_interval=index_interval)
-
-    # 6. Optional avalanche / steepness slope-angle shading RGBA GeoTIFF
     slope_tif: Path | None = None
-    if layout.spec.carto.show_slope_shading:
-        slope_tif = build_slope_shading(
-            dem_utm_tif,
-            color_mode=layout.spec.color_mode,
-            work_dir=work_dir,
-        )
-
-    # 7. Optional RF / line-of-sight viewshed RGBA raster & observer/range-ring GeoPackage
     viewshed_tif: Path | None = None
     viewshed_observers_gpkg: Path | None = None
-    if layout.spec.viewsheds:
-        viewshed_tif, viewshed_observers_gpkg = build_viewshed_products(
-            dem_utm_tif,
-            list(layout.spec.viewsheds),
-            layout.utm_epsg,
-            layout.spec.color_mode,
-            work_dir,
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fut_hs = pool.submit(_build_hillshade)
+        fut_ct = pool.submit(_build_contours)
+        fut_slope = (
+            pool.submit(
+                build_slope_shading,
+                dem_utm_tif,
+                layout.spec.color_mode,
+                work_dir,
+            )
+            if layout.spec.carto.show_slope_shading
+            else None
         )
+        fut_vs = (
+            pool.submit(
+                build_viewshed_products,
+                dem_utm_tif,
+                list(layout.spec.viewsheds),
+                layout.utm_epsg,
+                layout.spec.color_mode,
+                work_dir,
+            )
+            if layout.spec.viewsheds
+            else None
+        )
+
+        fut_hs.result()
+        fut_ct.result()
+        if fut_slope is not None:
+            slope_tif = fut_slope.result()
+        if fut_vs is not None:
+            viewshed_tif, viewshed_observers_gpkg = fut_vs.result()
 
     return TerrainResult(
         dem_utm_tif=dem_utm_tif,

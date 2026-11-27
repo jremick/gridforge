@@ -7,7 +7,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Literal, Optional, cast
+from typing import TYPE_CHECKING, Any, Literal, Optional, cast
 
 import typer
 
@@ -35,14 +35,69 @@ from gridforge.config import (
     WaypointCategory,
     WaypointInput,
 )
-from gridforge.geo.crs import compute_sheet_layout, parse_center
-from gridforge.geo.declination import compute_declination
-from gridforge.packs.builder import resolve_pack_directory
-from gridforge.pipeline.runner import run_export_job, run_render_job, run_strip_atlas_job
-from gridforge.sources.base import ElevationSource, OverlaySource, VectorSource
-from gridforge.sources.dem_local import LocalDEMSource
-from gridforge.sources.osm_pbf import LocalPBFSource
-from gridforge.sources.overlay_user import UserOverlaySource
+
+if TYPE_CHECKING:
+    from gridforge.sources.base import ElevationSource, OverlaySource, VectorSource
+
+
+def parse_center(*args: Any, **kwargs: Any) -> Any:
+    from gridforge.geo.crs import parse_center as _impl
+
+    return _impl(*args, **kwargs)
+
+
+def compute_sheet_layout(*args: Any, **kwargs: Any) -> Any:
+    from gridforge.geo.crs import compute_sheet_layout as _impl
+
+    return _impl(*args, **kwargs)
+
+
+def compute_declination(*args: Any, **kwargs: Any) -> Any:
+    from gridforge.geo.declination import compute_declination as _impl
+
+    return _impl(*args, **kwargs)
+
+
+def resolve_pack_directory(*args: Any, **kwargs: Any) -> Any:
+    from gridforge.packs.builder import resolve_pack_directory as _impl
+
+    return _impl(*args, **kwargs)
+
+
+def run_render_job(*args: Any, **kwargs: Any) -> Any:
+    from gridforge.pipeline.runner import run_render_job as _impl
+
+    return _impl(*args, **kwargs)
+
+
+def run_export_job(*args: Any, **kwargs: Any) -> Any:
+    from gridforge.pipeline.runner import run_export_job as _impl
+
+    return _impl(*args, **kwargs)
+
+
+def run_strip_atlas_job(*args: Any, **kwargs: Any) -> Any:
+    from gridforge.pipeline.runner import run_strip_atlas_job as _impl
+
+    return _impl(*args, **kwargs)
+
+
+def LocalDEMSource(*args: Any, **kwargs: Any) -> Any:  # noqa: N802
+    from gridforge.sources.dem_local import LocalDEMSource as _impl
+
+    return _impl(*args, **kwargs)
+
+
+def LocalPBFSource(*args: Any, **kwargs: Any) -> Any:  # noqa: N802
+    from gridforge.sources.osm_pbf import LocalPBFSource as _impl
+
+    return _impl(*args, **kwargs)
+
+
+def UserOverlaySource(*args: Any, **kwargs: Any) -> Any:  # noqa: N802
+    from gridforge.sources.overlay_user import UserOverlaySource as _impl
+
+    return _impl(*args, **kwargs)
 
 app = typer.Typer(
     name="gridforge",

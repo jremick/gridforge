@@ -465,6 +465,9 @@ AUSTRALIA_REGIONS: dict[str, RegionPreset] = {
 ALL_REGIONS: dict[str, RegionPreset] = {r.region_id: r for r in _RAW_REGIONS}
 
 
+MAX_CUSTOM_PACK_SPAN_DEG: float = 4.0
+
+
 def _infer_custom_country(bbox: BBox) -> tuple[RegionCountry, PackDemTier, str]:
     c_lon = (bbox.min_x + bbox.max_x) / 2.0
     c_lat = (bbox.min_y + bbox.max_y) / 2.0
@@ -476,7 +479,7 @@ def _infer_custom_country(bbox: BBox) -> tuple[RegionCountry, PackDemTier, str]:
         return ("CA", "ca-hrdem", "https://download.geofabrik.de/north-america/canada-latest.osm.pbf")
     if -126.0 <= c_lon <= -66.0 and 24.0 <= c_lat <= 49.5:
         return ("US", "usgs3dep", "https://download.geofabrik.de/north-america/us-latest.osm.pbf")
-    return ("CUSTOM", "glo30", DEFAULT_AU_PBF_URL)
+    return ("CUSTOM", "glo30", "")
 
 
 def list_regions(group: RegionGroup | None = None) -> list[RegionPreset]:
@@ -513,6 +516,12 @@ def resolve_region(region_or_bbox: str) -> RegionPreset:
             raise ValueError(
                 f"Invalid latitude bounds south={s}, north={n}; "
                 f"require {MIN_UTM_LAT} <= s < n <= {MAX_UTM_LAT}."
+            )
+
+        if (e - w) > MAX_CUSTOM_PACK_SPAN_DEG or (n - s) > MAX_CUSTOM_PACK_SPAN_DEG:
+            raise ValueError(
+                f"Custom pack bounding box span ({e - w:.2f}° x {n - s:.2f}°) exceeds "
+                f"maximum {MAX_CUSTOM_PACK_SPAN_DEG:.1f}° x {MAX_CUSTOM_PACK_SPAN_DEG:.1f}° limit."
             )
 
         bbox = BBox(min_x=w, min_y=s, max_x=e, max_y=n)

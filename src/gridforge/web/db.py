@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import shutil
 import sqlite3
+import threading
 import time
+from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -62,13 +65,122 @@ class InviteActionError(Exception):
         self.detail = detail
 
 
-def _connect(db_path: Path) -> sqlite3.Connection:
+_THREAD_CONN_LOCAL = threading.local()
+_MAX_POOLED_DBS_PER_THREAD = 8
+
+
+class _PooledConnection(sqlite3.Connection):
+    """Thread-local reusable SQLite connection whose ``close()`` returns it to the pool."""
+
+    _gf_pooled: bool = False
+    _gf_in_use: bool = False
+    _gf_file_id: tuple[int, int] | None = None
+
+    def close(self) -> None:
+        if not self._gf_pooled:
+            super().close()
+            return
+        try:
+            if self.in_transaction:
+                self.rollback()
+        except Exception:
+            self._gf_pooled = False
+            self._gf_in_use = False
+            super().close()
+            return
+        self._gf_in_use = False
+
+    def force_close(self) -> None:
+        self._gf_pooled = False
+        self._gf_in_use = False
+        try:
+            if self.in_transaction:
+                self.rollback()
+        except sqlite3.Error as exc:
+            logger.debug("Ignoring SQLite rollback error on pooled connection close: %s", exc)
+        super().close()
+
+
+def _get_thread_pool() -> OrderedDict[str, _PooledConnection]:
+    pool: OrderedDict[str, _PooledConnection] | None = getattr(_THREAD_CONN_LOCAL, "pool", None)
+    if pool is None:
+        pool = OrderedDict()
+        _THREAD_CONN_LOCAL.pool = pool
+    return pool
+
+
+def _path_file_id(db_path: Path) -> tuple[int, int] | None:
+    try:
+        st = os.stat(db_path)
+        return (st.st_dev, st.st_ino)
+    except OSError:
+        return None
+
+
+def close_thread_connections() -> None:
+    """Force-close all thread-local pooled SQLite connections on the current thread."""
+    pool: OrderedDict[str, _PooledConnection] | None = getattr(_THREAD_CONN_LOCAL, "pool", None)
+    if not pool:
+        return
+    for conn in list(pool.values()):
+        try:
+            conn.force_close()
+        except sqlite3.Error as exc:
+            logger.debug("Ignoring SQLite close error while draining thread pool: %s", exc)
+    pool.clear()
+
+
+def _open_configured_connection(db_path: Path, *, pooled: bool) -> _PooledConnection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path), timeout=15.0, isolation_level=None)
+    conn = sqlite3.connect(
+        str(db_path),
+        timeout=15.0,
+        isolation_level=None,
+        factory=_PooledConnection,
+    )
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA busy_timeout=5000;")
+    conn._gf_pooled = pooled
+    conn._gf_in_use = True
+    conn._gf_file_id = _path_file_id(db_path)
+    return conn
+
+
+def _connect(db_path: Path) -> sqlite3.Connection:
+    resolved_key = str(db_path.resolve())
+    pool = _get_thread_pool()
+    cur_file_id = _path_file_id(db_path)
+    existing = pool.get(resolved_key)
+    if existing is not None:
+        if existing._gf_in_use:
+            # Nested call on the same thread: return a dedicated non-pooled connection.
+            return _open_configured_connection(db_path, pooled=False)
+        if cur_file_id is not None and existing._gf_file_id == cur_file_id:
+            try:
+                existing.in_transaction  # cheap liveness check
+                existing._gf_in_use = True
+                pool.move_to_end(resolved_key)
+                return existing
+            except sqlite3.Error:
+                pass
+        pool.pop(resolved_key, None)
+        existing.force_close()
+
+    while len(pool) >= _MAX_POOLED_DBS_PER_THREAD:
+        evict_key = None
+        for k, c in pool.items():
+            if not c._gf_in_use:
+                evict_key = k
+                break
+        if evict_key is None:
+            return _open_configured_connection(db_path, pooled=False)
+        old = pool.pop(evict_key)
+        old.force_close()
+
+    conn = _open_configured_connection(db_path, pooled=True)
+    pool[resolved_key] = conn
     return conn
 
 
@@ -148,6 +260,8 @@ def init_db(db_path: Path) -> None:
 
             CREATE INDEX IF NOT EXISTS idx_jobs_status_created
                 ON jobs (status, created_at);
+            CREATE INDEX IF NOT EXISTS idx_jobs_created
+                ON jobs (created_at DESC);
 
             CREATE TABLE IF NOT EXISTS worker_heartbeat (
                 worker_id TEXT PRIMARY KEY,
@@ -232,6 +346,8 @@ def init_db(db_path: Path) -> None:
 
             CREATE INDEX IF NOT EXISTS idx_usage_type_created
                 ON usage_events (event_type, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_usage_created_type_role
+                ON usage_events (created_at, event_type, actor_role);
             CREATE INDEX IF NOT EXISTS idx_usage_actor_type_created
                 ON usage_events (actor_id, event_type, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_usage_ip_type_created
@@ -711,15 +827,16 @@ def prune_expired_jobs(
     max_age_hours: float = 24.0,
     guest_ttl_hours: float | None = None,
     friend_ttl_hours: float | None = None,
+    admin_ttl_hours: float | None = None,
     now: datetime | None = None,
     orphan_grace_seconds: float = 60.0,
 ) -> int:
     """Remove expired terminal jobs from SQLite and disk.
 
-    When ``guest_ttl_hours`` and ``friend_ttl_hours`` are both ``None``, preserves
-    legacy ``max_age_hours`` pruning across all terminal jobs. When either role TTL
-    is provided, only matching ``guest`` / ``friend`` terminal jobs are pruned and
-    ``admin`` / ``none`` jobs are preserved.
+    When role TTLs are all ``None``, preserves legacy ``max_age_hours`` pruning
+    across all terminal jobs. When role TTLs are provided, matching ``guest`` /
+    ``friend`` / ``admin`` terminal jobs are pruned according to each configured
+    TTL (``<= 0`` or ``None`` preserves that role).
     """
     ref_now = _resolve_now(now)
     conn = _connect(db_path)
@@ -731,7 +848,7 @@ def prune_expired_jobs(
             JobStatus.FAILED.value,
             JobStatus.CANCELLED.value,
         )
-        if guest_ttl_hours is None and friend_ttl_hours is None:
+        if guest_ttl_hours is None and friend_ttl_hours is None and admin_ttl_hours is None:
             cutoff = _dt_to_iso(ref_now - timedelta(hours=max_age_hours))
             rows = conn.execute(
                 """
@@ -745,14 +862,18 @@ def prune_expired_jobs(
         else:
             role_clauses: list[str] = []
             params: list[Any] = list(terminal_statuses)
-            if guest_ttl_hours is not None and guest_ttl_hours >= 0:
+            if guest_ttl_hours is not None and guest_ttl_hours > 0:
                 guest_cutoff = _dt_to_iso(ref_now - timedelta(hours=guest_ttl_hours))
                 role_clauses.append("(owner_role = 'guest' AND COALESCE(finished_at, created_at) < ?)")
                 params.append(guest_cutoff)
-            if friend_ttl_hours is not None and friend_ttl_hours >= 0:
+            if friend_ttl_hours is not None and friend_ttl_hours > 0:
                 friend_cutoff = _dt_to_iso(ref_now - timedelta(hours=friend_ttl_hours))
                 role_clauses.append("(owner_role = 'friend' AND COALESCE(finished_at, created_at) < ?)")
                 params.append(friend_cutoff)
+            if admin_ttl_hours is not None and admin_ttl_hours > 0:
+                admin_cutoff = _dt_to_iso(ref_now - timedelta(hours=admin_ttl_hours))
+                role_clauses.append("(owner_role = 'admin' AND COALESCE(finished_at, created_at) < ?)")
+                params.append(admin_cutoff)
             if role_clauses:
                 where_roles = " OR ".join(role_clauses)
                 rows = conn.execute(
@@ -1464,6 +1585,29 @@ def delete_sessions_for_user(db_path: Path, user_id: str) -> int:
         conn.close()
 
 
+def prune_expired_usage_events(
+    db_path: Path,
+    *,
+    retention_days: float = 30.0,
+    now: datetime | None = None,
+) -> int:
+    """Delete metered ``usage_events`` rows older than ``retention_days``."""
+    if retention_days <= 0:
+        return 0
+    cutoff = _dt_to_iso(_resolve_now(now) - timedelta(days=retention_days))
+    conn = _connect(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.execute("DELETE FROM usage_events WHERE created_at < ?", (cutoff,))
+        conn.execute("COMMIT")
+        return int(cur.rowcount)
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
 def record_usage_event(
     db_path: Path,
     *,
@@ -1804,41 +1948,37 @@ def get_admin_usage_report(
 
     conn = _connect(db_path)
     try:
-        renders_today = int(
-            conn.execute(
-                "SELECT COUNT(*) FROM usage_events WHERE event_type = 'job_render' AND created_at >= ?",
-                (today_start_iso,),
-            ).fetchone()[0]
-        )
-        renders_7d = int(
-            conn.execute(
-                "SELECT COUNT(*) FROM usage_events WHERE event_type = 'job_render' AND created_at >= ?",
-                (week_start_iso,),
-            ).fetchone()[0]
-        )
-        previews_today = int(
-            conn.execute(
-                """
-                SELECT COUNT(*) FROM usage_events
-                WHERE event_type IN ('viewshed_preview', 'rf_link_profile', 'ruler_metrics')
-                  AND created_at >= ?
-                """,
-                (today_start_iso,),
-            ).fetchone()[0]
-        )
+        role_rows = conn.execute(
+            """
+            SELECT actor_role,
+                   SUM(CASE WHEN event_type = 'job_render' AND created_at >= ? THEN 1 ELSE 0 END) AS renders_today,
+                   SUM(CASE WHEN event_type = 'job_render' AND created_at >= ? THEN 1 ELSE 0 END) AS renders_7d,
+                   SUM(CASE WHEN event_type IN ('viewshed_preview', 'rf_link_profile', 'ruler_metrics') AND created_at >= ? THEN 1 ELSE 0 END) AS previews_today,
+                   SUM(CASE WHEN event_type = 'geocode_miss' AND created_at >= ? THEN 1 ELSE 0 END) AS geocode_misses_today
+            FROM usage_events
+            WHERE created_at >= ?
+            GROUP BY actor_role
+            """,
+            (today_start_iso, week_start_iso, today_start_iso, today_start_iso, week_start_iso),
+        ).fetchall()
+        by_role: dict[str, dict[str, int]] = {}
+        for r in role_rows:
+            by_role[str(r["actor_role"])] = {
+                "renders_today": int(r["renders_today"] or 0),
+                "renders_7d": int(r["renders_7d"] or 0),
+                "previews_today": int(r["previews_today"] or 0),
+                "geocode_misses_today": int(r["geocode_misses_today"] or 0),
+            }
+
+        renders_today = sum(v["renders_today"] for v in by_role.values())
+        renders_7d = sum(v["renders_7d"] for v in by_role.values())
+        previews_today = sum(v["previews_today"] for v in by_role.values())
+        global_daily_public_used = by_role.get("guest", {}).get("renders_today", 0)
+
         active_queue_depth = int(
             conn.execute(
                 "SELECT COUNT(*) FROM jobs WHERE status IN (?, ?)",
                 (JobStatus.QUEUED.value, JobStatus.RUNNING.value),
-            ).fetchone()[0]
-        )
-        global_daily_public_used = int(
-            conn.execute(
-                """
-                SELECT COUNT(*) FROM usage_events
-                WHERE event_type = 'job_render' AND actor_role = 'guest' AND created_at >= ?
-                """,
-                (today_start_iso,),
             ).fetchone()[0]
         )
 
@@ -1870,28 +2010,6 @@ def get_admin_usage_report(
             if perf_row is not None and perf_row["max_rss"] is not None
             else None
         )
-
-        role_rows = conn.execute(
-            """
-            SELECT actor_role,
-                   SUM(CASE WHEN event_type = 'job_render' AND created_at >= ? THEN 1 ELSE 0 END) AS renders_today,
-                   SUM(CASE WHEN event_type = 'job_render' AND created_at >= ? THEN 1 ELSE 0 END) AS renders_7d,
-                   SUM(CASE WHEN event_type IN ('viewshed_preview', 'rf_link_profile', 'ruler_metrics') AND created_at >= ? THEN 1 ELSE 0 END) AS previews_today,
-                   SUM(CASE WHEN event_type = 'geocode_miss' AND created_at >= ? THEN 1 ELSE 0 END) AS geocode_misses_today
-            FROM usage_events
-            WHERE created_at >= ?
-            GROUP BY actor_role
-            """,
-            (today_start_iso, week_start_iso, today_start_iso, today_start_iso, week_start_iso),
-        ).fetchall()
-        by_role: dict[str, dict[str, int]] = {}
-        for r in role_rows:
-            by_role[str(r["actor_role"])] = {
-                "renders_today": int(r["renders_today"] or 0),
-                "renders_7d": int(r["renders_7d"] or 0),
-                "previews_today": int(r["previews_today"] or 0),
-                "geocode_misses_today": int(r["geocode_misses_today"] or 0),
-            }
 
         ev_rows = conn.execute(
             """

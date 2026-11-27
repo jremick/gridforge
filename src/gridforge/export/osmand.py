@@ -139,6 +139,7 @@ def export_osmand_sqlitedb(
     dpi: int = 300,
     include_grid: bool = True,
     collarless_tif: Path | None = None,
+    mbtiles_path: Path | None = None,
 ) -> ExportResult:
     """Export the exact sheet map body to an atomic OsmAnd BigPlanet ``.sqlitedb`` archive."""
     t0 = time.perf_counter()
@@ -170,20 +171,23 @@ def export_osmand_sqlitedb(
         ) as staged,
         tempfile.TemporaryDirectory(prefix="gridforge_osmand_") as tmp_dir_str,
     ):
-        tmp_dir = Path(tmp_dir_str)
-        temp_mbtiles = tmp_dir / "intermediate.mbtiles"
-        export_mbtiles(
-            workspace,
-            temp_mbtiles,
-            tile_format=tile_format,
-            jpeg_quality=jpeg_quality,
-            dpi=dpi,
-            include_grid=include_grid,
-            collarless_tif=collarless_tif,
-        )
+        if mbtiles_path is not None and Path(mbtiles_path).is_file():
+            src_mbtiles = Path(mbtiles_path).resolve()
+        else:
+            tmp_dir = Path(tmp_dir_str)
+            src_mbtiles = tmp_dir / "intermediate.mbtiles"
+            export_mbtiles(
+                workspace,
+                src_mbtiles,
+                tile_format=tile_format,
+                jpeg_quality=jpeg_quality,
+                dpi=dpi,
+                include_grid=include_grid,
+                collarless_tif=collarless_tif,
+            )
 
         tile_count, min_zoom, max_zoom, max_tile_bytes = _write_osmand_from_mbtiles(
-            temp_mbtiles,
+            src_mbtiles,
             staged,
             sheet_name=sheet_name,
             description=description,

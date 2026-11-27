@@ -6,15 +6,20 @@ import logging
 import math
 import os
 import re
+import shutil
 import subprocess
 import tempfile
+import uuid
 from collections.abc import Iterator, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import httpx
 from osgeo import gdal, ogr, osr
+
+from gridforge.subprocess_env import build_safe_subprocess_env
 
 from gridforge.config import (
     AUOverlayKind,
@@ -74,9 +79,13 @@ _GDAL_CURL_ENV: dict[str, str] = {
     "VSI_CACHE_SIZE": "67108864",
     "GDAL_HTTP_MAX_RETRY": "3",
     "GDAL_HTTP_RETRY_DELAY": "2",
+    "GDAL_HTTP_TIMEOUT": "30",
+    "GDAL_HTTP_CONNECTTIMEOUT": "10",
     "GDAL_CACHEMAX": "128",
     "OMP_THREAD_LIMIT": "1",
 }
+
+MAX_PACK_DOWNLOAD_BYTES: int = 4 * 1024 * 1024 * 1024  # 4 GiB hard stream cap
 
 _ALL_AU_OVERLAYS: tuple[AUOverlayKind, ...] = (
     AUOverlayKind.AU_HYDRO,
@@ -103,11 +112,10 @@ def _run_cmd(
     *,
     step: str,
     extra_env: Mapping[str, str] | None = None,
+    timeout: int = 600,
 ) -> None:
-    env = os.environ.copy()
-    if extra_env:
-        env.update(extra_env)
-    proc = subprocess.run(cmd, env=env, capture_output=True, text=True, check=False)
+    env = build_safe_subprocess_env(extra=extra_env)
+    proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout, check=False)
     if proc.returncode != 0:
         raise RuntimeError(
             f"{step} failed (exit={proc.returncode}).\n"
@@ -124,31 +132,42 @@ def _default_cache_dir(cache_dir: Path | None) -> Path:
     return Path(env_dir).resolve()
 
 
-def _stream_download_file(url: str, dest: Path, *, chunk_bytes: int = 1_048_576) -> Path:
+def _stream_download_file(
+    url: str,
+    dest: Path,
+    *,
+    chunk_bytes: int = 1_048_576,
+    max_bytes: int = MAX_PACK_DOWNLOAD_BYTES,
+) -> Path:
     """Stream a large file to disk in fixed-size chunks (1 MiB) with atomic rename."""
+    if not url.lower().startswith("https://"):
+        raise ValueError(f"Refusing non-HTTPS pack download URL: {url!r}")
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.is_file() and dest.stat().st_size > 0:
         logger.info("Using cached download %s (%d bytes)", dest, dest.stat().st_size)
         return dest
 
-    part_path = dest.with_suffix(dest.suffix + ".part")
-    if part_path.exists():
-        part_path.unlink()
+    part_path = dest.with_name(f"{dest.name}.part.{uuid.uuid4().hex[:8]}")
 
     headers = {"User-Agent": "gridforge/0.1 (+https://github.com/gridforge/gridforge)"}
     timeout = httpx.Timeout(connect=30.0, read=120.0, write=30.0, pool=30.0)
     try:
+        written = 0
         with httpx.Client(follow_redirects=True, timeout=timeout, headers=headers) as client:
             with client.stream("GET", url) as resp:
                 resp.raise_for_status()
                 with part_path.open("wb") as fh:
                     for chunk in resp.iter_bytes(chunk_size=chunk_bytes):
                         if chunk:
+                            written += len(chunk)
+                            if written > max_bytes:
+                                raise RuntimeError(
+                                    f"Pack download exceeded {max_bytes // (1024 * 1024)} MiB limit."
+                                )
                             fh.write(chunk)
         part_path.replace(dest)
     except Exception:
-        if part_path.exists():
-            part_path.unlink()
+        part_path.unlink(missing_ok=True)
         raise
 
     return dest
@@ -173,6 +192,11 @@ def _extract_osm_pbf(
             url = os.environ.get("GRIDFORGE_AU_PBF_URL", pbf_url).strip()
         else:
             url = os.environ.get("GRIDFORGE_PBF_URL", pbf_url).strip()
+        if not url:
+            raise ValueError(
+                "Automatic OSM PBF download for custom bounding boxes is supported for AU, NZ, US, "
+                "and CA regions; supply source_pbf (or GRIDFORGE_PBF_URL) for other regions."
+            )
         filename = Path(url.split("?")[0]).name or "region-latest.osm.pbf"
         src = _stream_download_file(url, cache_dir / "geofabrik" / filename)
 
@@ -536,6 +560,9 @@ def _append_gpkg_layers_wgs84(
     for layer_name, count in layers:
         if count <= 0:
             continue
+        if not layer_name or layer_name.startswith("-") or "\x00" in layer_name:
+            logger.warning("Skipping overlay layer with unsafe name: %r", layer_name)
+            continue
         cmd = ["ogr2ogr", "-f", "GPKG", "-t_srs", "EPSG:4326"]
         if spat_bbox is not None:
             cmd.extend(
@@ -763,7 +790,7 @@ def build_offline_pack(
     """Build a self-contained, air-gapped offline regional pack streaming disk-to-disk."""
     preset: RegionPreset = resolve_region(region_or_bbox)
     out_dir = Path(output_dir).resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.parent.mkdir(parents=True, exist_ok=True)
     resolved_cache = _default_cache_dir(cache_dir)
 
     effective_dem_tier: PackDemTier = dem_tier
@@ -774,107 +801,159 @@ def build_offline_pack(
     pack_name = name or preset.name
     attributions: list[str] = []
 
-    osm_rel: str | None = None
-    if include_osm:
-        _extract_osm_pbf(
-            preset.bbox_wgs84,
-            out_dir / "osm.osm.pbf",
-            source_pbf=Path(source_pbf) if source_pbf is not None else None,
-            cache_dir=resolved_cache,
-            pbf_url=preset.pbf_url,
-            country=preset.country,
-        )
-        osm_rel = "osm.osm.pbf"
-        attributions.append(OSM_ATTRIBUTION)
+    staging_dir = out_dir.parent / f".staging-{out_dir.name}-{uuid.uuid4().hex[:8]}"
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    backup_dir: Path | None = None
+    try:
+        osm_rel: str | None = None
+        dem_rel: str | None = None
+        vertical_datum = _local_dem_metadata(effective_dem_tier)[0]
+        dem_attr: str | None = None
+        overlays_rel: dict[str, str] = {}
+        ov_attrs: list[str] = []
 
-    dem_rel: str | None = None
-    vertical_datum = _local_dem_metadata(effective_dem_tier)[0]
-    dem_attr: str | None = None
-    if include_dem:
-        _, vertical_datum, dem_attr = _extract_dem(
-            preset.bbox_wgs84,
-            out_dir / "dem.tif",
-            source_dem=Path(source_dem) if source_dem is not None else None,
-            dem_tier=effective_dem_tier,
-            cache_dir=resolved_cache,
-        )
-        dem_rel = "dem.tif"
-        if dem_attr and dem_attr not in attributions:
-            attributions.append(dem_attr)
-
-    overlays_rel: dict[str, str] = {}
-    if include_overlays:
-        overlays_rel, ov_attrs = _extract_regional_overlays(
-            preset.bbox_wgs84,
-            out_dir / "overlays",
-            country=preset.country,
-            local_overlay_overrides=local_overlay_overrides,
-            overlay_tile_deg=overlay_tile_deg,
-        )
-        for attr in ov_attrs:
-            if attr not in attributions:
-                attributions.append(attr)
-
-    basemap_rel: str | None = None
-    if include_basemap:
-        basemap_source_dem: Path | None = None
-        if dem_rel is not None and (out_dir / dem_rel).is_file():
-            basemap_source_dem = out_dir / dem_rel
-        elif source_dem is not None and Path(source_dem).is_file():
-            basemap_source_dem = Path(source_dem)
-
-        if basemap_source_dem is not None:
-            build_offline_basemap_mbtiles(
-                preset.bbox_wgs84,
-                out_dir / "basemap.mbtiles",
-                source_dem=basemap_source_dem,
-                min_zoom=basemap_min_zoom,
-                max_zoom=basemap_max_zoom,
-                name=f"{pack_name} Offline Basemap",
-                attribution=dem_attr,
-                cache_dir=resolved_cache,
+        # Run independent pack stages (OSM, DEM, overlays) concurrently.
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            fut_osm = (
+                pool.submit(
+                    _extract_osm_pbf,
+                    preset.bbox_wgs84,
+                    staging_dir / "osm.osm.pbf",
+                    source_pbf=Path(source_pbf) if source_pbf is not None else None,
+                    cache_dir=resolved_cache,
+                    pbf_url=preset.pbf_url,
+                    country=preset.country,
+                )
+                if include_osm
+                else None
             )
-            basemap_rel = "basemap.mbtiles"
-        else:
-            logger.info(
-                "Skipping offline basemap for '%s' because no DEM was included in this pack.",
-                pack_id,
+            fut_dem = (
+                pool.submit(
+                    _extract_dem,
+                    preset.bbox_wgs84,
+                    staging_dir / "dem.tif",
+                    source_dem=Path(source_dem) if source_dem is not None else None,
+                    dem_tier=effective_dem_tier,
+                    cache_dir=resolved_cache,
+                )
+                if include_dem
+                else None
+            )
+            fut_ov = (
+                pool.submit(
+                    _extract_regional_overlays,
+                    preset.bbox_wgs84,
+                    staging_dir / "overlays",
+                    country=preset.country,
+                    local_overlay_overrides=local_overlay_overrides,
+                    overlay_tile_deg=overlay_tile_deg,
+                )
+                if include_overlays
+                else None
             )
 
-    created_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    manifest_path = out_dir / "pack.json"
+            if fut_osm is not None:
+                fut_osm.result()
+                osm_rel = "osm.osm.pbf"
+                attributions.append(OSM_ATTRIBUTION)
+            if fut_dem is not None:
+                _, vertical_datum, dem_attr = fut_dem.result()
+                dem_rel = "dem.tif"
+                if dem_attr and dem_attr not in attributions:
+                    attributions.append(dem_attr)
+            if fut_ov is not None:
+                overlays_rel, ov_attrs = fut_ov.result()
+                for attr in ov_attrs:
+                    if attr not in attributions:
+                        attributions.append(attr)
 
-    # Compute total pack size across all data artifacts + manifest.
-    manifest = PackManifest(
-        pack_id=pack_id,
-        name=pack_name,
-        region=preset.region_id,
-        bbox_wgs84=preset.bbox_wgs84,
-        utm_zones=preset.utm_zones,
-        dem_path=dem_rel,
-        vertical_datum=vertical_datum,
-        dem_attribution=dem_attr,
-        osm_pbf_path=osm_rel,
-        basemap_path=basemap_rel,
-        overlays=overlays_rel,
-        attributions=attributions,
-        created_at=created_at,
-        size_bytes=0,
-    )
-    payload = manifest.model_dump_json(indent=2)
-    artifact_bytes = sum(
-        p.stat().st_size
-        for p in out_dir.rglob("*")
-        if p.is_file() and p.resolve() != manifest_path.resolve()
-    )
-    manifest = manifest.model_copy(
-        update={"size_bytes": artifact_bytes + len(payload.encode("utf-8"))}
-    )
-    tmp_manifest = out_dir / "pack.json.tmp"
-    tmp_manifest.write_text(manifest.model_dump_json(indent=2) + "\n", encoding="utf-8")
-    tmp_manifest.replace(manifest_path)
+        basemap_rel: str | None = None
+        if include_basemap:
+            basemap_source_dem: Path | None = None
+            if dem_rel is not None and (staging_dir / dem_rel).is_file():
+                basemap_source_dem = staging_dir / dem_rel
+            elif source_dem is not None and Path(source_dem).is_file():
+                basemap_source_dem = Path(source_dem)
 
-    return manifest
+            if basemap_source_dem is not None:
+                build_offline_basemap_mbtiles(
+                    preset.bbox_wgs84,
+                    staging_dir / "basemap.mbtiles",
+                    source_dem=basemap_source_dem,
+                    min_zoom=basemap_min_zoom,
+                    max_zoom=basemap_max_zoom,
+                    name=f"{pack_name} Offline Basemap",
+                    attribution=dem_attr,
+                    cache_dir=resolved_cache,
+                )
+                basemap_rel = "basemap.mbtiles"
+            else:
+                logger.info(
+                    "Skipping offline basemap for '%s' because no DEM was included in this pack.",
+                    pack_id,
+                )
+
+        created_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        manifest_path = staging_dir / "pack.json"
+
+        # Compute total pack size across all data artifacts + manifest.
+        manifest = PackManifest(
+            pack_id=pack_id,
+            name=pack_name,
+            region=preset.region_id,
+            bbox_wgs84=preset.bbox_wgs84,
+            utm_zones=preset.utm_zones,
+            dem_path=dem_rel,
+            vertical_datum=vertical_datum,
+            dem_attribution=dem_attr,
+            osm_pbf_path=osm_rel,
+            basemap_path=basemap_rel,
+            overlays=overlays_rel,
+            attributions=attributions,
+            created_at=created_at,
+            size_bytes=0,
+        )
+        payload = manifest.model_dump_json(indent=2)
+        artifact_bytes = sum(
+            p.stat().st_size
+            for p in staging_dir.rglob("*")
+            if p.is_file() and p.resolve() != manifest_path.resolve()
+        )
+        manifest = manifest.model_copy(
+            update={"size_bytes": artifact_bytes + len(payload.encode("utf-8"))}
+        )
+        tmp_manifest = staging_dir / "pack.json.tmp"
+        tmp_manifest.write_text(manifest.model_dump_json(indent=2) + "\n", encoding="utf-8")
+        tmp_manifest.replace(manifest_path)
+
+        # Atomically swap staging directory into final out_dir
+        if out_dir.exists():
+            backup_dir = out_dir.parent / f".backup-{out_dir.name}-{uuid.uuid4().hex[:8]}"
+            out_dir.replace(backup_dir)
+        try:
+            staging_dir.replace(out_dir)
+        except Exception:
+            if backup_dir is not None and backup_dir.exists() and not out_dir.exists():
+                backup_dir.replace(out_dir)
+            raise
+        if backup_dir is not None and backup_dir.exists():
+            shutil.rmtree(backup_dir, ignore_errors=True)
+        return manifest
+    except Exception:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        raise
+
+
+def resolve_pack_asset_path(pack_dir: Path | str, rel_path: str | Path) -> Path:
+    """Resolve a manifest asset path strictly contained within ``pack_dir``."""
+    resolved_pack = Path(pack_dir).resolve()
+    raw = str(rel_path).strip()
+    if not raw or "\x00" in raw or Path(raw).is_absolute():
+        raise ValueError(f"Offline pack asset path '{rel_path}' must be a relative path.")
+    candidate = (resolved_pack / raw).resolve()
+    if not candidate.is_relative_to(resolved_pack):
+        raise ValueError(f"Offline pack asset path '{rel_path}' escapes pack directory.")
+    return candidate
 
 
 def load_pack_manifest(pack_dir: Path | str) -> PackManifest:
@@ -891,15 +970,22 @@ def _installed_packs(packs_root: Path | str) -> Iterator[tuple[Path, PackManifes
     root = Path(packs_root)
     if not root.is_dir():
         return
+    resolved_root = root.resolve()
 
     seen_ids: set[str] = set()
 
     candidates: list[Path] = []
     if (root / "pack.json").is_file():
-        candidates.append(root)
+        candidates.append(resolved_root)
     for child in sorted(root.iterdir()):
-        if child.is_dir() and (child / "pack.json").is_file():
-            candidates.append(child)
+        if not child.is_dir():
+            continue
+        resolved_child = child.resolve()
+        if not resolved_child.is_relative_to(resolved_root):
+            logger.warning("Skipping offline pack directory escaping packs_root: '%s'", child)
+            continue
+        if (resolved_child / "pack.json").is_file():
+            candidates.append(resolved_child)
 
     for pack_dir in candidates:
         try:

@@ -91,6 +91,11 @@ def _make_label_format(
     return fmt
 
 
+def _escape_qgis_label_text(text: str) -> str:
+    """Neutralize QGIS layout expression delimiters ``[% ... %]`` in label text."""
+    return text.replace("[%", "[\u200b%").replace("%]", "%\u200b]")
+
+
 def _add_label(
     print_layout: Any,
     text: str,
@@ -128,7 +133,7 @@ def _add_label(
     }
 
     lbl = QgsLayoutItemLabel(print_layout)
-    lbl.setText(text)
+    lbl.setText(_escape_qgis_label_text(text))
     lbl.setTextFormat(_make_label_format(size_pt, color_hex, bold=bold, italic=italic))
     lbl.setHAlign(h_map[halign])
     lbl.setVAlign(v_map[valign])

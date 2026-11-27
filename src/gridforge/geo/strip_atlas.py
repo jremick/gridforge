@@ -101,35 +101,53 @@ def _append_dedup(target: list[tuple[float, float]], lon: float, lat: float) -> 
     target.append((float(lon), float(lat)))
 
 
+_MAX_GEOMETRY_DEPTH = 8
+_MAX_ROUTE_VERTICES = 50_000
+
+
 def _extract_coords_from_geometry(
     geom: dict[str, Any],
     line_pts: list[tuple[float, float]],
     point_pts: list[tuple[float, float]],
+    *,
+    depth: int = 0,
 ) -> None:
+    if depth > _MAX_GEOMETRY_DEPTH:
+        raise ValueError(f"GeoJSON GeometryCollection nesting exceeds limit ({_MAX_GEOMETRY_DEPTH}).")
+    if len(line_pts) >= _MAX_ROUTE_VERTICES and len(point_pts) >= _MAX_ROUTE_VERTICES:
+        raise ValueError(f"Route exceeds maximum vertex count ({_MAX_ROUTE_VERTICES:,}).")
     gtype = geom.get("type")
     coords = geom.get("coordinates")
     if gtype == "LineString" and isinstance(coords, list):
         for c in coords:
+            if len(line_pts) >= _MAX_ROUTE_VERTICES:
+                raise ValueError(f"Route exceeds maximum vertex count ({_MAX_ROUTE_VERTICES:,}).")
             if isinstance(c, (list, tuple)) and len(c) >= 2:
                 _append_dedup(line_pts, float(c[0]), float(c[1]))
     elif gtype == "MultiLineString" and isinstance(coords, list):
         for seg in coords:
             if isinstance(seg, list):
                 for c in seg:
+                    if len(line_pts) >= _MAX_ROUTE_VERTICES:
+                        raise ValueError(f"Route exceeds maximum vertex count ({_MAX_ROUTE_VERTICES:,}).")
                     if isinstance(c, (list, tuple)) and len(c) >= 2:
                         _append_dedup(line_pts, float(c[0]), float(c[1]))
     elif gtype == "Polygon" and isinstance(coords, list) and coords:
         outer = coords[0]
         if isinstance(outer, list):
             for c in outer:
+                if len(line_pts) >= _MAX_ROUTE_VERTICES:
+                    raise ValueError(f"Route exceeds maximum vertex count ({_MAX_ROUTE_VERTICES:,}).")
                 if isinstance(c, (list, tuple)) and len(c) >= 2:
                     _append_dedup(line_pts, float(c[0]), float(c[1]))
     elif gtype == "Point" and isinstance(coords, (list, tuple)) and len(coords) >= 2:
+        if len(point_pts) >= _MAX_ROUTE_VERTICES:
+            raise ValueError(f"Route exceeds maximum vertex count ({_MAX_ROUTE_VERTICES:,}).")
         _append_dedup(point_pts, float(coords[0]), float(coords[1]))
     elif gtype == "GeometryCollection":
         for sub in geom.get("geometries", []):
             if isinstance(sub, dict):
-                _extract_coords_from_geometry(sub, line_pts, point_pts)
+                _extract_coords_from_geometry(sub, line_pts, point_pts, depth=depth + 1)
 
 
 def parse_route_geojson(data: dict[str, Any]) -> list[tuple[float, float]]:
@@ -161,6 +179,9 @@ def parse_route_geojson(data: dict[str, Any]) -> list[tuple[float, float]]:
 
 
 def _parse_gpx_bytes(raw_bytes: bytes) -> list[tuple[float, float]]:
+    upper_head = raw_bytes[:4096].upper()
+    if b"<!ENTITY" in upper_head or b"<!DOCTYPE" in upper_head:
+        raise ValueError("GPX XML must not contain DTD or ENTITY declarations.")
     try:
         root = ET.fromstring(raw_bytes)
     except ET.ParseError as exc:
@@ -171,6 +192,8 @@ def _parse_gpx_bytes(raw_bytes: bytes) -> list[tuple[float, float]]:
         for el in root.iter():
             tag = el.tag.rsplit("}", 1)[-1].lower()
             if tag == local_name:
+                if len(out) >= _MAX_ROUTE_VERTICES:
+                    raise ValueError(f"Route exceeds maximum vertex count ({_MAX_ROUTE_VERTICES:,}).")
                 lat_s = el.attrib.get("lat")
                 lon_s = el.attrib.get("lon")
                 if lat_s is not None and lon_s is not None:
@@ -311,6 +334,18 @@ def plan_strip_atlas(
     usable_factor = max(0.2, 1.0 - (overlap_pct / 100.0))
     safe_w = ground_w * usable_factor
     safe_h = ground_h * usable_factor
+
+    # Fail fast BEFORE densification if route length cannot possibly fit within max_sheets
+    # (prevents OOM DoS from short zigzag routes spanning huge distances at 1:10,000).
+    max_feasible_m = max_sheets * math.hypot(safe_w, safe_h) * 3.0
+    if len(utm_raw) > _MAX_ROUTE_VERTICES:
+        raise ValueError(f"Route exceeds maximum vertex count ({_MAX_ROUTE_VERTICES:,}).")
+    if total_m > max_feasible_m:
+        raise ValueError(
+            f"Route ({route_distance_km:.1f} km) requires more than {max_sheets} sheets "
+            f"at 1:{scale:,} ({paper.value.upper()} {orientation.value}). "
+            "Choose a smaller scale (e.g. 1:50,000), larger paper (A3), or landscape orientation."
+        )
 
     # Densify long straight legs so greedy walk guarantees smooth transitions & overlap
     dense_step = min(safe_w, safe_h) * 0.05

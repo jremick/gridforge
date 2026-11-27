@@ -12,13 +12,34 @@ import shutil
 import subprocess
 from pathlib import Path
 from typing import Any, Final, Literal
+from urllib.parse import urlparse
 
 import httpx
 
 from gridforge.config import BBox, SheetLayout
 from gridforge.sources.dem_copernicus import CopernicusGLO30Source, GDAL_VSICURL_ENV
+from gridforge.subprocess_env import build_safe_subprocess_env
 
 logger = logging.getLogger(__name__)
+
+_ALLOWED_CA_HOST_SUFFIXES: Final[tuple[str, ...]] = (
+    "nrcan.gc.ca",
+    "geo.ca",
+    "canada.ca",
+    "amazonaws.com",
+)
+
+
+def _is_allowed_ca_tile_url(url: str) -> bool:
+    if any(ch in url for ch in ("\r", "\n", "\x00")):
+        return False
+    parsed = urlparse(url)
+    if parsed.scheme.lower() != "https" or parsed.username or parsed.password:
+        return False
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if not host or ".." in parsed.path.split("/"):
+        return False
+    return any(host == suffix or host.endswith(f".{suffix}") for suffix in _ALLOWED_CA_HOST_SUFFIXES)
 
 NRCAN_STAC_SEARCH_URL: Final[str] = "https://datacube.services.geo.ca/stac/api/search"
 NRCAN_MRDEM_30_DTM_URL: Final[str] = (
@@ -198,8 +219,8 @@ def _raster_valid_pixel_fraction(tif_path: Path) -> float:
         ds = None
 
 
-def _run_subprocess(cmd: list[str], env: dict[str, str], context: str) -> None:
-    proc = subprocess.run(cmd, env=env, capture_output=True, text=True, check=False)
+def _run_subprocess(cmd: list[str], env: dict[str, str], context: str, *, timeout: int = 300) -> None:
+    proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout, check=False)
     if proc.returncode != 0:
         raise RuntimeError(
             f"{context} failed (exit {proc.returncode}):\n"
@@ -227,7 +248,7 @@ def extract_stac_cog_hrefs(
             if isinstance(entry, dict) and entry.get("href"):
                 chosen = str(entry["href"]).strip()
                 break
-        if chosen and chosen.lower().startswith(("https://", "http://")) and chosen not in seen:
+        if chosen and _is_allowed_ca_tile_url(chosen) and chosen not in seen:
             seen.add(chosen)
             hrefs.append(chosen)
     return hrefs
@@ -289,11 +310,9 @@ class CanadaHRDEMSource:
         self.resolved_attribution: str = self.attribution
 
     def _gdal_env(self) -> dict[str, str]:
-        env = os.environ.copy()
-        for key, value in GDAL_VSICURL_ENV.items():
-            env.setdefault(key, value)
-        env["CPL_VSIL_CURL_ALLOWED_EXTENSIONS"] = ".tif,.tiff,.vrt"
-        return env
+        extra = dict(GDAL_VSICURL_ENV)
+        extra["CPL_VSIL_CURL_ALLOWED_EXTENSIONS"] = ".tif,.tiff,.vrt"
+        return build_safe_subprocess_env(extra=extra)
 
     def _stac_search(self, collection: str, clip_bbox: BBox) -> list[str]:
         key = _bbox_hash(clip_bbox)

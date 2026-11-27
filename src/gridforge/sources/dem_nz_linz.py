@@ -7,17 +7,54 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
 from typing import Any, Final
+from urllib.parse import urlparse
 
 import httpx
 
 from gridforge.config import BBox, SheetLayout
 from gridforge.sources.dem_copernicus import CopernicusGLO30Source, GDAL_VSICURL_ENV
+from gridforge.subprocess_env import build_safe_subprocess_env
 
 logger = logging.getLogger(__name__)
+
+_SAFE_LINZ_CODE_RE = re.compile(r"^[A-Za-z0-9_-]{2,64}$")
+_SAFE_REL_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_ALLOWED_NZ_HOST_SUFFIXES: Final[tuple[str, ...]] = (
+    "amazonaws.com",
+    "linz.govt.nz",
+)
+
+
+def _is_safe_rel_href(rel_href: str) -> bool:
+    if not rel_href or rel_href.startswith(("/", "http://", "https://")) or "\\" in rel_href:
+        return False
+    if any(ch in rel_href for ch in ("\r", "\n", "\x00", "?", "#", "@")):
+        return False
+    parts = [p for p in rel_href.split("/") if p]
+    if not parts or any(p in (".", "..") or not _SAFE_REL_SEGMENT_RE.match(p) for p in parts):
+        return False
+    return True
+
+
+def _is_allowed_linz_url(url: str, *, base_url: str | None = None) -> bool:
+    if any(ch in url for ch in ("\r", "\n", "\x00")):
+        return False
+    parsed = urlparse(url)
+    if parsed.scheme.lower() != "https" or parsed.username or parsed.password:
+        return False
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if not host or ".." in parsed.path.split("/"):
+        return False
+    if base_url:
+        base_host = (urlparse(base_url).hostname or "").lower().rstrip(".")
+        if base_host and host == base_host:
+            return True
+    return any(host == suffix or host.endswith(f".{suffix}") for suffix in _ALLOWED_NZ_HOST_SUFFIXES)
 
 LINZ_S3_BASE_URL: Final[str] = "https://nz-elevation.s3.ap-southeast-2.amazonaws.com"
 LINZ_STAC_CATALOG_URL: Final[str] = f"{LINZ_S3_BASE_URL}/catalog.json"
@@ -221,8 +258,8 @@ def _raster_valid_pixel_fraction(tif_path: Path) -> float:
         ds = None
 
 
-def _run_subprocess(cmd: list[str], env: dict[str, str], context: str) -> None:
-    proc = subprocess.run(cmd, env=env, capture_output=True, text=True, check=False)
+def _run_subprocess(cmd: list[str], env: dict[str, str], context: str, *, timeout: int = 300) -> None:
+    proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout, check=False)
     if proc.returncode != 0:
         raise RuntimeError(
             f"{context} failed (exit {proc.returncode}):\n"
@@ -281,12 +318,10 @@ class NZLinzDEMSource:
         self.resolved_attribution: str = self.attribution
 
     def _gdal_env(self) -> dict[str, str]:
-        env = os.environ.copy()
-        for key, value in GDAL_VSICURL_ENV.items():
-            env.setdefault(key, value)
+        extra = dict(GDAL_VSICURL_ENV)
         # Allow .tiff extension used by LINZ COGs in addition to .tif/.vrt
-        env["CPL_VSIL_CURL_ALLOWED_EXTENSIONS"] = ".tif,.tiff,.vrt"
-        return env
+        extra["CPL_VSIL_CURL_ALLOWED_EXTENSIONS"] = ".tif,.tiff,.vrt"
+        return build_safe_subprocess_env(extra=extra)
 
     def _get_json_cached(self, url: str, cache_path: Path) -> dict[str, Any]:
         if cache_path.is_file() and cache_path.stat().st_size > 0:
@@ -334,10 +369,12 @@ class NZLinzDEMSource:
         for link in catalog.get("links", []):
             if link.get("rel") != "child":
                 continue
-            href = str(link.get("href") or "")
+            href = str(link.get("href") or "").strip()
             if "/dem_1m/2193/collection.json" not in href:
                 continue
-            norm = href.lstrip("./")
+            norm = href[2:] if href.startswith("./") else href
+            if not _is_safe_rel_href(norm):
+                continue
             region_slug = norm.split("/", 1)[0].lower()
             if candidate_regions and region_slug not in candidate_regions:
                 continue
@@ -350,6 +387,8 @@ class NZLinzDEMSource:
         matched_urls: list[tuple[str, str]] = []  # (collection_sort_key, cog_url)
         for rel_href in sorted(dem1m_hrefs):
             col_url = f"{self.s3_base_url}/{rel_href}"
+            if not _is_allowed_linz_url(col_url, base_url=self.s3_base_url):
+                continue
             col_hash = hashlib.sha256(rel_href.encode("ascii")).hexdigest()[:16]
             try:
                 col = self._get_json_cached(col_url, self.cache_dir / "stac" / f"col_{col_hash}.json")
@@ -365,9 +404,11 @@ class NZLinzDEMSource:
 
             col_dir = col_url.rsplit("/", 1)[0]
             items_in_col = {
-                str(lk.get("href") or "").rsplit("/", 1)[-1].removesuffix(".json")
+                code
                 for lk in col.get("links", [])
                 if lk.get("rel") == "item"
+                for code in (str(lk.get("href") or "").rsplit("/", 1)[-1].removesuffix(".json"),)
+                if _SAFE_LINZ_CODE_RE.match(code)
             }
             hits = sorted(wanted_set & items_in_col)
             if hits:
@@ -375,7 +416,9 @@ class NZLinzDEMSource:
                 temporal = ((col.get("extent") or {}).get("temporal") or {}).get("interval") or [[""]]
                 sort_key = str((temporal[0][0] if temporal and temporal[0] else "") or rel_href)
                 for code in hits:
-                    matched_urls.append((sort_key, f"{col_dir}/{code}.tiff"))
+                    cog_url = f"{col_dir}/{code}.tiff"
+                    if _is_allowed_linz_url(cog_url, base_url=self.s3_base_url):
+                        matched_urls.append((sort_key, cog_url))
 
         matched_urls.sort(key=lambda pair: (pair[0], pair[1]))
         # Deduplicate preserving newest ordering

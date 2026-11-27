@@ -3,17 +3,61 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
+import urllib.parse
 import uuid
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from gridforge.web import db
 
 _PROJECT_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{8,64}$")
+_JOB_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{8,64}$")
+MAX_PROJECT_STATE_BYTES = 65_536
+DEFAULT_MAX_PROJECTS_PER_GUEST = 5
+DEFAULT_MAX_GUEST_PROJECTS = 500
+DEFAULT_GUEST_PROJECT_TTL_HOURS = 24.0
+
+
+class ProjectPayloadTooLargeError(ValueError):
+    """Raised when serialized project state exceeds ``MAX_PROJECT_STATE_BYTES``."""
+
+
+def _serialize_project_state(state: dict[str, Any]) -> str:
+    try:
+        serialized = json.dumps(state, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid project state payload: {exc}") from exc
+    if len(serialized.encode("utf-8")) > MAX_PROJECT_STATE_BYTES:
+        raise ProjectPayloadTooLargeError(
+            f"Project state exceeds maximum size of {MAX_PROJECT_STATE_BYTES // 1024} KB."
+        )
+    return serialized
+
+
+def _env_pos_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return default
+
+
+def _env_pos_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return default
 
 
 class ProjectCreateRequest(BaseModel):
@@ -24,6 +68,18 @@ class ProjectCreateRequest(BaseModel):
     notes: str | None = Field(default=None, max_length=500)
     state: dict[str, Any] = Field(default_factory=dict)
     last_job_id: str | None = Field(default=None, max_length=64)
+
+    @field_validator("last_job_id")
+    @classmethod
+    def _validate_last_job_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        if not cleaned:
+            return None
+        if not _JOB_ID_RE.match(cleaned):
+            raise ValueError("Invalid last_job_id.")
+        return cleaned
 
     @model_validator(mode="after")
     def _sync_notes_and_description(self) -> ProjectCreateRequest:
@@ -45,6 +101,18 @@ class ProjectUpdateRequest(BaseModel):
     notes: str | None = Field(default=None, max_length=500)
     state: dict[str, Any] | None = None
     last_job_id: str | None = Field(default=None, max_length=64)
+
+    @field_validator("last_job_id")
+    @classmethod
+    def _validate_last_job_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        if not cleaned:
+            return None
+        if not _JOB_ID_RE.match(cleaned):
+            raise ValueError("Invalid last_job_id.")
+        return cleaned
 
 
 class ProjectRecord(BaseModel):
@@ -84,7 +152,11 @@ def _row_to_project(row: sqlite3.Row) -> ProjectRecord:
     except Exception:
         state = {}
     last_job_id = str(row["last_job_id"]) if row["last_job_id"] else None
-    thumb_url = f"/api/jobs/{last_job_id}/thumbnail.png" if last_job_id else None
+    thumb_url = (
+        f"/api/jobs/{urllib.parse.quote(last_job_id, safe='')}/thumbnail.png"
+        if last_job_id and _JOB_ID_RE.match(last_job_id)
+        else None
+    )
     desc_text = str(row["description"] or "")
     keys = set(row.keys())
     owner_id = str(row["owner_id"]) if "owner_id" in keys and row["owner_id"] else "local"
@@ -149,14 +221,84 @@ def create_project(
     *,
     owner_id: str = "local",
     owner_role: str = "none",
+    max_per_guest: int | None = None,
+    max_guest_projects_global: int | None = None,
+    guest_ttl_hours: float | None = None,
 ) -> ProjectRecord:
-    """Persist a new saved trip project and return its record."""
+    """Persist a new saved trip project and return its record.
+
+    For anonymous ``guest`` projects, enforces a 64 KB serialized state limit and
+    bounds storage by automatically pruning expired guest projects and evicting
+    the oldest guest projects when either the per-guest or global guest cap is reached.
+    """
     project_id = uuid.uuid4().hex[:16]
-    now = db._utc_now_iso()
-    state_json = json.dumps(req.state, separators=(",", ":"))
+    ref_now = db._resolve_now(None)
+    now = db._dt_to_iso(ref_now)
+    state_json = _serialize_project_state(req.state)
     conn = db._connect(db_path)
     try:
         conn.execute("BEGIN IMMEDIATE")
+        if owner_role == "guest":
+            eff_ttl = (
+                guest_ttl_hours
+                if guest_ttl_hours is not None
+                else _env_pos_float("GRIDFORGE_GUEST_TTL_HOURS", DEFAULT_GUEST_PROJECT_TTL_HOURS)
+            )
+            if eff_ttl > 0:
+                expired_cutoff = db._dt_to_iso(ref_now - timedelta(hours=eff_ttl))
+                conn.execute(
+                    "DELETE FROM projects WHERE owner_role = 'guest' AND updated_at < ?",
+                    (expired_cutoff,),
+                )
+
+            per_guest_cap = (
+                max(1, int(max_per_guest))
+                if max_per_guest is not None
+                else _env_pos_int("GRIDFORGE_MAX_PROJECTS_PER_GUEST", DEFAULT_MAX_PROJECTS_PER_GUEST)
+            )
+            owned_rows = conn.execute(
+                """
+                SELECT project_id FROM projects
+                WHERE owner_role = 'guest' AND owner_id = ?
+                ORDER BY updated_at ASC, rowid ASC
+                """,
+                (owner_id,),
+            ).fetchall()
+            excess_owned = len(owned_rows) - (per_guest_cap - 1)
+            if excess_owned > 0:
+                evict_ids = [str(r["project_id"]) for r in owned_rows[:excess_owned]]
+                placeholders = ",".join("?" for _ in evict_ids)
+                conn.execute(f"DELETE FROM projects WHERE project_id IN ({placeholders})", evict_ids)
+
+            global_cap = (
+                max(1, int(max_guest_projects_global))
+                if max_guest_projects_global is not None
+                else _env_pos_int("GRIDFORGE_MAX_GUEST_PROJECTS", DEFAULT_MAX_GUEST_PROJECTS)
+            )
+            total_guests = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM projects WHERE owner_role = 'guest'"
+                ).fetchone()[0]
+            )
+            excess_global = total_guests - (global_cap - 1)
+            if excess_global > 0:
+                evict_rows = conn.execute(
+                    """
+                    SELECT project_id FROM projects
+                    WHERE owner_role = 'guest'
+                    ORDER BY updated_at ASC, rowid ASC
+                    LIMIT ?
+                    """,
+                    (excess_global,),
+                ).fetchall()
+                evict_ids = [str(r["project_id"]) for r in evict_rows]
+                if evict_ids:
+                    placeholders = ",".join("?" for _ in evict_ids)
+                    conn.execute(
+                        f"DELETE FROM projects WHERE project_id IN ({placeholders})",
+                        evict_ids,
+                    )
+
         conn.execute(
             """
             INSERT INTO projects (
@@ -198,6 +340,11 @@ def update_project(
     """Partially update an existing saved project. Returns ``None`` if not found."""
     now = db._utc_now_iso()
     fields = req.model_fields_set
+    validated_state_json = (
+        _serialize_project_state(req.state)
+        if ("state" in fields and req.state is not None)
+        else None
+    )
     conn = db._connect(db_path)
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -217,8 +364,8 @@ def update_project(
         else:
             new_desc = str(existing["description"] or "")
         new_state_json = (
-            json.dumps(req.state, separators=(",", ":"))
-            if ("state" in fields and req.state is not None)
+            validated_state_json
+            if validated_state_json is not None
             else str(existing["state_json"])
         )
         new_last_job = (

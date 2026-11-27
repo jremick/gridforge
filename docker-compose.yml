@@ -10,18 +10,25 @@ services:
     environment:
       - GRIDFORGE_DATA_DIR=/data/jobs
       - GRIDFORGE_PACKS_DIR=/data/packs
+      - GRIDFORGE_CACHE_DIR=/tmp/gridforge-cache
       - GRIDFORGE_WEB_DIST=/app/web/dist
       - GRIDFORGE_ALLOWED_HOSTS=${GRIDFORGE_ALLOWED_HOSTS:-}
       - FORWARDED_ALLOW_IPS=${FORWARDED_ALLOW_IPS:-127.0.0.1}
       - GRIDFORGE_AUTH_MODE=${GRIDFORGE_AUTH_MODE:-none}
       - GRIDFORGE_TRUST_CF_CONNECTING_IP=${GRIDFORGE_TRUST_CF_CONNECTING_IP:-false}
+      - GRIDFORGE_ORIGIN_PROXY_SECRET=${GRIDFORGE_ORIGIN_PROXY_SECRET:-}
       - GRIDFORGE_SESSION_SECRET=${GRIDFORGE_SESSION_SECRET:-}
       - GRIDFORGE_SAMPLES_DIR=${GRIDFORGE_SAMPLES_DIR:-}
-      - GDAL_CACHEMAX=192
+      - GDAL_CACHEMAX=64
       - OMP_THREAD_LIMIT=1
     volumes:
       - gridforge-data:/data/jobs
+      - gridforge-cache:/tmp/gridforge-cache
       - ./packs:/data/packs
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     # Web server never imports qgis.core; stays lightweight (< 150 MB typical)
     mem_limit: 512m
     healthcheck:
@@ -48,6 +55,7 @@ services:
       - GRIDFORGE_PRUNE_INTERVAL_SECONDS=${GRIDFORGE_PRUNE_INTERVAL_SECONDS:-900}
       - GRIDFORGE_GUEST_TTL_HOURS=${GRIDFORGE_GUEST_TTL_HOURS:-24}
       - GRIDFORGE_FRIEND_TTL_HOURS=${GRIDFORGE_FRIEND_TTL_HOURS:-336}
+      - GRIDFORGE_ADMIN_TTL_HOURS=${GRIDFORGE_ADMIN_TTL_HOURS:-720}
       - GRIDFORGE_CACHE_MAX_BYTES=${GRIDFORGE_CACHE_MAX_BYTES:-2147483648}
       - GDAL_CACHEMAX=192
       - OMP_THREAD_LIMIT=1
@@ -56,6 +64,10 @@ services:
       - gridforge-data:/data/jobs
       - gridforge-cache:/tmp/gridforge-cache
       - ./packs:/data/packs:ro
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     # Single-concurrency worker with strict memory guardrails for 16 GB hosts
     mem_limit: 3g
     memswap_limit: 3584m

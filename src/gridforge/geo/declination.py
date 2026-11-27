@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import functools
 import math
+import re
 from datetime import date, datetime, timezone
 from pathlib import Path
+from typing import NamedTuple
 from xml.sax.saxutils import escape
 
 import pyproj
@@ -15,6 +18,35 @@ from gridforge.config import DeclinationInfo, MGRSGridMeta, SheetLayout
 DEG_TO_NATO_MILS: float = 6400.0 / 360.0
 WMM2025_MIN_YEAR: float = 2025.0
 WMM2025_MAX_YEAR: float = 2030.0
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+class PointDeclination(NamedTuple):
+    """Point-level magnetic declination, UTM grid convergence, and G-M angle (degrees)."""
+
+    magnetic_declination_deg: float
+    grid_convergence_deg: float
+    gm_angle_deg: float
+
+
+@functools.lru_cache(maxsize=1)
+def _default_geomag() -> GeoMag:
+    """Return a process-cached default WMM2025 ``GeoMag`` instance."""
+    return GeoMag()
+
+
+@functools.lru_cache(maxsize=8)
+def _custom_geomag(cof_path_str: str) -> tuple[float, float, str, GeoMag]:
+    """Cache custom WMM ``.COF`` model metadata and ``GeoMag`` instance."""
+    cof_path = Path(cof_path_str)
+    min_year, max_year, model_name = _read_cof_metadata(cof_path)
+    return (min_year, max_year, model_name, GeoMag(coefficients_file=cof_path_str))
+
+
+@functools.lru_cache(maxsize=64)
+def _utm_proj(utm_epsg: int) -> pyproj.Proj:
+    """Return a cached ``pyproj.Proj`` instance for UTM convergence lookups."""
+    return pyproj.Proj(f"EPSG:{utm_epsg}")
 
 
 def _wrap_180(deg: float) -> float:
@@ -29,8 +61,12 @@ def _parse_date_to_decimal_year(date_iso: str | None) -> float:
         target = datetime.now(timezone.utc).date()
     else:
         raw = date_iso.strip()
+        if not _ISO_DATE_RE.match(raw):
+            raise ValueError(
+                f"Invalid ISO date '{date_iso}'. Expected YYYY-MM-DD."
+            )
         try:
-            target = date.fromisoformat(raw[:10])
+            target = date.fromisoformat(raw)
         except ValueError as exc:
             raise ValueError(
                 f"Invalid ISO date '{date_iso}'. Expected YYYY-MM-DD."
@@ -52,6 +88,28 @@ def _read_cof_metadata(cof_path: Path) -> tuple[float, float, str]:
     return (epoch, epoch + 5.0, model_name)
 
 
+def compute_point_declination(
+    lat: float,
+    lon: float,
+    utm_epsg: int,
+    *,
+    date_iso: str | None = None,
+    elevation_m: float = 0.0,
+) -> PointDeclination:
+    """Fast point-level ``(magnetic_declination_deg, grid_convergence_deg, gm_angle_deg)``."""
+    decimal_year = _parse_date_to_decimal_year(date_iso)
+    if not (WMM2025_MIN_YEAR <= decimal_year <= WMM2025_MAX_YEAR):
+        raise ValueError(
+            f"Decimal year {decimal_year:.3f} is outside WMM2025 valid range "
+            f"[{WMM2025_MIN_YEAR:.1f}, {WMM2025_MAX_YEAR:.1f}]."
+        )
+    alt_km = float(elevation_m) / 1000.0
+    mag_decl = float(_default_geomag().calculate(glat=lat, glon=lon, alt=alt_km, time=decimal_year).d)
+    gamma = float(_utm_proj(utm_epsg).get_factors(lon, lat).meridian_convergence)
+    gm_angle = _wrap_180(mag_decl - gamma)
+    return PointDeclination(mag_decl, gamma, gm_angle)
+
+
 def compute_declination(
     layout: SheetLayout,
     elevation_m: float = 0.0,
@@ -63,15 +121,14 @@ def compute_declination(
     if cof_path is not None:
         if not cof_path.exists():
             raise FileNotFoundError(f"Custom WMM .COF file not found: '{cof_path}'")
-        min_year, max_year, model_name = _read_cof_metadata(cof_path)
-        geo_mag = GeoMag(coefficients_file=str(cof_path))
+        min_year, max_year, model_name, geo_mag = _custom_geomag(str(cof_path.resolve()))
     else:
         min_year, max_year, model_name = (
             WMM2025_MIN_YEAR,
             WMM2025_MAX_YEAR,
             "WMM2025",
         )
-        geo_mag = GeoMag()
+        geo_mag = _default_geomag()
 
     if not (min_year <= decimal_year <= max_year):
         raise ValueError(
@@ -94,7 +151,7 @@ def compute_declination(
     annual_change = _wrap_180(d2 - d1) / (t2 - t1)
 
     # Grid convergence via PROJ (lon first! + = Grid North clockwise/East of True North).
-    proj = pyproj.Proj(f"EPSG:{layout.utm_epsg}")
+    proj = _utm_proj(layout.utm_epsg)
     gamma = float(proj.get_factors(lon, lat).meridian_convergence)
 
     # Hemisphere-invariant TC 3-25.26 G-M angle (+ = Easterly G-M, - = Westerly G-M).

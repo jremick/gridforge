@@ -167,7 +167,17 @@ def _assemble_supplemental_pages(
         and len(route_lonlat) >= 2
     )
     will_render_index = bool(req.include_atlas_index and atlas_index_sheets)
+    from gridforge.geo.supplements import (
+        _build_atlas_index_payload,
+        _build_calibration_payload,
+        _build_elevation_profile_payload,
+        _build_rf_link_card_payload,
+        _build_route_card_payload,
+        _spawn_supplement_batch,
+    )
+
     first_map_page = 1 + (1 if will_render_index else 0) + (1 if will_render_elev else 0)
+    batch_tasks: list[tuple[str, dict[str, Any], Path]] = []
 
     # 0. Optional Atlas Overview & Sheet Index Cover Page (Page 1)
     if will_render_index and atlas_index_sheets:
@@ -186,29 +196,36 @@ def _assemble_supplemental_pages(
             )
             route_utm = [(float(x), float(y)) for x, y in zip(xs, ys)]
 
-        idx_pdf = render_atlas_index_pdf(
-            indexed_sheets,
-            page_width_mm=anchor_layout.page_width_mm,
-            page_height_mm=anchor_layout.page_height_mm,
-            scale=spec.scale,
-            utm_epsg=anchor_layout.utm_epsg,
-            title=atlas_title or spec.title or f"SHEET ATLAS ({anchor_layout.gzd})",
-            overlap_pct=atlas_overlap_pct,
-            route_utm=route_utm,
-            output_pdf=supp_dir / "atlas_index.pdf",
-            bw=bw,
+        idx_pdf = supp_dir / "atlas_index.pdf"
+        batch_tasks.append(
+            (
+                "atlas-index",
+                _build_atlas_index_payload(
+                    indexed_sheets,
+                    page_width_mm=anchor_layout.page_width_mm,
+                    page_height_mm=anchor_layout.page_height_mm,
+                    scale=spec.scale,
+                    utm_epsg=anchor_layout.utm_epsg,
+                    title=atlas_title or spec.title or f"SHEET ATLAS ({anchor_layout.gzd})",
+                    overlap_pct=atlas_overlap_pct,
+                    route_utm=route_utm,
+                    bw=bw,
+                ),
+                idx_pdf,
+            )
         )
         front_pages.append(idx_pdf)
 
     # 1. Optional Route Overview & Elevation Profile page
     if will_render_elev and route_lonlat is not None:
         profile = sample_route_elevation(route_lonlat, dem_paths, anchor_layout.utm_epsg)
-        elev_pdf = render_elevation_profile_pdf(
-            profile,
-            strip_plan,
-            anchor_layout,
-            supp_dir / "elevation_profile.pdf",
-            bw=bw,
+        elev_pdf = supp_dir / "elevation_profile.pdf"
+        batch_tasks.append(
+            (
+                "elevation-profile",
+                _build_elevation_profile_payload(profile, strip_plan, anchor_layout, bw=bw),
+                elev_pdf,
+            )
         )
         front_pages.append(elev_pdf)
 
@@ -221,12 +238,13 @@ def _assemble_supplemental_pages(
             date_iso=spec.date_iso,
             dem_path=dem_for_wp,
         )
-        card_pdf = render_route_card_pdf(
-            route_metrics,
-            anchor_layout,
-            anchor_declination,
-            supp_dir / "route_card.pdf",
-            bw=bw,
+        card_pdf = supp_dir / "route_card.pdf"
+        batch_tasks.append(
+            (
+                "route-card",
+                _build_route_card_payload(route_metrics, anchor_layout, anchor_declination, bw=bw),
+                card_pdf,
+            )
         )
         back_pages.append(card_pdf)
 
@@ -242,24 +260,35 @@ def _assemble_supplemental_pages(
                 compute_rf_fn(dem_paths[0], link, anchor_layout.utm_epsg, **rf_kwargs)
                 for link in req.rf_links
             ]
-            rf_pdf = render_rf_link_card_pdf(
-                rf_profiles,
-                anchor_layout,
-                supp_dir / "rf_link_card.pdf",
-                bw=bw,
+            rf_pdf = supp_dir / "rf_link_card.pdf"
+            batch_tasks.append(
+                (
+                    "rf-link-card",
+                    _build_rf_link_card_payload(rf_profiles, anchor_layout, bw=bw),
+                    rf_pdf,
+                )
             )
             back_pages.append(rf_pdf)
 
     # 4. Optional 100 mm Scale Calibration & MGRS Romer page
     if req.include_calibration_page:
-        cal_pdf = render_calibration_pdf(
-            anchor_layout.page_width_mm,
-            anchor_layout.page_height_mm,
-            spec.scale,
-            supp_dir / "calibration.pdf",
-            bw=bw,
+        cal_pdf = supp_dir / "calibration.pdf"
+        batch_tasks.append(
+            (
+                "calibration",
+                _build_calibration_payload(
+                    anchor_layout.page_width_mm,
+                    anchor_layout.page_height_mm,
+                    spec.scale,
+                    bw=bw,
+                ),
+                cal_pdf,
+            )
         )
         back_pages.append(cal_pdf)
+
+    if batch_tasks:
+        _spawn_supplement_batch(batch_tasks)
 
     all_pages = [*front_pages, *map_pdfs, *back_pages]
     if len(all_pages) == 1 and all_pages[0].resolve() == final_pdf.resolve():
@@ -480,7 +509,12 @@ def process_single_job(
             collected_dem_paths: list[Path] = []
             anchor_layout: SheetLayout | None = None
             anchor_declination: DeclinationInfo | None = None
+            reused_anchor_workspace = None
             pdf_budget_pct = 72 if wants_any_export else 88
+            need_dem_collection = bool(
+                req.include_elevation_profile
+                or (req.include_rf_link_card and req.rf_links)
+            )
 
             if outputs.pdf:
                 for idx, (sheet_id, sheet_spec) in enumerate(atlas_sheets, start=1):
@@ -492,6 +526,7 @@ def process_single_job(
 
                     sheet_work = tmp_work_dir / f"sheet_{idx:02d}_{sheet_id}"
                     sheet_work.mkdir(parents=True, exist_ok=True)
+                    keep_for_export = False
                     try:
                         prep_kwargs = _build_prep_kwargs(
                             req, claimed=claimed, packs_dir=packs_dir, progress_cb=None
@@ -504,7 +539,7 @@ def process_single_job(
                         if anchor_declination is None and hasattr(sheet_ws, "declination"):
                             anchor_declination = sheet_ws.declination
                         if (
-                            req.include_elevation_profile
+                            need_dem_collection
                             and hasattr(sheet_ws, "dem_utm_tif")
                             and Path(sheet_ws.dem_utm_tif).is_file()
                         ):
@@ -515,8 +550,20 @@ def process_single_job(
                         sheet_pdf = sheet_pdfs_dir / f"sheet_{idx:02d}_{sheet_id}.pdf"
                         PyQGISRenderer().render_pdf(sheet_ws, sheet_pdf)
                         rendered_sheet_pdfs.append(sheet_pdf)
+
+                        # Reuse matching center sheet workspace directly for digital exports
+                        # instead of rebuilding a 10th workspace from scratch.
+                        if (
+                            wants_any_export
+                            and reused_anchor_workspace is None
+                            and abs(sheet_spec.center_lat - spec.center_lat) < 1e-5
+                            and abs(sheet_spec.center_lon - spec.center_lon) < 1e-5
+                        ):
+                            reused_anchor_workspace = sheet_ws
+                            keep_for_export = True
                     finally:
-                        shutil.rmtree(sheet_work, ignore_errors=True)
+                        if not keep_for_export:
+                            shutil.rmtree(sheet_work, ignore_errors=True)
 
                 if _is_cancelled(db_path, job_id):
                     return db.get_job(db_path, job_id)
@@ -562,8 +609,8 @@ def process_single_job(
                     )
                 )
 
-            anchor_workspace = None
-            if wants_any_export:
+            anchor_workspace = reused_anchor_workspace
+            if wants_any_export and anchor_workspace is None:
                 if _is_cancelled(db_path, job_id):
                     return db.get_job(db_path, job_id)
                 _report_stage("preparing_center_sheet_export", 74)
@@ -581,6 +628,8 @@ def process_single_job(
             eff_dpi = outputs.export_dpi or spec.dpi
             eff_grid = outputs.include_grid_on_digital
             shared_tif: Path | None = None
+            shared_warped_3857: Path | None = None
+            built_mbt_path: Path | None = None
 
             raster_export_count = sum(
                 1
@@ -601,6 +650,18 @@ def process_single_job(
                     include_grid=eff_grid,
                 )
 
+            if shared_tif is not None and outputs.mbtiles and outputs.gpkg_tiles:
+                from gridforge.export.mbtiles import prepare_warped_3857
+
+                shared_warped_3857 = prepare_warped_3857(
+                    shared_tif,
+                    tmp_work_dir / "shared_warped_3857.tif",
+                    tile_format=outputs.mbtiles_format,
+                    color_mode=spec.color_mode,
+                    tmp_dir=tmp_work_dir,
+                    step_label="gdalwarp shared EPSG:3857 for MBTiles & GPKG tiles",
+                )
+
             if outputs.mbtiles:
                 if _is_cancelled(db_path, job_id):
                     return db.get_job(db_path, job_id)
@@ -614,7 +675,9 @@ def process_single_job(
                     dpi=eff_dpi,
                     include_grid=eff_grid,
                     collarless_tif=shared_tif,
+                    warped_3857_tif=shared_warped_3857,
                 )
+                built_mbt_path = mbt_path
                 artifacts.append(
                     JobArtifact(
                         kind="mbtiles",
@@ -661,6 +724,7 @@ def process_single_job(
                     dpi=eff_dpi,
                     include_grid=eff_grid,
                     collarless_tif=shared_tif,
+                    warped_3857_tif=shared_warped_3857,
                 )
                 artifacts.append(
                     JobArtifact(
@@ -684,6 +748,7 @@ def process_single_job(
                     dpi=eff_dpi,
                     include_grid=eff_grid,
                     collarless_tif=shared_tif,
+                    mbtiles_path=built_mbt_path,
                 )
                 artifacts.append(
                     JobArtifact(
@@ -741,10 +806,19 @@ def process_single_job(
         elapsed = time.perf_counter() - t0
         rss_mb = _peak_rss_mb()
         logger.exception("Job %s failed after %.2fs: %s", job_id, elapsed, exc)
+        auth_mode = _resolve_auth_mode()
+        if auth_mode == "hosted":
+            public_error = (
+                str(exc)
+                if isinstance(exc, ValueError) and len(str(exc)) <= 240
+                else "Map render failed due to an internal processing or upstream data error. Please try again."
+            )
+        else:
+            public_error = str(exc)
         failed = db.fail_job(
             db_path,
             job_id,
-            error=str(exc),
+            error=public_error,
             elapsed_seconds=elapsed,
             peak_rss_mb=rss_mb,
         )
@@ -815,6 +889,8 @@ def run_pruning_pass(
     max_job_age_hours: float = 24.0,
     guest_ttl_hours: float | None = None,
     friend_ttl_hours: float | None = None,
+    admin_ttl_hours: float | None = None,
+    usage_retention_days: float | None = None,
     cache_max_bytes: int | None = None,
     auth_mode: str | None = None,
 ) -> dict[str, Any]:
@@ -824,6 +900,7 @@ def run_pruning_pass(
         resolved_auth_mode == "hosted"
         or guest_ttl_hours is not None
         or friend_ttl_hours is not None
+        or admin_ttl_hours is not None
     )
 
     eff_guest_ttl = (
@@ -836,6 +913,19 @@ def run_pruning_pass(
         if friend_ttl_hours is not None
         else _env_float("GRIDFORGE_FRIEND_TTL_HOURS", DEFAULT_FRIEND_TTL_HOURS)
     )
+    if admin_ttl_hours is not None:
+        eff_admin_ttl: float | None = admin_ttl_hours if admin_ttl_hours > 0 else None
+    elif resolved_auth_mode == "hosted":
+        raw_admin_ttl = _env_float("GRIDFORGE_ADMIN_TTL_HOURS", 720.0)
+        eff_admin_ttl = raw_admin_ttl if raw_admin_ttl > 0 else None
+    else:
+        eff_admin_ttl = None
+
+    eff_usage_days = (
+        usage_retention_days
+        if usage_retention_days is not None
+        else _env_float("GRIDFORGE_USAGE_RETENTION_DAYS", 30.0)
+    )
 
     if use_role_ttl:
         pruned_jobs = db.prune_expired_jobs(
@@ -843,6 +933,7 @@ def run_pruning_pass(
             data_dir=data_dir,
             guest_ttl_hours=eff_guest_ttl,
             friend_ttl_hours=eff_friend_ttl,
+            admin_ttl_hours=eff_admin_ttl,
         )
     else:
         pruned_jobs = db.prune_expired_jobs(
@@ -857,6 +948,7 @@ def run_pruning_pass(
         friend_ttl_hours=eff_friend_ttl,
     )
     pruned_shares = db.prune_expired_shares(db_path)
+    pruned_usage = db.prune_expired_usage_events(db_path, retention_days=eff_usage_days)
 
     cache_result: cache_prune.CachePruneResult | None = None
     if cache_dir is not None and cache_max_bytes is not None:
@@ -872,14 +964,16 @@ def run_pruning_pass(
         or auth_pruned["sessions"]
         or auth_pruned["invites"]
         or pruned_shares
+        or pruned_usage
         or deleted_cache_files
         or removed_cache_dirs
     ):
         logger.info(
-            "Pruned jobs=%d projects=%d shares=%d sessions=%d invites=%d cache_files=%d cache_bytes=%d cache_dirs=%d",
+            "Pruned jobs=%d projects=%d shares=%d usage=%d sessions=%d invites=%d cache_files=%d cache_bytes=%d cache_dirs=%d",
             pruned_jobs,
             auth_pruned["projects"],
             pruned_shares,
+            pruned_usage,
             auth_pruned["sessions"],
             auth_pruned["invites"],
             deleted_cache_files,
@@ -891,6 +985,7 @@ def run_pruning_pass(
         "jobs": pruned_jobs,
         "projects": auth_pruned["projects"],
         "shares": pruned_shares,
+        "usage_events": pruned_usage,
         "sessions": auth_pruned["sessions"],
         "invites": auth_pruned["invites"],
         "cache_deleted_files": deleted_cache_files,

@@ -20,9 +20,14 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
+from gridforge.subprocess_env import build_safe_subprocess_env
 from gridforge.web import db
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_HOSTED_FORWARDED_ALLOW_IPS: str = (
+    "127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10,::1,fc00::/7"
+)
 
 _RAILWAY_ENV_MARKERS: tuple[str, ...] = (
     "RAILWAY_ENVIRONMENT_ID",
@@ -99,15 +104,20 @@ def configure_environment(
 
     auth_mode = (configured.get("GRIDFORGE_AUTH_MODE") or "none").strip().lower() or "none"
     if not configured.get("FORWARDED_ALLOW_IPS", "").strip():
-        configured["FORWARDED_ALLOW_IPS"] = "*" if auth_mode == "hosted" else "127.0.0.1"
+        configured["FORWARDED_ALLOW_IPS"] = (
+            DEFAULT_HOSTED_FORWARDED_ALLOW_IPS if auth_mode == "hosted" else "127.0.0.1"
+        )
 
     if any(configured.get(marker, "").strip() for marker in _RAILWAY_ENV_MARKERS):
+        existing_hosts = configured.get("GRIDFORGE_ALLOWED_HOSTS", "").strip()
         extra_hosts = ["healthcheck.railway.app"]
         public_domain = configured.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
-        if public_domain:
+        # Only auto-trust RAILWAY_PUBLIC_DOMAIN when the operator has not explicitly
+        # restricted GRIDFORGE_ALLOWED_HOSTS to custom domains.
+        if public_domain and not existing_hosts:
             extra_hosts.append(public_domain)
         configured["GRIDFORGE_ALLOWED_HOSTS"] = _append_allowed_hosts(
-            configured.get("GRIDFORGE_ALLOWED_HOSTS", ""),
+            existing_hosts,
             extra_hosts,
         )
 
@@ -218,6 +228,57 @@ def _terminate_process(proc: Any, *, sig: int, grace_seconds: float) -> int | No
     return _terminate_processes([proc], sig=sig, grace_seconds=grace_seconds)[0]
 
 
+def _resolve_drop_privileges(
+    configured_env: dict[str, str],
+    *,
+    popen_cls: Any,
+) -> dict[str, Any]:
+    """If started as root (e.g. Railway volume mount), chown dirs and drop to ``gridforge``."""
+    if popen_cls is not subprocess.Popen or not hasattr(os, "geteuid") or os.geteuid() != 0:
+        return {}
+    try:
+        import pwd
+
+        pw = pwd.getpwnam("gridforge")
+    except (ImportError, KeyError):
+        return {}
+
+    uid, gid = pw.pw_uid, pw.pw_gid
+    dirs_to_own = [
+        Path(configured_env["GRIDFORGE_DATA_DIR"]),
+        Path(configured_env["GRIDFORGE_PACKS_DIR"]),
+        Path(configured_env["GRIDFORGE_CACHE_DIR"]),
+        Path(configured_env["GRIDFORGE_SAMPLES_DIR"]),
+    ]
+    rt_dir = Path(configured_env.setdefault("XDG_RUNTIME_DIR", "/tmp/runtime-gridforge"))
+    rt_dir.mkdir(parents=True, exist_ok=True)
+    dirs_to_own.append(rt_dir)
+
+    for target in dirs_to_own:
+        try:
+            os.chown(target, uid, gid)
+            for root_dir, subdirs, files in os.walk(target):
+                for name in subdirs:
+                    try:
+                        os.chown(os.path.join(root_dir, name), uid, gid)
+                    except OSError:
+                        pass
+                for name in files:
+                    try:
+                        os.chown(os.path.join(root_dir, name), uid, gid)
+                    except OSError:
+                        pass
+        except OSError as exc:
+            logger.warning("Could not chown %s for gridforge user: %s", target, exc)
+
+    try:
+        rt_dir.chmod(0o700)
+    except OSError:
+        pass
+    configured_env["HOME"] = pw.pw_dir
+    return {"user": uid, "group": gid}
+
+
 def supervise(
     *,
     env: Mapping[str, str] | None = None,
@@ -236,6 +297,8 @@ def supervise(
     )
     data_dir = Path(configured_env["GRIDFORGE_DATA_DIR"])
     init_db_fn(data_dir / "gridforge_jobs.sqlite3")
+    drop_kwargs = _resolve_drop_privileges(configured_env, popen_cls=popen_cls)
+    worker_env = build_safe_subprocess_env(base=configured_env, include_linz_key=True)
 
     if shutdown_grace_seconds is not None:
         grace = max(0.0, float(shutdown_grace_seconds))
@@ -268,9 +331,9 @@ def supervise(
             configured_env["GRIDFORGE_DATA_DIR"],
             configured_env["GRIDFORGE_CACHE_DIR"],
         )
-        web_proc = popen_cls(web_cmd, env=configured_env)
+        web_proc = popen_cls(web_cmd, env=configured_env, **drop_kwargs)
         try:
-            worker_proc = popen_cls(worker_cmd, env=configured_env)
+            worker_proc = popen_cls(worker_cmd, env=worker_env, **drop_kwargs)
         except Exception:
             _terminate_process(web_proc, sig=signal.SIGTERM, grace_seconds=grace)
             raise

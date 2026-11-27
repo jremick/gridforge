@@ -4,9 +4,14 @@ from __future__ import annotations
 
 from enum import Enum
 from pathlib import Path
+import re
 from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
+
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
 class PaperSize(str, Enum):
@@ -236,6 +241,18 @@ class TacticalGraphic(BaseModel):
                 raise ValueError(f"Tactical graphic radius {r} km must be within (0, 500].")
         return radii
 
+    @field_validator("color")
+    @classmethod
+    def _validate_color(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        if not cleaned:
+            return None
+        if not _HEX_COLOR_RE.match(cleaned):
+            raise ValueError(f"Tactical graphic color '{value}' must be a #RRGGBB hex string.")
+        return cleaned
+
 
 class CartoOptions(BaseModel):
     """Phase 2+ cartographic density and layer visibility controls."""
@@ -272,8 +289,8 @@ class SheetSpec(BaseModel):
     orientation: Orientation = Orientation.PORTRAIT
     color_mode: ColorMode = ColorMode.COLOR
     units: Units = Units.METRIC
-    title: str | None = None
-    date_iso: str | None = None
+    title: str | None = Field(default=None, max_length=120)
+    date_iso: str | None = Field(default=None, max_length=10)
     geopdf: bool = False
     dpi: int = Field(default=300, ge=72, le=1200)
     wmm_cof_path: Path | None = None
@@ -303,6 +320,26 @@ class SheetSpec(BaseModel):
                 "(polar UPS regions are not supported in UTM sheets)."
             )
         return value
+
+    @field_validator("title")
+    @classmethod
+    def _validate_title(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = _CONTROL_CHARS_RE.sub("", value).strip()
+        return cleaned or None
+
+    @field_validator("date_iso")
+    @classmethod
+    def _validate_date_iso(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        if not cleaned:
+            return None
+        if not _ISO_DATE_RE.match(cleaned):
+            raise ValueError(f"Invalid ISO date '{value}'. Expected YYYY-MM-DD.")
+        return cleaned
 
     @field_validator("center_lon")
     @classmethod

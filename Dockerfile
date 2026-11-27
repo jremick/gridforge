@@ -1,7 +1,9 @@
 # syntax=docker/dockerfile:1
 # Multi-stage, multi-arch (linux/arm64 + linux/amd64) GridForge image:
-#   Stage 1 (frontend): Builds the MapLibre GL JS + Vite SPA (`web/dist`)
-#   Stage 2 (runtime):  Headless PyQGIS 3.40 LTR + GDAL + FastAPI/Uvicorn on Debian Trixie
+#   Stage 1 (frontend):     Builds the MapLibre GL JS + Vite SPA (`web/dist`)
+#   Stage 2 (runtime-base): Headless PyQGIS 3.40 LTR + GDAL + FastAPI/Uvicorn on Debian Trixie
+#   Stage 3 (test):         CI test target adding pytest (not included in production runtime)
+#   Stage 4 (runtime):      Lean production non-root image (default build target)
 
 FROM node:22-slim AS frontend
 
@@ -12,7 +14,7 @@ COPY web/index.html web/tsconfig.json web/vite.config.ts ./
 COPY web/src/ ./src/
 RUN npm run build
 
-FROM debian:trixie-slim AS runtime
+FROM debian:trixie-slim AS runtime-base
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -40,7 +42,7 @@ RUN python3 -m venv --system-site-packages /opt/venv \
     && echo 'export PATH="/opt/venv/bin:${PATH}"' > /etc/profile.d/gridforge-venv.sh
 ENV PATH="/opt/venv/bin:${PATH}"
 
-# Install Python runtime, web API, and test dependencies before copying application code for layer caching
+# Install Python runtime and web API dependencies before copying application code for layer caching
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
     && pip install --no-cache-dir \
         "typer>=0.12" \
@@ -50,17 +52,21 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
         "pygeomag==1.1.0" \
         "shapely>=2.0" \
         "httpx>=0.27" \
-        "pypdf>=4.2" \
-        "pillow>=10.3" \
-        "fastapi>=0.115" \
+        "pypdf>=7.0.1" \
+        "pillow>=13.0.0" \
+        "fastapi>=0.115.12" \
         "starlette>=1.9" \
         "uvicorn[standard]>=0.30" \
-        "python-multipart>=0.0.9" \
-        "pytest>=8.0"
+        "h11>=0.16.0" \
+        "python-multipart>=0.0.31"
 
-# Headless Qt, PROJ, GDAL /vsicurl/ COG streaming, and strict 16 GB-host memory-bounded defaults
+# Create dedicated non-root runtime user (UID/GID 10001)
+RUN groupadd --gid 10001 gridforge \
+    && useradd --uid 10001 --gid 10001 --create-home --shell /usr/sbin/nologin gridforge
+
+# Headless Qt, PROJ, GDAL /vsicurl/ COG streaming, bounded timeouts, and strict 16 GB-host memory defaults
 ENV QT_QPA_PLATFORM=offscreen \
-    XDG_RUNTIME_DIR=/tmp/runtime-root \
+    XDG_RUNTIME_DIR=/tmp/runtime-gridforge \
     PROJ_DATA=/usr/share/proj \
     GDAL_CACHEMAX=192 \
     OMP_THREAD_LIMIT=1 \
@@ -70,12 +76,15 @@ ENV QT_QPA_PLATFORM=offscreen \
     VSI_CACHE_SIZE=67108864 \
     GDAL_HTTP_MAX_RETRY=3 \
     GDAL_HTTP_RETRY_DELAY=2 \
+    GDAL_HTTP_TIMEOUT=30 \
+    GDAL_HTTP_CONNECTTIMEOUT=10 \
     GRIDFORGE_WEB_DIST=/app/web/dist \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app/src
 
-RUN mkdir -p /tmp/runtime-root /tmp/gridforge-cache /data/jobs /data/packs /data/cache /data/samples \
-    && chmod 700 /tmp/runtime-root
+RUN mkdir -p /tmp/runtime-gridforge /tmp/gridforge-cache /data/jobs /data/packs /data/cache /data/samples \
+    && chmod 700 /tmp/runtime-gridforge \
+    && chown -R 10001:10001 /tmp/runtime-gridforge /tmp/gridforge-cache /data
 
 WORKDIR /app
 
@@ -86,7 +95,15 @@ COPY assets/ ./assets/
 COPY src/ ./src/
 COPY --from=frontend /web/dist /app/web/dist
 
-RUN pip install --no-cache-dir --no-deps --no-build-isolation -e .
+RUN pip install --no-cache-dir --no-deps --no-build-isolation -e . \
+    && chown -R 10001:10001 /app
+
+FROM runtime-base AS test
+RUN pip install --no-cache-dir "pytest>=8.0"
+USER 10001:10001
+
+FROM runtime-base AS runtime
+USER 10001:10001
 
 EXPOSE 8080
 

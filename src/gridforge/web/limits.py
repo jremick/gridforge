@@ -109,6 +109,7 @@ class LimitsConfig:
     friend_rf_link_hourly_limit: int | None = 120
     guest_share_hourly_limit: int | None = 30
     friend_share_hourly_limit: int | None = 120
+    guest_project_hourly_limit: int | None = 20
     guest_share_ttl_hours: float = 168.0
     friend_share_ttl_hours: float = 720.0
     geocode_hourly_limit: int | None = 30
@@ -152,6 +153,9 @@ class LimitsConfig:
             ),
             friend_share_hourly_limit=_env_opt_int(
                 "GRIDFORGE_FRIEND_SHARE_HOURLY_LIMIT", 120 if is_hosted else None
+            ),
+            guest_project_hourly_limit=_env_opt_int(
+                "GRIDFORGE_GUEST_PROJECT_HOURLY_LIMIT", 20 if is_hosted else None
             ),
             guest_share_ttl_hours=max(
                 1.0, float(_env_int("GRIDFORGE_GUEST_SHARE_TTL_HOURS", 168))
@@ -646,6 +650,35 @@ def enforce_and_record_share_create(
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 
 
+def enforce_and_record_project_create(
+    db_path: Path,
+    *,
+    role: str,
+    owner_id: str,
+    client_ip: str,
+    cfg: LimitsConfig,
+) -> None:
+    """Enforce hourly anonymous guest project creation cap in hosted mode."""
+    if cfg.auth_mode != "hosted" or role != "guest":
+        return
+    limit = cfg.guest_project_hourly_limit
+    if limit is None:
+        return
+    try:
+        db.atomic_check_and_record_rate_limit(
+            db_path,
+            event_type="project_create",
+            actor_id=owner_id,
+            actor_role=role,
+            client_ip=client_ip,
+            limit=limit,
+            window_seconds=3600,
+            by_ip_only=True,
+        )
+    except db.QuotaLimitError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+
 def enforce_and_record_auth_attempt(
     db_path: Path,
     *,
@@ -653,8 +686,9 @@ def enforce_and_record_auth_attempt(
     client_ip: str,
     cfg: LimitsConfig,
     detail: dict[str, Any] | None = None,
+    account_key: str | None = None,
 ) -> None:
-    """Enforce per-IP 1-minute rolling rate limit on password login and invite redemption."""
+    """Enforce per-IP and optional per-account 1-minute rolling rate limit on auth endpoints."""
     if cfg.auth_mode != "hosted":
         return
     limit = cfg.auth_rate_limit_per_minute
@@ -670,5 +704,18 @@ def enforce_and_record_auth_attempt(
             by_ip_only=True,
             detail=detail,
         )
+        if account_key and limit is not None:
+            norm_acct = account_key.strip().lower()[:254]
+            if norm_acct:
+                db.atomic_check_and_record_rate_limit(
+                    db_path,
+                    event_type=f"{event_type}_acct",
+                    actor_id=f"acct:{norm_acct}",
+                    actor_role="auth",
+                    client_ip=client_ip,
+                    limit=limit,
+                    window_seconds=60,
+                    by_ip_only=False,
+                )
     except db.QuotaLimitError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc

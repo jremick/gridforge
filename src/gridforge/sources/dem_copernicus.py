@@ -15,6 +15,7 @@ from typing import Final
 import httpx
 
 from gridforge.config import BBox, SheetLayout
+from gridforge.subprocess_env import build_safe_subprocess_env
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,8 @@ GDAL_VSICURL_ENV: Final[dict[str, str]] = {
     "VSI_CACHE_SIZE": "67108864",
     "GDAL_HTTP_MAX_RETRY": "3",
     "GDAL_HTTP_RETRY_DELAY": "2",
+    "GDAL_HTTP_TIMEOUT": "30",
+    "GDAL_HTTP_CONNECTTIMEOUT": "10",
     "GDAL_HTTP_USERAGENT": USER_AGENT,
 }
 
@@ -214,10 +217,7 @@ class CopernicusGLO30Source:
         return parse_tile_list(text)
 
     def _gdal_env(self) -> dict[str, str]:
-        env = os.environ.copy()
-        for key, value in GDAL_VSICURL_ENV.items():
-            env.setdefault(key, value)
-        return env
+        return build_safe_subprocess_env(extra=GDAL_VSICURL_ENV)
 
     def fetch_dem(self, layout: SheetLayout, work_dir: Path) -> Path:
         """Stream and clip Copernicus GLO-30 elevation data for ``layout.wgs84_fetch_bbox``."""
@@ -289,8 +289,8 @@ class CopernicusGLO30Source:
         return out_tif
 
 
-def _run_subprocess(cmd: list[str], env: dict[str, str], context: str) -> None:
-    proc = subprocess.run(cmd, env=env, capture_output=True, text=True, check=False)
+def _run_subprocess(cmd: list[str], env: dict[str, str], context: str, *, timeout: int = 300) -> None:
+    proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout, check=False)
     if proc.returncode != 0:
         raise RuntimeError(
             f"{context} failed (exit {proc.returncode}):\n"

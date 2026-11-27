@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 _PACK_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 _TASK_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{8,64}$")
+MAX_TASK_HISTORY = 100
 
 
 def _utc_now_iso() -> str:
@@ -157,15 +158,40 @@ class PackTaskManager:
         packs_dir: Path,
         *,
         pack_builder: Callable[..., PackManifest] | None = None,
+        hosted_mode: bool = False,
     ) -> None:
         self._packs_dir = Path(packs_dir).resolve()
         self._builder: Callable[..., PackManifest] = pack_builder or build_offline_pack
+        self._hosted_mode = bool(hosted_mode)
         self._lock = threading.Lock()
         self._tasks: dict[str, PackTaskRecord] = {}
         self._task_order: list[str] = []
         self._active_task_id: str | None = None
+        self._deleting_packs: set[str] = set()
         self._queue: queue.Queue[tuple[str, PackBuildRequest, Path]] = queue.Queue()
         self._worker_started = False
+
+    def _is_pack_busy_locked(self, pack_id: str) -> bool:
+        if pack_id in self._deleting_packs:
+            return True
+        for rec in self._tasks.values():
+            if rec.status in ("queued", "running") and rec.pack_id == pack_id:
+                return True
+        return False
+
+    def _prune_history_locked(self) -> None:
+        if len(self._task_order) <= MAX_TASK_HISTORY:
+            return
+        kept: list[str] = []
+        excess = len(self._task_order) - MAX_TASK_HISTORY
+        for tid in self._task_order:
+            rec = self._tasks.get(tid)
+            if excess > 0 and rec is not None and rec.status in ("succeeded", "failed"):
+                self._tasks.pop(tid, None)
+                excess -= 1
+            else:
+                kept.append(tid)
+        self._task_order = kept
 
     def _ensure_worker_started(self) -> None:
         if self._worker_started:
@@ -201,6 +227,10 @@ class PackTaskManager:
         now_iso = _utc_now_iso()
 
         with self._lock:
+            if self._is_pack_busy_locked(slug):
+                raise RuntimeError(
+                    f"Offline pack '{slug}' already has an active build or deletion in progress."
+                )
             idle = self._active_task_id is None and self._queue.empty()
             initial_status: Literal["queued", "running"] = "running" if idle else "queued"
             record = PackTaskRecord(
@@ -208,7 +238,7 @@ class PackTaskManager:
                 status=initial_status,
                 region=preset.region_id,
                 region_name=(req.name.strip() if req.name and req.name.strip() else preset.name),
-                output_dir=str(out_dir),
+                output_dir=slug if self._hosted_mode else str(out_dir),
                 pack_id=slug,
                 stage="building_pack" if idle else "queued",
                 message=(
@@ -221,6 +251,7 @@ class PackTaskManager:
             )
             self._tasks[task_id] = record
             self._task_order.append(task_id)
+            self._prune_history_locked()
             if idle:
                 self._active_task_id = task_id
             self._ensure_worker_started()
@@ -281,22 +312,31 @@ class PackTaskManager:
             except Exception as exc:
                 elapsed = round(time.perf_counter() - t0, 3)
                 logger.exception("Pack build task %s failed after %.2fs: %s", task_id, elapsed, exc)
+                if self._hosted_mode:
+                    public_err = (
+                        str(exc)
+                        if isinstance(exc, ValueError) and len(str(exc)) <= 200
+                        else "Pack build failed due to an internal error. Check server logs."
+                    )
+                else:
+                    public_err = str(exc)
                 with self._lock:
                     rec = self._tasks[task_id]
                     self._tasks[task_id] = rec.model_copy(
                         update={
                             "status": "failed",
                             "stage": "failed",
-                            "message": f"Pack build failed: {exc}",
+                            "message": f"Pack build failed: {public_err}",
                             "finished_at": _utc_now_iso(),
                             "elapsed_seconds": elapsed,
-                            "error": str(exc),
+                            "error": public_err,
                         }
                     )
             finally:
                 with self._lock:
                     if self._active_task_id == task_id:
                         self._active_task_id = None
+                    self._prune_history_locked()
                 self._queue.task_done()
 
     def list_tasks(self) -> list[PackTaskRecord]:
@@ -315,10 +355,7 @@ class PackTaskManager:
 
     def is_pack_busy(self, pack_id: str) -> bool:
         with self._lock:
-            for rec in self._tasks.values():
-                if rec.status in ("queued", "running") and rec.pack_id == pack_id:
-                    return True
-            return False
+            return self._is_pack_busy_locked(pack_id)
 
     def find_pack_dir(self, pack_id: str) -> Path | None:
         """Locate a pack directory by manifest ``pack_id`` strictly inside ``packs_dir``."""
@@ -352,14 +389,33 @@ class PackTaskManager:
 
     def delete_pack(self, pack_id: str) -> bool:
         """Safely delete a built offline pack directory strictly inside ``packs_dir``."""
-        target = self.find_pack_dir(pack_id)
-        if target is None:
-            return False
-        if self.is_pack_busy(pack_id):
-            raise RuntimeError(f"Offline pack '{pack_id}' is currently being built and cannot be deleted.")
-        # Final containment guard against symlink tricks
-        resolved = target.resolve()
-        if not resolved.is_relative_to(self._packs_dir) or resolved == self._packs_dir:
-            raise ValueError(f"Refusing to delete path outside packs directory for '{pack_id}'.")
-        shutil.rmtree(resolved)
-        return True
+        if (
+            not pack_id
+            or not _PACK_ID_RE.match(pack_id)
+            or "/" in pack_id
+            or "\\" in pack_id
+            or ".." in pack_id
+            or "\x00" in pack_id
+        ):
+            raise ValueError(f"Invalid pack_id '{pack_id}'.")
+
+        with self._lock:
+            if self._is_pack_busy_locked(pack_id):
+                raise RuntimeError(
+                    f"Offline pack '{pack_id}' is currently being built and cannot be deleted."
+                )
+            self._deleting_packs.add(pack_id)
+
+        try:
+            target = self.find_pack_dir(pack_id)
+            if target is None:
+                return False
+            # Final containment guard against symlink tricks
+            resolved = target.resolve()
+            if not resolved.is_relative_to(self._packs_dir) or resolved == self._packs_dir:
+                raise ValueError(f"Refusing to delete path outside packs directory for '{pack_id}'.")
+            shutil.rmtree(resolved)
+            return True
+        finally:
+            with self._lock:
+                self._deleting_packs.discard(pack_id)

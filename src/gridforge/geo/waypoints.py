@@ -11,9 +11,9 @@ from osgeo import gdal, ogr, osr
 from pydantic import BaseModel, Field
 from pyproj import Geod, Transformer
 
-from gridforge.config import SheetSpec, Units, WaypointCategory, WaypointInput
-from gridforge.geo.crs import compute_sheet_layout, resolve_utm_zone
-from gridforge.geo.declination import DEG_TO_NATO_MILS, compute_declination
+from gridforge.config import Units, WaypointCategory, WaypointInput
+from gridforge.geo.crs import resolve_utm_zone
+from gridforge.geo.declination import DEG_TO_NATO_MILS, compute_point_declination
 
 KM_TO_MILES: float = 0.621371192237334
 _MGRS_SPLIT_RE = re.compile(r"^0?([1-9]|[1-5]\d|60)([C-HJ-NP-X])([A-HJ-NP-Z]{2})(\d*)$")
@@ -90,23 +90,25 @@ def _format_mgrs_10m(lat: float, lon: float) -> str:
     return f"{gzd} {sq} {digits[:half]} {digits[half:]}"
 
 
-def _sample_point_elev_m(dem_path: Path, lat: float, lon: float) -> float | None:
-    """Sample elevation (meters) at (lat, lon) from a local GeoTIFF DEM if covered."""
-    if not dem_path.is_file():
-        return None
+def _sample_points_elev_m(dem_path: Path, points: list[tuple[float, float]]) -> list[float | None]:
+    """Sample elevations (meters) for a batch of ``(lat, lon)`` points opening the DEM once."""
+    if not points or not dem_path.is_file():
+        return [None] * len(points)
     gdal.UseExceptions()
     osr.UseExceptions()
-    ds = gdal.Open(str(dem_path))
+    ds = gdal.Open(str(dem_path), gdal.GA_ReadOnly)
     if ds is None:
-        return None
+        return [None] * len(points)
     try:
         band = ds.GetRasterBand(1)
         nodata = band.GetNoDataValue()
         gt = ds.GetGeoTransform()
         inv_gt = gdal.InvGeoTransform(gt)
         wkt = ds.GetProjection()
+        width = ds.RasterXSize
+        height = ds.RasterYSize
 
-        x, y = lon, lat
+        ct = None
         if wkt:
             src_srs = osr.SpatialReference()
             src_srs.ImportFromEPSG(4326)
@@ -115,23 +117,37 @@ def _sample_point_elev_m(dem_path: Path, lat: float, lon: float) -> float | None
             dst_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
             if not src_srs.IsSame(dst_srs):
                 ct = osr.CoordinateTransformation(src_srs, dst_srs)
-                x, y, _ = ct.TransformPoint(lon, lat)
 
-        px = int(math.floor(inv_gt[0] + inv_gt[1] * x + inv_gt[2] * y))
-        py = int(math.floor(inv_gt[3] + inv_gt[4] * x + inv_gt[5] * y))
-        if not (0 <= px < ds.RasterXSize and 0 <= py < ds.RasterYSize):
-            return None
-        arr = band.ReadAsArray(px, py, 1, 1)
-        if arr is None:
-            return None
-        val = float(arr[0, 0])
-        if not math.isfinite(val):
-            return None
-        if nodata is not None and math.isclose(val, nodata, rel_tol=1e-5, abs_tol=1e-4):
-            return None
-        return round(val, 1)
+        results: list[float | None] = []
+        for lat, lon in points:
+            x, y = lon, lat
+            if ct is not None:
+                x, y, _ = ct.TransformPoint(lon, lat)
+            px = int(math.floor(inv_gt[0] + inv_gt[1] * x + inv_gt[2] * y))
+            py = int(math.floor(inv_gt[3] + inv_gt[4] * x + inv_gt[5] * y))
+            if not (0 <= px < width and 0 <= py < height):
+                results.append(None)
+                continue
+            arr = band.ReadAsArray(px, py, 1, 1)
+            if arr is None:
+                results.append(None)
+                continue
+            val = float(arr[0, 0])
+            if not math.isfinite(val):
+                results.append(None)
+                continue
+            if nodata is not None and math.isclose(val, nodata, rel_tol=1e-5, abs_tol=1e-4):
+                results.append(None)
+                continue
+            results.append(round(val, 1))
+        return results
     finally:
         ds = None
+
+
+def _sample_point_elev_m(dem_path: Path, lat: float, lon: float) -> float | None:
+    """Sample elevation (meters) at (lat, lon) from a local GeoTIFF DEM if covered."""
+    return _sample_points_elev_m(dem_path, [(lat, lon)])[0]
 
 
 def compute_route_metrics(
@@ -149,13 +165,14 @@ def compute_route_metrics(
     legs: list[RouteLegMetric] = []
     cum_km = 0.0
 
-    for idx, wp in enumerate(waypoints, start=1):
+    elevs = (
+        _sample_points_elev_m(dem_path, [(wp.lat, wp.lon) for wp in waypoints])
+        if dem_path is not None
+        else [None] * len(waypoints)
+    )
+
+    for idx, (wp, elev_m) in enumerate(zip(waypoints, elevs), start=1):
         _, _, epsg, _ = resolve_utm_zone(wp.lat, wp.lon)
-        elev_m = (
-            _sample_point_elev_m(dem_path, wp.lat, wp.lon)
-            if dem_path is not None
-            else None
-        )
         wp_metrics.append(
             WaypointMetric(
                 seq=idx,
@@ -193,10 +210,14 @@ def compute_route_metrics(
         elif w2.elev_m is not None:
             mid_elev = w2.elev_m
 
-        mid_layout = compute_sheet_layout(
-            SheetSpec(center_lat=mid_lat, center_lon=mid_lon, date_iso=date_iso)
+        _, _, mid_epsg, _ = resolve_utm_zone(mid_lat, mid_lon)
+        decl = compute_point_declination(
+            mid_lat,
+            mid_lon,
+            utm_epsg=mid_epsg,
+            date_iso=date_iso,
+            elevation_m=mid_elev,
         )
-        decl = compute_declination(mid_layout, elevation_m=mid_elev)
 
         grid_az = (true_az - decl.grid_convergence_deg) % 360.0
         mag_az = (true_az - decl.magnetic_declination_deg) % 360.0
@@ -291,34 +312,40 @@ def write_waypoints_gpkg(
 
         pts_defn = lyr_pts.GetLayerDefn()
         utm_coords: list[tuple[float, float]] = []
-        for wp in metrics.waypoints:
-            ux, uy = to_utm.transform(wp.lon, wp.lat)
-            utm_coords.append((float(ux), float(uy)))
+        ds.StartTransaction()
+        try:
+            for wp in metrics.waypoints:
+                ux, uy = to_utm.transform(wp.lon, wp.lat)
+                utm_coords.append((float(ux), float(uy)))
 
-            feat = ogr.Feature(pts_defn)
-            geom = ogr.Geometry(ogr.wkbPoint)
-            geom.AddPoint_2D(float(ux), float(uy))
-            feat.SetGeometry(geom)
-            feat.SetField("seq", int(wp.seq))
-            feat.SetField("code", wp.code)
-            feat.SetField("label", wp.label)
-            feat.SetField("category", wp.category.value)
-            feat.SetField("mgrs_10m", wp.mgrs_10m)
-            if wp.elev_m is not None:
-                feat.SetField("elev_m", float(wp.elev_m))
-            lyr_pts.CreateFeature(feat)
+                feat = ogr.Feature(pts_defn)
+                geom = ogr.Geometry(ogr.wkbPoint)
+                geom.AddPoint_2D(float(ux), float(uy))
+                feat.SetGeometry(geom)
+                feat.SetField("seq", int(wp.seq))
+                feat.SetField("code", wp.code)
+                feat.SetField("label", wp.label)
+                feat.SetField("category", wp.category.value)
+                feat.SetField("mgrs_10m", wp.mgrs_10m)
+                if wp.elev_m is not None:
+                    feat.SetField("elev_m", float(wp.elev_m))
+                lyr_pts.CreateFeature(feat)
 
-        # 2. waypoint_route
-        lyr_route = ds.CreateLayer("waypoint_route", srs=srs, geom_type=ogr.wkbLineString)
-        lyr_route.CreateField(ogr.FieldDefn("total_km", ogr.OFTReal))
-        if len(utm_coords) >= 2:
-            rfeat = ogr.Feature(lyr_route.GetLayerDefn())
-            line = ogr.Geometry(ogr.wkbLineString)
-            for ux, uy in utm_coords:
-                line.AddPoint_2D(ux, uy)
-            rfeat.SetGeometry(line)
-            rfeat.SetField("total_km", float(metrics.total_distance_km))
-            lyr_route.CreateFeature(rfeat)
+            # 2. waypoint_route
+            lyr_route = ds.CreateLayer("waypoint_route", srs=srs, geom_type=ogr.wkbLineString)
+            lyr_route.CreateField(ogr.FieldDefn("total_km", ogr.OFTReal))
+            if len(utm_coords) >= 2:
+                rfeat = ogr.Feature(lyr_route.GetLayerDefn())
+                line = ogr.Geometry(ogr.wkbLineString)
+                for ux, uy in utm_coords:
+                    line.AddPoint_2D(ux, uy)
+                rfeat.SetGeometry(line)
+                rfeat.SetField("total_km", float(metrics.total_distance_km))
+                lyr_route.CreateFeature(rfeat)
+            ds.CommitTransaction()
+        except Exception:
+            ds.RollbackTransaction()
+            raise
 
         ds.FlushCache()
     finally:

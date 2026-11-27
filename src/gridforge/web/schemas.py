@@ -371,24 +371,24 @@ class CreateJobRequest(BaseModel):
     orientation: Orientation = Orientation.PORTRAIT
     color_mode: ColorMode = ColorMode.COLOR
     units: Units = Units.METRIC
-    title: str | None = None
-    date_iso: str | None = None
+    title: str | None = Field(default=None, max_length=120)
+    date_iso: str | None = Field(default=None, max_length=10, pattern=r"^\d{4}-\d{2}-\d{2}$")
     dpi: int = Field(default=300, ge=72, le=600)
     dem_source: DemSourceKind = DemSourceKind.AUTO
     pack_id: str | None = None
-    us_overlays: list[USOverlayKind] = Field(default_factory=list)
-    au_overlays: list[AUOverlayKind] = Field(default_factory=list)
-    nz_overlays: list[NZOverlayKind] = Field(default_factory=list)
-    ca_overlays: list[CAOverlayKind] = Field(default_factory=list)
+    us_overlays: list[USOverlayKind] = Field(default_factory=list, max_length=16)
+    au_overlays: list[AUOverlayKind] = Field(default_factory=list, max_length=16)
+    nz_overlays: list[NZOverlayKind] = Field(default_factory=list, max_length=8)
+    ca_overlays: list[CAOverlayKind] = Field(default_factory=list, max_length=8)
     carto: CartoOptions = Field(default_factory=CartoOptions)
     outputs: OutputOptions = Field(default_factory=OutputOptions)
     grid_cols: int = Field(default=1, ge=1, le=3)
     grid_rows: int = Field(default=1, ge=1, le=3)
-    waypoints: list[WaypointInput] = Field(default_factory=list)
-    viewsheds: list[ViewshedObserver] = Field(default_factory=list)
-    rf_links: list[RFLinkSpec] = Field(default_factory=list)
-    tactical_graphics: list[TacticalGraphic] = Field(default_factory=list)
-    strip_sheets: list[StripSheetInput] = Field(default_factory=list)
+    waypoints: list[WaypointInput] = Field(default_factory=list, max_length=200)
+    viewsheds: list[ViewshedObserver] = Field(default_factory=list, max_length=10)
+    rf_links: list[RFLinkSpec] = Field(default_factory=list, max_length=20)
+    tactical_graphics: list[TacticalGraphic] = Field(default_factory=list, max_length=50)
+    strip_sheets: list[StripSheetInput] = Field(default_factory=list, max_length=24)
     include_calibration_page: bool = False
     include_route_card: bool = False
     include_elevation_profile: bool = False

@@ -240,6 +240,13 @@ def dedupe_pois(
     return deduped
 
 
+def _redact_url_secrets(text: str) -> str:
+    """Strip inline WFS/API key tokens (e.g. ``;key=...`` or ``key=...``) before logging."""
+    redacted = re.sub(r"(;key=)[^/&\s;]+", r"\1REDACTED", text, flags=re.IGNORECASE)
+    redacted = re.sub(r"([?&](?:api_?)?key=)[^&\s]+", r"\1REDACTED", redacted, flags=re.IGNORECASE)
+    return redacted
+
+
 def query_wfs_geojson(
     wfs_url: str,
     type_name: str,
@@ -308,11 +315,11 @@ def query_wfs_geojson(
                 resp.raise_for_status()
                 data = resp.json()
             except Exception as exc:
-                last_error = f"{wfs_url} ({type_name}, try={attempt + 1}): {exc}"
+                last_error = f"{_redact_url_secrets(wfs_url)} ({type_name}, try={attempt + 1}): {_redact_url_secrets(str(exc))}"
                 continue
 
             if not isinstance(data, dict) or not isinstance(data.get("features"), list):
-                last_error = f"{wfs_url} ({type_name}): unexpected WFS payload"
+                last_error = f"{_redact_url_secrets(wfs_url)} ({type_name}): unexpected WFS payload"
                 continue
 
             features = [
@@ -1890,94 +1897,100 @@ def _merge_state_trail_gpkgs(
     total_written = 0
 
     try:
-        for src_path in gpkg_paths:
-            src_ds = ogr.Open(str(src_path))
-            if src_ds is None:
-                continue
-            try:
-                src_trails = src_ds.GetLayerByName("au_state_trails")
-                if src_trails is not None:
-                    for feat in src_trails:
-                        geom = feat.GetGeometryRef()
-                        if geom is None or geom.IsEmpty():
-                            continue
-                        env = geom.GetEnvelope()
-                        name = str(feat.GetField("name") or "").strip()
-                        tclass = str(feat.GetField("trail_class") or "").strip()
-                        tkey = (
-                            tclass.lower(),
-                            name.lower(),
-                            int(round(env[0] / 25.0)),
-                            int(round(env[2] / 25.0)),
-                            int(round(env[1] / 25.0)),
-                            int(round(env[3] / 25.0)),
-                        )
-                        if name and tkey in seen_trails:
-                            continue
-                        seen_trails.add(tkey)
-
-                        out_feat = ogr.Feature(trails_defn)
-                        out_geom = geom.Clone()
-                        out_geom.FlattenTo2D()
-                        out_feat.SetGeometry(out_geom)
-                        out_feat.SetField("name", name)
-                        out_feat.SetField("trail_class", tclass)
-                        out_feat.SetField("surface", str(feat.GetField("surface") or "").strip())
-                        out_feat.SetField("state", str(feat.GetField("state") or "").strip())
-                        trails_lyr.CreateFeature(out_feat)
-                        out_feat = None
-                        total_written += 1
-
-                src_pois = src_ds.GetLayerByName("au_state_pois")
-                if src_pois is not None:
-                    for feat in src_pois:
-                        geom = feat.GetGeometryRef()
-                        if geom is None or geom.IsEmpty():
-                            continue
-                        out_geom = geom.Clone()
-                        out_geom.FlattenTo2D()
-                        x, y = out_geom.GetX(), out_geom.GetY()
-                        name = str(feat.GetField("name") or "").strip()
-                        ptype = str(feat.GetField("poi_type") or "").strip()
-                        elev = feat.GetField("elev_m")
-                        pkey = (
-                            ptype.lower(),
-                            name.lower(),
-                            int(round(x / 100.0)),
-                            int(round(y / 100.0)),
-                        )
-                        poi_records.append(
-                            (
-                                bytes(out_geom.ExportToWkb()),
-                                {
-                                    "name": name,
-                                    "poi_type": ptype,
-                                    "elev_m": elev,
-                                    "state": str(feat.GetField("state") or "").strip(),
-                                },
-                                pkey,
+        dst_ds.StartTransaction()
+        try:
+            for src_path in gpkg_paths:
+                src_ds = ogr.Open(str(src_path))
+                if src_ds is None:
+                    continue
+                try:
+                    src_trails = src_ds.GetLayerByName("au_state_trails")
+                    if src_trails is not None:
+                        for feat in src_trails:
+                            geom = feat.GetGeometryRef()
+                            if geom is None or geom.IsEmpty():
+                                continue
+                            env = geom.GetEnvelope()
+                            name = str(feat.GetField("name") or "").strip()
+                            tclass = str(feat.GetField("trail_class") or "").strip()
+                            tkey = (
+                                tclass.lower(),
+                                name.lower(),
+                                int(round(env[0] / 25.0)),
+                                int(round(env[2] / 25.0)),
+                                int(round(env[1] / 25.0)),
+                                int(round(env[3] / 25.0)),
                             )
-                        )
-            finally:
-                src_ds = None
+                            if name and tkey in seen_trails:
+                                continue
+                            seen_trails.add(tkey)
 
-        # Prefer POIs with non-None elev_m when deduplicating across state borders
-        poi_records.sort(key=lambda r: 0 if r[1]["elev_m"] is not None else 1)
-        seen_pois: set[tuple[str, str, int, int]] = set()
-        for wkb, attrs, pkey in poi_records:
-            if pkey in seen_pois:
-                continue
-            seen_pois.add(pkey)
-            out_feat = ogr.Feature(pois_defn)
-            out_feat.SetGeometry(ogr.CreateGeometryFromWkb(wkb))
-            out_feat.SetField("name", attrs["name"])
-            out_feat.SetField("poi_type", attrs["poi_type"])
-            if attrs["elev_m"] is not None:
-                out_feat.SetField("elev_m", float(attrs["elev_m"]))
-            out_feat.SetField("state", attrs["state"])
-            pois_lyr.CreateFeature(out_feat)
-            out_feat = None
-            total_written += 1
+                            out_feat = ogr.Feature(trails_defn)
+                            out_geom = geom.Clone()
+                            out_geom.FlattenTo2D()
+                            out_feat.SetGeometry(out_geom)
+                            out_feat.SetField("name", name)
+                            out_feat.SetField("trail_class", tclass)
+                            out_feat.SetField("surface", str(feat.GetField("surface") or "").strip())
+                            out_feat.SetField("state", str(feat.GetField("state") or "").strip())
+                            trails_lyr.CreateFeature(out_feat)
+                            out_feat = None
+                            total_written += 1
+
+                    src_pois = src_ds.GetLayerByName("au_state_pois")
+                    if src_pois is not None:
+                        for feat in src_pois:
+                            geom = feat.GetGeometryRef()
+                            if geom is None or geom.IsEmpty():
+                                continue
+                            out_geom = geom.Clone()
+                            out_geom.FlattenTo2D()
+                            x, y = out_geom.GetX(), out_geom.GetY()
+                            name = str(feat.GetField("name") or "").strip()
+                            ptype = str(feat.GetField("poi_type") or "").strip()
+                            elev = feat.GetField("elev_m")
+                            pkey = (
+                                ptype.lower(),
+                                name.lower(),
+                                int(round(x / 100.0)),
+                                int(round(y / 100.0)),
+                            )
+                            poi_records.append(
+                                (
+                                    bytes(out_geom.ExportToWkb()),
+                                    {
+                                        "name": name,
+                                        "poi_type": ptype,
+                                        "elev_m": elev,
+                                        "state": str(feat.GetField("state") or "").strip(),
+                                    },
+                                    pkey,
+                                )
+                            )
+                finally:
+                    src_ds = None
+
+            # Prefer POIs with non-None elev_m when deduplicating across state borders
+            poi_records.sort(key=lambda r: 0 if r[1]["elev_m"] is not None else 1)
+            seen_pois: set[tuple[str, str, int, int]] = set()
+            for wkb, attrs, pkey in poi_records:
+                if pkey in seen_pois:
+                    continue
+                seen_pois.add(pkey)
+                out_feat = ogr.Feature(pois_defn)
+                out_feat.SetGeometry(ogr.CreateGeometryFromWkb(wkb))
+                out_feat.SetField("name", attrs["name"])
+                out_feat.SetField("poi_type", attrs["poi_type"])
+                if attrs["elev_m"] is not None:
+                    out_feat.SetField("elev_m", float(attrs["elev_m"]))
+                out_feat.SetField("state", attrs["state"])
+                pois_lyr.CreateFeature(out_feat)
+                out_feat = None
+                total_written += 1
+            dst_ds.CommitTransaction()
+        except Exception:
+            dst_ds.RollbackTransaction()
+            raise
     finally:
         dst_ds = None
 
