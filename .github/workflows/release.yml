@@ -19,30 +19,40 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: jremick/gridforge
 
 jobs:
-  build-and-push:
-    name: Build & Push linux/amd64 + linux/arm64 to GHCR
+  resolve-release:
+    name: Verify the release tag
+    if: github.event_name == 'push' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
+      minor: ${{ steps.resolve.outputs.minor }}
+      is_latest: ${{ steps.resolve.outputs.is_latest }}
+      commit: ${{ steps.resolve.outputs.commit }}
     steps:
+      - name: Fetch the default branch and release tags
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: refs/heads/${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+
       - name: Resolve release tag
         id: resolve
         env:
           INPUT_TAG: ${{ inputs.tag }}
         run: |
           if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
-            TAG="${INPUT_TAG:-v1.7.0}"
+            TAG="${INPUT_TAG}"
           else
             TAG="${GITHUB_REF_NAME}"
           fi
-          if [[ ! "${TAG}" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)(-.*)?$ ]]; then
+          if [[ ! "${TAG}" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
             echo "Invalid semver tag: ${TAG}" >&2
             exit 1
           fi
@@ -52,31 +62,54 @@ jobs:
           else
             IS_LATEST="false"
           fi
+          COMMIT=$(git rev-parse --verify "refs/tags/${TAG}^{commit}")
+          git merge-base --is-ancestor "${COMMIT}" HEAD || {
+            echo "Release tag must point to a commit on the default branch." >&2
+            exit 1
+          }
+          if [[ "${GITHUB_EVENT_NAME}" == push && "${COMMIT}" != "$(git rev-parse "${GITHUB_SHA}^{commit}")" ]]; then
+            echo "The tag has moved since the push event." >&2
+            exit 1
+          fi
           {
+            echo "commit=${COMMIT}"
             echo "tag=${TAG}"
             echo "minor=${MINOR}"
             echo "is_latest=${IS_LATEST}"
           } >> "${GITHUB_OUTPUT}"
 
+  build-and-push:
+    name: Build & Push linux/amd64 + linux/arm64 to GHCR
+    needs: resolve-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          ref: ${{ steps.resolve.outputs.tag }}
+          ref: ${{ needs.resolve-release.outputs.commit }}
+          persist-credentials: false
 
       - name: Run release & marketing hygiene preflight
+        env:
+          RELEASE_TAG: ${{ needs.resolve-release.outputs.tag }}
         run: |
           if [ -f scripts/release_preflight.py ]; then
-            python3 scripts/release_preflight.py --tag "${{ steps.resolve.outputs.tag }}"
+            python3 scripts/release_preflight.py --tag "${RELEASE_TAG}"
           fi
 
       - name: Set up QEMU for multi-arch builds
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -84,23 +117,24 @@ jobs:
 
       - name: Extract Docker metadata (tags & OCI annotations)
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=${{ steps.resolve.outputs.tag }}
-            type=raw,value=${{ steps.resolve.outputs.minor }}
-            type=raw,value=latest,enable=${{ steps.resolve.outputs.is_latest }}
+            type=raw,value=${{ needs.resolve-release.outputs.tag }}
+            type=raw,value=${{ needs.resolve-release.outputs.minor }},enable=${{ needs.resolve-release.outputs.is_latest }}
+            type=raw,value=latest,enable=${{ needs.resolve-release.outputs.is_latest }}
           labels: |
             org.opencontainers.image.title=GridForge
             org.opencontainers.image.description=Open-source military-style MGRS topographic map generator, print studio & offline device exporter (Headless PyQGIS 3.40 LTR)
             org.opencontainers.image.source=https://github.com/jremick/gridforge
             org.opencontainers.image.url=https://github.com/jremick/gridforge
-            org.opencontainers.image.version=${{ steps.resolve.outputs.tag }}
+            org.opencontainers.image.version=${{ needs.resolve-release.outputs.tag }}
             org.opencontainers.image.licenses=GPL-3.0
 
       - name: Build and push multi-arch image
-        uses: docker/build-push-action@v6
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -112,7 +146,7 @@ jobs:
 
   render-samples:
     name: Render & Attach Verified Sample PDFs
-    needs: build-and-push
+    needs: [resolve-release, build-and-push]
     if: github.event_name == 'push' || inputs.render_samples == true
     runs-on: ubuntu-latest
     timeout-minutes: 25
@@ -121,12 +155,13 @@ jobs:
       packages: read
     steps:
       - name: Checkout release tag
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          ref: ${{ needs.build-and-push.outputs.tag }}
+          ref: ${{ needs.resolve-release.outputs.commit }}
+          persist-credentials: false
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -134,25 +169,25 @@ jobs:
 
       - name: Render 300-600 DPI sample PDFs from published image
         env:
-          RELEASE_TAG: ${{ needs.build-and-push.outputs.tag }}
+          IMAGE_DIGEST: ${{ needs.build-and-push.outputs.digest }}
         run: |
-          IMAGE="${REGISTRY}/${IMAGE_NAME}:${RELEASE_TAG}"
+          IMAGE="${REGISTRY}/${IMAGE_NAME}@${IMAGE_DIGEST}"
           docker pull "${IMAGE}"
           ./scripts/render_release_samples.sh \
             --image "${IMAGE}" \
             --out-dir "${RUNNER_TEMP}/release-samples"
 
       - name: Upload sample PDFs as workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: release-samples-${{ needs.build-and-push.outputs.tag }}
+          name: release-samples-${{ needs.resolve-release.outputs.tag }}
           path: ${{ runner.temp }}/release-samples/sample-*.pdf
           retention-days: 14
 
       - name: Attach sample PDFs to GitHub Release (if release exists)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ needs.build-and-push.outputs.tag }}
+          RELEASE_TAG: ${{ needs.resolve-release.outputs.tag }}
         run: |
           if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
             gh release upload "${RELEASE_TAG}" \

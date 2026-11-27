@@ -23,7 +23,7 @@ Keep `README.md` structured as a **product landing page** (not a reverse-chronol
 - **Keep Capability Tables, Docs & Metrics Current:** Keep `README.md` concise and skimmable while updating the comparison table, key metrics, and downloadable sample PDF links to match the new release tag, and keep detailed references current in `docs/DATA_SOURCES.md`, `docs/CLI_COOKBOOK.md`, `docs/GALLERY.md`, and `deploy/hosted-mode.md`.
 - **Keep Planned Roadmap Current:** Prune or check off shipped items in `README.md`'s **Planned Roadmap** section and refresh upcoming high-value priorities whenever features land or a release is cut.
 - **Showcase Headline Features in Sample PDFs:** Update `scripts/render_release_samples.sh` whenever major new scales, DPI tiers, themes, or regions ship so visitors can inspect real vector outputs from the new release.
-- **Use Published Images in User Examples:** Use `ghcr.io/jremick/gridforge:latest` in all Quickstart and CLI Cookbook examples (reserve `gridforge:dev` strictly for local development/testing sections).
+- Use the published GHCR image in Quickstart and CLI Cookbook commands. After publication, update the version and multi-architecture image digest in `examples/render-examples.sh`. Local development can use `GRIDFORGE_IMAGE=gridforge:dev`.
 
 ## 3. Automated Verification, CI Mount Parity & Release Preflight
 
