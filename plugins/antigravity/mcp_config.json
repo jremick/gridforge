@@ -1,0 +1,29 @@
+{
+  "mcpServers": {
+    "gridforge": {
+      "command": "docker",
+      "args": [
+        "run",
+        "-i",
+        "--rm",
+        "-v",
+        "${PLUGIN_DATA}:/data",
+        "-e",
+        "GRIDFORGE_DATA_DIR=/data/jobs",
+        "-e",
+        "GRIDFORGE_PACKS_DIR=/data/packs",
+        "-e",
+        "GRIDFORGE_CACHE_DIR=/data/cache",
+        "-e",
+        "GRIDFORGE_URL",
+        "-e",
+        "GRIDFORGE_API_KEY",
+        "-e",
+        "GRIDFORGE_PUBLIC_URL",
+        "ghcr.io/jremick/gridforge:latest",
+        "gridforge",
+        "mcp"
+      ]
+    }
+  }
+}

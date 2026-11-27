@@ -184,6 +184,78 @@ def verify_signed_token(token: str | None, secret: bytes) -> str | None:
         return None
 
 
+DEFAULT_SIGNED_URL_TTL_SECONDS: int = 3600
+
+
+def sign_artifact_token(
+    job_id: str,
+    resource: str,
+    secret: bytes,
+    ttl_seconds: int | None = None,
+    *,
+    now_unix: int | None = None,
+) -> str:
+    """Sign a short-lived HMAC-SHA256 token scoped to one job artifact or page preview."""
+    ttl = DEFAULT_SIGNED_URL_TTL_SECONDS if ttl_seconds is None else max(1, int(ttl_seconds))
+    now_ts = int(time.time()) if now_unix is None else int(now_unix)
+    payload = json.dumps(
+        {"j": job_id, "r": resource, "exp": now_ts + ttl},
+        separators=(",", ":"),
+    )
+    return sign_token(payload, secret)
+
+
+def verify_artifact_token(
+    token: str | None,
+    *,
+    expected_job_id: str,
+    expected_resource: str,
+    secret: bytes,
+    now_unix: int | None = None,
+) -> bool:
+    """Verify a short-lived artifact/page HMAC token against job_id, resource, and expiry."""
+    decoded = verify_signed_token(token, secret)
+    if not decoded:
+        return False
+    try:
+        obj = json.loads(decoded)
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(obj, dict):
+        return False
+    j = obj.get("j")
+    r = obj.get("r")
+    exp = obj.get("exp")
+    if not isinstance(j, str) or not isinstance(r, str) or not isinstance(exp, int) or isinstance(exp, bool):
+        return False
+    now_ts = int(time.time()) if now_unix is None else int(now_unix)
+    if exp <= now_ts:
+        return False
+    return hmac.compare_digest(j, expected_job_id) and hmac.compare_digest(r, expected_resource)
+
+
+def extract_api_key_from_headers(headers: Any) -> tuple[bool, str | None]:
+    """Extract an explicitly supplied Bearer or ``X-API-Key`` token from HTTP headers.
+
+    Returns ``(was_supplied, raw_token)``.
+    """
+    auth_header = headers.get("authorization")
+    if auth_header is not None and auth_header.strip():
+        parts = auth_header.strip().split(None, 1)
+        if parts and parts[0].lower() == "bearer":
+            return (True, parts[1].strip() if len(parts) > 1 else "")
+    if "x-api-key" in headers:
+        return (True, (headers.get("x-api-key") or "").strip())
+    return (False, None)
+
+
+def constant_time_key_matches(supplied: str | None, expected: str | None) -> bool:
+    """Compare two API keys in constant time."""
+    if not supplied or not expected:
+        return False
+    return hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8"))
+
+
 @dataclass(frozen=True)
 class AuthConfig:
     """Dynamic environment configuration for GridForge authentication."""
@@ -194,6 +266,9 @@ class AuthConfig:
     cookie_secure: bool | None = None
     session_ttl_hours: int = 720
     guest_ttl_hours: int = 24
+    signed_url_ttl_seconds: int = DEFAULT_SIGNED_URL_TTL_SECONDS
+    api_key: str | None = None
+    public_url: str | None = None
     turnstile_site_key: str | None = None
     turnstile_secret_key: str | None = None
     google_client_id: str | None = None
@@ -246,6 +321,14 @@ class AuthConfig:
 
         session_ttl = max(1, int(os.environ.get("GRIDFORGE_SESSION_TTL_HOURS", "720").strip() or "720"))
         guest_ttl = max(1, int(os.environ.get("GRIDFORGE_GUEST_COOKIE_TTL_HOURS", "24").strip() or "24"))
+        raw_sig_ttl = os.environ.get("GRIDFORGE_SIGNED_URL_TTL_SECONDS", "").strip()
+        signed_url_ttl = (
+            max(1, int(raw_sig_ttl))
+            if raw_sig_ttl
+            else DEFAULT_SIGNED_URL_TTL_SECONDS
+        )
+        raw_public_url = _opt_str_env("GRIDFORGE_PUBLIC_URL")
+        public_url = raw_public_url.rstrip("/") if raw_public_url else None
 
         return cls(
             auth_mode=auth_mode,
@@ -254,6 +337,9 @@ class AuthConfig:
             cookie_secure=_parse_opt_bool_env("GRIDFORGE_COOKIE_SECURE"),
             session_ttl_hours=session_ttl,
             guest_ttl_hours=guest_ttl,
+            signed_url_ttl_seconds=signed_url_ttl,
+            api_key=_opt_str_env("GRIDFORGE_API_KEY"),
+            public_url=public_url,
             turnstile_site_key=_opt_str_env("GRIDFORGE_TURNSTILE_SITE_KEY"),
             turnstile_secret_key=_opt_str_env("GRIDFORGE_TURNSTILE_SECRET_KEY"),
             google_client_id=_opt_str_env("GRIDFORGE_GOOGLE_CLIENT_ID"),
@@ -284,6 +370,8 @@ class AuthContext:
     new_guest_cookie_value: str | None = None
     clear_session_cookie: bool = False
     session_token_hash: str | None = None
+    auth_method: Literal["none", "guest", "session", "api_key"] = "none"
+    api_key_id: str | None = None
 
 
 class AuthManager:
@@ -342,9 +430,44 @@ class AuthManager:
         *,
         issue_guest_cookie: bool = True,
     ) -> AuthContext:
-        """Resolve role, owner_id, user, and pending cookie updates for an HTTP request."""
+        """Resolve role, owner_id, user, and pending cookie updates for an HTTP request.
+
+        Checks ``Authorization: Bearer <tok>`` and ``X-API-Key: <tok>`` headers BEFORE cookies.
+        """
         client_ip = get_client_ip(request)
+        key_supplied, raw_api_key = extract_api_key_from_headers(request.headers)
+
         if self.config.auth_mode == "none":
+            if self.config.api_key:
+                path = request.url.path
+                is_mcp = path == "/mcp" or path.startswith("/mcp/")
+                is_mutating_api = path.startswith("/api/") and request.method.upper() not in {
+                    "GET",
+                    "HEAD",
+                    "OPTIONS",
+                }
+                if key_supplied:
+                    if not constant_time_key_matches(raw_api_key, self.config.api_key):
+                        raise HTTPException(
+                            status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail="Invalid or expired API key.",
+                            headers={"WWW-Authenticate": "Bearer"},
+                        )
+                    return AuthContext(
+                        auth_mode="none",
+                        role="none",
+                        authenticated=True,
+                        owner_id="local",
+                        user=None,
+                        client_ip=client_ip,
+                        auth_method="api_key",
+                    )
+                if is_mutating_api or (is_mcp and request.method.upper() != "OPTIONS"):
+                    raise HTTPException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        detail="API key required.",
+                        headers={"WWW-Authenticate": "Bearer"},
+                    )
             return AuthContext(
                 auth_mode="none",
                 role="none",
@@ -352,6 +475,48 @@ class AuthManager:
                 owner_id="local",
                 user=None,
                 client_ip=client_ip,
+                auth_method="none",
+            )
+
+        # Hosted mode: check Bearer / X-API-Key headers BEFORE session/guest cookies.
+        if key_supplied:
+            if not raw_api_key:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Invalid or expired API key.",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+            token_hash = sha256_hex(raw_api_key)
+            hit = db.get_api_key_and_user_by_token_hash(self.db_path, token_hash)
+            if hit is None:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Invalid or expired API key.",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+            api_key_row, user = hit
+            if user.get("disabled"):
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Invalid or expired API key.",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+            try:
+                db.touch_api_key_last_used(self.db_path, str(api_key_row["key_id"]))
+            except Exception as exc:
+                logger.debug("Failed to update api_key last_used_at: %s", exc)
+            role_val: Literal["friend", "admin"] = (
+                "admin" if user["role"] == "admin" else "friend"
+            )
+            return AuthContext(
+                auth_mode="hosted",
+                role=role_val,
+                authenticated=True,
+                owner_id=str(user["user_id"]),
+                user=user,
+                client_ip=client_ip,
+                auth_method="api_key",
+                api_key_id=str(api_key_row["key_id"]),
             )
 
         clear_session = False
@@ -364,17 +529,18 @@ class AuthManager:
                 token_hash = sha256_hex(raw_session_token)
                 user = db.get_session_and_user_by_token_hash(self.db_path, token_hash)
                 if user is not None and not user.get("disabled"):
-                    role_val: Literal["friend", "admin"] = (
+                    role_val_sess: Literal["friend", "admin"] = (
                         "admin" if user["role"] == "admin" else "friend"
                     )
                     return AuthContext(
                         auth_mode="hosted",
-                        role=role_val,
+                        role=role_val_sess,
                         authenticated=True,
                         owner_id=str(user["user_id"]),
                         user=user,
                         client_ip=client_ip,
                         session_token_hash=token_hash,
+                        auth_method="session",
                     )
             clear_session = True
 
@@ -396,6 +562,7 @@ class AuthManager:
             client_ip=client_ip,
             new_guest_cookie_value=new_guest_cookie,
             clear_session_cookie=clear_session,
+            auth_method="guest",
         )
 
     def apply_auth_cookies(

@@ -195,7 +195,14 @@ def check_release(tag: str | None = None) -> list[str]:
         *(ROOT / "scripts").glob("*.sh"),
         *(ROOT / "scripts").glob("*.py"),
     ]
-    for tree in (ROOT / "src", ROOT / "tests", ROOT / "web" / "src"):
+    for tree in (
+        ROOT / "src",
+        ROOT / "tests",
+        ROOT / "web" / "src",
+        ROOT / "web" / "mcp-app",
+        ROOT / "docs",
+        ROOT / "plugins",
+    ):
         if tree.is_dir():
             for p in tree.rglob("*"):
                 if p.is_file() and p.suffix.lower() in _text_suffixes:

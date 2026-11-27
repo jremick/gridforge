@@ -21,6 +21,7 @@ _EXPLICIT_SECRET_KEYS: frozenset[str] = frozenset(
         "GRIDFORGE_TURNSTILE_SECRET_KEY",
         "GRIDFORGE_TURNSTILE_SITE_KEY",
         "GRIDFORGE_ORIGIN_PROXY_SECRET",
+        "GRIDFORGE_API_KEY",
         "AWS_SECRET_ACCESS_KEY",
         "AWS_SESSION_TOKEN",
         "AWS_ACCESS_KEY_ID",
@@ -109,7 +110,7 @@ def _is_secret_key(key: str) -> bool:
     if upper in _EXPLICIT_SECRET_KEYS:
         return True
     if upper.startswith("GRIDFORGE_") and any(
-        tok in upper for tok in ("SECRET", "PASSWORD", "TOKEN", "CLIENT_SECRET")
+        tok in upper for tok in ("SECRET", "PASSWORD", "TOKEN", "CLIENT_SECRET", "API_KEY")
     ):
         return True
     return False

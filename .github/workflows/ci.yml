@@ -45,8 +45,8 @@ jobs:
         working-directory: .
         run: python3 scripts/release_preflight.py
 
-      - name: Typecheck and build SPA
-        run: npm run build
+      - name: Typecheck and build SPA + MCP App
+        run: npm run build && npm run build:mcp-app
 
   docker-ci:
     name: Headless PyQGIS Docker Build & Offline Test Suite

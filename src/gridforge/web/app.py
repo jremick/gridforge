@@ -28,9 +28,18 @@ from fastapi import FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
+from fastapi.openapi.utils import get_openapi
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+)
 from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
+from pypdf import PdfReader
+from starlette.datastructures import Headers
 from starlette.formparsers import MultiPartException, MultiPartParser
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -53,6 +62,7 @@ from gridforge.geo.strip_atlas import (
 from gridforge.geo.tactical import RulerMetricsResponse
 from gridforge.geo.waypoints import compute_route_metrics
 from gridforge.packs.builder import discover_packs
+from gridforge.subprocess_env import build_safe_subprocess_env
 from gridforge.web import db, projects as projects_store, shares as shares_store
 from gridforge.web.access import (
     OriginProxyAuthMiddleware,
@@ -65,9 +75,14 @@ from gridforge.web.auth import (
     AuthConfig,
     AuthContext,
     AuthManager,
+    constant_time_key_matches,
+    extract_api_key_from_headers,
     sha256_hex,
+    sign_artifact_token,
+    verify_artifact_token,
 )
 from gridforge.web.basemap import BasemapInfoResponse, MBTilesBasemapStore
+from gridforge.web.capabilities import CapabilitiesResponse, build_capabilities_response
 from gridforge.web.limits import (
     LimitsConfig,
     effective_share_ttl_hours,
@@ -113,7 +128,11 @@ from gridforge.web.schemas import (
     AdminUsageSummary,
     AdminUserRecord,
     AdminUsersResponse,
+    ApiKeyRecord,
+    ApiKeysListResponse,
     AuthSessionResponse,
+    CreateApiKeyRequest,
+    CreateApiKeyResponse,
     CreateInviteRequest,
     CreateInviteResponse,
     CreateJobRequest,
@@ -122,11 +141,16 @@ from gridforge.web.schemas import (
     GeocodeResponse,
     GeocodeResult,
     HealthResponse,
+    JobArtifact,
+    JobPageInfo,
+    JobPagesResponse,
     JobRecord,
     JobsListResponse,
+    JobStatus,
     LoginRequest,
     PacksResponse,
     PackSummary,
+    RevokeApiKeyResponse,
     RevokeInviteResponse,
     RFLinkProfileRequest,
     RFLinkProfileResponse,
@@ -878,6 +902,93 @@ def _resolve_default_samples_dir() -> Path | None:
     return None
 
 
+class _StaticApiKeyMiddleware:
+    """Enforce static ``GRIDFORGE_API_KEY`` in ``auth_mode=none`` on mutating ``/api/*`` and ``/mcp`` calls."""
+
+    def __init__(self, app: ASGIApp, *, expected_key: str) -> None:
+        self.app = app
+        self._expected_key = expected_key
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http":
+            path = str(scope.get("path") or "")
+            method = str(scope.get("method") or "GET").upper()
+            headers = Headers(scope=scope)
+            key_supplied, raw_key = extract_api_key_from_headers(headers)
+            is_mcp = path == "/mcp" or path.startswith("/mcp/")
+            is_mutating_api = path.startswith("/api/") and method not in {
+                "GET",
+                "HEAD",
+                "OPTIONS",
+            }
+            if is_mutating_api or (is_mcp and method != "OPTIONS"):
+                if not key_supplied or not constant_time_key_matches(raw_key, self._expected_key):
+                    resp = JSONResponse(
+                        {"detail": "Invalid or missing API key."},
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        headers={"WWW-Authenticate": "Bearer"},
+                    )
+                    await resp(scope, receive, send)
+                    return
+            elif key_supplied and path.startswith("/api/"):
+                if not constant_time_key_matches(raw_key, self._expected_key):
+                    resp = JSONResponse(
+                        {"detail": "Invalid or expired API key."},
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        headers={"WWW-Authenticate": "Bearer"},
+                    )
+                    await resp(scope, receive, send)
+                    return
+        await self.app(scope, receive, send)
+
+
+def _build_llms_txt(auth_config: AuthConfig) -> str:
+    """Build concise machine- and AI-readable discovery instructions for ``GET /llms.txt``."""
+    base = auth_config.public_url or ""
+
+    def p(path: str) -> str:
+        return f"{base}{path}" if base else path
+    auth_note = (
+        "Hosted mode: mint a personal access token (`gf_...`) via `POST /api/auth/api-keys` "
+        "and send `Authorization: Bearer <token>` or `X-API-Key: <token>`."
+        if auth_config.auth_mode == "hosted"
+        else (
+            "Local mode with `GRIDFORGE_API_KEY` enabled: send `Authorization: Bearer <key>` "
+            "or `X-API-Key: <key>` on mutating `/api/*` and `/mcp` calls."
+            if auth_config.api_key
+            else "Local mode (`auth_mode=none`): no login required."
+        )
+    )
+    return "\n".join(
+        [
+            f"# {auth_config.brand_name} (v{__version__})",
+            "",
+            "> True-scale local UTM / MGRS topographic map generator, RF line-of-sight & viewshed studio, and offline field map exporter.",
+            "",
+            "## Discovery & AI Integration",
+            f"- MCP Streamable HTTP endpoint (with SEP-1865 MCP Apps UI): {p('/mcp')}",
+            f"- Live JSON Capabilities catalog: {p('/api/capabilities')}",
+            f"- Complete OpenAPI 3.1 schema: {p('/openapi.json')}",
+            f"- Interactive API docs (Swagger UI): {p('/docs')}",
+            "",
+            "## Authentication",
+            f"- {auth_note}",
+            "- Completed jobs include short-lived HMAC-signed `signed_download_url` (`?sig=...`) and page preview `signed_preview_url` links usable directly without cookies or Bearer headers.",
+            "",
+            "## Key HTTP Workflows",
+            f"- Instant planning & briefing: `GET {p('/api/geocode')}?q=...`, `POST {p('/api/footprint')}`, `POST {p('/api/rf-link-profile')}`, `POST {p('/api/viewshed-preview')}`, `POST {p('/api/route-metrics')}`, `POST {p('/api/ruler-metrics')}`, `POST {p('/api/strip-plan')}`",
+            f"- Render printable PDF / GeoPDF / ATAK MBTiles / Garmin KMZ / OsmAnd / Field Bundle ZIP: `POST {p('/api/jobs')}?wait=true&timeout_s=120` (returns `200 OK` when finished, or omit `wait` for async `202 Accepted` + poll `GET {p('/api/jobs/{job_id}')}`)",
+            f"- Inspect rendered PDF pages as PNG: `GET {p('/api/jobs/{job_id}/pages')}` and `GET {p('/api/jobs/{job_id}/pages/{page_num}.png')}?width=1200`",
+            f"- Share interactive Studio map links: `POST {p('/api/shares')}` -> `/?share={{share_id}}`",
+            "",
+            "## CLI for Coding Agents",
+            "- Render from JSON spec: `gridforge render --spec-file spec.json --output map.pdf --json` (pass `--spec-file -` for stdin)",
+            "- Start stdio MCP server: `gridforge mcp`",
+            "",
+        ]
+    )
+
+
 def create_app(
     *,
     data_dir: Path | str | None = None,
@@ -947,6 +1058,8 @@ def create_app(
     application.add_middleware(GZipMiddleware, minimum_size=500)
     application.add_middleware(_SecurityHeadersMiddleware)
     application.add_middleware(_MaxBodySizeMiddleware, max_bytes=_DEFAULT_MAX_JSON_BODY_BYTES)
+    if auth_config.auth_mode == "none" and auth_config.api_key:
+        application.add_middleware(_StaticApiKeyMiddleware, expected_key=auth_config.api_key)
     application.add_middleware(SameOriginWritesMiddleware)
     application.add_middleware(OriginProxyAuthMiddleware)
     allowed_hosts = ["localhost", "127.0.0.1", "[::1]"]
@@ -985,7 +1098,61 @@ def create_app(
             )
         return ctx
 
-    @application.get("/api/health", response_model=HealthResponse)
+    def _require_api_key_user(request: Request) -> AuthContext:
+        ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=False)
+        if auth_config.auth_mode != "hosted":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="API key management is disabled when GRIDFORGE_AUTH_MODE=none.",
+            )
+        if not ctx.authenticated or ctx.role not in {"friend", "admin"} or ctx.user is None:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="API key management requires a signed-in Friend or Admin account.",
+            )
+        return ctx
+
+    def _enrich_job_record(record: JobRecord) -> JobRecord:
+        if not record.artifacts:
+            return record
+        enriched: list[JobArtifact] = []
+        for a in record.artifacts:
+            tok = sign_artifact_token(
+                record.job_id,
+                f"artifact:{a.filename}",
+                auth_config.session_secret,
+                ttl_seconds=auth_config.signed_url_ttl_seconds,
+            )
+            sep = "&" if "?" in a.download_url else "?"
+            enriched.append(
+                a.model_copy(
+                    update={"signed_download_url": f"{a.download_url}{sep}sig={tok}"}
+                )
+            )
+        return record.model_copy(update={"artifacts": enriched})
+
+    def _resolve_job_pdf(job_id: str, record: JobRecord) -> Path | None:
+        job_root = (resolved_data_dir / job_id).resolve()
+        if not job_root.is_relative_to(resolved_data_dir):
+            return None
+        artifacts_dir = (job_root / "artifacts").resolve()
+        pdf_candidates = [
+            artifacts_dir / a.filename for a in record.artifacts if a.kind == "pdf"
+        ]
+        if not pdf_candidates and artifacts_dir.is_dir():
+            pdf_candidates = sorted(artifacts_dir.glob("*.pdf"))
+        source_pdf = next((p.resolve() for p in pdf_candidates if p.is_file()), None)
+        if source_pdf is None or not source_pdf.is_relative_to(artifacts_dir):
+            return None
+        return source_pdf
+
+    @application.get(
+        "/api/health",
+        response_model=HealthResponse,
+        tags=["Discovery"],
+        summary="Check service health, queue depth, worker status, and pack count",
+        operation_id="getHealth",
+    )
     def api_health() -> HealthResponse:
         worker_alive, last_seen = db.get_heartbeat(db_path)
         queue_depth = db.get_queue_depth(db_path)
@@ -999,14 +1166,163 @@ def create_app(
             packs_count=len(packs),
         )
 
-    @application.get("/api/auth/session", response_model=AuthSessionResponse)
+    @application.get(
+        "/api/capabilities",
+        response_model=CapabilitiesResponse,
+        tags=["Discovery"],
+        summary="Discover supported scales, themes, DEM sources, overlays, RF bands, and caller limits",
+        operation_id="getCapabilities",
+    )
+    def api_capabilities(request: Request) -> CapabilitiesResponse:
+        ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=False)
+        packs = discover_packs(resolved_packs_dir)
+        return build_capabilities_response(
+            auth_mode=auth_config.auth_mode,
+            caller_role=ctx.role,
+            authenticated=ctx.authenticated,
+            caller_capabilities=_caps_for(ctx),
+            installed_packs_count=len(packs),
+            brand_name=auth_config.brand_name,
+            public_url=auth_config.public_url,
+            signed_url_ttl_seconds=auth_config.signed_url_ttl_seconds,
+        )
+
+    @application.get("/llms.txt", response_class=PlainTextResponse, include_in_schema=False)
+    def api_llms_txt() -> PlainTextResponse:
+        return PlainTextResponse(
+            content=_build_llms_txt(auth_config),
+            media_type="text/plain; charset=utf-8",
+            headers={"Cache-Control": "public, max-age=300"},
+        )
+
+    @application.get(
+        "/api/auth/session",
+        response_model=AuthSessionResponse,
+        tags=["Authentication"],
+        summary="Get current auth session, role capabilities, and live quotas",
+        operation_id="getAuthSession",
+    )
     def api_auth_session(request: Request, response: Response) -> AuthSessionResponse:
         ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=True)
         payload = auth_manager.build_session_response(ctx, limits_config)
         auth_manager.apply_auth_cookies(response, ctx, request)
         return payload
 
-    @application.post("/api/auth/login", response_model=AuthSessionResponse)
+    @application.get(
+        "/api/auth/api-keys",
+        response_model=ApiKeysListResponse,
+        tags=["Authentication"],
+        summary="List caller's scoped Bearer API keys",
+        operation_id="listApiKeys",
+    )
+    def api_list_api_keys(request: Request) -> ApiKeysListResponse:
+        ctx = _require_api_key_user(request)
+        rows = db.list_api_keys(db_path, user_id=ctx.owner_id)
+        return ApiKeysListResponse(
+            api_keys=[
+                ApiKeyRecord(
+                    key_id=r["key_id"],
+                    name=r["name"],
+                    key_prefix=r["key_prefix"],
+                    scopes=r["scopes"],
+                    created_at=r["created_at"],
+                    expires_at=r["expires_at"],
+                    revoked_at=r["revoked_at"],
+                    last_used_at=r["last_used_at"],
+                    status=r["status"],
+                )
+                for r in rows
+            ]
+        )
+
+    @application.post(
+        "/api/auth/api-keys",
+        response_model=CreateApiKeyResponse,
+        status_code=status.HTTP_201_CREATED,
+        tags=["Authentication"],
+        summary="Create a new scoped Bearer API key (plaintext token returned once)",
+        operation_id="createApiKey",
+    )
+    def api_create_api_key(
+        req: CreateApiKeyRequest,
+        request: Request,
+    ) -> CreateApiKeyResponse:
+        ctx = _require_api_key_user(request)
+        existing_keys = db.list_api_keys(db_path, user_id=ctx.owner_id)
+        active_count = sum(1 for k in existing_keys if k.get("status") == "active")
+        if active_count >= 25:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Maximum active API keys reached (25). Revoke an unused key before creating another.",
+            )
+        key_id = f"key_{uuid.uuid4().hex[:12]}"
+        raw_token = f"gf_{secrets.token_urlsafe(32)}"
+        key_prefix = raw_token[:12]
+        expires_at = (
+            db._dt_to_iso(datetime.now(timezone.utc) + timedelta(days=req.expires_days))
+            if req.expires_days is not None
+            else None
+        )
+        created = db.create_api_key(
+            db_path,
+            key_id=key_id,
+            user_id=ctx.owner_id,
+            name=req.name,
+            key_prefix=key_prefix,
+            token_hash=sha256_hex(raw_token),
+            scopes=req.scopes,
+            expires_at=expires_at,
+        )
+        return CreateApiKeyResponse(
+            api_key=ApiKeyRecord(
+                key_id=created["key_id"],
+                name=created["name"],
+                key_prefix=created["key_prefix"],
+                scopes=created["scopes"],
+                created_at=created["created_at"],
+                expires_at=created["expires_at"],
+                revoked_at=created["revoked_at"],
+                last_used_at=created["last_used_at"],
+                status=created["status"],
+            ),
+            token=raw_token,
+        )
+
+    @application.delete(
+        "/api/auth/api-keys/{key_id}",
+        response_model=RevokeApiKeyResponse,
+        tags=["Authentication"],
+        summary="Revoke a Bearer API key",
+        operation_id="revokeApiKey",
+    )
+    def api_revoke_api_key(key_id: str, request: Request) -> RevokeApiKeyResponse:
+        ctx = _require_api_key_user(request)
+        if not _JOB_ID_RE.match(key_id):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid key_id.",
+            )
+        existing = db.get_api_key(db_path, key_id)
+        if existing is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="API key not found.",
+            )
+        if existing["user_id"] != ctx.owner_id and ctx.role != "admin":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have permission to revoke this API key.",
+            )
+        db.revoke_api_key(db_path, key_id)
+        return RevokeApiKeyResponse(revoked=True, key_id=key_id)
+
+    @application.post(
+        "/api/auth/login",
+        response_model=AuthSessionResponse,
+        tags=["Authentication"],
+        summary="Sign in with email and password",
+        operation_id="authLogin",
+    )
     def api_auth_login(
         req: LoginRequest,
         request: Request,
@@ -1034,7 +1350,13 @@ def create_app(
         )
         return auth_manager.build_session_response(ctx, limits_config)
 
-    @application.post("/api/auth/logout", response_model=AuthSessionResponse)
+    @application.post(
+        "/api/auth/logout",
+        response_model=AuthSessionResponse,
+        tags=["Authentication"],
+        summary="Log out current session cookie",
+        operation_id="authLogout",
+    )
     def api_auth_logout(request: Request, response: Response) -> AuthSessionResponse:
         ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=False)
         auth_manager.logout_session(ctx)
@@ -1067,14 +1389,25 @@ def create_app(
             auth_manager.apply_auth_cookies(response, next_ctx, request)
         return auth_manager.build_session_response(next_ctx, limits_config)
 
-    @application.post("/api/auth/register")
+    @application.post(
+        "/api/auth/register",
+        tags=["Authentication"],
+        summary="Public registration (disabled; invite-only)",
+        operation_id="authRegister",
+    )
     def api_auth_register() -> None:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Public signup is disabled; an admin invite is required.",
         )
 
-    @application.post("/api/auth/accept-invite", response_model=AuthSessionResponse)
+    @application.post(
+        "/api/auth/accept-invite",
+        response_model=AuthSessionResponse,
+        tags=["Authentication"],
+        summary="Redeem an invite token and create an account",
+        operation_id="acceptInvite",
+    )
     def api_auth_accept_invite(
         req: AcceptInviteRequest,
         request: Request,
@@ -1155,7 +1488,13 @@ def create_app(
         auth_manager.set_session_cookie(resp, raw_session_token, request)
         return resp
 
-    @application.get("/api/admin/usage", response_model=AdminUsageResponse)
+    @application.get(
+        "/api/admin/usage",
+        response_model=AdminUsageResponse,
+        tags=["Admin"],
+        summary="Get aggregate usage metrics and recent events",
+        operation_id="adminGetUsage",
+    )
     def api_admin_usage(request: Request) -> AdminUsageResponse:
         _require_admin(request)
         report = db.get_admin_usage_report(
@@ -1168,7 +1507,13 @@ def create_app(
             recent_events=[AdminUsageEvent(**ev) for ev in report["recent_events"]],
         )
 
-    @application.get("/api/admin/users", response_model=AdminUsersResponse)
+    @application.get(
+        "/api/admin/users",
+        response_model=AdminUsersResponse,
+        tags=["Admin"],
+        summary="List hosted user accounts and invites",
+        operation_id="adminListUsers",
+    )
     def api_admin_users(request: Request) -> AdminUsersResponse:
         _require_admin(request)
         users = [
@@ -1208,6 +1553,9 @@ def create_app(
         "/api/admin/invites",
         response_model=CreateInviteResponse,
         status_code=status.HTTP_201_CREATED,
+        tags=["Admin"],
+        summary="Create a single-use account invite",
+        operation_id="adminCreateInvite",
     )
     def api_admin_create_invite(
         req: CreateInviteRequest,
@@ -1235,7 +1583,13 @@ def create_app(
             expires_at=expires_at,
         )
 
-    @application.delete("/api/admin/invites/{invite_id}", response_model=RevokeInviteResponse)
+    @application.delete(
+        "/api/admin/invites/{invite_id}",
+        response_model=RevokeInviteResponse,
+        tags=["Admin"],
+        summary="Revoke a pending invite",
+        operation_id="adminRevokeInvite",
+    )
     def api_admin_revoke_invite(invite_id: str, request: Request) -> RevokeInviteResponse:
         _require_admin(request)
         if not _JOB_ID_RE.match(invite_id):
@@ -1245,7 +1599,13 @@ def create_app(
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invite not found.")
         return RevokeInviteResponse(revoked=True, invite_id=invite_id)
 
-    @application.patch("/api/admin/users/{user_id}", response_model=UpdateUserResponse)
+    @application.patch(
+        "/api/admin/users/{user_id}",
+        response_model=UpdateUserResponse,
+        tags=["Admin"],
+        summary="Update user role, status, or per-user quota overrides",
+        operation_id="adminUpdateUser",
+    )
     def api_admin_update_user(
         user_id: str,
         req: UpdateUserRequest,
@@ -1295,7 +1655,13 @@ def create_app(
             )
         )
 
-    @application.post("/api/admin/settings", response_model=AdminSettingsResponse)
+    @application.post(
+        "/api/admin/settings",
+        response_model=AdminSettingsResponse,
+        tags=["Admin"],
+        summary="Update global hosted settings (e.g. pause public renders)",
+        operation_id="adminUpdateSettings",
+    )
     def api_admin_settings(
         req: AdminSettingsRequest,
         request: Request,
@@ -1304,7 +1670,13 @@ def create_app(
         db.set_setting(db_path, "public_renders_paused", bool(req.public_renders_paused))
         return AdminSettingsResponse(public_renders_paused=bool(req.public_renders_paused))
 
-    @application.get("/api/basemap/info", response_model=BasemapInfoResponse)
+    @application.get(
+        "/api/basemap/info",
+        response_model=BasemapInfoResponse,
+        tags=["Basemap"],
+        summary="Get local offline MBTiles basemap metadata",
+        operation_id="getBasemapInfo",
+    )
     def api_basemap_info(pack_id: str | None = Query(default=None)) -> BasemapInfoResponse:
         if pack_id is not None and not _PACK_ID_RE.match(pack_id):
             raise HTTPException(
@@ -1313,7 +1685,12 @@ def create_app(
             )
         return basemap_store.get_info(pack_id=pack_id)
 
-    @application.get("/api/basemap/{z}/{x}/{y}.{ext}")
+    @application.get(
+        "/api/basemap/{z}/{x}/{y}.{ext}",
+        tags=["Basemap"],
+        summary="Fetch a raster basemap tile from a local MBTiles archive",
+        operation_id="getBasemapTile",
+    )
     def api_basemap_tile(
         z: int,
         x: int,
@@ -1341,7 +1718,13 @@ def create_app(
             headers={"Cache-Control": "public, max-age=86400"},
         )
 
-    @application.get("/api/packs", response_model=PacksResponse)
+    @application.get(
+        "/api/packs",
+        response_model=PacksResponse,
+        tags=["Offline Packs"],
+        summary="List installed offline regional data packs",
+        operation_id="listPacks",
+    )
     def api_packs() -> PacksResponse:
         manifests = _discover_packs_cached(resolved_packs_dir)
         summaries = [
@@ -1364,7 +1747,13 @@ def create_app(
         ]
         return PacksResponse(packs=summaries)
 
-    @application.get("/api/packs/regions", response_model=PackRegionsResponse)
+    @application.get(
+        "/api/packs/regions",
+        response_model=PackRegionsResponse,
+        tags=["Offline Packs"],
+        summary="List curated offline pack region presets",
+        operation_id="listPackRegions",
+    )
     def api_pack_regions() -> PackRegionsResponse:
         return get_pack_regions_response()
 
@@ -1372,6 +1761,9 @@ def create_app(
         "/api/packs/build",
         response_model=PackTaskRecord,
         status_code=status.HTTP_202_ACCEPTED,
+        tags=["Offline Packs"],
+        summary="Enqueue an asynchronous offline regional pack build",
+        operation_id="buildPack",
     )
     def api_build_pack(req: PackBuildRequest, request: Request) -> PackTaskRecord:
         ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=False)
@@ -1390,7 +1782,13 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=_HTTP_422, detail=str(exc)) from exc
 
-    @application.get("/api/packs/tasks", response_model=PackTasksListResponse)
+    @application.get(
+        "/api/packs/tasks",
+        response_model=PackTasksListResponse,
+        tags=["Offline Packs"],
+        summary="List active and recent offline pack build tasks",
+        operation_id="listPackTasks",
+    )
     def api_list_pack_tasks(request: Request) -> PackTasksListResponse:
         ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=False)
         if auth_config.auth_mode == "hosted" and ctx.role != "admin":
@@ -1400,7 +1798,13 @@ def create_app(
             )
         return PackTasksListResponse(tasks=pack_manager.list_tasks())
 
-    @application.get("/api/packs/tasks/{task_id}", response_model=PackTaskRecord)
+    @application.get(
+        "/api/packs/tasks/{task_id}",
+        response_model=PackTaskRecord,
+        tags=["Offline Packs"],
+        summary="Get status of an offline pack build task",
+        operation_id="getPackTask",
+    )
     def api_get_pack_task(task_id: str, request: Request) -> PackTaskRecord:
         ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=False)
         if auth_config.auth_mode == "hosted" and ctx.role != "admin":
@@ -1415,7 +1819,12 @@ def create_app(
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pack task not found.")
         return record
 
-    @application.delete("/api/packs/{pack_id}")
+    @application.delete(
+        "/api/packs/{pack_id}",
+        tags=["Offline Packs"],
+        summary="Delete an installed offline regional pack",
+        operation_id="deletePack",
+    )
     def api_delete_pack(pack_id: str, request: Request) -> dict[str, Any]:
         ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=False)
         if auth_config.auth_mode == "hosted" and ctx.role != "admin":
@@ -1438,7 +1847,13 @@ def create_app(
         basemap_store.invalidate_cache()
         return {"deleted": True, "pack_id": pack_id}
 
-    @application.post("/api/viewshed-preview", response_model=ViewshedPreviewResponse)
+    @application.post(
+        "/api/viewshed-preview",
+        response_model=ViewshedPreviewResponse,
+        tags=["Planning & Analysis"],
+        summary="Compute terrain-masked RF / line-of-sight viewshed coverage",
+        operation_id="computeViewshedPreview",
+    )
     def api_viewshed_preview(
         req: ViewshedPreviewRequest,
         request: Request,
@@ -1496,7 +1911,13 @@ def create_app(
                 detail=detail,
             ) from exc
 
-    @application.post("/api/rf-link-profile", response_model=RFLinkProfileResponse)
+    @application.post(
+        "/api/rf-link-profile",
+        response_model=RFLinkProfileResponse,
+        tags=["Planning & Analysis"],
+        summary="Analyze point-to-point curved-Earth RF Fresnel zone clearance",
+        operation_id="computeRfLinkProfile",
+    )
     def api_rf_link_profile(
         req: RFLinkProfileRequest,
         request: Request,
@@ -1554,7 +1975,13 @@ def create_app(
                 detail=detail,
             ) from exc
 
-    @application.post("/api/ruler-metrics", response_model=RulerMetricsResponse)
+    @application.post(
+        "/api/ruler-metrics",
+        response_model=RulerMetricsResponse,
+        tags=["Planning & Analysis"],
+        summary="Measure distances, bearings, mils, and optional terrain elevation along points",
+        operation_id="computeRulerMetrics",
+    )
     def api_ruler_metrics(
         req: RulerMetricsRequest,
         request: Request,
@@ -1613,7 +2040,13 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=_HTTP_422, detail=str(exc)) from exc
 
-    @application.get("/api/projects", response_model=ProjectsListResponse)
+    @application.get(
+        "/api/projects",
+        response_model=ProjectsListResponse,
+        tags=["Projects"],
+        summary="List saved map projects",
+        operation_id="listProjects",
+    )
     def api_list_projects(
         request: Request,
         response: Response,
@@ -1630,6 +2063,9 @@ def create_app(
         "/api/projects",
         response_model=ProjectRecord,
         status_code=status.HTTP_201_CREATED,
+        tags=["Projects"],
+        summary="Save a new map project",
+        operation_id="createProject",
     )
     def api_create_project(
         req: ProjectCreateRequest,
@@ -1665,7 +2101,13 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=_HTTP_422, detail=str(exc)) from exc
 
-    @application.get("/api/projects/{project_id}", response_model=ProjectRecord)
+    @application.get(
+        "/api/projects/{project_id}",
+        response_model=ProjectRecord,
+        tags=["Projects"],
+        summary="Get a saved map project by ID",
+        operation_id="getProject",
+    )
     def api_get_project(
         project_id: str,
         request: Request,
@@ -1685,7 +2127,13 @@ def create_app(
             )
         return record
 
-    @application.patch("/api/projects/{project_id}", response_model=ProjectRecord)
+    @application.patch(
+        "/api/projects/{project_id}",
+        response_model=ProjectRecord,
+        tags=["Projects"],
+        summary="Update a saved map project",
+        operation_id="updateProject",
+    )
     def api_update_project(
         project_id: str,
         req: ProjectUpdateRequest,
@@ -1724,7 +2172,12 @@ def create_app(
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found.")
         return record
 
-    @application.delete("/api/projects/{project_id}")
+    @application.delete(
+        "/api/projects/{project_id}",
+        tags=["Projects"],
+        summary="Delete a saved map project",
+        operation_id="deleteProject",
+    )
     def api_delete_project(
         project_id: str,
         request: Request,
@@ -1747,7 +2200,13 @@ def create_app(
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found.")
         return {"deleted": True, "id": project_id, "project_id": project_id}
 
-    @application.get("/api/shares", response_model=SharesListResponse)
+    @application.get(
+        "/api/shares",
+        response_model=SharesListResponse,
+        tags=["Shares"],
+        summary="List caller's shareable Studio snapshots",
+        operation_id="listShares",
+    )
     def api_list_shares(
         request: Request,
         response: Response,
@@ -1764,6 +2223,9 @@ def create_app(
         "/api/shares",
         response_model=ShareSnapshotPublic,
         status_code=status.HTTP_201_CREATED,
+        tags=["Shares"],
+        summary="Create an immutable shareable Studio map link",
+        operation_id="createShare",
     )
     def api_create_share(
         req: ShareCreateRequest,
@@ -1843,7 +2305,13 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=_HTTP_422, detail=str(exc)) from exc
 
-    @application.get("/api/shares/{share_id}", response_model=ShareSnapshotPublic)
+    @application.get(
+        "/api/shares/{share_id}",
+        response_model=ShareSnapshotPublic,
+        tags=["Shares"],
+        summary="Fetch a public shareable Studio snapshot",
+        operation_id="getShare",
+    )
     def api_get_share(
         share_id: str,
         response: Response,
@@ -1862,7 +2330,12 @@ def create_app(
         response.headers["Cache-Control"] = "no-cache"
         return record
 
-    @application.delete("/api/shares/{share_id}")
+    @application.delete(
+        "/api/shares/{share_id}",
+        tags=["Shares"],
+        summary="Delete a shareable Studio snapshot",
+        operation_id="deleteShare",
+    )
     def api_delete_share(
         share_id: str,
         request: Request,
@@ -1899,7 +2372,13 @@ def create_app(
             )
         return {"deleted": True, "share_id": share_id}
 
-    @application.get("/api/geocode", response_model=GeocodeResponse)
+    @application.get(
+        "/api/geocode",
+        response_model=GeocodeResponse,
+        tags=["Planning & Analysis"],
+        summary="Geocode a place name into WGS84 coordinates",
+        operation_id="geocodePlace",
+    )
     def api_geocode(
         request: Request,
         q: str = Query(default="", max_length=200),
@@ -1918,11 +2397,23 @@ def create_app(
         ) if auth_config.auth_mode == "hosted" else None
         return GeocodeResponse(results=_search_nominatim(q, limit=limit, on_cache_miss=on_miss))
 
-    @application.post("/api/footprint", response_model=FootprintResponse)
+    @application.post(
+        "/api/footprint",
+        response_model=FootprintResponse,
+        tags=["Planning & Analysis"],
+        summary="Compute true-scale UTM footprint, 1 km MGRS preview grid, and WMM2025 declination",
+        operation_id="previewFootprint",
+    )
     def api_footprint(req: FootprintRequest) -> FootprintResponse:
         return _build_footprint_preview(req)
 
-    @application.post("/api/strip-plan", response_model=StripPlanResponse)
+    @application.post(
+        "/api/strip-plan",
+        response_model=StripPlanResponse,
+        tags=["Planning & Analysis"],
+        summary="Plan overlapping strip-atlas sheets along a GPX or GeoJSON route",
+        operation_id="planStripAtlas",
+    )
     async def api_strip_plan(request: Request, response: Response) -> StripPlanResponse:
         ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=True)
         auth_manager.apply_auth_cookies(response, ctx, request)
@@ -2043,7 +2534,13 @@ def create_app(
         except (ValueError, ValidationError) as exc:
             raise HTTPException(status_code=_HTTP_422, detail=str(exc)) from exc
 
-    @application.post("/api/route-metrics", response_model=RouteMetricsResponse)
+    @application.post(
+        "/api/route-metrics",
+        response_model=RouteMetricsResponse,
+        tags=["Planning & Analysis"],
+        summary="Compute leg distances, MGRS coordinates, and True/Grid/Magnetic bearings for waypoints",
+        operation_id="computeRouteMetrics",
+    )
     def api_route_metrics(req: RouteMetricsRequest) -> RouteMetricsResponse:
         try:
             return compute_route_metrics(
@@ -2058,8 +2555,24 @@ def create_app(
         "/api/jobs",
         response_model=JobRecord,
         status_code=status.HTTP_202_ACCEPTED,
+        tags=["Jobs & Artifacts"],
+        summary="Enqueue a map render/export job (or wait synchronously with wait=true)",
+        operation_id="createJob",
     )
-    async def api_create_job(request: Request, response: Response) -> JobRecord:
+    async def api_create_job(
+        request: Request,
+        response: Response,
+        wait: bool = Query(
+            default=False,
+            description="If true, hold the response and poll until the job completes or timeout_s expires (200 OK when terminal, 202 Accepted if still pending).",
+        ),
+        timeout_s: float = Query(
+            default=120.0,
+            ge=1.0,
+            le=300.0,
+            description="Maximum wait duration in seconds when wait=true (1–300).",
+        ),
+    ) -> JobRecord:
         ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=True)
         auth_manager.apply_auth_cookies(response, ctx, request)
         caps = _caps_for(ctx)
@@ -2309,7 +2822,7 @@ def create_app(
                     raise
 
             try:
-                return enforce_and_create_job(
+                record = enforce_and_create_job(
                     db_path,
                     role=ctx.role,
                     owner_id=ctx.owner_id,
@@ -2333,11 +2846,42 @@ def create_app(
                 if saved_overlay is not None:
                     shutil.rmtree(resolved_data_dir / job_id, ignore_errors=True)
                 raise
+
+            terminal_statuses = {
+                JobStatus.SUCCEEDED,
+                JobStatus.FAILED,
+                JobStatus.CANCELLED,
+            }
+            if wait:
+                deadline = time.monotonic() + float(timeout_s)
+                current: JobRecord | None = record
+                while current is not None and current.status not in terminal_statuses:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    await anyio.sleep(min(0.25, remaining))
+                    latest = db.get_job(db_path, job_id)
+                    if latest is None:
+                        break
+                    current = latest
+                if current is not None:
+                    record = current
+                if record.status in terminal_statuses:
+                    response.status_code = status.HTTP_200_OK
+                else:
+                    response.status_code = status.HTTP_202_ACCEPTED
+            return _enrich_job_record(record)
         finally:
             if form is not None:
                 await form.close()
 
-    @application.get("/api/jobs", response_model=JobsListResponse)
+    @application.get(
+        "/api/jobs",
+        response_model=JobsListResponse,
+        tags=["Jobs & Artifacts"],
+        summary="List render jobs with signed artifact download URLs",
+        operation_id="listJobs",
+    )
     def api_list_jobs(
         request: Request,
         response: Response,
@@ -2346,9 +2890,19 @@ def create_app(
         ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=True)
         auth_manager.apply_auth_cookies(response, ctx, request)
         owner_filter = ctx.owner_id if auth_config.auth_mode == "hosted" else None
-        return JobsListResponse(jobs=db.list_jobs(db_path, limit=limit, owner_id=owner_filter))
+        jobs = [
+            _enrich_job_record(job)
+            for job in db.list_jobs(db_path, limit=limit, owner_id=owner_filter)
+        ]
+        return JobsListResponse(jobs=jobs)
 
-    @application.get("/api/jobs/{job_id}", response_model=JobRecord)
+    @application.get(
+        "/api/jobs/{job_id}",
+        response_model=JobRecord,
+        tags=["Jobs & Artifacts"],
+        summary="Get render job status, progress, and signed artifact URLs",
+        operation_id="getJob",
+    )
     def api_get_job(job_id: str, request: Request, response: Response) -> JobRecord:
         ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=True)
         auth_manager.apply_auth_cookies(response, ctx, request)
@@ -2362,9 +2916,15 @@ def create_app(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="You do not have permission to access this job.",
             )
-        return record
+        return _enrich_job_record(record)
 
-    @application.post("/api/jobs/{job_id}/cancel", response_model=JobRecord)
+    @application.post(
+        "/api/jobs/{job_id}/cancel",
+        response_model=JobRecord,
+        tags=["Jobs & Artifacts"],
+        summary="Cancel a queued or running render job",
+        operation_id="cancelJob",
+    )
     def api_cancel_job(job_id: str, request: Request, response: Response) -> JobRecord:
         ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=True)
         auth_manager.apply_auth_cookies(response, ctx, request)
@@ -2381,9 +2941,14 @@ def create_app(
         record = db.cancel_job(db_path, job_id)
         if record is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found.")
-        return record
+        return _enrich_job_record(record)
 
-    @application.delete("/api/jobs/{job_id}")
+    @application.delete(
+        "/api/jobs/{job_id}",
+        tags=["Jobs & Artifacts"],
+        summary="Delete a render job and its generated artifacts",
+        operation_id="deleteJob",
+    )
     def api_delete_job(job_id: str, request: Request, response: Response) -> dict[str, Any]:
         ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=True)
         auth_manager.apply_auth_cookies(response, ctx, request)
@@ -2402,16 +2967,23 @@ def create_app(
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found.")
         return {"deleted": True, "job_id": job_id}
 
-    @application.get("/api/jobs/{job_id}/artifacts/{filename:path}")
+    @application.get(
+        "/api/jobs/{job_id}/artifacts/{filename:path}",
+        tags=["Jobs & Artifacts"],
+        summary="Download a job artifact (authenticated or via short-lived ?sig= token)",
+        operation_id="downloadJobArtifact",
+    )
     def api_download_artifact(
         job_id: str,
         filename: str,
         request: Request,
         response: Response,
         inline: bool = Query(default=False),
+        sig: str | None = Query(
+            default=None,
+            description="Optional short-lived HMAC signature token from JobArtifact.signed_download_url.",
+        ),
     ) -> FileResponse:
-        ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=True)
-        auth_manager.apply_auth_cookies(response, ctx, request)
         if not _JOB_ID_RE.match(job_id):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid job_id.")
         # Strictly reject path separators, null bytes, and parent directory references.
@@ -2428,15 +3000,31 @@ def create_app(
                 detail="Invalid artifact filename.",
             )
 
-        if auth_config.auth_mode == "hosted":
-            record = db.get_job(db_path, job_id)
-            if record is None:
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found.")
-            if record.owner_id != ctx.owner_id:
+        if sig is not None:
+            if not verify_artifact_token(
+                sig,
+                expected_job_id=job_id,
+                expected_resource=f"artifact:{filename}",
+                secret=auth_config.session_secret,
+            ):
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
-                    detail="You do not have permission to download this artifact.",
+                    detail="Invalid or expired signed artifact URL.",
                 )
+            if db.get_job(db_path, job_id) is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found.")
+        else:
+            ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=True)
+            auth_manager.apply_auth_cookies(response, ctx, request)
+            if auth_config.auth_mode == "hosted":
+                record = db.get_job(db_path, job_id)
+                if record is None:
+                    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found.")
+                if record.owner_id != ctx.owner_id:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="You do not have permission to download this artifact.",
+                    )
 
         artifacts_dir = (resolved_data_dir / job_id / "artifacts").resolve()
         candidate = (artifacts_dir / filename).resolve()
@@ -2469,7 +3057,207 @@ def create_app(
             headers=headers or None,
         )
 
-    @application.get("/api/jobs/{job_id}/thumbnail.png")
+    @application.get(
+        "/api/jobs/{job_id}/pages",
+        response_model=JobPagesResponse,
+        tags=["Jobs & Artifacts"],
+        summary="List rendered PDF pages with PNG preview URLs",
+        operation_id="listJobPages",
+    )
+    def api_job_pages(
+        job_id: str,
+        request: Request,
+        response: Response,
+    ) -> JobPagesResponse:
+        ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=True)
+        auth_manager.apply_auth_cookies(response, ctx, request)
+        if not _JOB_ID_RE.match(job_id):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid job_id.")
+        record = db.get_job(db_path, job_id)
+        if record is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found.")
+        if auth_config.auth_mode == "hosted" and record.owner_id != ctx.owner_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have permission to access this job.",
+            )
+
+        source_pdf = _resolve_job_pdf(job_id, record)
+        if source_pdf is None:
+            return JobPagesResponse(job_id=job_id, page_count=0, pages=[])
+        try:
+            page_count = len(PdfReader(str(source_pdf)).pages)
+        except Exception as exc:
+            logger.warning("Failed to inspect PDF page count for %s: %s", job_id, exc)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to inspect PDF pages.",
+            ) from exc
+
+        pages: list[JobPageInfo] = []
+        for page_num in range(1, page_count + 1):
+            preview_url = f"/api/jobs/{job_id}/pages/{page_num}.png"
+            tok = sign_artifact_token(
+                job_id,
+                f"page:{page_num}",
+                auth_config.session_secret,
+                ttl_seconds=auth_config.signed_url_ttl_seconds,
+            )
+            pages.append(
+                JobPageInfo(
+                    page=page_num,
+                    preview_url=preview_url,
+                    signed_preview_url=f"{preview_url}?sig={tok}",
+                )
+            )
+        return JobPagesResponse(job_id=job_id, page_count=page_count, pages=pages)
+
+    @application.get(
+        "/api/jobs/{job_id}/pages/{page_num}.png",
+        tags=["Jobs & Artifacts"],
+        summary="Fetch a rasterized PNG preview of a single PDF page",
+        operation_id="getJobPagePreview",
+    )
+    def api_job_page_preview(
+        job_id: str,
+        page_num: int,
+        request: Request,
+        response: Response,
+        width: int = Query(
+            default=1200,
+            ge=240,
+            le=2400,
+            description="Target raster width/height scale-to dimension in pixels (240–2400).",
+        ),
+        sig: str | None = Query(
+            default=None,
+            description="Optional short-lived HMAC signature token from signed_preview_url.",
+        ),
+    ) -> FileResponse:
+        if not _JOB_ID_RE.match(job_id):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid job_id.")
+        if page_num < 1:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="page_num must be >= 1.",
+            )
+
+        if sig is not None:
+            if not verify_artifact_token(
+                sig,
+                expected_job_id=job_id,
+                expected_resource=f"page:{page_num}",
+                secret=auth_config.session_secret,
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Invalid or expired signed page preview URL.",
+                )
+            record = db.get_job(db_path, job_id)
+            if record is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found.")
+        else:
+            ctx = auth_manager.resolve_request_context(request, issue_guest_cookie=True)
+            auth_manager.apply_auth_cookies(response, ctx, request)
+            record = db.get_job(db_path, job_id)
+            if record is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found.")
+            if auth_config.auth_mode == "hosted" and record.owner_id != ctx.owner_id:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="You do not have permission to access this page preview.",
+                )
+
+        job_root = (resolved_data_dir / job_id).resolve()
+        if not job_root.is_relative_to(resolved_data_dir):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid job_id.")
+
+        source_pdf = _resolve_job_pdf(job_id, record)
+        if source_pdf is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No PDF artifact available for page preview.",
+            )
+        try:
+            page_count = len(PdfReader(str(source_pdf)).pages)
+        except Exception as exc:
+            logger.warning("Failed to inspect PDF page count for %s: %s", job_id, exc)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to inspect PDF pages.",
+            ) from exc
+        if page_num > page_count:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Page {page_num} out of range (1..{page_count}).",
+            )
+
+        pages_dir = (job_root / "pages").resolve()
+        if not pages_dir.is_relative_to(job_root):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid job_id.")
+        cached_png = (pages_dir / f"page_{page_num}_{width}.png").resolve()
+        if not cached_png.is_relative_to(pages_dir):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid page preview path.")
+
+        if not cached_png.is_file():
+            with _get_thumb_lock(f"{job_id}:p{page_num}:{width}"):
+                if not cached_png.is_file():
+                    pages_dir.mkdir(parents=True, exist_ok=True)
+                    tmp_prefix = pages_dir / f".page_{page_num}_{width}_{uuid.uuid4().hex[:8]}"
+                    with _acquire_preview_slot():
+                        proc = subprocess.run(
+                            [
+                                "pdftoppm",
+                                "-png",
+                                "-f",
+                                str(page_num),
+                                "-l",
+                                str(page_num),
+                                "-scale-to",
+                                str(width),
+                                "-singlefile",
+                                str(source_pdf),
+                                str(tmp_prefix),
+                            ],
+                            env=build_safe_subprocess_env(allow_network=False),
+                            capture_output=True,
+                            text=True,
+                            timeout=30,
+                            check=False,
+                        )
+                    rendered_png = tmp_prefix.with_suffix(".png")
+                    if proc.returncode != 0 or not rendered_png.is_file():
+                        rendered_png.unlink(missing_ok=True)
+                        if db.get_job(db_path, job_id) is None:
+                            shutil.rmtree(job_root, ignore_errors=True)
+                            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found.")
+                        raise HTTPException(
+                            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                            detail="Failed to rasterize PDF page preview.",
+                        )
+                    if db.get_job(db_path, job_id) is None:
+                        rendered_png.unlink(missing_ok=True)
+                        shutil.rmtree(job_root, ignore_errors=True)
+                        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found.")
+                    rendered_png.replace(cached_png)
+
+        cache_header = (
+            "private, max-age=3600"
+            if auth_config.auth_mode == "hosted"
+            else "public, max-age=3600"
+        )
+        return FileResponse(
+            path=cached_png,
+            media_type="image/png",
+            headers={"Cache-Control": cache_header},
+        )
+
+    @application.get(
+        "/api/jobs/{job_id}/thumbnail.png",
+        tags=["Jobs & Artifacts"],
+        summary="Fetch a 480 px PNG thumbnail of page 1 of a rendered PDF",
+        operation_id="getJobThumbnail",
+    )
     def api_job_thumbnail(
         job_id: str,
         request: Request,
@@ -2496,14 +3284,8 @@ def create_app(
         if not thumb_path.is_file():
             with _get_thumb_lock(job_id):
                 if not thumb_path.is_file():
-                    artifacts_dir = (job_root / "artifacts").resolve()
-                    pdf_candidates = [
-                        artifacts_dir / a.filename for a in record.artifacts if a.kind == "pdf"
-                    ]
-                    if not pdf_candidates and artifacts_dir.is_dir():
-                        pdf_candidates = sorted(artifacts_dir.glob("*.pdf"))
-                    source_pdf = next((p.resolve() for p in pdf_candidates if p.is_file()), None)
-                    if source_pdf is None or not source_pdf.is_relative_to(artifacts_dir):
+                    source_pdf = _resolve_job_pdf(job_id, record)
+                    if source_pdf is None:
                         raise HTTPException(
                             status_code=status.HTTP_404_NOT_FOUND,
                             detail="No PDF artifact available for thumbnail.",
@@ -2526,6 +3308,7 @@ def create_app(
                                 str(source_pdf),
                                 str(tmp_prefix),
                             ],
+                            env=build_safe_subprocess_env(allow_network=False),
                             capture_output=True,
                             text=True,
                             timeout=30,
@@ -2592,6 +3375,14 @@ def create_app(
             media_type=media_type,
             headers={"Cache-Control": "public, max-age=604800"},
         )
+
+    # Mount native Streamable HTTP MCP router defensively before SPA fallback.
+    try:
+        from gridforge.mcp.http import create_mcp_router
+
+        application.include_router(create_mcp_router(lambda: application))
+    except ImportError:
+        pass
 
     # Mount built SPA frontend if present; otherwise expose clean JSON root for headless/API mode.
     index_html = resolved_web_dist / "index.html"
@@ -2663,9 +3454,12 @@ def create_app(
         @application.get("/{full_path:path}", include_in_schema=False)
         def serve_spa_fallback(full_path: str) -> Response:
             if (
-                full_path.startswith("api/")
+                full_path == "api"
+                or full_path.startswith("api/")
                 or full_path == "samples"
                 or full_path.startswith("samples/")
+                or full_path == "mcp"
+                or full_path.startswith("mcp/")
                 or (
                     not enable_docs
                     and full_path in ("docs", "docs/", "redoc", "redoc/", "openapi.json")
@@ -2693,8 +3487,144 @@ def create_app(
                     "status": "ok",
                     "frontend_built": False,
                     "docs": "/docs",
+                    "openapi": "/openapi.json",
+                    "capabilities": "/api/capabilities",
+                    "llms_txt": "/llms.txt",
+                    "mcp": "/mcp",
                 }
             )
+
+    def custom_openapi() -> dict[str, Any]:
+        if application.openapi_schema is not None:
+            return application.openapi_schema
+        schema = get_openapi(
+            title=application.title,
+            version=application.version,
+            description=application.description,
+            routes=application.routes,
+        )
+        components = schema.setdefault("components", {})
+        schemas = components.setdefault("schemas", {})
+
+        for model_cls in (CreateJobRequest, StripPlanRequest):
+            model_schema = model_cls.model_json_schema(
+                ref_template="#/components/schemas/{model}"
+            )
+            defs = model_schema.pop("$defs", None)
+            if isinstance(defs, dict):
+                for def_name, def_body in defs.items():
+                    schemas.setdefault(def_name, def_body)
+            schemas[model_cls.__name__] = model_schema
+
+        paths = schema.get("paths", {})
+        jobs_post = paths.get("/api/jobs", {}).get("post")
+        if isinstance(jobs_post, dict):
+            jobs_post["requestBody"] = {
+                "required": True,
+                "description": (
+                    "Map render and offline export specification. Send either a JSON "
+                    "`CreateJobRequest` body (`application/json`) or a `multipart/form-data` "
+                    "request with a JSON-encoded `payload` field and optional `overlay_file`."
+                ),
+                "content": {
+                    "application/json": {
+                        "schema": {"$ref": "#/components/schemas/CreateJobRequest"},
+                    },
+                    "multipart/form-data": {
+                        "schema": {
+                            "type": "object",
+                            "required": ["payload"],
+                            "properties": {
+                                "payload": {
+                                    "type": "string",
+                                    "description": "JSON-serialized CreateJobRequest payload.",
+                                },
+                                "overlay_file": {
+                                    "type": "string",
+                                    "format": "binary",
+                                    "description": "Optional GeoJSON, GPX, or CSV overlay file.",
+                                },
+                                "turnstile_token": {
+                                    "type": "string",
+                                    "description": "Optional Cloudflare Turnstile token for anonymous guests in hosted mode.",
+                                },
+                            },
+                        },
+                    },
+                },
+            }
+            responses = jobs_post.setdefault("responses", {})
+            if "200" not in responses:
+                responses["200"] = {
+                    "description": (
+                        "Completed terminal JobRecord (returned when wait=true completes before timeout_s)."
+                    ),
+                    "content": {
+                        "application/json": {
+                            "schema": {"$ref": "#/components/schemas/JobRecord"},
+                        }
+                    },
+                }
+
+        strip_post = paths.get("/api/strip-plan", {}).get("post")
+        if isinstance(strip_post, dict):
+            strip_post["requestBody"] = {
+                "required": True,
+                "description": (
+                    "Strip-atlas route planning request. Send either a JSON `StripPlanRequest` "
+                    "(`application/json`) or `multipart/form-data` with a `.gpx`/`.geojson` `route_file`."
+                ),
+                "content": {
+                    "application/json": {
+                        "schema": {"$ref": "#/components/schemas/StripPlanRequest"},
+                    },
+                    "multipart/form-data": {
+                        "schema": {
+                            "type": "object",
+                            "required": ["route_file"],
+                            "properties": {
+                                "route_file": {
+                                    "type": "string",
+                                    "format": "binary",
+                                    "description": "GPX or GeoJSON route file.",
+                                },
+                                "scale": {"type": "integer", "default": 25000},
+                                "paper": {"type": "string", "default": "a4"},
+                                "orientation": {"type": "string", "default": "portrait"},
+                                "units": {"type": "string", "default": "metric"},
+                                "overlap_pct": {"type": "number", "default": 10.0},
+                                "max_sheets": {"type": "integer", "default": 12},
+                            },
+                        },
+                    },
+                },
+            }
+
+        security_schemes = components.setdefault("securitySchemes", {})
+        security_schemes["BearerAuth"] = {
+            "type": "http",
+            "scheme": "bearer",
+            "bearerFormat": "API Key (gf_...)",
+            "description": (
+                "Scoped personal access token minted via POST /api/auth/api-keys in hosted mode, "
+                "or static GRIDFORGE_API_KEY when configured in auth_mode=none."
+            ),
+        }
+        security_schemes["ApiKeyHeader"] = {
+            "type": "apiKey",
+            "in": "header",
+            "name": "X-API-Key",
+            "description": "Alternative header for passing a GridForge API key.",
+        }
+        schema["security"] = [{"BearerAuth": []}, {"ApiKeyHeader": []}, {}]
+
+        if auth_config.public_url:
+            schema["servers"] = [{"url": auth_config.public_url}]
+
+        application.openapi_schema = schema
+        return application.openapi_schema
+
+    application.openapi = custom_openapi  # type: ignore[method-assign]  # FastAPI documents overriding app.openapi for custom schema injection
 
     return application
 

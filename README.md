@@ -15,7 +15,7 @@
 
 True-scale **local UTM** 300–600 DPI print PDFs (`1:10k`–`1:50k`) · **4 Cartography Themes** · **1 m LiDAR & RF Fresnel Planning** · **100% Offline Packs & ATAK/Garmin/OsmAnd/GeoPackage Exports**
 
-**[Try GridMaps Live](https://gridmaps.net)** · [Quickstart](#quickstart) · [Sample PDFs](#sample-print-pdfs) · [Highlights](#highlights) · [CLI](#cli) · [Deployment](#deployment) · [Planned Roadmap](#planned-roadmap) · [Changelog](CHANGELOG.md)
+**[Try GridMaps Live](https://gridmaps.net)** · [Quickstart](#quickstart) · [Sample PDFs](#sample-print-pdfs) · [Highlights](#highlights) · [AI & MCP](#ai-tools-mcp--interactive-chat-ui) · [CLI](#cli) · [Deployment](#deployment) · [Planned Roadmap](#planned-roadmap) · [Changelog](CHANGELOG.md)
 
 </div>
 
@@ -105,6 +105,30 @@ See the full **[CLI Cookbook](docs/CLI_COOKBOOK.md)** (Canada, Australia, New Ze
 
 ---
 
+## AI Tools, MCP & Interactive Chat UI
+
+Connect GridForge directly to **Claude Desktop & Claude Code**, **OpenAI Codex**, **Google Antigravity**, **ChatGPT**, **Cursor**, and **VS Code** — zero extra Python dependencies required:
+
+- **Native MCP (`stdio` + Streamable HTTP `/mcp`):** Run locally via `ghcr.io/jremick/gridforge:latest gridforge mcp` or connect directly to `/mcp` on any self-hosted or hosted deployment (`14` model-visible tools, `3` app-only UI tools, `3` resources, `4` prompts).
+- **Interactive SEP-1865 MCP Apps (`ui://gridforge/app.html`):** Supporting hosts (**Google Antigravity** — inline + side pane **`GridForge Studio`** + sidebar **`GridForge Maps`** via [`plugins/antigravity/`](plugins/antigravity/README.md) — and MCP Apps-capable **Claude** / **ChatGPT** clients) render an interactive pan/zoom UTM & 1 km MGRS map canvas, SVG WMM2025 declination compass, hover-scrubbing 1st Fresnel RF chart, and a live multi-page printable PDF viewer right inside chat.
+- **Visual PNG Cards & Natural-Language Q&A:** Every MCP host receives concise answers alongside compact Pillow PNG cards (UTM footprints, viewsheds, RF Fresnel charts, route cards) and rasterized PDF page previews (`/api/jobs/{job_id}/pages/{page}.png`).
+- **ChatGPT Actions, Bearer API Keys & Agent Discovery:** Import `/openapi.json` (`GRIDFORGE_ENABLE_DOCS=true` in hosted mode) with scoped `gf_...` Personal Access Tokens (`POST /api/auth/api-keys`), synchronous `POST /api/jobs?wait=true`, short-lived HMAC-signed download/preview URLs (`?sig=...`), `GET /api/capabilities`, `GET /llms.txt`, and `gridforge render --spec-file`.
+
+```bash
+# Claude Code — connect to your local self-hosted Studio MCP endpoint
+claude mcp add --transport http gridforge http://127.0.0.1:8080/mcp
+
+# Google Antigravity — install the interactive MCP Apps plugin (inline + side pane + sidebar)
+cp -r plugins/antigravity ~/.gemini/config/plugins/gridforge
+
+# Any MCP stdio host — run the zero-build multi-arch container directly
+docker run -i --rm ghcr.io/jremick/gridforge:latest gridforge mcp --url http://host.docker.internal:8080
+```
+
+Read the full **[AI Agents & MCP Integration Guide](docs/ai-agents.md)**, install the reusable **[GridForge Agent Skill](docs/agent-skill/SKILL.md)**, or grab the **[Google Antigravity Plugin](plugins/antigravity/README.md)**.
+
+---
+
 ## Deployment
 
 - **Local-First Security:** Binds to `127.0.0.1:8080` by default with `TrustedHostMiddleware` + `SameOriginWritesMiddleware` protecting all mutating endpoints.
@@ -119,6 +143,7 @@ See the full **[CLI Cookbook](docs/CLI_COOKBOOK.md)** (Canada, Australia, New Ze
 GridForge pairs a lean FastAPI + SQLite WAL `web` server (`zero qgis imports`, `< 100 MiB` RAM) and TypeScript/MapLibre Studio (`web/`) with ephemeral headless PyQGIS 3.40 LTR `worker` subprocesses (`< 2 GB` peak RSS).
 
 - **[CONTRIBUTING.md](CONTRIBUTING.md)** — local Docker/Vite development, offline & live test suites, and engineering guardrails
+- **[docs/ai-agents.md](docs/ai-agents.md)** — MCP (`stdio` + `/mcp`), interactive SEP-1865 MCP Apps, ChatGPT Actions, Bearer API keys, and Agent Skill setup
 - **[docs/STYLING_GUIDE.md](docs/STYLING_GUIDE.md)** — authoring 4-theme QGIS 3.40 `.qml` cartography styles
 - **[docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md)** — release preflight, GHCR publishing, and sample PDF verification
 
