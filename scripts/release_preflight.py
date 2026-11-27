@@ -185,6 +185,8 @@ def check_release(tag: str | None = None) -> list[str]:
         ROOT / "README.md",
         ROOT / "CHANGELOG.md",
         ROOT / "CONTRIBUTING.md",
+        ROOT / "SECURITY.md",
+        ROOT / "CODE_OF_CONDUCT.md",
         ROOT / "Dockerfile",
         ROOT / "docker-compose.yml",
         ROOT / "docker-compose.ghcr.yml",
