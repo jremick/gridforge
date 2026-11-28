@@ -546,6 +546,23 @@ async function bundleTsModule(relPath) {
     format: "esm",
     platform: "browser",
     loader: { ".css": "empty" },
+    plugins: [
+      {
+        name: "vite-url-asset",
+        setup(build) {
+          build.onResolve({ filter: /\?url$/ }, (args) => ({
+            path: args.path,
+            namespace: "vite-url",
+          }));
+          build.onLoad({ filter: /.*/, namespace: "vite-url" }, (args) => ({
+            contents: `export default ${JSON.stringify(
+              "/assets/" + path.basename(args.path.replace(/\?url$/, ""))
+            )};`,
+            loader: "js",
+          }));
+        },
+      },
+    ],
     write: false,
   });
   const code = res.outputFiles[0].text;
@@ -1694,5 +1711,69 @@ test("mountMapCanvas releases pointer capture on pointerup only when canvas hold
       void origCreate;
       void origSetInner;
     }
+  });
+});
+
+test("TelemetryBar theme toggle updates aria state and invokes callback; PacksModal surfaces region load error with Retry", async () => {
+  const { TelemetryBar } = await bundleTsModule("src/components/telemetry.ts");
+  const { PacksModal } = await bundleTsModule("src/components/packsModal.ts");
+
+  await withDom(async ({ doc }) => {
+    let toggled = 0;
+    const header = doc.createElement("header");
+    doc.body.appendChild(header);
+    const bar = new TelemetryBar(header, {
+      onToggleDrawer: () => {},
+      onToggleProjects: () => {},
+      onCopyMgrs: () => {},
+      onToggleTheme: () => {
+        toggled += 1;
+      },
+    });
+
+    const themeBtn = header.querySelector("[data-role='theme-toggle']");
+    assert.ok(themeBtn);
+    themeBtn.click();
+    assert.equal(toggled, 1);
+    bar.updateTheme("light");
+    assert.equal(themeBtn.getAttribute("aria-pressed"), "true");
+    assert.match(themeBtn.getAttribute("aria-label"), /Dark/i);
+    bar.updateTheme("dark");
+    assert.equal(themeBtn.getAttribute("aria-pressed"), "false");
+    assert.match(themeBtn.getAttribute("aria-label"), /Daylight/i);
+
+    // PacksModal offline/error state renders retry action instead of perpetual loading
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify({ detail: "API offline" }), {
+        status: 503,
+        headers: { "content-type": "application/json" },
+      });
+    const modalHost = doc.createElement("div");
+    doc.body.appendChild(modalHost);
+    const modal = new PacksModal(modalHost, {
+      onPacksUpdated: () => {},
+      onSelectPack: () => {},
+      onBasemapRefresh: () => {},
+      onToast: () => {},
+      getCurrentBBoxString: () => null,
+    });
+    modal.open();
+    await new Promise((r) => setTimeout(r, 20));
+    const retryBtn = modalHost.querySelector("[data-region-action='retry-regions']");
+    assert.ok(retryBtn, "Expected Retry button when /api/packs/regions fails");
+    assert.match(modalHost.textContent, /Unable to load curated regions/);
+    modal.dispose();
+
+    // Sidebar footer exposes secure GitHub repository link
+    const sidebarSource = fs.readFileSync(
+      path.join(WEB_DIR, "src/components/sidebar.ts"),
+      "utf8"
+    );
+    assert.match(sidebarSource, /href="https:\/\/github\.com\/jremick\/gridforge"/);
+    assert.match(sidebarSource, /rel="noopener noreferrer"/);
+
+    // MapLibre v6 worker URL is explicitly wired to the Vite-emitted worker asset
+    const mapMod = await bundleTsModule("src/map.ts");
+    assert.match(mapMod.MAPLIBRE_WORKER_URL, /\/assets\/maplibre-gl-worker\.mjs$/);
   });
 });

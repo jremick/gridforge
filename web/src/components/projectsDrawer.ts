@@ -4,6 +4,7 @@ import {
   fetchProjects,
   jobThumbnailUrl,
 } from "../api";
+import { ICON_CLOSE, ICON_REFRESH } from "../icons";
 import { escapeHtml } from "../presets";
 import type { SavedProject } from "../types";
 import { reportAbortAwareError } from "./lifecycle";
@@ -60,8 +61,8 @@ export class ProjectsDrawer {
           <span class="gf-section-pill" data-role="projects-count">0</span>
         </div>
         <div class="gf-drawer-actions">
-          <button type="button" class="gf-icon-btn" data-role="projects-refresh" title="Refresh projects">↻</button>
-          <button type="button" class="gf-icon-btn" data-role="projects-close" title="Close projects drawer">×</button>
+          <button type="button" class="gf-icon-btn" data-role="projects-refresh" aria-label="Refresh projects" title="Refresh projects">${ICON_REFRESH}</button>
+          <button type="button" class="gf-icon-btn" data-role="projects-close" aria-label="Close projects drawer" title="Close projects drawer">${ICON_CLOSE}</button>
         </div>
       </div>
 

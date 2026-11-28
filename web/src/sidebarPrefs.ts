@@ -78,6 +78,16 @@ function parsePrefsJson(
   }
 }
 
+export function defaultSidebarCollapsedForViewport(
+  viewportWidth = 1440
+): boolean {
+  return (
+    Number.isFinite(viewportWidth) &&
+    viewportWidth > 0 &&
+    viewportWidth <= SIDEBAR_MOBILE_BREAKPOINT
+  );
+}
+
 export function loadSidebarPrefs(
   userId?: string | null,
   viewportWidth = 1440,
@@ -85,7 +95,7 @@ export function loadSidebarPrefs(
 ): SidebarPrefs {
   const fallback: SidebarPrefs = {
     width: clampSidebarWidth(DEFAULT_SIDEBAR_WIDTH, viewportWidth),
-    collapsed: false,
+    collapsed: defaultSidebarCollapsedForViewport(viewportWidth),
   };
   if (!storage) return fallback;
 

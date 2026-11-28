@@ -4,6 +4,12 @@ import {
   jobThumbnailUrl,
 } from "../api";
 import {
+  ICON_CLOSE,
+  ICON_DOWNLOAD,
+  ICON_EXTERNAL,
+  ICON_REFRESH,
+} from "../icons";
+import {
   escapeHtml,
   formatArtifactLabel,
   formatBytes,
@@ -69,8 +75,8 @@ export class JobsDrawer {
           <span class="gf-section-pill" data-role="drawer-count">0</span>
         </div>
         <div class="gf-drawer-actions">
-          <button type="button" class="gf-icon-btn" data-role="drawer-refresh" title="Refresh jobs">↻</button>
-          <button type="button" class="gf-icon-btn" data-role="drawer-close" title="Close queue drawer">×</button>
+          <button type="button" class="gf-icon-btn" data-role="drawer-refresh" aria-label="Refresh jobs" title="Refresh jobs">${ICON_REFRESH}</button>
+          <button type="button" class="gf-icon-btn" data-role="drawer-close" aria-label="Close queue drawer" title="Close queue drawer">${ICON_CLOSE}</button>
         </div>
       </div>
       <div class="gf-drawer-body" data-role="drawer-body"></div>
@@ -256,7 +262,7 @@ export class JobsDrawer {
                         rel="noopener"
                         title="Open ${escapeHtml(art.filename)} in new tab"
                       >
-                        <span>↗ Preview</span>
+                        ${ICON_EXTERNAL}<span>Preview</span>
                       </a>
                       <a
                         class="gf-artifact-btn"
@@ -264,7 +270,7 @@ export class JobsDrawer {
                         download="${escapeHtml(art.filename)}"
                         title="Download ${escapeHtml(art.filename)}"
                       >
-                        <span>↓ ${escapeHtml(label)}</span>
+                        <span class="gf-artifact-label">${ICON_DOWNLOAD}<span>${escapeHtml(label)}</span></span>
                         <span class="gf-artifact-size">${escapeHtml(formatBytes(art.size_bytes))}</span>
                       </a>
                     </div>
@@ -278,7 +284,7 @@ export class JobsDrawer {
                     target="_blank"
                     rel="noopener"
                   >
-                    <span>↓ ${escapeHtml(label)}</span>
+                    <span class="gf-artifact-label">${ICON_DOWNLOAD}<span>${escapeHtml(label)}</span></span>
                     <span class="gf-artifact-size">${escapeHtml(formatBytes(art.size_bytes))}</span>
                   </a>
                 `;

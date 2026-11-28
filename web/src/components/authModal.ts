@@ -4,6 +4,7 @@ import {
   loginWithPassword,
   logoutSession,
 } from "../api";
+import { ICON_CLOSE } from "../icons";
 import { TrapFocusHelper } from "../modalFocus";
 import { escapeHtml } from "../presets";
 import { initModalBackdrop } from "./lifecycle";
@@ -32,7 +33,6 @@ export interface AuthModalOpenOptions {
 export class AuthModal {
   private readonly root: HTMLElement;
   private readonly panelEl: HTMLElement;
-  private readonly badgeEl: HTMLElement;
   private readonly titleEl: HTMLElement;
   private readonly bodyEl: HTMLElement;
   private readonly callbacks: AuthModalCallbacks;
@@ -59,11 +59,10 @@ export class AuthModal {
       <div class="gf-modal-panel gf-modal-panel-sm" data-role="modal-panel">
         <div class="gf-modal-header">
           <div class="gf-modal-title-group">
-            <span class="gf-section-index" data-role="auth-badge">HOSTED</span>
             <h2 class="gf-modal-title" id="gf-auth-modal-title" data-role="auth-title">Sign In</h2>
           </div>
           <div class="gf-drawer-actions">
-            <button type="button" class="gf-icon-btn" data-role="modal-close" aria-label="Close dialog" title="Close (Esc)">×</button>
+            <button type="button" class="gf-icon-btn" data-role="modal-close" aria-label="Close dialog" title="Close (Esc)">${ICON_CLOSE}</button>
           </div>
         </div>
         <div class="gf-modal-body gf-auth-body" data-role="auth-body"></div>
@@ -71,7 +70,6 @@ export class AuthModal {
     `;
 
     this.panelEl = this.q("[data-role='modal-panel']");
-    this.badgeEl = this.q("[data-role='auth-badge']");
     this.titleEl = this.q("[data-role='auth-title']");
     this.bodyEl = this.q("[data-role='auth-body']");
     this.focusTrap = new TrapFocusHelper(this.panelEl);
@@ -471,7 +469,6 @@ export class AuthModal {
           ? "Unlimited"
           : `${q.hourly_previews_remaining ?? Math.max(0, q.hourly_previews_limit - q.hourly_previews_used)} / ${q.hourly_previews_limit} left this hour`;
 
-      this.badgeEl.textContent = roleLabel.toUpperCase();
       this.titleEl.textContent = "Account";
 
       this.bodyEl.innerHTML = `
@@ -508,7 +505,6 @@ export class AuthModal {
     }
 
     if (this.mode === "invite") {
-      this.badgeEl.textContent = "INVITE";
       this.titleEl.textContent = "Redeem Invite";
 
       const googleSection = googleEnabled
@@ -595,7 +591,6 @@ export class AuthModal {
     }
 
     // Sign In mode (default)
-    this.badgeEl.textContent = "HOSTED";
     this.titleEl.textContent = "Sign In";
 
     const googleSection = googleEnabled

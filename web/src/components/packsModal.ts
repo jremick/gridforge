@@ -5,6 +5,7 @@ import {
   fetchPacks,
   startPackBuild,
 } from "../api";
+import { ICON_CLOSE, ICON_REFRESH } from "../icons";
 import { TrapFocusHelper } from "../modalFocus";
 import { escapeHtml, formatBytes, formatDuration } from "../presets";
 import { classifyApiError } from "../session";
@@ -57,6 +58,7 @@ export class PacksModal {
   private isOpen = false;
   private manageAllowed = true;
   private tasksDeniedMessage: string | null = null;
+  private regionsLoadError: string | null = null;
   private activeTab: ModalRegionTab = "au_tactical";
   private packs: PackSummary[] = [];
   private regions: PackRegionPreset[] = [];
@@ -83,12 +85,11 @@ export class PacksModal {
       <div class="gf-modal-panel" data-role="modal-panel">
         <div class="gf-modal-header">
           <div class="gf-modal-title-group">
-            <span class="gf-section-index">AIR-GAP</span>
             <h2 class="gf-modal-title" id="gf-packs-modal-title">Offline Pack Manager</h2>
           </div>
           <div class="gf-drawer-actions">
-            <button type="button" class="gf-icon-btn" data-role="modal-refresh" aria-label="Refresh packs and tasks" title="Refresh packs &amp; tasks">↻</button>
-            <button type="button" class="gf-icon-btn" data-role="modal-close" aria-label="Close dialog" title="Close (Esc)">×</button>
+            <button type="button" class="gf-icon-btn" data-role="modal-refresh" aria-label="Refresh packs and tasks" title="Refresh packs &amp; tasks">${ICON_REFRESH}</button>
+            <button type="button" class="gf-icon-btn" data-role="modal-close" aria-label="Close dialog" title="Close (Esc)">${ICON_CLOSE}</button>
           </div>
         </div>
 
@@ -117,8 +118,8 @@ export class PacksModal {
 
             <div class="gf-pack-build-opts">
               <label class="gf-inline-check">
-                <span>DEM</span>
-                <select class="gf-mini-select" data-role="pack-dem-tier">
+                <span>Elevation</span>
+                <select class="gf-mini-select" data-role="pack-dem-tier" aria-label="Elevation DEM tier">
                   <option value="auto" selected>Auto (Best Regional DEM)</option>
                   <option value="srtm-1s">DEA SRTM 1s (AU AHD)</option>
                   <option value="au-elvis">GA 5m / SRTM (AU AHD)</option>
@@ -191,6 +192,10 @@ export class PacksModal {
       void this.refreshAll();
     });
 
+    this.incDemCheck.addEventListener("change", () => {
+      this.demTierSelect.disabled = !this.incDemCheck.checked;
+    });
+
     this.root
       .querySelectorAll<HTMLButtonElement>("[data-tab]")
       .forEach((btn) => {
@@ -227,6 +232,8 @@ export class PacksModal {
       if (action === "build") {
         const regionId = btn.dataset.regionId;
         if (regionId) void this.handleBuildPack(regionId);
+      } else if (action === "retry-regions") {
+        void this.refreshAll();
       } else if (action === "fill-sheet-bbox") {
         const bbox = this.callbacks.getCurrentBBoxString();
         if (bbox) {
@@ -366,7 +373,14 @@ export class PacksModal {
     }
     if (regionsRes.status === "fulfilled") {
       this.regions = regionsRes.value;
+      this.regionsLoadError = null;
       this.updateTabLabels();
+    } else if (this.regions.length === 0) {
+      const msg =
+        regionsRes.reason instanceof Error
+          ? regionsRes.reason.message
+          : "Offline pack catalog is unavailable right now.";
+      this.regionsLoadError = msg;
     }
     if (tasksRes.status === "fulfilled") {
       this.tasks = tasksRes.value;
@@ -610,7 +624,16 @@ export class PacksModal {
     this.regionsEl.className = "gf-pack-regions-grid";
     const filtered = this.regions.filter((r) => r.group === this.activeTab);
     if (filtered.length === 0) {
-      this.regionsEl.innerHTML = `<div class="gf-wp-empty">Loading curated offline pack regions…</div>`;
+      if (this.regionsLoadError) {
+        this.regionsEl.innerHTML = `
+          <div class="gf-wp-empty gf-pack-regions-error">
+            <span>Unable to load curated regions (${escapeHtml(this.regionsLoadError)}).</span>
+            <button type="button" class="gf-mini-btn" data-region-action="retry-regions">Retry</button>
+          </div>
+        `;
+      } else {
+        this.regionsEl.innerHTML = `<div class="gf-wp-empty">Loading curated offline pack regions…</div>`;
+      }
       return;
     }
 

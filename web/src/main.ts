@@ -1,4 +1,23 @@
+import "@fontsource/ibm-plex-sans/latin-400.css";
+import "@fontsource/ibm-plex-sans/latin-500.css";
+import "@fontsource/ibm-plex-sans/latin-600.css";
+import "@fontsource/ibm-plex-sans/latin-700.css";
+import "@fontsource/ibm-plex-mono/latin-400.css";
+import "@fontsource/ibm-plex-mono/latin-500.css";
+import "@fontsource/ibm-plex-mono/latin-600.css";
+import "@fontsource/ibm-plex-mono/latin-700.css";
 import "./styles.css";
+import {
+  ICON_FIT,
+  ICON_LAYERS,
+  ICON_LOS,
+  ICON_MINUS,
+  ICON_PLUS,
+  ICON_RING,
+  ICON_RULER,
+  ICON_SECTOR,
+  ICON_WAYPOINT,
+} from "./icons";
 import {
   ApiError,
   cancelJob,
@@ -53,11 +72,18 @@ import {
 import {
   DEFAULT_SIDEBAR_WIDTH,
   MIN_SIDEBAR_WIDTH,
+  SIDEBAR_MOBILE_BREAKPOINT,
   clampSidebarWidth,
   getMaxSidebarWidthForViewport,
   loadSidebarPrefs,
   saveSidebarPrefs,
 } from "./sidebarPrefs";
+import {
+  applyStudioTheme,
+  loadStudioTheme,
+  saveStudioTheme,
+  type StudioTheme,
+} from "./themePrefs";
 import { TurnstileController } from "./turnstile";
 import type {
   BasemapId,
@@ -121,7 +147,10 @@ class GridForgeApp {
   private readonly turnstile: TurnstileController;
   private readonly map: GridForgeMap;
   private readonly basemapSwitcherEl: HTMLElement;
+  private readonly basemapSelectEl: HTMLSelectElement;
+  private readonly sidebarScrimEl: HTMLElement;
   private readonly offlineReadyBadgeEl: HTMLButtonElement;
+  private studioTheme: StudioTheme = loadStudioTheme();
   private readonly globalStatusBannerEl: HTMLElement;
   private readonly footprintBannerEl: HTMLElement;
   private readonly mapHintEl: HTMLElement;
@@ -201,6 +230,8 @@ class GridForgeApp {
     this.viewshedSeq = this.state.viewsheds.length + 1;
     this.rfLinkSeq = this.state.rfLinks.length + 1;
 
+    applyStudioTheme(this.studioTheme);
+
     root.innerHTML = `
       <div class="gf-shell" data-role="shell">
         <header data-role="topbar"></header>
@@ -221,6 +252,7 @@ class GridForgeApp {
             tabindex="0"
             title="Drag to resize sidebar · Double-click to reset"
           ></div>
+          <div class="gf-sidebar-scrim" data-role="sidebar-scrim" aria-hidden="true"></div>
 
           <div class="gf-map-toolbar">
             <div class="gf-toolbar-row">
@@ -228,7 +260,7 @@ class GridForgeApp {
                 type="button"
                 class="gf-offline-ready-pill hidden"
                 data-role="offline-ready-pill"
-                title="External tiles failed — click to switch to local Offline MBTiles basemap"
+                title="External tiles failed. Click to switch to local Offline MBTiles basemap"
               >Offline Basemap Ready</button>
               <div class="gf-basemap-switcher" data-role="basemap-switcher" role="group" aria-label="Basemap switcher">
                 ${BASEMAP_OPTIONS.map(
@@ -236,26 +268,35 @@ class GridForgeApp {
                     `<button type="button" class="gf-basemap-btn ${b.id === this.activeBasemap ? "active" : ""}" data-basemap="${escapeHtml(b.id)}">${escapeHtml(b.label)}</button>`
                 ).join("")}
               </div>
+              <label class="gf-basemap-select-wrap" aria-label="Basemap">
+                ${ICON_LAYERS}
+                <select class="gf-basemap-select" data-role="basemap-select" aria-label="Basemap">
+                  ${BASEMAP_OPTIONS.map(
+                    (b) =>
+                      `<option value="${escapeHtml(b.id)}" ${b.id === this.activeBasemap ? "selected" : ""}>${escapeHtml(b.label)}</option>`
+                  ).join("")}
+                </select>
+              </label>
               <div class="gf-map-actions">
-                <button type="button" class="gf-map-icon-btn" data-map-action="fit" title="Fit sheet footprint (F)">⌖ Fit</button>
-                <button type="button" class="gf-map-icon-btn" data-map-action="zoom-in" title="Zoom in">+</button>
-                <button type="button" class="gf-map-icon-btn" data-map-action="zoom-out" title="Zoom out">−</button>
-                <button type="button" class="gf-map-icon-btn" data-map-action="north" title="Reset north">N</button>
+                <button type="button" class="gf-map-icon-btn" data-map-action="fit" title="Fit sheet footprint (F)">${ICON_FIT}<span>Fit</span></button>
+                <button type="button" class="gf-map-icon-btn gf-map-icon-only" data-map-action="zoom-in" aria-label="Zoom in" title="Zoom in">${ICON_PLUS}</button>
+                <button type="button" class="gf-map-icon-btn gf-map-icon-only" data-map-action="zoom-out" aria-label="Zoom out" title="Zoom out">${ICON_MINUS}</button>
+                <button type="button" class="gf-map-icon-btn gf-map-icon-only" data-map-action="north" aria-label="Reset north" title="Reset north">N</button>
               </div>
             </div>
             <div class="gf-toolbar-row">
               <div class="gf-map-actions gf-tactical-bar" role="group" aria-label="Tactical map tools">
-                <button type="button" class="gf-map-icon-btn gf-markup-btn" data-map-tool="markup" aria-pressed="false" title="Drop waypoints on map (M)">⌖ WP</button>
-                <button type="button" class="gf-map-icon-btn gf-ruler-btn" data-map-tool="ruler" aria-pressed="false" title="Measure distance, magnetic bearing & grade (R)">📏 Ruler</button>
-                <button type="button" class="gf-map-icon-btn gf-ring-btn" data-map-tool="ring" aria-pressed="false" title="Drop concentric range rings on map">◎ Ring</button>
-                <button type="button" class="gf-map-icon-btn gf-sector-btn" data-map-tool="sector" aria-pressed="false" title="Draw shaded AOI sector polygon">⬠ Sector</button>
-                <button type="button" class="gf-map-icon-btn gf-los-btn" data-map-tool="los" aria-pressed="false" title="Drop RF / LOS viewshed observer (V)">📡 LOS</button>
+                <button type="button" class="gf-map-icon-btn gf-markup-btn" data-map-tool="markup" aria-pressed="false" title="Drop waypoints on map (M)">${ICON_WAYPOINT}<span>WP</span></button>
+                <button type="button" class="gf-map-icon-btn gf-ruler-btn" data-map-tool="ruler" aria-pressed="false" title="Measure distance, magnetic bearing &amp; grade (R)">${ICON_RULER}<span>Ruler</span></button>
+                <button type="button" class="gf-map-icon-btn gf-ring-btn" data-map-tool="ring" aria-pressed="false" title="Drop concentric range rings on map">${ICON_RING}<span>Ring</span></button>
+                <button type="button" class="gf-map-icon-btn gf-sector-btn" data-map-tool="sector" aria-pressed="false" title="Draw shaded AOI sector polygon">${ICON_SECTOR}<span>Sector</span></button>
+                <button type="button" class="gf-map-icon-btn gf-los-btn" data-map-tool="los" aria-pressed="false" title="Drop RF / LOS viewshed observer (V)">${ICON_LOS}<span>LOS</span></button>
               </div>
             </div>
+            <div class="gf-footprint-banner hidden" data-role="footprint-banner"></div>
           </div>
 
           <div class="gf-global-status-banner hidden" data-role="global-status-banner" role="status"></div>
-          <div class="gf-footprint-banner hidden" data-role="footprint-banner"></div>
 
           <div class="gf-map-hint" data-role="map-hint">
             <span data-role="map-hint-text">Click map or drag reticle · F to fit</span>
@@ -274,6 +315,11 @@ class GridForgeApp {
 
     this.shellEl = this.q(root, "[data-role='shell']");
     this.basemapSwitcherEl = this.q(root, "[data-role='basemap-switcher']");
+    this.basemapSelectEl = this.q<HTMLSelectElement>(
+      root,
+      "[data-role='basemap-select']"
+    );
+    this.sidebarScrimEl = this.q(root, "[data-role='sidebar-scrim']");
     this.offlineReadyBadgeEl = this.q<HTMLButtonElement>(
       root,
       "[data-role='offline-ready-pill']"
@@ -295,6 +341,7 @@ class GridForgeApp {
 
     this.telemetry = new TelemetryBar(this.q(root, "[data-role='topbar']"), {
       onToggleSidebar: () => this.setSidebarCollapsed(!this.sidebarCollapsed),
+      onToggleTheme: () => this.toggleStudioTheme(),
       onToggleDrawer: () => this.setDrawerOpen(!this.drawerOpen),
       onToggleProjects: () => this.setProjectsOpen(!this.projectsOpen),
       onCopyMgrs: (mgrs) => this.copyText(mgrs, `Copied ${mgrs}`),
@@ -514,7 +561,7 @@ class GridForgeApp {
             : "opentopo";
           this.selectBasemap(fallback);
           this.showToast(
-            "Vector HD tiles unavailable — switched back to raster basemap",
+            "Vector HD tiles unavailable; switched back to raster basemap",
             "info"
           );
         },
@@ -526,6 +573,9 @@ class GridForgeApp {
         initialBasemap: this.activeBasemap,
       }
     );
+
+    this.telemetry.updateTheme(this.studioTheme);
+    this.map.setTheme(this.studioTheme);
 
     this.restoreSidebarPrefs(null);
     this.bindChromeEvents(root);
@@ -710,6 +760,18 @@ class GridForgeApp {
       this.workspaceEdited();
     });
 
+    this.basemapSelectEl.addEventListener("change", () => {
+      const id = this.basemapSelectEl.value as BasemapId;
+      this.selectBasemap(id);
+      this.workspaceEdited();
+    });
+
+    this.sidebarScrimEl.addEventListener("click", () => {
+      if (!this.sidebarCollapsed) {
+        this.setSidebarCollapsed(true, { persist: false });
+      }
+    });
+
     this.offlineReadyBadgeEl.addEventListener("click", () => {
       this.selectBasemap("offline");
       this.workspaceEdited();
@@ -840,6 +902,14 @@ class GridForgeApp {
     });
   }
 
+  private toggleStudioTheme(): void {
+    this.studioTheme = this.studioTheme === "dark" ? "light" : "dark";
+    saveStudioTheme(this.studioTheme);
+    applyStudioTheme(this.studioTheme);
+    this.telemetry.updateTheme(this.studioTheme);
+    this.map.setTheme(this.studioTheme);
+  }
+
   private selectBasemap(id: BasemapId): void {
     this.activeBasemap = id;
     this.map.setBasemap(id);
@@ -849,6 +919,11 @@ class GridForgeApp {
     this.basemapSwitcherEl
       .querySelectorAll<HTMLButtonElement>("[data-basemap]")
       .forEach((b) => b.classList.toggle("active", b.dataset.basemap === id));
+    if (
+      Array.from(this.basemapSelectEl.options).some((o) => o.value === id)
+    ) {
+      this.basemapSelectEl.value = id;
+    }
   }
 
   private updateMapHintForMode(): void {
@@ -898,6 +973,13 @@ class GridForgeApp {
 
     this.interactionMode = mode;
     this.map.setInteractionMode(mode);
+    if (
+      mode !== "pan" &&
+      !this.sidebarCollapsed &&
+      window.innerWidth <= SIDEBAR_MOBILE_BREAKPOINT
+    ) {
+      this.setSidebarCollapsed(true, { persist: false });
+    }
     this.sidebar.setInteractionMode(mode, this.rfPendingFrom !== null);
 
     this.toolBarButtons.forEach((btn) => {
@@ -1203,6 +1285,7 @@ class GridForgeApp {
     this.map.resetWorkspace(this.state.lat, this.state.lon);
     this.selectBasemap(DEFAULT_BASEMAP);
     this.basemapSwitcherEl.querySelector("[data-basemap='offline']")?.remove();
+    this.basemapSelectEl.querySelector("option[value='offline']")?.remove();
     this.offlineReadyBadgeEl.classList.add("hidden");
     this.sidebar.resetWorkspace();
     this.telemetry.resetWorkspace();
@@ -1463,6 +1546,7 @@ class GridForgeApp {
       if (!info.available || !info.format) {
         this.map.enableOfflineBasemap(info);
         if (existingBtn) existingBtn.remove();
+        this.basemapSelectEl.querySelector("option[value='offline']")?.remove();
         this.pendingOfflineBasemapFromUrl = false;
         if (this.activeBasemap === "offline") {
           this.selectBasemap("opentopo");
@@ -1486,6 +1570,13 @@ class GridForgeApp {
         this.basemapSwitcherEl.appendChild(btn);
       } else {
         existingBtn.title = titleText;
+      }
+
+      if (!this.basemapSelectEl.querySelector("option[value='offline']")) {
+        const opt = document.createElement("option");
+        opt.value = "offline";
+        opt.textContent = "Offline";
+        this.basemapSelectEl.appendChild(opt);
       }
 
       if (this.pendingOfflineBasemapFromUrl) {
@@ -1650,7 +1741,7 @@ class GridForgeApp {
       this.getCurrentUrlViewState()
     );
     const toastMsg = direct.truncated
-      ? "Direct link copied (compact URL omitted some markups — use Short Share Link for full fidelity)"
+      ? "Direct link copied (compact URL omitted some markups; use Short Share Link for full fidelity)"
       : this.state.overlayFile
         ? "Direct link copied (local uploaded GPX/KML file is not embedded)"
         : "Direct link copied to clipboard";

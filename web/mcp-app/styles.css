@@ -2,22 +2,22 @@
 
 :root,
 [data-theme="dark"] {
-  --gf-bg-page: var(--color-background-primary, #0d1218);
-  --gf-bg-card: var(--color-background-secondary, #141b23);
+  --gf-bg-page: var(--color-background-primary, #0d1217);
+  --gf-bg-card: var(--color-background-secondary, #131a22);
   --gf-bg-elevated: var(--color-background-tertiary, #1b2430);
-  --gf-surface-inset: #0b1016;
+  --gf-surface-inset: #0b1015;
   --gf-map-bg: #0a1017;
 
-  --gf-text-primary: var(--color-text-primary, #e6edf3);
-  --gf-text-secondary: var(--color-text-secondary, #9fb0c2);
-  --gf-text-muted: var(--color-text-tertiary, #6e8094);
+  --gf-text-primary: var(--color-text-primary, #edf2f7);
+  --gf-text-secondary: var(--color-text-secondary, #b4c2d0);
+  --gf-text-muted: var(--color-text-tertiary, #8c9dae);
 
-  --gf-border-subtle: var(--color-border-secondary, #233040);
-  --gf-border-strong: var(--color-border-primary, #33455a);
-  --gf-ring: var(--color-ring-primary, #38bdf8);
+  --gf-border-subtle: var(--color-border-secondary, rgba(148, 163, 184, 0.18));
+  --gf-border-strong: var(--color-border-primary, rgba(148, 163, 184, 0.32));
+  --gf-ring: var(--color-ring-primary, #f59e0b);
 
   --gf-accent-amber: #f59e0b;
-  --gf-accent-amber-soft: rgba(245, 158, 11, 0.14);
+  --gf-accent-amber-soft: rgba(245, 158, 11, 0.15);
   --gf-accent-amber-text: #fbbf24;
   --gf-accent-cyan: #38bdf8;
   --gf-accent-cyan-soft: rgba(56, 189, 248, 0.14);
@@ -33,54 +33,54 @@
 
   --gf-font-sans: var(
     --font-sans,
+    "IBM Plex Sans",
     -apple-system,
     BlinkMacSystemFont,
-    "Inter",
     "Segoe UI",
     Roboto,
     Helvetica,
     Arial,
     sans-serif
   );
-  --gf-font-mono: "JetBrains Mono", "SF Mono", "Fira Code", ui-monospace,
-    SFMono-Regular, Menlo, Consolas, monospace;
+  --gf-font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", SFMono-Regular,
+    Menlo, Consolas, monospace;
 
-  --gf-radius-sm: 6px;
-  --gf-radius-md: 9px;
-  --gf-radius-lg: 12px;
+  --gf-radius-sm: 5px;
+  --gf-radius-md: 7px;
+  --gf-radius-lg: 10px;
   --gf-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.28);
 }
 
 [data-theme="light"] {
-  --gf-bg-page: var(--color-background-primary, #f8fafc);
+  --gf-bg-page: var(--color-background-primary, #f3f1eb);
   --gf-bg-card: var(--color-background-secondary, #ffffff);
-  --gf-bg-elevated: var(--color-background-tertiary, #f1f5f9);
-  --gf-surface-inset: #f4f7fb;
-  --gf-map-bg: #eef3f8;
+  --gf-bg-elevated: var(--color-background-tertiary, #edeae1);
+  --gf-surface-inset: #f5f2ea;
+  --gf-map-bg: #ebe7dc;
 
-  --gf-text-primary: var(--color-text-primary, #0f172a);
-  --gf-text-secondary: var(--color-text-secondary, #475569);
-  --gf-text-muted: var(--color-text-tertiary, #64748b);
+  --gf-text-primary: var(--color-text-primary, #141c24);
+  --gf-text-secondary: var(--color-text-secondary, #374656);
+  --gf-text-muted: var(--color-text-tertiary, #4c5c6c);
 
-  --gf-border-subtle: var(--color-border-secondary, #dce4ee);
-  --gf-border-strong: var(--color-border-primary, #cbd5e1);
-  --gf-ring: var(--color-ring-primary, #0284c7);
+  --gf-border-subtle: var(--color-border-secondary, rgba(20, 28, 36, 0.13));
+  --gf-border-strong: var(--color-border-primary, rgba(20, 28, 36, 0.24));
+  --gf-ring: var(--color-ring-primary, #d97706);
 
   --gf-accent-amber: #d97706;
-  --gf-accent-amber-soft: rgba(217, 119, 6, 0.12);
-  --gf-accent-amber-text: #b45309;
+  --gf-accent-amber-soft: rgba(217, 119, 6, 0.13);
+  --gf-accent-amber-text: #92400e;
   --gf-accent-cyan: #0284c7;
   --gf-accent-cyan-soft: rgba(2, 132, 199, 0.11);
   --gf-accent-emerald: #059669;
   --gf-accent-emerald-soft: rgba(5, 150, 105, 0.12);
   --gf-accent-red: #dc2626;
-  --gf-accent-red-soft: rgba(220, 38, 38, 0.12);
+  --gf-accent-red-soft: rgba(220, 38, 38, 0.11);
 
-  --gf-grid-line: rgba(15, 23, 42, 0.11);
+  --gf-grid-line: rgba(20, 28, 36, 0.11);
   --gf-terrain-top: #94a3b8;
   --gf-terrain-bot: #cbd5e1;
   --gf-terrain-stroke: #475569;
-  --gf-shadow-sm: 0 1px 3px rgba(15, 23, 42, 0.08);
+  --gf-shadow-sm: 0 1px 3px rgba(20, 28, 36, 0.08);
 }
 
 *,
@@ -840,10 +840,8 @@ select:focus-visible {
 }
 
 .gf-table th {
-  font-size: 10px;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
+  font-size: 12px;
+  font-weight: 600;
   color: var(--gf-text-muted);
   background: var(--gf-bg-elevated);
 }

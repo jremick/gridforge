@@ -1,5 +1,13 @@
 import * as maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
+import maplibreWorkerUrl from "maplibre-gl/dist/maplibre-gl-worker.mjs?url";
+
+// MapLibre GL JS v6 resolves its worker relative to import.meta.url, which breaks
+// after Vite bundles maplibre-gl into /assets/maplibre-*.js. Point MapLibre at
+// the Vite-emitted hashed worker asset so Vector HD and GeoJSON sources work in
+// both dev and production builds under worker-src 'self'.
+export const MAPLIBRE_WORKER_URL: string = maplibreWorkerUrl;
+maplibregl.setWorkerUrl(MAPLIBRE_WORKER_URL);
 import type {
   Feature,
   FeatureCollection,
@@ -14,6 +22,7 @@ import {
   DEFAULT_MAP_ZOOM,
   WAYPOINT_CATEGORY_OPTIONS,
 } from "./presets";
+import type { StudioTheme } from "./themePrefs";
 import type {
   BasemapId,
   BasemapInfoResponse,
@@ -762,6 +771,7 @@ export class GridForgeMap {
   private dynamicIconGroups = new Map<string, Set<string>>();
   private currentFootprint: FeatureCollection | null = null;
   private currentBasemap: BasemapId = "opentopo";
+  private currentTheme: StudioTheme = "dark";
   private suppressClickUntil = 0;
   private draggingMarker = false;
   private interactionMode: MapInteractionMode = "pan";
@@ -797,6 +807,18 @@ export class GridForgeMap {
       new maplibregl.ScaleControl({ maxWidth: 120, unit: "metric" }),
       "bottom-left"
     );
+
+    if (typeof window !== "undefined") {
+      window.requestAnimationFrame(() => {
+        if (window.innerWidth <= 680) {
+          const attrib = this.container.querySelector<HTMLElement>(
+            ".maplibregl-ctrl-attrib.maplibregl-compact"
+          );
+          attrib?.classList.remove("maplibregl-compact-show");
+          attrib?.removeAttribute("open");
+        }
+      });
+    }
 
     this.marker = new maplibregl.Marker({
       element: createReticleElement(),
@@ -896,6 +918,14 @@ export class GridForgeMap {
 
     this.map.on("load", () => {
       this.isLoaded = true;
+      this.setTheme(this.currentTheme);
+      if (typeof window !== "undefined" && window.innerWidth <= 680) {
+        const attrib = this.container.querySelector<HTMLElement>(
+          ".maplibregl-ctrl-attrib.maplibregl-compact"
+        );
+        attrib?.classList.remove("maplibregl-compact-show");
+        attrib?.removeAttribute("open");
+      }
       if (this.pendingOfflineBasemap) {
         this.attachOfflineBasemapLayer(this.pendingOfflineBasemap);
         this.pendingOfflineBasemap = null;
@@ -1035,6 +1065,22 @@ export class GridForgeMap {
       this.map.doubleClickZoom.disable();
     } else {
       this.map.doubleClickZoom.enable();
+    }
+  }
+
+  setTheme(theme: StudioTheme): void {
+    this.currentTheme = theme;
+    if (!this.isLoaded) return;
+    try {
+      if (this.map.getLayer("bg-dark")) {
+        this.map.setPaintProperty(
+          "bg-dark",
+          "background-color",
+          theme === "light" ? "#E8E4D9" : "#0D1217"
+        );
+      }
+    } catch (err) {
+      console.debug("Skipped map background theme update during style transition:", err);
     }
   }
 

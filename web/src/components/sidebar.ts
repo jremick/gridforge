@@ -1,5 +1,18 @@
 import { ApiError, fetchGeocode } from "../api";
 import {
+  ICON_CHEVRON_DOWN,
+  ICON_CHEVRON_UP,
+  ICON_CLOSE,
+  ICON_GITHUB,
+  ICON_LOS,
+  ICON_REFRESH,
+  ICON_RF_LINK,
+  ICON_RULER,
+  ICON_SECTOR,
+  ICON_SLIDERS,
+  ICON_TERMINAL,
+} from "../icons";
+import {
   ATLAS_GRID_OPTIONS,
   AU_OVERLAY_OPTIONS,
   AU_STATE_TRAIL_CHIPS,
@@ -114,7 +127,24 @@ export interface SidebarCallbacks {
 }
 
 const GEOCODE_DEBOUNCE_MS = 300;
-const CHEVRON_SVG = `<svg class="gf-chevron" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+const CHEVRON_SVG = ICON_CHEVRON_DOWN;
+
+type OverlayRegionTab = "au" | "nz" | "us" | "ca";
+
+const OVERLAY_REGION_TABS: readonly { id: OverlayRegionTab; label: string }[] = [
+  { id: "au", label: "AU" },
+  { id: "nz", label: "NZ" },
+  { id: "us", label: "US" },
+  { id: "ca", label: "CA" },
+];
+
+function inferOverlayRegion(lat: number, lon: number): OverlayRegionTab {
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return "au";
+  if (lat >= 48.8 && lon >= -141 && lon <= -52) return "ca";
+  if (lon < -50 && lat >= 18) return "us";
+  if (lon > 160 && lat < -30) return "nz";
+  return "au";
+}
 
 const CATEGORY_COLOR_MAP: Record<WaypointCategory, string> = Object.fromEntries(
   WAYPOINT_CATEGORY_OPTIONS.map((o) => [o.value, o.color])
@@ -149,10 +179,10 @@ export class SidebarPanel {
   private atlasSublabelEl!: HTMLElement;
   private atlasTierHintEl!: HTMLElement;
   private foldMarksCheck!: HTMLInputElement;
-  private sheetAtlasIndexCheck!: HTMLInputElement;
   private demSelect!: HTMLSelectElement;
   private packSelect!: HTMLSelectElement;
   private managePacksBtn!: HTMLButtonElement;
+  private overlayTabsEl!: HTMLElement;
   private stateAutoCheck!: HTMLInputElement;
   private contourSelect!: HTMLSelectElement;
   private hillshadeSelect!: HTMLSelectElement;
@@ -165,11 +195,10 @@ export class SidebarPanel {
   private dropzoneEl!: HTMLElement;
   private stripBarEl!: HTMLElement;
 
-  // Section 05 Waypoints & Tactical Markup
+  // Section: Waypoints & Tactical Markup
   private waypointsSectionEl!: HTMLDetailsElement;
   private waypointsPillEl!: HTMLElement;
   private wpClearBtn!: HTMLButtonElement;
-  private wpRouteCardCheck!: HTMLInputElement;
   private wpListEl!: HTMLElement;
   private wpTotalEl!: HTMLElement;
   private rulerBoxEl!: HTMLElement;
@@ -178,7 +207,7 @@ export class SidebarPanel {
   private tacticalListEl!: HTMLElement;
   private tacticalClearBtn!: HTMLButtonElement;
 
-  // Section 06 RF / Viewshed
+  // Section: RF & Viewshed
   private viewshedSectionEl!: HTMLDetailsElement;
   private viewshedPillEl!: HTMLElement;
   private vsToggleBtn!: HTMLButtonElement;
@@ -194,10 +223,14 @@ export class SidebarPanel {
   private rfFreqInput!: HTMLInputElement;
   private rfTxHInput!: HTMLInputElement;
   private rfRxHInput!: HTMLInputElement;
-  private rfCardCheck!: HTMLInputElement;
   private rfLinksListEl!: HTMLElement;
 
-  // Sticky Footer Outputs
+  // Sticky Footer & Upward Outputs Drawer
+  private outputsDrawerEl!: HTMLElement;
+  private outputsTriggerBtn!: HTMLButtonElement;
+  private outputsSummaryEl!: HTMLElement;
+  private outputsCloseBtn!: HTMLButtonElement;
+  private outputsDrawerOpen = false;
   private outPdfCheck!: HTMLInputElement;
   private outPdfDpiSelect!: HTMLSelectElement;
   private outGeoPdfCheck!: HTMLInputElement;
@@ -230,6 +263,8 @@ export class SidebarPanel {
   private isSubmitting = false;
   private activePresetTab: PresetRegionTab = "nsw-vic";
   private activePresetId: string | null = "blue-mountains";
+  private activeOverlayRegion: OverlayRegionTab = "au";
+  private overlayRegionManuallySet = false;
   private interactionMode: MapInteractionMode = "pan";
   private planningStrip = false;
   private routeMetrics: RouteMetricsResponse | null = null;
@@ -284,7 +319,11 @@ export class SidebarPanel {
     const themeBtnsHtml = COLOR_MODE_OPTIONS.map(
       (m) => `
         <button type="button" class="gf-theme-btn" data-value="${m.value}" title="${escapeHtml(m.hint)}">
-          <span class="gf-theme-swatch" style="background:${m.swatch}"></span>
+          <span class="gf-theme-swatch" aria-hidden="true">
+            <i style="background:${m.palette[0]}"></i>
+            <i style="background:${m.palette[1]}"></i>
+            <i style="background:${m.palette[2]}"></i>
+          </span>
           <span>${escapeHtml(m.label)}</span>
         </button>
       `
@@ -376,13 +415,17 @@ export class SidebarPanel {
       `<option value="custom">Custom MHz</option>`,
     ].join("");
 
+    const overlayTabsHtml = OVERLAY_REGION_TABS.map(
+      (t) =>
+        `<button type="button" class="gf-seg-btn ${t.id === this.activeOverlayRegion ? "active" : ""}" data-overlay-tab="${t.id}">${escapeHtml(t.label)}</button>`
+    ).join("");
+
     this.root.innerHTML = `
       <div class="gf-sidebar-scroll">
         <!-- 1. Location & Presets -->
         <details class="gf-section" open>
           <summary class="gf-section-summary">
             <span class="gf-section-title-group">
-              <span class="gf-section-index">01</span>
               <span class="gf-section-title">Location &amp; Presets</span>
             </span>
             <span class="gf-section-meta">
@@ -427,7 +470,6 @@ export class SidebarPanel {
         <details class="gf-section" open>
           <summary class="gf-section-summary">
             <span class="gf-section-title-group">
-              <span class="gf-section-index">02</span>
               <span class="gf-section-title">Sheet &amp; Print</span>
             </span>
             <span class="gf-section-meta">
@@ -453,7 +495,7 @@ export class SidebarPanel {
             <div class="gf-field-row">
               <div class="gf-field">
                 <label class="gf-label" for="gf-scale-select">Scale</label>
-                <select id="gf-scale-select" class="gf-select mono">
+                <select id="gf-scale-select" class="gf-select">
                   ${scaleOptsHtml}
                 </select>
               </div>
@@ -475,21 +517,16 @@ export class SidebarPanel {
               </div>
               <div class="gf-tier-hint hidden" data-role="atlas-tier-hint"></div>
               <div class="gf-atlas-extras">
-                <label class="gf-toggle-chip" title="Draw 0.20 mm corner registration & fold/join marks for multi-sheet assembly">
+                <label class="gf-toggle-chip" title="Draw 0.20 mm corner registration and fold/join marks for multi-sheet assembly">
                   <input type="checkbox" data-role="fold-marks" />
                   <span>Fold / Join Marks</span>
-                </label>
-                <label class="gf-toggle-chip" title="Prepend pure-vector Atlas Overview & Sheet Index cover page">
-                  <input type="checkbox" data-role="sheet-atlas-index" />
-                  <span>Atlas Index Cover</span>
                 </label>
               </div>
             </div>
 
             <div class="gf-field">
               <span class="gf-label">
-                <span>Map Theme</span>
-                <span class="gf-sublabel">Color · B&amp;W · Night-Red · Alpine</span>
+                <span>Print Cartography Theme</span>
               </span>
               <div class="gf-theme-grid" data-seg="color_mode">
                 ${themeBtnsHtml}
@@ -516,10 +553,9 @@ export class SidebarPanel {
         </details>
 
         <!-- 3. Elevation & Regional Overlays -->
-        <details class="gf-section" open>
+        <details class="gf-section" data-role="overlays-section">
           <summary class="gf-section-summary">
             <span class="gf-section-title-group">
-              <span class="gf-section-index">03</span>
               <span class="gf-section-title">Elevation &amp; Overlays</span>
             </span>
             <span class="gf-section-meta">
@@ -540,7 +576,7 @@ export class SidebarPanel {
                 <span>Offline Pack</span>
                 <span class="gf-label-actions">
                   <button type="button" class="gf-mini-btn gf-manage-packs-btn" data-role="manage-packs" title="Build or manage air-gapped offline packs">Manage Packs</button>
-                  <button type="button" class="gf-mini-btn" data-role="refresh-packs" title="Reload installed packs">↻</button>
+                  <button type="button" class="gf-mini-btn gf-mini-icon-btn" data-role="refresh-packs" aria-label="Reload installed packs" title="Reload installed packs">${ICON_REFRESH}</button>
                 </span>
               </label>
               <select id="gf-pack-select" class="gf-select">
@@ -548,13 +584,23 @@ export class SidebarPanel {
               </select>
             </div>
 
-            <div class="gf-overlay-group">
-              <span class="gf-overlay-heading">Australia Overlays (CC BY 4.0)</span>
+            <div class="gf-field">
+              <div class="gf-label">
+                <span>Regional Open-Data Layers</span>
+                <span class="gf-sublabel">Auto-matched to map center</span>
+              </div>
+              <div class="gf-segmented gf-overlay-tabs" data-role="overlay-tabs" role="tablist" aria-label="Regional overlay layers">
+                ${overlayTabsHtml}
+              </div>
+            </div>
+
+            <div class="gf-overlay-group" data-overlay-panel="au">
+              <span class="gf-overlay-heading">Australia (CC BY 4.0)</span>
               <div class="gf-state-trails-box">
                 <label class="gf-check-row gf-state-auto-row">
                   <input type="checkbox" data-role="au-state-auto" />
                   <span class="gf-check-text">
-                    <span class="gf-check-title">State Fire Trails, Huts &amp; Trigs (Auto — All 8 States)</span>
+                    <span class="gf-check-title">State Fire Trails, Huts &amp; Trigs (Auto, All 8 States)</span>
                     <span class="gf-check-hint">Auto-detects NSW, VIC, TAS, QLD, WA, SA, NT, ACT (incl. cross-border)</span>
                   </span>
                 </label>
@@ -565,14 +611,18 @@ export class SidebarPanel {
               ${auOverlaysHtml}
             </div>
 
-            <div class="gf-overlay-group">
-              <span class="gf-overlay-heading">New Zealand Overlays (CC BY 4.0)</span>
+            <div class="gf-overlay-group" data-overlay-panel="nz" hidden>
+              <span class="gf-overlay-heading">New Zealand (CC BY 4.0)</span>
               ${nzOverlaysHtml}
             </div>
 
-            <div class="gf-overlay-group">
-              <span class="gf-overlay-heading">North America Overlays (US &amp; Canada)</span>
+            <div class="gf-overlay-group" data-overlay-panel="us" hidden>
+              <span class="gf-overlay-heading">United States (Public Domain)</span>
               ${usOverlaysHtml}
+            </div>
+
+            <div class="gf-overlay-group" data-overlay-panel="ca" hidden>
+              <span class="gf-overlay-heading">Canada (OGL-Canada)</span>
               ${caOverlaysHtml}
             </div>
           </div>
@@ -582,7 +632,6 @@ export class SidebarPanel {
         <details class="gf-section" data-role="carto-section">
           <summary class="gf-section-summary">
             <span class="gf-section-title-group">
-              <span class="gf-section-index">04</span>
               <span class="gf-section-title">Cartography &amp; File Overlay</span>
             </span>
             <span class="gf-section-meta">
@@ -633,7 +682,7 @@ export class SidebarPanel {
 
             <div class="gf-field">
               <span class="gf-label">
-                <span>Custom User Overlay &amp; Strip Route</span>
+                <span>Custom Overlay &amp; Strip Route</span>
                 <span class="gf-sublabel">.geojson · .gpx · .csv</span>
               </span>
               <div class="gf-dropzone" data-role="dropzone">
@@ -647,7 +696,7 @@ export class SidebarPanel {
                   accept=".geojson,.json,.gpx,.csv"
                   hidden
                 />
-                <button type="button" class="gf-file-clear" data-role="file-clear" title="Clear overlay file" hidden>×</button>
+                <button type="button" class="gf-file-clear" data-role="file-clear" aria-label="Clear overlay file" title="Clear overlay file" hidden>${ICON_CLOSE}</button>
               </div>
               <div class="gf-strip-bar hidden" data-role="strip-bar"></div>
             </div>
@@ -658,7 +707,6 @@ export class SidebarPanel {
         <details class="gf-section" data-role="waypoints-section">
           <summary class="gf-section-summary">
             <span class="gf-section-title-group">
-              <span class="gf-section-index">05</span>
               <span class="gf-section-title">Waypoints &amp; Tactical</span>
             </span>
             <span class="gf-section-meta">
@@ -667,13 +715,6 @@ export class SidebarPanel {
             </span>
           </summary>
           <div class="gf-section-body">
-            <div class="gf-tactical-tools-grid">
-              <button type="button" class="gf-tool-btn" data-tool-btn="markup" title="Drop numbered waypoints on map (M)">⌖ WP</button>
-              <button type="button" class="gf-tool-btn" data-tool-btn="ruler" title="Measure distance, magnetic bearing & grade (R)">📏 Ruler</button>
-              <button type="button" class="gf-tool-btn" data-tool-btn="ring" title="Drop concentric range rings on map">◎ Ring</button>
-              <button type="button" class="gf-tool-btn" data-tool-btn="sector" title="Click ≥3 vertices to draw shaded AOI sector">⬠ Sector</button>
-            </div>
-
             <div class="gf-ruler-box hidden" data-role="ruler-box"></div>
             <div class="gf-sector-draft-bar hidden" data-role="sector-draft-bar"></div>
 
@@ -682,7 +723,7 @@ export class SidebarPanel {
                 <label class="gf-label" for="gf-ring-radii">Ring Radii (km)</label>
                 <input
                   id="gf-ring-radii"
-                  class="gf-input mono"
+                  class="gf-input"
                   type="text"
                   data-role="ring-radii-input"
                   value="1, 3, 5"
@@ -702,11 +743,6 @@ export class SidebarPanel {
               <button type="button" class="gf-mini-btn danger" data-role="wp-clear-all" disabled>Clear WPs</button>
             </div>
 
-            <label class="gf-inline-check gf-wp-card-toggle">
-              <input type="checkbox" data-role="wp-route-card" />
-              <span>Include Tactical Route Card Page (MGRS &amp; Mag Azimuths)</span>
-            </label>
-
             <div class="gf-wp-list" data-role="wp-list"></div>
             <div class="gf-wp-total hidden" data-role="wp-total"></div>
           </div>
@@ -716,8 +752,7 @@ export class SidebarPanel {
         <details class="gf-section" data-role="viewshed-section">
           <summary class="gf-section-summary">
             <span class="gf-section-title-group">
-              <span class="gf-section-index">06</span>
-              <span class="gf-section-title">RF / Viewshed</span>
+              <span class="gf-section-title">RF &amp; Viewshed</span>
             </span>
             <span class="gf-section-meta">
               <span class="gf-section-pill" data-role="viewshed-pill">Off</span>
@@ -728,7 +763,7 @@ export class SidebarPanel {
             <div class="gf-subdivider"><span>Area Viewshed (DEM LOS)</span></div>
             <div class="gf-wp-controls">
               <button type="button" class="gf-wp-markup-btn gf-vs-toggle-btn" data-role="vs-toggle">
-                <span>📡 Drop Observer</span>
+                ${ICON_LOS}<span>Drop Observer</span>
               </button>
               <button type="button" class="gf-mini-btn danger" data-role="vs-clear-all" disabled>
                 Clear All
@@ -738,15 +773,15 @@ export class SidebarPanel {
             <div class="gf-field-row-3">
               <div class="gf-field">
                 <label class="gf-label" for="gf-vs-obs-h">Obs H (m)</label>
-                <input id="gf-vs-obs-h" class="gf-input mono" type="number" min="0" max="500" step="0.5" value="2" />
+                <input id="gf-vs-obs-h" class="gf-input" type="number" min="0" max="500" step="0.5" value="2" />
               </div>
               <div class="gf-field">
                 <label class="gf-label" for="gf-vs-tgt-h">Tgt H (m)</label>
-                <input id="gf-vs-tgt-h" class="gf-input mono" type="number" min="0" max="500" step="0.5" value="1.5" />
+                <input id="gf-vs-tgt-h" class="gf-input" type="number" min="0" max="500" step="0.5" value="1.5" />
               </div>
               <div class="gf-field">
                 <label class="gf-label" for="gf-vs-rad-km">Max (km)</label>
-                <input id="gf-vs-rad-km" class="gf-input mono" type="number" min="0.25" max="25" step="0.5" value="10" />
+                <input id="gf-vs-rad-km" class="gf-input" type="number" min="0.25" max="25" step="0.5" value="10" />
               </div>
             </div>
 
@@ -760,7 +795,7 @@ export class SidebarPanel {
 
             <div class="gf-wp-controls">
               <button type="button" class="gf-wp-markup-btn gf-rf-pick-btn" data-role="rf-link-toggle">
-                <span>⚡ A ↔ B Pick</span>
+                ${ICON_RF_LINK}<span>A ↔ B Pick</span>
               </button>
               <button type="button" class="gf-mini-btn" data-role="rf-use-obs" disabled title="Compute Fresnel link between OBS1 and OBS2">
                 OBS1 → OBS2
@@ -777,136 +812,166 @@ export class SidebarPanel {
             <div class="gf-field-row-3">
               <div class="gf-field">
                 <label class="gf-label" for="gf-rf-freq">Freq (MHz)</label>
-                <input id="gf-rf-freq" class="gf-input mono" type="number" min="30" max="60000" step="0.1" value="915" />
+                <input id="gf-rf-freq" class="gf-input" type="number" min="30" max="60000" step="0.1" value="915" />
               </div>
               <div class="gf-field">
                 <label class="gf-label" for="gf-rf-tx-h">Tx H (m)</label>
-                <input id="gf-rf-tx-h" class="gf-input mono" type="number" min="0" max="500" step="0.5" value="2" />
+                <input id="gf-rf-tx-h" class="gf-input" type="number" min="0" max="500" step="0.5" value="2" />
               </div>
               <div class="gf-field">
                 <label class="gf-label" for="gf-rf-rx-h">Rx H (m)</label>
-                <input id="gf-rf-rx-h" class="gf-input mono" type="number" min="0" max="500" step="0.5" value="2" />
+                <input id="gf-rf-rx-h" class="gf-input" type="number" min="0" max="500" step="0.5" value="2" />
               </div>
             </div>
-
-            <label class="gf-inline-check">
-              <input type="checkbox" data-role="rf-link-card" />
-              <span>Include RF Fresnel Link Card PDF Page</span>
-            </label>
 
             <div class="gf-wp-list gf-rf-list" data-role="rf-links-list"></div>
           </div>
         </details>
       </div>
 
-      <!-- Sticky Outputs & Generate Footer -->
+      <!-- Compact Sticky Footer with Upward-Expanding Outputs Drawer -->
       <div class="gf-sidebar-footer">
-        <div class="gf-outputs-box">
-          <div class="gf-output-line">
-            <label class="gf-output-check">
-              <input type="checkbox" data-role="out-pdf" />
-              <span>Print PDF</span>
-            </label>
-            <div class="gf-output-inline">
-              <select
-                class="gf-mini-select"
-                data-role="out-pdf-dpi"
-                aria-label="Print PDF resolution (DPI)"
-                title="Print PDF resolution (300 DPI standard; 450/600 DPI ultra-sharp hillshade)"
-              >
-                ${dpiOptsHtml}
-              </select>
-              <label class="gf-inline-check" title="Embed geospatial reference tags in PDF">
-                <input type="checkbox" data-role="out-geopdf" />
-                <span>GeoPDF</span>
+        <div
+          id="gf-outputs-drawer"
+          class="gf-outputs-drawer"
+          data-role="outputs-drawer"
+          role="region"
+          aria-label="Print and digital output options"
+          hidden
+        >
+          <div class="gf-outputs-drawer-head">
+            <span class="gf-outputs-drawer-title">Print &amp; Digital Outputs</span>
+            <button
+              type="button"
+              class="gf-icon-btn gf-outputs-close"
+              data-role="outputs-close"
+              aria-label="Close outputs panel"
+              title="Close outputs (Esc)"
+            >${ICON_CLOSE}</button>
+          </div>
+
+          <div class="gf-outputs-box">
+            <div class="gf-output-line">
+              <label class="gf-output-check">
+                <input type="checkbox" data-role="out-pdf" />
+                <span>Print PDF</span>
+              </label>
+              <div class="gf-output-inline">
+                <select
+                  class="gf-mini-select"
+                  data-role="out-pdf-dpi"
+                  aria-label="Print PDF resolution (DPI)"
+                  title="Print PDF resolution (300 DPI standard; 450/600 DPI ultra-sharp hillshade)"
+                >
+                  ${dpiOptsHtml}
+                </select>
+                <label class="gf-inline-check" title="Embed geospatial reference tags in PDF">
+                  <input type="checkbox" data-role="out-geopdf" />
+                  <span>GeoPDF</span>
+                </label>
+              </div>
+            </div>
+
+            <div class="gf-supp-pages" data-role="supp-pages">
+              <label class="gf-inline-check" title="Append true-scale 100 mm ruler and MGRS Romer verification page">
+                <input type="checkbox" data-role="out-calibration" />
+                <span>100 mm Scale Calibration &amp; Romer Page</span>
+              </label>
+              <div class="gf-supp-chips">
+                <label class="gf-inline-check" title="Append Tactical Waypoints and Magnetic Bearings table page">
+                  <input type="checkbox" data-role="out-route-card" />
+                  <span>Route Card</span>
+                </label>
+                <label class="gf-inline-check" title="Prepend DEM Elevation Profile cover page">
+                  <input type="checkbox" data-role="out-elev-profile" />
+                  <span>Elev Profile</span>
+                </label>
+                <label class="gf-inline-check" title="Prepend Atlas Overview and Sheet Index cover page">
+                  <input type="checkbox" data-role="out-atlas-index" />
+                  <span>Atlas Index</span>
+                </label>
+                <label class="gf-inline-check" title="Append RF Fresnel Zone and FSPL Link Card PDF page">
+                  <input type="checkbox" data-role="out-rf-link-card" />
+                  <span>RF Link Card</span>
+                </label>
+              </div>
+            </div>
+
+            <div class="gf-output-line">
+              <label class="gf-output-check">
+                <input type="checkbox" data-role="out-mbtiles" />
+                <span>ATAK .mbtiles</span>
+              </label>
+              <div class="gf-output-inline">
+                <select class="gf-mini-select" data-role="out-mbtiles-fmt" aria-label="MBTiles tile format">
+                  <option value="png">PNG</option>
+                  <option value="jpg">JPG</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="gf-output-line">
+              <label class="gf-output-check">
+                <input type="checkbox" data-role="out-kmz" />
+                <span>Garmin .kmz</span>
+              </label>
+              <div class="gf-output-inline">
+                <select class="gf-mini-select" data-role="out-garmin-profile" aria-label="Garmin Custom Maps profile">
+                  <option value="standard">Standard ≤100</option>
+                  <option value="modern">Modern ≤500</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="gf-extra-outputs">
+              <label class="gf-output-chip" title="OGC GeoPackage Raster Tiles (.gpkg) for QGIS, AlpineQuest &amp; Gaia">
+                <input type="checkbox" data-role="out-gpkg" />
+                <span>.gpkg</span>
+              </label>
+              <label class="gf-output-chip" title="OsmAnd / Locus Map BigPlanet SQLite (.sqlitedb)">
+                <input type="checkbox" data-role="out-osmand" />
+                <span>.sqlitedb</span>
+              </label>
+              <label class="gf-output-chip gf-bundle-chip" title="Single Field Bundle (.zip) containing PDF, digital tiles, GPX 1.1 &amp; README">
+                <input type="checkbox" data-role="out-bundle" />
+                <span>Field Bundle (.zip)</span>
               </label>
             </div>
-          </div>
 
-          <div class="gf-supp-pages" data-role="supp-pages">
-            <label class="gf-inline-check" title="Append true-scale 100 mm ruler & MGRS Romer verification page">
-              <input type="checkbox" data-role="out-calibration" />
-              <span>100 mm Scale Calibration &amp; Romer Page</span>
-            </label>
-            <div class="gf-supp-chips">
-              <label class="gf-inline-check" title="Append Tactical Waypoints & Magnetic Bearings table page">
-                <input type="checkbox" data-role="out-route-card" />
-                <span>Route Card</span>
+            <div class="gf-digital-opts-row" data-role="digital-grid-row">
+              <label class="gf-inline-check">
+                <input type="checkbox" data-role="out-digital-grid" />
+                <span>MGRS Grid on Digital</span>
               </label>
-              <label class="gf-inline-check" title="Prepend DEM Elevation Profile cover page">
-                <input type="checkbox" data-role="out-elev-profile" />
-                <span>Elev Profile</span>
-              </label>
-              <label class="gf-inline-check" title="Prepend Atlas Overview & Sheet Index cover page">
-                <input type="checkbox" data-role="out-atlas-index" />
-                <span>Atlas Index</span>
-              </label>
-              <label class="gf-inline-check" title="Append RF Fresnel Zone & FSPL Link Card PDF page">
-                <input type="checkbox" data-role="out-rf-link-card" />
-                <span>RF Link Card</span>
-              </label>
-            </div>
-          </div>
-
-          <div class="gf-output-line">
-            <label class="gf-output-check">
-              <input type="checkbox" data-role="out-mbtiles" />
-              <span>ATAK .mbtiles</span>
-            </label>
-            <div class="gf-output-inline">
-              <select class="gf-mini-select" data-role="out-mbtiles-fmt" aria-label="MBTiles tile format">
-                <option value="png">PNG</option>
-                <option value="jpg">JPG</option>
-              </select>
-            </div>
-          </div>
-
-          <div class="gf-output-line">
-            <label class="gf-output-check">
-              <input type="checkbox" data-role="out-kmz" />
-              <span>Garmin .kmz</span>
-            </label>
-            <div class="gf-output-inline">
-              <select class="gf-mini-select" data-role="out-garmin-profile" aria-label="Garmin Custom Maps profile">
-                <option value="standard">Standard ≤100</option>
-                <option value="modern">Modern ≤500</option>
-              </select>
-            </div>
-          </div>
-
-          <div class="gf-extra-outputs">
-            <label class="gf-output-chip" title="OGC GeoPackage Raster Tiles (.gpkg) for QGIS, AlpineQuest & Gaia">
-              <input type="checkbox" data-role="out-gpkg" />
-              <span>.gpkg</span>
-            </label>
-            <label class="gf-output-chip" title="OsmAnd / Locus Map BigPlanet SQLite (.sqlitedb)">
-              <input type="checkbox" data-role="out-osmand" />
-              <span>.sqlitedb</span>
-            </label>
-            <label class="gf-output-chip gf-bundle-chip" title="Single Field Bundle (.zip) containing PDF, digital tiles, GPX 1.1 & README">
-              <input type="checkbox" data-role="out-bundle" />
-              <span>Field Bundle (.zip)</span>
-            </label>
-          </div>
-
-          <div class="gf-digital-opts-row" data-role="digital-grid-row">
-            <label class="gf-inline-check">
-              <input type="checkbox" data-role="out-digital-grid" />
-              <span>MGRS Grid on Digital</span>
-            </label>
-            <div class="gf-output-inline">
-              <span class="gf-mini-label">Tiles</span>
-              <select
-                class="gf-mini-select"
-                data-role="out-export-dpi"
-                aria-label="Digital export tile resolution (DPI)"
-                title="Digital export rasterization DPI (higher DPI generates sharper max zoom tiles)"
-              >
-                ${dpiOptsHtml}
-              </select>
+              <div class="gf-output-inline">
+                <span class="gf-mini-label">Tiles</span>
+                <select
+                  class="gf-mini-select"
+                  data-role="out-export-dpi"
+                  aria-label="Digital export tile resolution (DPI)"
+                  title="Digital export rasterization DPI (higher DPI generates sharper max zoom tiles)"
+                >
+                  ${dpiOptsHtml}
+                </select>
+              </div>
             </div>
           </div>
         </div>
+
+        <button
+          type="button"
+          class="gf-outputs-trigger"
+          data-role="outputs-trigger"
+          aria-expanded="false"
+          aria-controls="gf-outputs-drawer"
+        >
+          <span class="gf-outputs-trigger-left">
+            ${ICON_SLIDERS}
+            <span class="gf-outputs-trigger-label">Outputs</span>
+            <span class="gf-outputs-summary" data-role="outputs-summary">Print PDF · 300 DPI</span>
+          </span>
+          <span class="gf-outputs-chevron" aria-hidden="true">${ICON_CHEVRON_UP}</span>
+        </button>
 
         <div class="gf-turnstile-slot hidden" data-role="turnstile-slot"></div>
         <div class="gf-quota-notice hidden" data-role="quota-notice" role="status"></div>
@@ -923,11 +988,24 @@ export class SidebarPanel {
             aria-label="Copy CLI command"
             title="Copy Docker Compose command"
           >
-            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-              <path d="M2.5 4.5L6 8L2.5 11.5M7.5 11.5H13.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
-            </svg>
+            ${ICON_TERMINAL}
             <span>CLI</span>
           </button>
+        </div>
+
+        <div class="gf-footer-meta">
+          <span>Open-source · GPL-3.0</span>
+          <a
+            class="gf-footer-repo-link"
+            data-role="repo-link"
+            href="https://github.com/jremick/gridforge"
+            target="_blank"
+            rel="noopener noreferrer"
+            aria-label="View GridForge repository on GitHub"
+          >
+            ${ICON_GITHUB}
+            <span>GitHub</span>
+          </a>
         </div>
       </div>
     `;
@@ -944,12 +1022,10 @@ export class SidebarPanel {
     this.atlasSublabelEl = this.q("[data-role='atlas-sublabel']");
     this.atlasTierHintEl = this.q("[data-role='atlas-tier-hint']");
     this.foldMarksCheck = this.q<HTMLInputElement>("[data-role='fold-marks']");
-    this.sheetAtlasIndexCheck = this.q<HTMLInputElement>(
-      "[data-role='sheet-atlas-index']"
-    );
     this.demSelect = this.q<HTMLSelectElement>("#gf-dem-select");
     this.packSelect = this.q<HTMLSelectElement>("#gf-pack-select");
     this.managePacksBtn = this.q<HTMLButtonElement>("[data-role='manage-packs']");
+    this.overlayTabsEl = this.q("[data-role='overlay-tabs']");
     this.stateAutoCheck = this.q<HTMLInputElement>("[data-role='au-state-auto']");
     this.contourSelect = this.q<HTMLSelectElement>("#gf-contour-select");
     this.hillshadeSelect = this.q<HTMLSelectElement>("#gf-hillshade-select");
@@ -967,9 +1043,6 @@ export class SidebarPanel {
     );
     this.waypointsPillEl = this.q("[data-role='waypoints-pill']");
     this.wpClearBtn = this.q<HTMLButtonElement>("[data-role='wp-clear-all']");
-    this.wpRouteCardCheck = this.q<HTMLInputElement>(
-      "[data-role='wp-route-card']"
-    );
     this.wpListEl = this.q("[data-role='wp-list']");
     this.wpTotalEl = this.q("[data-role='wp-total']");
     this.rulerBoxEl = this.q("[data-role='ruler-box']");
@@ -1000,9 +1073,16 @@ export class SidebarPanel {
     this.rfFreqInput = this.q<HTMLInputElement>("#gf-rf-freq");
     this.rfTxHInput = this.q<HTMLInputElement>("#gf-rf-tx-h");
     this.rfRxHInput = this.q<HTMLInputElement>("#gf-rf-rx-h");
-    this.rfCardCheck = this.q<HTMLInputElement>("[data-role='rf-link-card']");
     this.rfLinksListEl = this.q("[data-role='rf-links-list']");
 
+    this.outputsDrawerEl = this.q("[data-role='outputs-drawer']");
+    this.outputsTriggerBtn = this.q<HTMLButtonElement>(
+      "[data-role='outputs-trigger']"
+    );
+    this.outputsSummaryEl = this.q("[data-role='outputs-summary']");
+    this.outputsCloseBtn = this.q<HTMLButtonElement>(
+      "[data-role='outputs-close']"
+    );
     this.outPdfCheck = this.q<HTMLInputElement>("[data-role='out-pdf']");
     this.outPdfDpiSelect = this.q<HTMLSelectElement>("[data-role='out-pdf-dpi']");
     this.outGeoPdfCheck = this.q<HTMLInputElement>("[data-role='out-geopdf']");
@@ -1229,8 +1309,37 @@ export class SidebarPanel {
       if (!preset) return;
       this.closeGeocodeMenu();
       this.activePresetId = preset.id;
+      this.overlayRegionManuallySet = false;
       this.setFormError(null);
       this.callbacks.onPresetSelect(preset);
+    });
+
+    // Regional Overlay Tabs (AU / NZ / US / CA)
+    this.overlayTabsEl.addEventListener("click", (e) => {
+      const target = e.target as HTMLElement | null;
+      const btn = target?.closest<HTMLButtonElement>("[data-overlay-tab]");
+      if (!btn) return;
+      const region = btn.dataset.overlayTab as OverlayRegionTab;
+      if (!region) return;
+      this.overlayRegionManuallySet = true;
+      this.setOverlayRegionTab(region);
+    });
+
+    // Upward Outputs Drawer Toggle
+    this.outputsTriggerBtn.addEventListener("click", () => {
+      this.setOutputsDrawerOpen(!this.outputsDrawerOpen);
+    });
+
+    this.outputsCloseBtn.addEventListener("click", () => {
+      this.setOutputsDrawerOpen(false, { restoreFocus: true });
+    });
+
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && this.outputsDrawerOpen) {
+        e.preventDefault();
+        e.stopPropagation();
+        this.setOutputsDrawerOpen(false, { restoreFocus: true });
+      }
     });
 
     this.titleInput.addEventListener("input", () => {
@@ -1253,14 +1362,6 @@ export class SidebarPanel {
       this.callbacks.onFootprintParamsChange();
     });
 
-    const syncAtlasIndexChecks = (checked: boolean) => {
-      this.state.include_atlas_index = checked;
-      this.sheetAtlasIndexCheck.checked = checked;
-      this.outAtlasIndexCheck.checked = checked;
-      this.setFormError(null);
-      this.callbacks.onStateChange();
-    };
-
     this.root
       .querySelectorAll<HTMLButtonElement>("[data-atlas-cols]")
       .forEach((btn) => {
@@ -1282,16 +1383,15 @@ export class SidebarPanel {
           this.state.grid_rows = rows;
           if (wasSingle && cols * rows > 1) {
             this.state.include_atlas_index = true;
-            this.sheetAtlasIndexCheck.checked = true;
             this.outAtlasIndexCheck.checked = true;
           } else if (cols * rows === 1) {
             this.state.include_atlas_index = false;
-            this.sheetAtlasIndexCheck.checked = false;
             this.outAtlasIndexCheck.checked = false;
           }
           this.setFormError(null);
           this.updateAtlasButtons();
           this.updateSectionPills();
+          this.updateOutputsSummary();
           this.callbacks.onFootprintParamsChange({ fitAfterLoad: true });
         });
       });
@@ -1300,10 +1400,6 @@ export class SidebarPanel {
       this.state.show_fold_marks = this.foldMarksCheck.checked;
       this.setFormError(null);
       this.callbacks.onStateChange();
-    });
-
-    this.sheetAtlasIndexCheck.addEventListener("change", () => {
-      syncAtlasIndexChecks(this.sheetAtlasIndexCheck.checked);
     });
 
     this.bindSegmented("orientation", (val) => {
@@ -1638,18 +1734,6 @@ export class SidebarPanel {
       this.callbacks.onWaypointsClear();
     });
 
-    const syncRouteCardChecks = (checked: boolean) => {
-      this.state.include_route_card = checked;
-      this.wpRouteCardCheck.checked = checked;
-      this.outRouteCardCheck.checked = checked;
-      this.setFormError(null);
-      this.callbacks.onStateChange();
-    };
-
-    this.wpRouteCardCheck.addEventListener("change", () => {
-      syncRouteCardChecks(this.wpRouteCardCheck.checked);
-    });
-
     this.wpListEl.addEventListener("change", (e) => {
       const target = e.target as HTMLElement | null;
       if (!target) return;
@@ -1808,18 +1892,6 @@ export class SidebarPanel {
       this.rfRxHInput.value = String(v);
     });
 
-    const syncRfCardChecks = (checked: boolean) => {
-      this.state.include_rf_link_card = checked;
-      this.rfCardCheck.checked = checked;
-      this.outRfLinkCardCheck.checked = checked;
-      this.setFormError(null);
-      this.callbacks.onStateChange();
-    };
-
-    this.rfCardCheck.addEventListener("change", () => {
-      syncRfCardChecks(this.rfCardCheck.checked);
-    });
-
     this.rfLinksListEl.addEventListener("click", (e) => {
       const target = e.target as HTMLElement | null;
       const btn = target?.closest<HTMLButtonElement>("button[data-rf-action]");
@@ -1856,31 +1928,43 @@ export class SidebarPanel {
     this.outGeoPdfCheck.addEventListener("change", () => {
       this.state.outputs.geopdf = this.outGeoPdfCheck.checked;
       this.setFormError(null);
+      this.updateOutputsSummary();
       this.callbacks.onStateChange();
     });
 
     this.outCalibrationCheck.addEventListener("change", () => {
       this.state.include_calibration_page = this.outCalibrationCheck.checked;
       this.setFormError(null);
+      this.updateOutputsSummary();
       this.callbacks.onStateChange();
     });
 
     this.outRouteCardCheck.addEventListener("change", () => {
-      syncRouteCardChecks(this.outRouteCardCheck.checked);
+      this.state.include_route_card = this.outRouteCardCheck.checked;
+      this.setFormError(null);
+      this.updateOutputsSummary();
+      this.callbacks.onStateChange();
     });
 
     this.outElevProfileCheck.addEventListener("change", () => {
       this.state.include_elevation_profile = this.outElevProfileCheck.checked;
       this.setFormError(null);
+      this.updateOutputsSummary();
       this.callbacks.onStateChange();
     });
 
     this.outAtlasIndexCheck.addEventListener("change", () => {
-      syncAtlasIndexChecks(this.outAtlasIndexCheck.checked);
+      this.state.include_atlas_index = this.outAtlasIndexCheck.checked;
+      this.setFormError(null);
+      this.updateOutputsSummary();
+      this.callbacks.onStateChange();
     });
 
     this.outRfLinkCardCheck.addEventListener("change", () => {
-      syncRfCardChecks(this.outRfLinkCardCheck.checked);
+      this.state.include_rf_link_card = this.outRfLinkCardCheck.checked;
+      this.setFormError(null);
+      this.updateOutputsSummary();
+      this.callbacks.onStateChange();
     });
 
     this.outMbtilesCheck.addEventListener("change", () => {
@@ -1940,6 +2024,7 @@ export class SidebarPanel {
       if (Number.isFinite(nextDpi) && nextDpi <= maxDpi) {
         this.state.dpi = nextDpi;
         this.updateSectionPills();
+        this.updateOutputsSummary();
         this.setFormError(null);
         this.callbacks.onStateChange();
       } else {
@@ -1969,11 +2054,13 @@ export class SidebarPanel {
 
     this.generateBtn.addEventListener("click", () => {
       if (!this.hasAnyOutputEnabled()) {
+        this.setOutputsDrawerOpen(true);
         this.setFormError(
           "Select at least one output (PDF, MBTiles, KMZ, GPKG, SQLiteDB, or Bundle)."
         );
         return;
       }
+      this.setOutputsDrawerOpen(false);
       this.setFormError(null);
       this.callbacks.onSubmitJob();
     });
@@ -2230,27 +2317,107 @@ export class SidebarPanel {
     }
   }
 
-  private syncToolButtons(): void {
-    this.root
-      .querySelectorAll<HTMLButtonElement>("[data-tool-btn]")
-      .forEach((btn) => {
-        const active = btn.dataset.toolBtn === this.interactionMode;
-        btn.classList.toggle("active", active);
-        btn.setAttribute("aria-pressed", String(active));
+  private setOutputsDrawerOpen(
+    open: boolean,
+    options: { restoreFocus?: boolean } = {}
+  ): void {
+    this.outputsDrawerOpen = open;
+    if (this.outputsDrawerEl) {
+      this.outputsDrawerEl.hidden = !open;
+    }
+    if (this.outputsTriggerBtn) {
+      this.outputsTriggerBtn.setAttribute("aria-expanded", String(open));
+      this.outputsTriggerBtn.classList.toggle("open", open);
+    }
+    if (!open && options.restoreFocus) {
+      this.outputsTriggerBtn?.focus();
+    }
+  }
+
+  private setOverlayRegionTab(region: OverlayRegionTab): void {
+    this.activeOverlayRegion = region;
+    this.overlayTabsEl
+      ?.querySelectorAll<HTMLButtonElement>("[data-overlay-tab]")
+      .forEach((b) => {
+        const active = b.dataset.overlayTab === region;
+        b.classList.toggle("active", active);
+        b.setAttribute("aria-selected", String(active));
       });
+    this.root
+      ?.querySelectorAll<HTMLElement>("[data-overlay-panel]")
+      .forEach((panel) => {
+        panel.hidden = panel.dataset.overlayPanel !== region;
+      });
+  }
+
+  private updateOverlayTabCounts(): void {
+    if (!this.overlayTabsEl) return;
+    const counts: Record<OverlayRegionTab, number> = {
+      au: this.state.au_overlays.length,
+      nz: this.state.nz_overlays.length,
+      us: this.state.us_overlays.length,
+      ca: this.state.ca_overlays.length,
+    };
+    for (const tab of OVERLAY_REGION_TABS) {
+      const btn = this.overlayTabsEl.querySelector<HTMLButtonElement>(
+        `[data-overlay-tab='${tab.id}']`
+      );
+      if (!btn) continue;
+      const c = counts[tab.id];
+      btn.textContent = c > 0 ? `${tab.label} · ${c}` : tab.label;
+    }
+  }
+
+  private updateOutputsSummary(): void {
+    if (!this.outputsSummaryEl) return;
+    const o = this.state.outputs;
+    const parts: string[] = [];
+    if (o.pdf) {
+      parts.push(`${o.geopdf ? "GeoPDF" : "Print PDF"} ${this.state.dpi} DPI`);
+      const suppCount = [
+        this.state.include_calibration_page,
+        this.state.include_route_card,
+        this.state.include_elevation_profile,
+        this.state.include_atlas_index,
+        this.state.include_rf_link_card,
+      ].filter(Boolean).length;
+      if (suppCount > 0) {
+        parts.push(`+${suppCount} pg${suppCount === 1 ? "" : "s"}`);
+      }
+    }
+    const digital: string[] = [];
+    if (o.mbtiles) digital.push("ATAK");
+    if (o.kmz) digital.push("KMZ");
+    if (o.gpkg_tiles) digital.push("GPKG");
+    if (o.osmand_sqlitedb) digital.push("SQLite");
+    if (o.field_bundle_zip) digital.push("Bundle");
+    if (digital.length > 0) {
+      parts.push(
+        digital.length <= 2 ? digital.join(" · ") : `+${digital.length} digital`
+      );
+    }
+
+    const empty = parts.length === 0;
+    this.outputsSummaryEl.textContent = empty
+      ? "None selected"
+      : parts.join(" · ");
+    this.outputsTriggerBtn?.classList.toggle("is-empty", empty);
+  }
+
+  private syncToolButtons(): void {
     this.vsToggleBtn.classList.toggle("active", this.interactionMode === "los");
     this.vsToggleBtn.innerHTML =
       this.interactionMode === "los"
-        ? `<span>📡 LOS ON (Click Map)</span>`
-        : `<span>📡 Drop Observer</span>`;
+        ? `${ICON_LOS}<span>LOS Active (Click Map)</span>`
+        : `${ICON_LOS}<span>Drop Observer</span>`;
 
     this.rfPickBtn.classList.toggle("active", this.interactionMode === "rf-link");
     this.rfPickBtn.innerHTML =
       this.interactionMode === "rf-link"
         ? this.rfPendingFrom
-          ? `<span>⚡ Click Point B…</span>`
-          : `<span>⚡ Click Point A…</span>`
-        : `<span>⚡ A ↔ B Pick</span>`;
+          ? `${ICON_RF_LINK}<span>Click Point B…</span>`
+          : `${ICON_RF_LINK}<span>Click Point A…</span>`
+        : `${ICON_RF_LINK}<span>A ↔ B Pick</span>`;
   }
 
   private renderRulerBox(): void {
@@ -2265,7 +2432,7 @@ export class SidebarPanel {
     if (count === 0) {
       this.rulerBoxEl.innerHTML = `
         <div class="gf-ruler-head">
-          <span class="gf-ruler-title">📏 Ruler Active</span>
+          <span class="gf-ruler-title">${ICON_RULER}<span>Ruler Active</span></span>
           <span class="gf-sublabel">Click map points to measure</span>
         </div>
       `;
@@ -2319,7 +2486,7 @@ export class SidebarPanel {
     this.sectorDraftBarEl.classList.remove("hidden");
     this.sectorDraftBarEl.innerHTML = `
       <div class="gf-ruler-head">
-        <span class="gf-ruler-title mono">⬠ Sector Draft: ${this.sectorDraftCount} pt${this.sectorDraftCount === 1 ? "" : "s"}</span>
+        <span class="gf-ruler-title">${ICON_SECTOR}<span>Sector Draft: ${this.sectorDraftCount} pt${this.sectorDraftCount === 1 ? "" : "s"}</span></span>
         <div class="gf-ruler-actions">
           <button type="button" class="gf-mini-btn gf-pin-btn" data-sector-action="finish" ${this.sectorDraftCount < 3 ? "disabled" : ""}>Finish</button>
           <button type="button" class="gf-mini-btn danger" data-sector-action="cancel">Cancel</button>
@@ -2376,7 +2543,7 @@ export class SidebarPanel {
                 maxlength="48"
                 aria-label="Tactical graphic ${idx + 1} label"
               />
-              <button type="button" class="gf-wp-del" data-tg-del="${idx}" title="Remove graphic">×</button>
+              <button type="button" class="gf-wp-del" data-tg-del="${idx}" aria-label="Remove graphic" title="Remove graphic">${ICON_CLOSE}</button>
             </div>
             <div class="gf-wp-meta mono">
               <span>${escapeHtml(meta)}</span>
@@ -2416,7 +2583,7 @@ export class SidebarPanel {
     if (wps.length === 0) {
       this.wpListEl.innerHTML = `
         <div class="gf-wp-empty">
-          Use <strong>⌖ WP</strong> (<kbd>M</kbd>), <strong>📏 Ruler</strong> (<kbd>R</kbd>), <strong>◎ Ring</strong>, or <strong>⬠ Sector</strong> to annotate your sheet.
+          Choose <strong>WP</strong> (<kbd>M</kbd>), <strong>Ruler</strong> (<kbd>R</kbd>), <strong>Ring</strong>, or <strong>Sector</strong> on the map toolbar to annotate your sheet.
         </div>
       `;
       this.wpTotalEl.classList.add("hidden");
@@ -2471,7 +2638,7 @@ export class SidebarPanel {
               <select class="gf-wp-cat-select" data-wp-cat="${idx}" aria-label="Waypoint ${idx + 1} category">
                 ${catOptions}
               </select>
-              <button type="button" class="gf-wp-del" data-wp-del="${idx}" title="Remove ${code}">×</button>
+              <button type="button" class="gf-wp-del" data-wp-del="${idx}" aria-label="Remove ${code}" title="Remove ${code}">${ICON_CLOSE}</button>
             </div>
             <div class="gf-wp-meta mono">
               <span class="gf-wp-mgrs" title="10m MGRS">${escapeHtml(mgrsStr)}</span>
@@ -2524,7 +2691,7 @@ export class SidebarPanel {
     if (entries.length === 0) {
       this.vsListEl.innerHTML = `
         <div class="gf-wp-empty">
-          Click <strong>📡 Drop Observer</strong> (<kbd>V</kbd>) and click a summit or repeater site to preview DEM line-of-sight RF coverage.
+          Select <strong>Drop Observer</strong> (<kbd>V</kbd>) and click a summit or repeater site to preview DEM line-of-sight RF coverage.
         </div>
       `;
       return;
@@ -2568,8 +2735,8 @@ export class SidebarPanel {
                 maxlength="60"
                 aria-label="Observer ${idx + 1} label"
               />
-              <button type="button" class="gf-wp-del" data-vs-action="recompute" data-vs-id="${escapeHtml(entry.id)}" title="Recompute viewshed">↻</button>
-              <button type="button" class="gf-wp-del" data-vs-action="delete" data-vs-id="${escapeHtml(entry.id)}" title="Remove ${code}">×</button>
+              <button type="button" class="gf-wp-del" data-vs-action="recompute" data-vs-id="${escapeHtml(entry.id)}" aria-label="Recompute viewshed" title="Recompute viewshed">${ICON_REFRESH}</button>
+              <button type="button" class="gf-wp-del" data-vs-action="delete" data-vs-id="${escapeHtml(entry.id)}" aria-label="Remove ${code}" title="Remove ${code}">${ICON_CLOSE}</button>
             </div>
             <div class="gf-vs-params mono">
               <label>Obs <input type="number" min="0" max="500" step="0.5" value="${o.observer_height_m}" data-vs-id="${escapeHtml(entry.id)}" data-vs-field="obs_h" />m</label>
@@ -2594,7 +2761,7 @@ export class SidebarPanel {
     if (links.length === 0) {
       this.rfLinksListEl.innerHTML = `
         <div class="gf-wp-empty">
-          Click <strong>⚡ A ↔ B Pick</strong> and select two points on the map (or use <strong>OBS1 → OBS2</strong>) for live Fresnel zone &amp; FSPL clearance analysis.
+          Click <strong>A ↔ B Pick</strong> and select two points on the map (or use <strong>OBS1 → OBS2</strong>) for live Fresnel zone &amp; FSPL clearance analysis.
         </div>
       `;
       return;
@@ -2635,8 +2802,8 @@ export class SidebarPanel {
             <div class="gf-wp-top">
               <span class="gf-rf-title mono">${escapeHtml(s.from_label)} ↔ ${escapeHtml(s.to_label)} · ${s.freq_mhz} MHz</span>
               ${badgeHtml}
-              <button type="button" class="gf-wp-del" data-rf-action="recompute" data-rf-id="${escapeHtml(entry.id)}" title="Recompute RF link">↻</button>
-              <button type="button" class="gf-wp-del" data-rf-action="delete" data-rf-id="${escapeHtml(entry.id)}" title="Remove RF link">×</button>
+              <button type="button" class="gf-wp-del" data-rf-action="recompute" data-rf-id="${escapeHtml(entry.id)}" aria-label="Recompute RF link" title="Recompute RF link">${ICON_REFRESH}</button>
+              <button type="button" class="gf-wp-del" data-rf-action="delete" data-rf-id="${escapeHtml(entry.id)}" aria-label="Remove RF link" title="Remove RF link">${ICON_CLOSE}</button>
             </div>
             ${bodyHtml}
           </div>
@@ -2681,6 +2848,7 @@ export class SidebarPanel {
                 : "GLO-30";
     this.overlayPillEl.textContent =
       overlayCount > 0 ? `${demShort} · +${overlayCount}` : demShort;
+    this.updateOverlayTabCounts();
 
     const customCarto =
       this.state.carto.contour_density !== "normal" ||
@@ -2712,12 +2880,14 @@ export class SidebarPanel {
     this.scaleSelect.value = String(this.state.scale);
     this.paperSelect.value = this.state.paper;
     this.foldMarksCheck.checked = this.state.show_fold_marks;
-    this.sheetAtlasIndexCheck.checked = this.state.include_atlas_index;
     this.setSegmentedValue("orientation", this.state.orientation);
     this.setSegmentedValue("color_mode", this.state.color_mode);
     this.setSegmentedValue("units", this.state.units);
     this.demSelect.value = this.state.dem_source;
     this.packSelect.value = this.state.pack_id;
+    if (!this.overlayRegionManuallySet) {
+      this.setOverlayRegionTab(inferOverlayRegion(this.state.lat, this.state.lon));
+    }
 
     this.syncStateTrailControls();
 
@@ -2791,11 +2961,9 @@ export class SidebarPanel {
     this.outGeoPdfCheck.checked = o.geopdf;
     this.outCalibrationCheck.checked = this.state.include_calibration_page;
     this.outRouteCardCheck.checked = this.state.include_route_card;
-    this.wpRouteCardCheck.checked = this.state.include_route_card;
     this.outElevProfileCheck.checked = this.state.include_elevation_profile;
     this.outAtlasIndexCheck.checked = this.state.include_atlas_index;
     this.outRfLinkCardCheck.checked = this.state.include_rf_link_card;
-    this.rfCardCheck.checked = this.state.include_rf_link_card;
 
     this.outMbtilesCheck.checked = o.mbtiles;
     this.outMbtilesFmt.value = o.mbtiles_format;
@@ -2926,7 +3094,8 @@ export class SidebarPanel {
       hosted && maxExportDpi < 600
         ? `Guest export resolution capped at ${maxExportDpi} DPI (sign in for 450/600 DPI)`
         : "Digital export rasterization DPI (higher DPI generates sharper max zoom tiles)";
-    this.digitalGridRow.style.opacity = anyDigital ? "1" : "0.45";
+    this.digitalGridRow.style.opacity = anyDigital ? "1" : "0.52";
+    this.updateOutputsSummary();
   }
 
   applySession(session: SessionResponse): void {
@@ -3043,6 +3212,10 @@ export class SidebarPanel {
     this.ringRadiiInput.value = this.ringRadiiInput.defaultValue;
     this.activePresetTab = "nsw-vic";
     this.activePresetId = "blue-mountains";
+    this.overlayRegionManuallySet = false;
+    if (this.outputsDrawerEl) {
+      this.setOutputsDrawerOpen(false);
+    }
     this.presetTabsEl
       .querySelectorAll<HTMLButtonElement>("[data-preset-tab]")
       .forEach((b) =>

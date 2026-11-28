@@ -1,10 +1,21 @@
 import {
+  ICON_ADMIN,
+  ICON_CHEVRON_DOWN,
+  ICON_COPY,
+  ICON_MOON,
+  ICON_PROJECTS,
+  ICON_SHARE,
+  ICON_SIDEBAR,
+  ICON_SUN,
+} from "../icons";
+import {
   escapeHtml,
   formatDeclinationCompass,
   formatSignedDeg,
   formatSignedMilsNumber,
 } from "../presets";
 import { formatAccountPill } from "../session";
+import type { StudioTheme } from "../themePrefs";
 import type {
   FootprintResponse,
   HealthResponse,
@@ -27,6 +38,7 @@ export interface ShortLinkDisplay {
 
 export interface TelemetryCallbacks {
   onToggleSidebar?: () => void;
+  onToggleTheme?: () => void;
   onToggleDrawer: () => void;
   onToggleProjects: () => void;
   onCopyMgrs: (mgrs: string) => void;
@@ -39,17 +51,13 @@ export interface TelemetryCallbacks {
   onOpenAdmin?: () => void;
 }
 
-const ICON_SIDEBAR = `<svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true"><rect x="1.5" y="2.25" width="13" height="11.5" rx="2" stroke="currentColor" stroke-width="1.4"/><line x1="6" y1="2.5" x2="6" y2="13.5" stroke="currentColor" stroke-width="1.4"/></svg>`;
-const ICON_SHARE = `<svg width="13.5" height="13.5" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M6.75 9.25L9.25 6.75" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><path d="M8.8 10.6L7.4 12C6.3 13.1 4.5 13.1 3.4 12C2.3 10.9 2.3 9.1 3.4 8L4.8 6.6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><path d="M7.2 5.4L8.6 4C9.7 2.9 11.5 2.9 12.6 4C13.7 5.1 13.7 6.9 12.6 8L11.2 9.4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>`;
-const ICON_PROJECTS = `<svg width="13.5" height="13.5" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M2 4.25C2 3.42 2.67 2.75 3.5 2.75H6.2L7.55 4.25H12.5C13.33 4.25 14 4.92 14 5.75V11.75C14 12.58 13.33 13.25 12.5 13.25H3.5C2.67 13.25 2 12.58 2 11.75V4.25Z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>`;
-const ICON_ADMIN = `<svg width="13.5" height="13.5" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M2.5 4.5H13.5M2.5 8H13.5M2.5 11.5H13.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><circle cx="5.5" cy="4.5" r="1.4" fill="#0c1116" stroke="currentColor" stroke-width="1.3"/><circle cx="10.5" cy="8" r="1.4" fill="#0c1116" stroke="currentColor" stroke-width="1.3"/><circle cx="6.5" cy="11.5" r="1.4" fill="#0c1116" stroke="currentColor" stroke-width="1.3"/></svg>`;
-const ICON_CHEVRON = `<svg class="gf-menu-chevron" width="11" height="11" viewBox="0 0 12 12" fill="none" aria-hidden="true"><path d="M3 4.5L6 7.5L9 4.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
-const ICON_COPY = `<svg class="gf-copy-glyph" width="11.5" height="11.5" viewBox="0 0 16 16" fill="none" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5" stroke="currentColor" stroke-width="1.4"/><path d="M10.5 5.5V3.75C10.5 3.06 9.94 2.5 9.25 2.5H3.75C3.06 2.5 2.5 3.06 2.5 3.75V9.25C2.5 9.94 3.06 10.5 3.75 10.5H5.5" stroke="currentColor" stroke-width="1.4"/></svg>`;
+const ICON_CHEVRON = ICON_CHEVRON_DOWN;
 
 export class TelemetryBar {
   private readonly root: HTMLElement;
   private readonly callbacks: TelemetryCallbacks;
   private readonly sidebarToggleBtn: HTMLButtonElement;
+  private readonly themeToggleBtn: HTMLButtonElement;
   private readonly brandEl: HTMLElement;
   private readonly brandNameEl: HTMLElement;
   private readonly brandSubEl: HTMLElement;
@@ -144,7 +152,7 @@ export class TelemetryBar {
             </svg>
           </div>
           <span class="gf-brand-name" data-role="brand-name">GridForge</span>
-          <span class="gf-brand-sub" data-role="brand-sub">Studio</span>
+          <span class="gf-brand-sub" data-role="brand-sub" hidden></span>
         </div>
       </div>
 
@@ -157,7 +165,7 @@ export class TelemetryBar {
           aria-label="Copy 10m MGRS coordinate"
         >
           <span class="gf-telemetry-label">MGRS</span>
-          <span class="gf-telemetry-value cyan" data-role="mgrs">—</span>
+          <span class="gf-telemetry-value cyan mono" data-role="mgrs">—</span>
           ${ICON_COPY}
         </button>
         <div class="gf-telemetry-item gf-tel-utm">
@@ -180,6 +188,13 @@ export class TelemetryBar {
 
       <div class="gf-topbar-right">
         <div class="gf-topbar-group" role="group" aria-label="Workspace panels">
+          <button
+            type="button"
+            class="gf-topbar-btn gf-theme-toggle"
+            data-role="theme-toggle"
+            aria-label="Switch to Daylight theme"
+            title="Switch to Daylight theme"
+          >${ICON_SUN}</button>
           <div class="gf-share-wrap" data-role="share-wrap">
             <button
               type="button"
@@ -281,6 +296,9 @@ export class TelemetryBar {
     this.sidebarToggleBtn = this.q<HTMLButtonElement>(
       "[data-role='sidebar-toggle']"
     );
+    this.themeToggleBtn = this.q<HTMLButtonElement>(
+      "[data-role='theme-toggle']"
+    );
     this.brandEl = this.q("[data-role='brand']");
     this.brandNameEl = this.q("[data-role='brand-name']");
     this.brandSubEl = this.q("[data-role='brand-sub']");
@@ -323,6 +341,10 @@ export class TelemetryBar {
 
     this.sidebarToggleBtn.addEventListener("click", () => {
       callbacks.onToggleSidebar?.();
+    });
+
+    this.themeToggleBtn.addEventListener("click", () => {
+      callbacks.onToggleTheme?.();
     });
 
     this.mgrsBoxBtn.addEventListener("click", () => {
@@ -397,6 +419,15 @@ export class TelemetryBar {
         injectedBrand.tagline
       );
     }
+  }
+
+  updateTheme(theme: StudioTheme): void {
+    const isLight = theme === "light";
+    this.themeToggleBtn.innerHTML = isLight ? ICON_MOON : ICON_SUN;
+    const label = isLight ? "Switch to Dark theme" : "Switch to Daylight theme";
+    this.themeToggleBtn.setAttribute("aria-label", label);
+    this.themeToggleBtn.title = label;
+    this.themeToggleBtn.setAttribute("aria-pressed", String(isLight));
   }
 
   updateBrand(name?: string, subtitle?: string, tagline?: string): void {
@@ -510,7 +541,7 @@ export class TelemetryBar {
     const notes: string[] = [];
     if (summary.directTruncated) {
       notes.push(
-        "Direct URL is compact and omits some markups — use Short Share Link for 100% fidelity."
+        "Direct URL is compact and omits some markups; use Short Share Link for full fidelity."
       );
     }
     if (summary.hasLocalOverlayFile) {
@@ -659,8 +690,8 @@ export class TelemetryBar {
       this.queueToggleBtn.classList.add("is-offline");
       this.queueLabelEl.textContent = "Offline";
       this.queueToggleBtn.title = errorMsg
-        ? `API offline (${errorMsg}) — click to open Queue`
-        : "API offline — click to open Queue";
+        ? `API offline (${errorMsg}). Click to open Queue`
+        : "API offline. Click to open Queue";
       this.syncQueueAriaLabel();
       return;
     }
@@ -870,7 +901,7 @@ export class TelemetryBar {
           class="gf-topbar-btn gf-admin-btn${pill.publicPaused ? " is-paused" : ""}"
           data-role="admin-open-btn"
           aria-label="Open admin dashboard"
-          title="${pill.publicPaused ? "Public renders PAUSED — open Admin dashboard" : "Admin usage, invites &amp; kill switch"}"
+          title="${pill.publicPaused ? "Public renders PAUSED: open Admin dashboard" : "Admin usage, invites &amp; kill switch"}"
         >
           ${ICON_ADMIN}
           <span class="gf-btn-text">Admin${pill.publicPaused ? " · Paused" : ""}</span>

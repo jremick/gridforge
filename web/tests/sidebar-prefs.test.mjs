@@ -6,11 +6,13 @@ import {
   MIN_SIDEBAR_WIDTH,
   MAX_SIDEBAR_WIDTH,
   clampSidebarWidth,
+  defaultSidebarCollapsedForViewport,
   getMaxSidebarWidthForViewport,
   loadSidebarPrefs,
   saveSidebarPrefs,
   sidebarStorageKey,
 } from "../src/sidebarPrefs.ts";
+import { loadStudioTheme, saveStudioTheme } from "../src/themePrefs.ts";
 
 function makeMemoryStorage() {
   const map = new Map();
@@ -104,4 +106,25 @@ test("loadSidebarPrefs and saveSidebarPrefs persist per-user and browser prefere
     saveSidebarPrefs({ width: 200, collapsed: true }, "usr-a", 1440, brokenStorage),
     { width: MIN_SIDEBAR_WIDTH, collapsed: true }
   );
+
+  // Mobile viewports (<= 680px) default to collapsed so first-time visitors see the live map
+  const emptyMobileStore = makeMemoryStorage();
+  assert.equal(defaultSidebarCollapsedForViewport(390), true);
+  assert.equal(defaultSidebarCollapsedForViewport(1440), false);
+  assert.deepEqual(loadSidebarPrefs(null, 390, emptyMobileStore), {
+    width: 360,
+    collapsed: true,
+  });
+});
+
+test("loadStudioTheme and saveStudioTheme default to dark and persist daylight selection safely", () => {
+  const store = makeMemoryStorage();
+  assert.equal(loadStudioTheme(store), "dark");
+  assert.equal(saveStudioTheme("light", store), "light");
+  assert.equal(loadStudioTheme(store), "light");
+  assert.equal(saveStudioTheme("dark", store), "dark");
+  assert.equal(loadStudioTheme(store), "dark");
+
+  store.setItem("gridforge.ui.theme.v1", "invalid");
+  assert.equal(loadStudioTheme(store), "dark");
 });

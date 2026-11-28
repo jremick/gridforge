@@ -6,6 +6,7 @@ import {
   updateAdminSettings,
   updateAdminUser,
 } from "../api";
+import { ICON_CLOSE, ICON_REFRESH } from "../icons";
 import { TrapFocusHelper } from "../modalFocus";
 import { escapeHtml, formatDuration } from "../presets";
 import {
@@ -142,12 +143,11 @@ export class AdminModal {
       <div class="gf-modal-panel gf-modal-panel-lg" data-role="modal-panel">
         <div class="gf-modal-header">
           <div class="gf-modal-title-group">
-            <span class="gf-section-index">ADMIN</span>
             <h2 class="gf-modal-title" id="gf-admin-modal-title">Admin Dashboard</h2>
           </div>
           <div class="gf-drawer-actions">
-            <button type="button" class="gf-icon-btn" data-role="admin-refresh" aria-label="Refresh admin data" title="Refresh admin data">↻</button>
-            <button type="button" class="gf-icon-btn" data-role="modal-close" aria-label="Close admin dashboard" title="Close (Esc)">×</button>
+            <button type="button" class="gf-icon-btn" data-role="admin-refresh" aria-label="Refresh admin data" title="Refresh admin data">${ICON_REFRESH}</button>
+            <button type="button" class="gf-icon-btn" data-role="modal-close" aria-label="Close admin dashboard" title="Close (Esc)">${ICON_CLOSE}</button>
           </div>
         </div>
 

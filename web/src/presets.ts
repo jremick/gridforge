@@ -556,31 +556,36 @@ export const COLOR_MODE_OPTIONS: readonly {
   value: ColorMode;
   label: string;
   swatch: string;
+  palette: readonly [string, string, string];
   hint: string;
 }[] = [
   {
     value: "color",
     label: "Color",
     swatch: "#22C55E",
-    hint: "Standard military topographic color",
+    palette: ["#F4F0E2", "#4D9A57", "#B45309"],
+    hint: "Standard topographic color print palette",
   },
   {
     value: "bw",
     label: "B&W Print",
     swatch: "#CBD5E1",
+    palette: ["#F8FAFC", "#94A3B8", "#1E293B"],
     hint: "High-contrast laser monochrome",
   },
   {
     value: "night-red",
     label: "Night (Red-Light)",
     swatch: "#38BDF8",
-    hint: "Red-headlamp safe (zero red/orange critical ink)",
+    palette: ["#0F172A", "#0EA5E9", "#2DD4BF"],
+    hint: "Red-headlamp safe (zero red or orange critical ink)",
   },
   {
     value: "alpine",
     label: "Alpine",
     swatch: "#60A5FA",
-    hint: "Winter/glacier contours & vivid avalanche slopes",
+    palette: ["#F8FAFC", "#38BDF8", "#9333EA"],
+    hint: "Winter/glacier contours and avalanche slope bands",
   },
 ];
 
