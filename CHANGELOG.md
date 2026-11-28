@@ -5,6 +5,38 @@ All notable changes to **GridForge** are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.0] - 2026-11-28
+
+Major **GridForge Studio** UI/UX and information-architecture redesign introducing a warm-paper **Daylight** theme alongside Dark mode, an upward-expanding **Outputs** drawer that reclaims sidebar scrolling space, auto-matched regional overlay tabs, self-hosted `IBM Plex` typography, unified inline SVG iconography, responsive mobile ergonomics, interactive MCP App theme parity, and a production **MapLibre GL JS v6** Web Worker bundling fix.
+
+### Added
+
+- **Warm-Paper Daylight Studio Theme & Persistence (`web/src/themePrefs.ts`, `web/src/styles.css`, `web/src/components/{telemetry,rfChart}.ts`, `web/src/map.ts`, `web/mcp-app/styles.css`):**
+  - Added a Sun/Moon theme switcher in the top telemetry bar toggling between Dark Studio (`data-theme="dark"`) and warm archival-paper Daylight Studio (`data-theme="light"`, persisted in `localStorage`), with WCAG AA contrast tokens, explicit `color-scheme` form controls, theme-reactive MapLibre background and RF Fresnel chart variables, and matching interactive MCP App light/dark tokens.
+- **Upward-Expanding Outputs Drawer & Footer GitHub Link (`web/src/components/sidebar.ts`, `web/src/styles.css`):**
+  - Replaced the tall always-open sticky output wall in the sidebar footer with a compact live summary trigger (`Outputs · Print PDF 300 DPI`) that expands an anchored **Print & Digital Outputs** drawer upward on demand, shrinking the footer from `~45%` to `~15%` of `1024×768` laptop viewport height.
+  - Added an `Open-source · GPL-3.0` + GitHub repository link (`https://github.com/jremick/gridforge`, `rel="noopener noreferrer"`) to the sidebar footer.
+- **Self-Hosted Bundled Typography & Unified Icon System (`web/package.json`, `web/src/icons.ts`, `web/src/main.ts`):**
+  - Bundled `@fontsource/ibm-plex-sans` and `@fontsource/ibm-plex-mono` Latin `.woff2`/`.woff` weights directly into Vite's static `/assets/` output for crisp offline/air-gapped typography with zero external CDN requests.
+  - Replaced mixed Unicode symbols and emoji icons across the telemetry bar, sidebar, map toolbars, modals, and drawers with a unified 16×16 `stroke-width="1.75"` inline SVG icon module (`web/src/icons.ts`).
+- **Auto-Matched Regional Overlay Tabs & Cartographic Theme Swatches (`web/src/components/sidebar.ts`, `web/src/presets.ts`):**
+  - Scoped **Terrain & Overlays** into `AU | NZ | US | CA` tabs with live active-layer counts that automatically match the selected regional preset instead of dumping all four countries' checkboxes simultaneously.
+  - Added 3-strip color-palette swatches to all 4 print cartography theme buttons (`Color`, `B&W Print`, `Night (Red-Light)`, `Alpine`) so operators can preview each palette at a glance.
+
+### Improved & Fixed
+
+- **MapLibre GL JS v6 Production Worker Bundling (`web/src/map.ts`, `web/tests/modal-dom.test.mjs`):**
+  - Explicitly wired `maplibregl.setWorkerUrl(...)` to Vite's `?url`-emitted `/assets/maplibre-gl-worker-<hash>.mjs` bundle so `Vector HD` basemaps and live GeoJSON sheet footprints, MGRS grids, viewsheds, RF links, and tactical overlays work reliably in production Docker builds under `worker-src 'self'` (fixing `/assets/maplibre-gl-worker.mjs` HTTP 404s introduced by MapLibre v6's external worker resolution).
+- **Information Architecture Cleanup & Error Recovery (`web/src/components/{sidebar,packsModal,authModal,adminModal,jobsDrawer,projectsDrawer}.ts`):**
+  - Flattened stacked sidebar cards into clean hairline sections, stripped numbered `01`–`06` and eyebrow noise chips, removed duplicated supplemental-page checkboxes and redundant sidebar tactical tool buttons, disabled the **Elevation** selector in the Pack Manager when DEM download is unchecked, and added an explicit error state with a `Retry` action when `/api/packs/regions` is unreachable.
+- **Responsive Mobile Studio (`<= 680px`) (`web/src/sidebarPrefs.ts`, `web/src/main.ts`, `web/src/map.ts`, `web/src/styles.css`):**
+  - Defaulted the mobile sidebar to collapsed so the map opens full-screen, added a click-outside scrim overlay and compact mobile basemap `<select>`, auto-collapsed the sidebar when choosing map tools, wrapped the 5-tab Pack Manager cleanly without horizontal clipping, adopted `100dvh` viewport sizing, collapsed compact attribution on load to prevent scale-bar overlap, and enlarged coarse-pointer touch targets.
+
+### Verification
+
+- **Automated & Live Visual Suites (`618` offline pytest + `67` frontend tests + live multi-region E2E):**
+  - Verified `618` offline PyQGIS tests (`--network none`), `67` frontend tests (covering mobile sidebar defaults, theme persistence/toggle, `PacksModal` retry recovery, GitHub footer link security attributes, and MapLibre v6 worker URL wiring), live multi-region open-data E2E renders across US/CA/AU/NZ, and zero-console-error Docker Studio visual captures at `1440×900`, `1024×768`, and `390×844` (`docs/images/studio-v18-{dark,daylight}.jpg`).
+
 ## [1.7.2] - 2026-11-28
 
 Reliability, maintainability, and test-hardening maintenance release consolidating Studio modal/drawer abort lifecycles, bounding browser API requests with explicit timeout signals, centralizing auth-mode configuration lookup, adding repository-level `anti-slop` guardrails, and substantially expanding mutation-verified frontend and backend test coverage.

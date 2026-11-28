@@ -94,7 +94,7 @@ let pollInFlight = false;
 let toastTimer: number | null = null;
 
 const app = new App(
-  { name: "GridForge", version: "1.7.2" },
+  { name: "GridForge", version: "1.8.0" },
   {},
   { autoResize: true }
 );
@@ -2366,7 +2366,7 @@ function buildDemoSheetPngBase64(page: number, title: string): string {
   ctx.fillText("0        1        2        3        4 km", 46, 926);
   ctx.font = "500 11px system-ui, sans-serif";
   ctx.fillStyle = "#475569";
-  ctx.fillText("Data: OpenStreetMap (ODbL) · ELVIS 5m DEM (CC BY 4.0) · NSW Spatial Trails · GridForge v1.7.2", 46, 962);
+  ctx.fillText("Data: OpenStreetMap (ODbL) · ELVIS 5m DEM (CC BY 4.0) · NSW Spatial Trails · GridForge v1.8.0", 46, 962);
   ctx.fillText(page === 1 ? "SHEET A1 — PRIMARY TOPOGRAPHIC MAP" : `SUPPLEMENT PAGE ${page} — CALIBRATION & NAVIGATION CARD`, 46, 984);
 
   const dataUrl = c.toDataURL("image/png");

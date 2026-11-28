@@ -4,7 +4,10 @@ Every sheet below was rendered directly by GridForge at 300–600 DPI in native 
 
 ## Print Studio
 
-![GridForge Studio — Vector HD Basemap, Resizable Sidebar, 1:10,000 Scale, and 600 DPI Print & Export Selectors](images/studio-v15-vector-dpi.jpg)
+| **Dark Studio — `Vector HD`, 4 Theme Swatches & Compact Footer** | **Daylight Studio — Warm Paper & Upward Outputs Drawer** |
+| :---: | :---: |
+| ![GridForge v1.8.0 Dark Studio — Vector HD Basemap, Tilted UTM Footprint, 4 Cartographic Theme Swatches, and Compact Outputs Trigger](images/studio-v18-dark.jpg) | ![GridForge v1.8.0 Daylight Studio — Warm-Paper Theme with Upward-Expanding Print & Digital Outputs Drawer](images/studio-v18-daylight.jpg) |
+| *Dark operational theme with self-hosted IBM Plex typography and live WMM2025 telemetry* | *Warm-paper daylight theme with collapsible Outputs drawer preserving sidebar scroll space* |
 
 ## Multi-Continent Themes, RF Fresnel Cards, Viewsheds & Atlas Covers
 
